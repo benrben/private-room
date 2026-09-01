@@ -23,6 +23,7 @@ import os
 import subprocess
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -143,6 +144,50 @@ def test_transcribe_under_1600_samples_returns_empty_without_touching_model(
     assert engine.transcribe("/nonexistent/whisper-model.bin", tiny, True) == ""
     assert calls["n"] == 0, "silence under the 1600-sample floor touched the model"
     assert engine._cache is None
+
+
+def test_transcribe_uses_a_fake_recognizer_for_segment_filtering_and_timestamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class _FakeModel:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self._ctx = object()
+
+        def transcribe(self, _pcm: np.ndarray, **kwargs: object):
+            calls.append(kwargs)
+            return [
+                SimpleNamespace(text=" [BLANK_AUDIO] ", t0=0),
+                SimpleNamespace(text=" Thank you. ", t0=100),
+                SimpleNamespace(text=" Thank you. ", t0=200),
+                SimpleNamespace(text="  Real speech  ", t0=300),
+            ]
+
+    monkeypatch.setattr(engine, "Model", _FakeModel)
+    monkeypatch.setattr(engine, "_n_threads", lambda: 3)
+    monkeypatch.setattr(
+        engine,
+        "_segment_mean_p",
+        lambda _ctx, index: 0.1 if index == 1 else 0.9,
+    )
+    pcm = np.zeros(1600, dtype=np.int16)
+
+    assert engine.transcribe("/fake/whisper.bin", pcm, False) == "Thank you. Real speech"
+    assert engine.transcribe("/fake/whisper.bin", pcm, True) == (
+        "[0:02] Thank you.\n[0:03] Real speech"
+    )
+    assert calls == [
+        {
+            "language": "auto",
+            "n_threads": 3,
+            "greedy": {"best_of": 1},
+            "print_special": False,
+            "print_progress": False,
+            "print_realtime": False,
+            "print_timestamps": False,
+        },
+    ] * 2
 
 
 # --------------------------------------------------- (1) real say roundtrip

@@ -12,23 +12,16 @@
 // string scan cannot.
 
 import { existsSync, readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { PAGE_SCRIPT_PATH } from "./pageScript.js";
+import { PAGE_SCRIPT_FILES, PAGE_SCRIPT_PATH, PAGE_SCRIPT_PATHS } from "./pageScript.js";
 import { READY_JS, buildCallJs } from "./evalBridge.js";
 
-const PAGE_JS = readFileSync(PAGE_SCRIPT_PATH, "utf8");
-
-/** The Rust original, while both trees still exist side by side. */
-const RUST_PAGE_JS = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "../../../../../src-tauri/src/browser/page.js",
-);
+const PAGE_JS = PAGE_SCRIPT_PATHS.map((scriptPath) => readFileSync(scriptPath, "utf8")).join("\n");
 
 describe("page_script_exposes_the_bridge_contract", () => {
   it("is where pageScript.ts says it is", () => {
-    expect(existsSync(PAGE_SCRIPT_PATH)).toBe(true);
+    expect(PAGE_SCRIPT_PATHS.every(existsSync)).toBe(true);
+    expect(PAGE_SCRIPT_PATHS.at(-1)).toBe(PAGE_SCRIPT_PATH);
   });
 
   it("exposes the call entry point and every op the bridge dispatches", () => {
@@ -107,23 +100,26 @@ describe("the Electron export footer — this port's one adaptation to the file"
   });
 });
 
-describe("the body is still a plain copy of the Rust original", () => {
-  // The whole claim in page.js's header is that syncing a fix from the Rust
-  // file stays a COPY of everything between the IIFE's first line and the
-  // export footer. Nothing else can check that; a drifted body would show up
-  // only as behaviour the two browsers no longer share.
-  const haveRust = existsSync(RUST_PAGE_JS);
-  it.skipIf(!haveRust)("matches src-tauri/src/browser/page.js from the IIFE to the api literal", () => {
-    const rust = readFileSync(RUST_PAGE_JS, "utf8");
-    const bodyOf = (src: string, endMarker: string) => {
-      const start = src.indexOf("(function () {");
-      const end = src.indexOf(endMarker);
-      expect(start, "IIFE start not found").toBeGreaterThan(-1);
-      expect(end, `${endMarker} not found`).toBeGreaterThan(start);
-      return src.slice(start, end);
-    };
-    expect(bodyOf(PAGE_JS, "  var api = {")).toBe(
-      bodyOf(rust, "  window.__arcelleBrowse = {"),
-    );
+describe("the ordered preload assembly", () => {
+  it("initializes one private scope and exposes the public bridge only from the final fragment", () => {
+    expect(PAGE_SCRIPT_FILES).toEqual([
+      "pageCore.js",
+      "pageSnapshot.js",
+      "pageRead.js",
+      "pageActions.js",
+      "page.js",
+    ]);
+
+    const fragments = PAGE_SCRIPT_PATHS.map((scriptPath) => readFileSync(scriptPath, "utf8"));
+    expect(fragments[0]).toContain("var scope = {};");
+    expect(fragments[0]).toContain("window.__arcellePageScope = scope;");
+    for (const fragment of fragments.slice(1)) {
+      expect(fragment).toContain("var scope = window.__arcellePageScope;");
+      expect(fragment).toContain("if (!scope) return;");
+    }
+    for (const fragment of fragments.slice(0, -1)) {
+      expect(fragment).not.toContain('require("electron").contextBridge.exposeInMainWorld');
+    }
+    expect(fragments.at(-1)).toContain('require("electron").contextBridge.exposeInMainWorld');
   });
 });

@@ -204,6 +204,19 @@ describe("waitReady", () => {
     ).resolves.toBeUndefined();
     expect(polls).toBeGreaterThan(1);
   });
+
+  it("uses the production poll delay before a page finishes loading", async () => {
+    let probes = 0;
+    const host = fakeHost(() => {
+      probes += 1;
+      return probes === 1
+        ? { ok: false, refused: false }
+        : { ok: true, url: "https://ready.example/" };
+    });
+
+    await expect(waitReady(host, "0", () => false, 5_000)).resolves.toBeUndefined();
+    expect(probes).toBe(2);
+  });
 });
 
 describe("docId", () => {
@@ -223,6 +236,17 @@ describe("docId", () => {
 });
 
 describe("callAsync", () => {
+  it("uses its production poll delay and returns null for a completed empty ticket", async () => {
+    const host = fakeHost((op) => {
+      if (op === "info") return { ok: true, doc: "doc-A" };
+      if (op === "begin") return { ok: true, ticket: "t1" };
+      if (op === "take") return { ok: true, done: true };
+      return { ok: false };
+    });
+
+    await expect(callAsync(host, "0", "act", {}, 5_000, () => false)).resolves.toBeNull();
+  });
+
   it("returns the ticket's own value once it completes — the Rust result shape", async () => {
     let takes = 0;
     const host = fakeHost((op) => {
@@ -263,6 +287,34 @@ describe("callAsync", () => {
         navBudgetMs: 50,
       }),
     ).resolves.toEqual({ ok: true, navigated: true, snapshot: { ok: true, count: 1 } });
+  });
+
+  it("records navigation before a replacement snapshot that cannot be read", async () => {
+    const events: string[] = [];
+    let doc = "doc-A";
+    const host = fakeHost((op) => {
+      if (op === "begin") return { ok: true, ticket: "t1" };
+      if (op === "take") {
+        doc = "doc-B";
+        return { ok: false, error: "Unknown ticket t1" };
+      }
+      if (op === "info") return { ok: true, doc };
+      if (op === "ping") return { ok: true, url: "https://after.example/" };
+      if (op === "snapshot") {
+        events.push("snapshot");
+        return { ok: false, error: "snapshot is no longer available" };
+      }
+      return { ok: false };
+    });
+
+    await expect(
+      callAsync(host, "0", "act", {}, 5_000, () => false, {
+        sleep: noSleep,
+        navBudgetMs: 50,
+        onNavigated: () => events.push("navigated"),
+      }),
+    ).resolves.toEqual({ ok: true, navigated: true, snapshot: null });
+    expect(events).toEqual(["navigated", "snapshot"]);
   });
 
   it("rethrows when the SAME document reports the ticket unknown — a real bug, not a navigation", async () => {

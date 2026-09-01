@@ -274,6 +274,16 @@ describe("parsePassPlan", () => {
     const plan = parsePassPlan(v);
     expect(plan.textSha256).toBeUndefined();
   });
+
+  it("rejects malformed containers and window shapes before a resume can use them", () => {
+    const valid = {
+      fileId: "f", fileName: "book.txt", instruction: "summarize", mode: "merge", textLen: 10,
+      windows: [[0, 10]],
+    };
+    expect(() => parsePassPlan(null)).toThrow("invalid PassPlan: not an object");
+    expect(() => parsePassPlan({ ...valid, windows: "not windows" })).toThrow('"windows" is not an array');
+    expect(() => parsePassPlan({ ...valid, windows: [[0, "end"]] })).toThrow("a window is not a [number, number] pair");
+  });
 });
 
 describe("the_section_constant_is_an_unstored_part_of_the_plan", () => {
@@ -359,6 +369,22 @@ describe("executePassStep dispatch", () => {
     const { result } = await runStep(rooms, "job", "/tmp/r1.roomai", plan, "text", step, new CancelFlag());
     expect(result).toEqual({ ok: false, error: "unknown pass step kind: workflow_node" });
   });
+
+  it("treats a non-object map params payload as the same absent-window fallback Rust uses", async () => {
+    const room = "/tmp/params.roomai";
+    const { rooms } = freshRoom(room);
+    const plan = planFor("merge", [[0, 4]], 4);
+    const step: Step = { id: 0, lane: "local_llm", kind: "map", params: null, dependsOn: [] };
+    const seen: Array<Record<string, unknown>> = [];
+    const { result } = await runStep(rooms, "job", room, plan, "text", step, new CancelFlag(), {
+      post: async (_endpoint, body) => {
+        seen.push(body as Record<string, unknown>);
+        return { kind: "value", value: { result: "notes", thread: "", skipped: false } };
+      },
+    });
+    expect(result).toEqual({ ok: true });
+    expect(seen[0]?.part).toBe(0);
+  });
 });
 
 // ------------------------------------------------------------- publish
@@ -380,7 +406,9 @@ describe("executePassStep: publish", () => {
     const cancel = new CancelFlag();
     const publish = steps[steps.length - 1] as Step;
 
-    const r1 = await runStep(rooms, job, room, plan, "text", publish, cancel);
+    const r1 = await runStep(rooms, job, room, plan, "text", publish, cancel, {
+      emit: () => { throw new Error("closed window"); },
+    });
     expect(r1.result.ok).toBe(true);
     const r2 = await runStep(rooms, job, room, plan, "text", publish, cancel);
     expect(r2.result.ok).toBe(true);
@@ -398,6 +426,23 @@ describe("executePassStep: publish", () => {
     // The publish step's own artifact carries the file id that makes it so.
     const recorded = loadArtifact(db, job, publish.id)?.fileId;
     expect(recorded).toBe(m1.id);
+  });
+
+  it("starts a fresh deliverable when a replay artifact points at a deleted file", async () => {
+    const room = "/tmp/stale-publish.roomai";
+    const { rooms, db } = freshRoom(room);
+    const plan = planFor("merge", [[0, 4]], 4);
+    const steps = buildPassSteps(1, "merge", "local_llm");
+    const publish = steps.at(-1)!;
+    const job = createJob(db, "file_pass", "Full pass", JSON.parse(JSON.stringify(plan)), steps.length);
+    storeArtifact(db, job, 0, art("notes", false));
+    storeArtifact(db, job, 1, art("<h2>Section</h2>", false));
+    storeArtifact(db, job, publish.id, { result: "old", thread: "", skipped: false, fileId: "deleted-file" });
+
+    const { result, meta } = await runStep(rooms, job, room, plan, "text", publish, new CancelFlag());
+    expect(result).toEqual({ ok: true });
+    expect(meta?.id).not.toBe("deleted-file");
+    expect(loadArtifact(db, job, publish.id)?.fileId).toBe(meta?.id);
   });
 
   it("publishes and replays a workspace pass as one normal versioned file", async () => {
@@ -820,12 +865,37 @@ describe("pass_artifact_wire_format_is_the_migration_contract", () => {
     expect(p.skipped).toBe(false);
     expect(p.thread).toBe("");
 
+    // `file_id` remains the wire-only spelling: a real publish artifact
+    // round-trips it, `null` remains an omitted optional field, and a
+    // present-but-wrong type is a deserialize failure rather than a guess.
+    db.prepare("INSERT OR REPLACE INTO job_artifacts(job_id, step_id, content) VALUES (?, 4, ?)").run(
+      job,
+      JSON.stringify({ result: "published", file_id: "deliverable-1" })
+    );
+    expect(loadArtifact(db, job, 4)).toMatchObject({
+      result: "published", thread: "", skipped: false, fileId: "deliverable-1",
+    });
+    db.prepare("INSERT OR REPLACE INTO job_artifacts(job_id, step_id, content) VALUES (?, 5, ?)").run(
+      job,
+      JSON.stringify({ file_id: null })
+    );
+    expect(loadArtifact(db, job, 5)).toEqual({ result: "", thread: "", skipped: false });
+
     // The malformed-reply fallback the map arm actually uses.
     db.prepare("INSERT OR REPLACE INTO job_artifacts(job_id, step_id, content) VALUES (?, 3, ?)").run(
       job,
       JSON.stringify({ skipped: "yes" })
     );
     expect(loadArtifact(db, job, 3)).toBeNull();
+    db.prepare("INSERT OR REPLACE INTO job_artifacts(job_id, step_id, content) VALUES (?, 6, ?)").run(
+      job,
+      JSON.stringify({ file_id: 7 })
+    );
+    expect(loadArtifact(db, job, 6)).toBeNull();
+    db.prepare("INSERT OR REPLACE INTO job_artifacts(job_id, step_id, content) VALUES (?, 7, 'not json')").run(job);
+    expect(loadArtifact(db, job, 7)).toBeNull();
+    db.prepare("INSERT OR REPLACE INTO job_artifacts(job_id, step_id, content) VALUES (?, 8, ?)").run(job, JSON.stringify("not an object"));
+    expect(loadArtifact(db, job, 8)).toBeNull();
   });
 });
 
@@ -1022,6 +1092,42 @@ describe("driveFilePass", () => {
     };
     await driveFilePass(deps, parent, room, file.id, file.name, "   ", "merge", new CancelFlag());
     expect(sawInstruction).toBe("Summarize this file completely and thoroughly.");
+  });
+
+  it("finishes the pass when best-effort child status and checkpoint writes fail", async () => {
+    const room = "/tmp/drive-best-effort.roomai";
+    const { rooms, db } = freshRoom(room);
+    const text = "content";
+    const file = insertFile(db, "f.txt", "text/plain", Buffer.from(text, "utf8"), text, "upload");
+    const parent = createJob(db, "workflow", "Test workflow", {}, 1);
+    const flakyDb = new Proxy(db, {
+      get(target, key, receiver) {
+        if (key !== "prepare") return Reflect.get(target, key, receiver);
+        return (sql: string) => {
+          if (sql.includes("UPDATE jobs SET status") || sql.includes("UPDATE jobs SET cursor")) {
+            throw new Error("room database closed during best-effort update");
+          }
+          return target.prepare(sql);
+        };
+      },
+    }) as Database.Database;
+    const flakyRooms: RoomSource = {
+      current: () => {
+        const current = rooms.current();
+        return current === null ? null : { ...current, db: flakyDb };
+      },
+    };
+    const deps: DriveFilePassDeps = {
+      rooms: flakyRooms,
+      post: async (endpoint) => endpoint === "/file_pass_map"
+        ? { kind: "value", value: { result: "notes", thread: "", skipped: false } }
+        : { kind: "value", value: { result: "<h2>S</h2>", thread: "", skipped: false } },
+      resolveEngine: async () => ({ model: "test-model", lane: "local_llm" }),
+    };
+
+    await expect(
+      driveFilePass(deps, parent, room, file.id, file.name, "summarize", "merge", new CancelFlag()),
+    ).resolves.toMatchObject({ meta: { name: "Full pass — f.txt.html" } });
   });
 
   it("surfaces the NOT_IMPLEMENTED seam when no engine resolver is supplied", async () => {

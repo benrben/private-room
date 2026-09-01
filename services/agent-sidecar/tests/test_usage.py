@@ -79,6 +79,11 @@ def test_a_tool_less_final_round_is_charged_no_catalog() -> None:
     assert totals["tools"] == 0
 
 
+def test_a_negative_tool_catalog_never_reduces_the_tool_cost() -> None:
+    totals = categorize_messages([], -1)
+    assert totals["tools"] == 0
+
+
 # --------------------------------------------------------------------------- #
 # the numbers on screen
 # --------------------------------------------------------------------------- #

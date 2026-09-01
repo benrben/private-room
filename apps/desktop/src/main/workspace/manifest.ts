@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, type BigIntStats } from "node:fs";
 import { lstat, opendir } from "node:fs/promises";
 import path from "node:path";
 import { PRIVATE_DIR, pathKey } from "./pathSafety.js";
@@ -36,6 +36,84 @@ export function isArcelleAtomicTemporaryName(name: string): boolean {
   return /^\..+\.arcelle-[0-9a-f-]+\.tmp$/i.test(name);
 }
 
+type WalkWorkspaceDirectory = (absoluteDir: string, prefix: string) => Promise<void>;
+
+function skipWorkspaceEntry(prefix: string, name: string): boolean {
+  return (prefix === "" && name.toLocaleLowerCase("en-US") === PRIVATE_DIR)
+    || isArcelleAtomicTemporaryName(name);
+}
+
+function workspaceRelativePath(prefix: string, name: string): string {
+  return prefix === "" ? name : `${prefix}/${name}`;
+}
+
+function filesystemIdentity(fileStat: BigIntStats): string {
+  return `${fileStat.dev}:${fileStat.ino}:${fileStat.birthtimeNs}`;
+}
+
+function canReuseTrustedHash(
+  trusted: TrustedManifestEntry | undefined,
+  sizeBytes: number,
+  mtimeNs: number,
+  fsIdentity: string
+): trusted is TrustedManifestEntry {
+  return trusted !== undefined
+    && trusted.sizeBytes === sizeBytes
+    && trusted.mtimeNs === mtimeNs
+    && trusted.fsIdentity === fsIdentity;
+}
+
+async function manifestSha256(
+  absolutePath: string,
+  relativePath: string,
+  trusted: TrustedManifestEntry | undefined,
+  sizeBytes: number,
+  mtimeNs: number,
+  fsIdentity: string,
+  options: ManifestScanOptions
+): Promise<string> {
+  if (canReuseTrustedHash(trusted, sizeBytes, mtimeNs, fsIdentity)) {
+    return trusted.sha256;
+  }
+  options.onHash?.(relativePath);
+  return hashFile(absolutePath);
+}
+
+async function scanWorkspaceEntry(
+  absoluteDir: string,
+  prefix: string,
+  name: string,
+  result: Map<string, ManifestEntry>,
+  options: ManifestScanOptions,
+  walk: WalkWorkspaceDirectory
+): Promise<void> {
+  const relativePath = workspaceRelativePath(prefix, name);
+  const absolutePath = path.join(absoluteDir, name);
+  const fileStat = await lstat(absolutePath, { bigint: true });
+  if (fileStat.isSymbolicLink()) return;
+  if (fileStat.isDirectory()) {
+    await walk(absolutePath, relativePath);
+    return;
+  }
+  if (!fileStat.isFile()) return;
+  const key = pathKey(relativePath);
+  if (result.has(key)) {
+    throw new Error(`Two room files use the same normalized path: ${relativePath}`);
+  }
+  const sizeBytes = Number(fileStat.size);
+  const mtimeNs = Number(fileStat.mtimeNs);
+  const fsIdentity = filesystemIdentity(fileStat);
+  const trusted = options.trustedEntries?.get(key);
+  result.set(key, {
+    relativePath: relativePath.normalize("NFC"),
+    pathKey: key,
+    sizeBytes,
+    mtimeNs,
+    sha256: await manifestSha256(absolutePath, relativePath, trusted, sizeBytes, mtimeNs, fsIdentity, options),
+    fsIdentity,
+  });
+}
+
 export async function scanWorkspaceManifest(
   rootPath: string,
   options: ManifestScanOptions = {},
@@ -43,41 +121,13 @@ export async function scanWorkspaceManifest(
   const root = path.resolve(rootPath);
   const result = new Map<string, ManifestEntry>();
 
-  async function walk(absoluteDir: string, prefix: string): Promise<void> {
+  const walk: WalkWorkspaceDirectory = async (absoluteDir, prefix) => {
     const dir = await opendir(absoluteDir);
     for await (const item of dir) {
-      if (prefix === "" && item.name.toLocaleLowerCase("en-US") === PRIVATE_DIR) continue;
-      if (isArcelleAtomicTemporaryName(item.name)) continue;
-      const relativePath = prefix === "" ? item.name : `${prefix}/${item.name}`;
-      const absolutePath = path.join(absoluteDir, item.name);
-      const fileStat = await lstat(absolutePath, { bigint: true });
-      if (fileStat.isSymbolicLink()) continue;
-      if (fileStat.isDirectory()) {
-        await walk(absolutePath, relativePath);
-        continue;
-      }
-      if (!fileStat.isFile()) continue;
-      const key = pathKey(relativePath);
-      if (result.has(key)) throw new Error(`Two room files use the same normalized path: ${relativePath}`);
-      const sizeBytes = Number(fileStat.size);
-      const mtimeNs = Number(fileStat.mtimeNs);
-      const fsIdentity = `${fileStat.dev}:${fileStat.ino}:${fileStat.birthtimeNs}`;
-      const trusted = options.trustedEntries?.get(key);
-      const canReuseHash = trusted !== undefined
-        && trusted.sizeBytes === sizeBytes
-        && trusted.mtimeNs === mtimeNs
-        && trusted.fsIdentity === fsIdentity;
-      if (!canReuseHash) options.onHash?.(relativePath);
-      result.set(key, {
-        relativePath: relativePath.normalize("NFC"),
-        pathKey: key,
-        sizeBytes,
-        mtimeNs,
-        sha256: canReuseHash ? trusted.sha256 : await hashFile(absolutePath),
-        fsIdentity,
-      });
+      if (skipWorkspaceEntry(prefix, item.name)) continue;
+      await scanWorkspaceEntry(absoluteDir, prefix, item.name, result, options, walk);
     }
-  }
+  };
 
   await walk(root, "");
   return result;

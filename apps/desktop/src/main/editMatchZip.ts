@@ -68,47 +68,102 @@ function findEocd(buf: Buffer): { cdOffset: number; cdSize: number; entryCount: 
  */
 export function parseZip(bytes: Uint8Array): ZipEntry[] {
   const buf = asBuffer(bytes);
-  if (buf.length < 22) {
-    throw new Error("Not a readable zip archive (too short).");
-  }
-  const { cdOffset, cdSize, entryCount } = findEocd(buf);
+  const directory = centralDirectory(buf);
   const entries: ZipEntry[] = [];
-  let p = cdOffset;
-  const cdEnd = cdOffset + cdSize;
-  for (let i = 0; i < entryCount; i++) {
-    if (p + 46 > cdEnd || p + 46 > buf.length || buf.readUInt32LE(p) !== CENTRAL_DIR_SIG) {
-      throw new Error("Malformed zip central directory.");
-    }
-    const method = buf.readUInt16LE(p + 10);
-    const crc32Value = buf.readUInt32LE(p + 16);
-    const compressedSize = buf.readUInt32LE(p + 20);
-    const uncompressedSize = buf.readUInt32LE(p + 24);
-    const nameLen = buf.readUInt16LE(p + 28);
-    const extraLen = buf.readUInt16LE(p + 30);
-    const commentLen = buf.readUInt16LE(p + 32);
-    const localHeaderOffset = buf.readUInt32LE(p + 42);
-    if (
-      compressedSize === ZIP64_SENTINEL ||
-      uncompressedSize === ZIP64_SENTINEL ||
-      localHeaderOffset === ZIP64_SENTINEL
-    ) {
-      throw new Error("This zip archive uses zip64 extensions, which this reader does not support.");
-    }
-    const name = buf.toString("utf8", p + 46, p + 46 + nameLen);
-    p += 46 + nameLen + extraLen + commentLen;
-
-    if (localHeaderOffset + 30 > buf.length || buf.readUInt32LE(localHeaderOffset) !== LOCAL_FILE_HEADER_SIG) {
-      throw new Error(`Malformed zip local header for entry "${name}".`);
-    }
-    const localNameLen = buf.readUInt16LE(localHeaderOffset + 26);
-    const localExtraLen = buf.readUInt16LE(localHeaderOffset + 28);
-    const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen;
-    if (dataStart + compressedSize > buf.length) {
-      throw new Error(`Truncated zip entry "${name}".`);
-    }
-    entries.push({ name, method, crc32: crc32Value, uncompressedSize, compressedData: buf.subarray(dataStart, dataStart + compressedSize) });
+  let position = directory.offset;
+  for (let index = 0; index < directory.entryCount; index += 1) {
+    const centralEntry = readCentralEntry(buf, position, directory.end);
+    entries.push(zipEntryAtLocalHeader(buf, centralEntry));
+    position = centralEntry.nextPosition;
   }
   return entries;
+}
+
+interface CentralDirectory {
+  readonly offset: number;
+  readonly end: number;
+  readonly entryCount: number;
+}
+
+interface CentralEntry {
+  readonly name: string;
+  readonly method: number;
+  readonly crc32: number;
+  readonly compressedSize: number;
+  readonly uncompressedSize: number;
+  readonly localHeaderOffset: number;
+  readonly nextPosition: number;
+}
+
+function centralDirectory(buf: Buffer): CentralDirectory {
+  if (buf.length < 22) throw new Error("Not a readable zip archive (too short).");
+  const { cdOffset, cdSize, entryCount } = findEocd(buf);
+  return { offset: cdOffset, end: cdOffset + cdSize, entryCount };
+}
+
+function readCentralEntry(buf: Buffer, position: number, end: number): CentralEntry {
+  if (!validCentralHeader(buf, position, end)) throw new Error("Malformed zip central directory.");
+  const entry = centralEntryAt(buf, position);
+  assertNotZip64(entry);
+  return entry;
+}
+
+function validCentralHeader(buf: Buffer, position: number, end: number): boolean {
+  return position + 46 <= end && position + 46 <= buf.length && buf.readUInt32LE(position) === CENTRAL_DIR_SIG;
+}
+
+function centralEntryAt(buf: Buffer, position: number): CentralEntry {
+  const nameLength = buf.readUInt16LE(position + 28);
+  const extraLength = buf.readUInt16LE(position + 30);
+  const commentLength = buf.readUInt16LE(position + 32);
+  return {
+    name: buf.toString("utf8", position + 46, position + 46 + nameLength),
+    method: buf.readUInt16LE(position + 10),
+    crc32: buf.readUInt32LE(position + 16),
+    compressedSize: buf.readUInt32LE(position + 20),
+    uncompressedSize: buf.readUInt32LE(position + 24),
+    localHeaderOffset: buf.readUInt32LE(position + 42),
+    nextPosition: position + 46 + nameLength + extraLength + commentLength,
+  };
+}
+
+function assertNotZip64(entry: CentralEntry): void {
+  if (zip64Field(entry.compressedSize) || zip64Field(entry.uncompressedSize) || zip64Field(entry.localHeaderOffset)) {
+    throw new Error("This zip archive uses zip64 extensions, which this reader does not support.");
+  }
+}
+
+function zip64Field(value: number): boolean {
+  return value === ZIP64_SENTINEL;
+}
+
+function zipEntryAtLocalHeader(buf: Buffer, entry: CentralEntry): ZipEntry {
+  const dataStart = localDataStart(buf, entry);
+  assertCompleteEntryData(buf, entry, dataStart);
+  return {
+    name: entry.name,
+    method: entry.method,
+    crc32: entry.crc32,
+    uncompressedSize: entry.uncompressedSize,
+    compressedData: buf.subarray(dataStart, dataStart + entry.compressedSize),
+  };
+}
+
+function localDataStart(buf: Buffer, entry: CentralEntry): number {
+  if (!validLocalHeader(buf, entry.localHeaderOffset)) {
+    throw new Error(`Malformed zip local header for entry "${entry.name}".`);
+  }
+  const nameLength = buf.readUInt16LE(entry.localHeaderOffset + 26);
+  const extraLength = buf.readUInt16LE(entry.localHeaderOffset + 28);
+  return entry.localHeaderOffset + 30 + nameLength + extraLength;
+}
+
+function validLocalHeader(buf: Buffer, offset: number): boolean {
+  return offset + 30 <= buf.length && buf.readUInt32LE(offset) === LOCAL_FILE_HEADER_SIG;
+}
+
+function assertCompleteEntryData(buf: Buffer, entry: CentralEntry, dataStart: number): void {
+  if (dataStart + entry.compressedSize > buf.length) throw new Error(`Truncated zip entry "${entry.name}".`);
 }
 
 /** Every entry name in the archive, in archive order. Empty for bytes that

@@ -1,0 +1,37 @@
+{
+  "source": {
+    "include": [
+      "apps/desktop/src/**",
+      "services/agent-sidecar/src/**"
+    ]
+  },
+  "test": {
+    "command": [
+      "node",
+      "scripts/quality-metrics.mjs",
+      "--run",
+      "--report",
+      "coverage/quality-metrics.json"
+    ],
+    "timeout_seconds": 1200
+  },
+  "metrics": {
+    "command": [
+      "node",
+      "scripts/quality-metrics.mjs",
+      "--report",
+      "{report}"
+    ],
+    "report": "{report}",
+    "timeout_seconds": 1200
+  },
+  "dependencies": {
+    "command": [
+      "node",
+      "scripts/quality-dependency-edges.mjs",
+      "--report",
+      "{report}"
+    ],
+    "edges_report": "{report}"
+  }
+}

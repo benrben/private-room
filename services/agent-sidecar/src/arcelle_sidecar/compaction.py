@@ -183,6 +183,37 @@ def _cache_put(key: str, digest: str) -> None:
         _CACHE.pop(next(iter(_CACHE)))
 
 
+def _call_mapping(value: Any) -> dict[str, Any]:
+    """Return provider data as a mapping, preserving unknown shapes as empty."""
+    return value if isinstance(value, dict) else {}
+
+
+def _call_name(call: dict[str, Any], function: dict[str, Any]) -> Any:
+    """Prefer the nested function name, then legacy provider name fields."""
+    return function.get("name") or call.get("name") or "tool"
+
+
+def _call_arguments(call: dict[str, Any], function: dict[str, Any]) -> Any:
+    """Read nested arguments without losing the legacy provider fallback."""
+    return function.get("arguments", call.get("arguments"))
+
+
+def _call_arguments_text(arguments: Any) -> str:
+    """Render absent arguments as empty parentheses and structured ones as JSON."""
+    if arguments is None or arguments == {} or arguments == "":
+        return ""
+    return arguments if isinstance(arguments, str) else compact_json(arguments)
+
+
+def _call_text(raw_call: Any) -> str:
+    """Render one provider-shaped call without silently dropping malformed data."""
+    call = _call_mapping(raw_call)
+    function = _call_mapping(call.get("function"))
+    name = _call_name(call, function)
+    arguments = _call_arguments_text(_call_arguments(call, function))
+    return f"{name}({arguments})"
+
+
 def _calls_text(tool_calls: list[dict[str, Any]]) -> str:
     """``name(args)`` for each call in a provider-shaped ``tool_calls`` array.
 
@@ -191,18 +222,7 @@ def _calls_text(tool_calls: list[dict[str, Any]]) -> str:
     as SOMETHING — a digest that silently drops a call is the failure this
     function exists to remove.
     """
-    out: list[str] = []
-    for call in tool_calls:
-        call = call if isinstance(call, dict) else {}
-        fn = call.get("function")
-        fn = fn if isinstance(fn, dict) else {}
-        name = fn.get("name") or call.get("name") or "tool"
-        args = fn.get("arguments", call.get("arguments"))
-        if args is None or args == {} or args == "":
-            out.append(f"{name}()")
-        else:
-            out.append(f"{name}({args if isinstance(args, str) else compact_json(args)})")
-    return ", ".join(out)
+    return ", ".join(_call_text(call) for call in tool_calls)
 
 
 def _render(m: Message) -> str:
@@ -217,13 +237,20 @@ def _render(m: Message) -> str:
     role = m.get("role") or ""
     content = m.get("content") or ""
     if role == "tool":
-        name = m.get("tool_name")
-        return f"tool {name}: {content}" if name else f"tool: {content}"
+        return _render_tool_message(m.get("tool_name"), content)
     calls = m.get("tool_calls")
     if calls:
-        called = f"called {_calls_text(calls)}"
-        return f"{role}: {content}\n{role}: {called}" if content else f"{role}: {called}"
+        return _render_call_message(role, content, calls)
     return f"{role}: {content}"
+
+
+def _render_tool_message(name: object, content: str) -> str:
+    return f"tool {name}: {content}" if name else f"tool: {content}"
+
+
+def _render_call_message(role: str, content: str, calls: list[dict[str, Any]]) -> str:
+    called = f"called {_calls_text(calls)}"
+    return f"{role}: {content}\n{role}: {called}" if content else f"{role}: {called}"
 
 
 def _key(messages: list[Message]) -> str:
@@ -355,6 +382,113 @@ def _chunks(messages: list[Message], limit: int) -> list[list[Message]]:
     return out
 
 
+def _needs_compaction(
+    messages: list[Message], budget_bytes: int, reserved_bytes: int
+) -> bool:
+    """Whether this payload is large enough to justify a digest."""
+    total = sum(msg_len(message) for message in messages) + reserved_bytes
+    return total > budget_bytes and total >= MIN_COMPACT_BYTES
+
+
+def _has_no_compaction_target(
+    messages: list[Message], budget_bytes: int | None
+) -> bool:
+    """Whether a caller supplied no usable payload budget."""
+    return budget_bytes is None or not messages
+
+
+def _fit_compacted_messages(
+    messages: list[Message],
+    compacted: bool,
+    budget_bytes: int,
+    reserved_bytes: int,
+) -> tuple[list[Message], bool]:
+    """Apply the final oversized-result fallback to a compaction outcome."""
+    from .budget import fit_oversized_results
+
+    fitted, cut = fit_oversized_results(messages, budget_bytes, reserved_bytes)
+    return fitted, compacted or cut
+
+
+def _digestable_messages(
+    messages: list[Message], recent_bytes: int
+) -> tuple[list[Message], list[Message], list[Message]]:
+    """Return the system turn, digestable older turns, and verbatim recent turns."""
+    older, recent = _split(messages, recent_bytes)
+    return older[:1], older[1:], recent
+
+
+def _tail_is_partial(chunks: list[list[Message]], limit: int) -> bool:
+    """Whether the moving final digest chunk must stay verbatim."""
+    return len(chunks) > 1 and sum(msg_len(message) for message in chunks[-1]) < limit
+
+
+def _stable_digest_chunks(
+    older_body: list[Message], recent: list[Message], limit: int
+) -> tuple[list[list[Message]], list[Message]]:
+    """Keep the moving partial digest chunk with the verbatim tail."""
+    chunks = _chunks(older_body, limit)
+    if _tail_is_partial(chunks, limit):
+        return chunks[:-1], chunks[-1] + recent
+    return chunks, recent
+
+
+def _digest_chunk_limit(chunk_bytes: int | None) -> int:
+    """Use the caller's cloud-sized limit or the local default."""
+    return chunk_bytes or DIGEST_CHUNK_BYTES
+
+
+async def _uncached_digest(key: str, chunk: list[Message], digest: _Digester) -> str:
+    """Create and retain one non-empty digest, leaving failures retryable."""
+    text = "\n".join(_render(message) for message in chunk)
+    try:
+        summary = (await digest(text)).strip()
+    except Exception:  # noqa: BLE001 - a failed digest must not fail the turn
+        return ""
+    if summary:
+        _cache_put(key, summary)
+    return summary
+
+
+async def _digest_chunk(chunk: list[Message], digest: _Digester) -> str:
+    """Read a chunk's cached digest or make one if the cache has no answer."""
+    key = _key(chunk)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    return await _uncached_digest(key, chunk, digest)
+
+
+async def _digest_chunks(
+    chunks: list[list[Message]], digest: _Digester
+) -> tuple[list[str], int]:
+    """Digest every stable chunk and count the stretches that could not be read."""
+    parts: list[str] = []
+    failed = 0
+    for chunk in chunks:
+        summary = await _digest_chunk(chunk, digest)
+        if summary:
+            parts.append(summary)
+        else:
+            failed += 1
+    return parts, failed
+
+
+def _combined_digest(parts: list[str], failed: int) -> str | None:
+    """Join successful digests and visibly account for any failed stretches."""
+    if not parts:
+        return None
+    if failed:
+        return "\n".join(
+            [
+                *parts,
+                f"[{failed} earlier stretch(es) of this conversation could not be "
+                "summarised and are missing from the above]",
+            ]
+        )
+    return "\n".join(parts)
+
+
 async def compact_to_budget(
     messages: list[Message],
     budget_bytes: int | None,
@@ -384,26 +518,17 @@ async def compact_to_budget(
     or CLI engine nothing downstream trims either. See that function for the
     failure it removes.
     """
-    from .budget import fit_oversized_results
-
-    def _fit(msgs: list[Message], did: bool) -> tuple[list[Message], bool]:
-        out, cut = fit_oversized_results(msgs, budget_bytes, reserved_bytes)
-        return out, did or cut
-
-    if budget_bytes is None or not messages:
+    if _has_no_compaction_target(messages, budget_bytes):
         return messages, False
-    total = sum(msg_len(m) for m in messages) + reserved_bytes
-    if total <= budget_bytes or total < MIN_COMPACT_BYTES:
-        return _fit(messages, False)
+    if not _needs_compaction(messages, budget_bytes, reserved_bytes):
+        return _fit_compacted_messages(messages, False, budget_bytes, reserved_bytes)
 
     recent_bytes = max(1, int(budget_bytes * RECENT_SHARE))
-    older, recent = _split(messages, recent_bytes)
-    system, older_body = older[:1], older[1:]
+    system, older_body, recent = _digestable_messages(messages, recent_bytes)
     if not older_body:
-        return _fit(messages, False)
+        return _fit_compacted_messages(messages, False, budget_bytes, reserved_bytes)
 
-    limit = chunk_bytes or DIGEST_CHUNK_BYTES
-    chunks = _chunks(older_body, limit)
+    limit = _digest_chunk_limit(chunk_bytes)
     # The LAST chunk is the only partially-filled one, and its contents SHIFT as
     # the turn grows: every round appends an assistant/tool message, the recent
     # tail overflows, and another message slides out of `recent` into `older` —
@@ -411,49 +536,18 @@ async def compact_to_budget(
     # on every single round, at a full model call each time. Leave it verbatim
     # instead: every digest is then of a FULL chunk on a boundary that never
     # moves, so it is computed once and reused for the life of the session.
-    if len(chunks) > 1 and sum(msg_len(m) for m in chunks[-1]) < limit:
-        recent = chunks.pop() + recent
-
-    parts: list[str] = []
-    failed = 0
-    for chunk in chunks:
-        key = _key(chunk)
-        cached = _cache_get(key)
-        if cached is None:
-            text = "\n".join(_render(m) for m in chunk)
-            try:
-                cached = (await digest(text)).strip()
-            except Exception:  # noqa: BLE001 - a failed digest must not fail the turn
-                cached = ""
-            # A FAILURE IS NOT CACHED. Filing "" under this chunk's hash used to
-            # retire that stretch of the conversation permanently — one flaky
-            # call and the model never saw those turns again for the rest of the
-            # session, with nothing anywhere saying so. Leaving it uncached costs
-            # a retry next round, which is what a transient failure deserves.
-            if cached:
-                _cache_put(key, cached)
-        if cached:
-            parts.append(cached)
-        else:
-            failed += 1
-
-    if failed and parts:
-        # Some stretches made it and some did not. Say so: an answer built on a
-        # transcript with a hole in it should be able to explain the hole.
-        parts.append(
-            f"[{failed} earlier stretch(es) of this conversation could not be "
-            "summarised and are missing from the above]"
-        )
-
-    if not parts:
+    chunks, recent = _stable_digest_chunks(older_body, recent, limit)
+    parts, failed = await _digest_chunks(chunks, digest)
+    combined = _combined_digest(parts, failed)
+    if combined is None:
         # Digesting failed outright. Returning the input unchanged is right on a
         # LOCAL room — `trim_messages_to_window` still runs after us and will
         # make it fit. On a cloud or CLI room nothing runs after us, so the
         # oversized-result fit is the whole fallback.
-        return _fit(messages, False)
+        return _fit_compacted_messages(messages, False, budget_bytes, reserved_bytes)
 
-    out = [*system, user_message(DIGEST_HEADER + "\n".join(parts)), *recent]
-    return _fit(out, True)
+    out = [*system, user_message(DIGEST_HEADER + combined), *recent]
+    return _fit_compacted_messages(out, True, budget_bytes, reserved_bytes)
 
 
 def clear_cache() -> None:

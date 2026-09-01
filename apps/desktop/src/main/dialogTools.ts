@@ -114,54 +114,64 @@ export interface ResolvedButtons {
  * each index answers with. See the module doc for why `labels` and `resultFor`
  * are not the same list.
  */
-export function resolveMessageButtons(buttons: MessageDialogButtons | undefined): ResolvedButtons {
-  if (buttons === undefined || buttons === "Ok") {
-    return { labels: ["OK"], defaultId: 0, cancelId: 0, resultFor: () => "Ok" };
+function oneButton(label: string, result: MessageDialogResult): ResolvedButtons {
+  return { labels: [label], defaultId: 0, cancelId: 0, resultFor: () => result };
+}
+
+function twoButtons(
+  labels: [string, string],
+  results: [MessageDialogResult, MessageDialogResult],
+): ResolvedButtons {
+  return {
+    labels,
+    defaultId: 0,
+    cancelId: 1,
+    resultFor: (index) => (index === 0 ? results[0] : results[1]),
+  };
+}
+
+function threeButtons(
+  labels: [string, string, string],
+  results: [MessageDialogResult, MessageDialogResult, MessageDialogResult],
+): ResolvedButtons {
+  return {
+    labels,
+    defaultId: 0,
+    cancelId: 2,
+    resultFor: (index) => (index === 0 ? results[0] : index === 1 ? results[1] : results[2]),
+  };
+}
+
+function presetButtons(buttons: MessageDialogButtons | undefined): ResolvedButtons | undefined {
+  switch (buttons) {
+    case undefined:
+    case "Ok":
+      return oneButton("OK", "Ok");
+    case "OkCancel":
+      return twoButtons(["OK", "Cancel"], ["Ok", "Cancel"]);
+    case "YesNo":
+      return twoButtons(["Yes", "No"], ["Yes", "No"]);
+    case "YesNoCancel":
+      return threeButtons(["Yes", "No", "Cancel"], ["Yes", "No", "Cancel"]);
+    default:
+      return undefined;
   }
-  if (buttons === "OkCancel") {
-    return {
-      labels: ["OK", "Cancel"],
-      defaultId: 0,
-      cancelId: 1,
-      resultFor: (i) => (i === 0 ? "Ok" : "Cancel"),
-    };
-  }
-  if (buttons === "YesNo") {
-    return {
-      labels: ["Yes", "No"],
-      defaultId: 0,
-      cancelId: 1,
-      resultFor: (i) => (i === 0 ? "Yes" : "No"),
-    };
-  }
-  if (buttons === "YesNoCancel") {
-    return {
-      labels: ["Yes", "No", "Cancel"],
-      defaultId: 0,
-      cancelId: 2,
-      resultFor: (i) => (i === 0 ? "Yes" : i === 1 ? "No" : "Cancel"),
-    };
-  }
+}
+
+function resolveCustomButtons(buttons: Exclude<MessageDialogButtons, string>): ResolvedButtons {
   if ("yes" in buttons) {
-    const { yes, no, cancel } = buttons;
-    return {
-      labels: [yes, no, cancel],
-      defaultId: 0,
-      cancelId: 2,
-      resultFor: (i) => (i === 0 ? yes : i === 1 ? no : cancel),
-    };
+    return threeButtons([buttons.yes, buttons.no, buttons.cancel], [buttons.yes, buttons.no, buttons.cancel]);
   }
   if ("cancel" in buttons) {
-    const { ok, cancel } = buttons;
-    return {
-      labels: [ok, cancel],
-      defaultId: 0,
-      cancelId: 1,
-      resultFor: (i) => (i === 0 ? ok : cancel),
-    };
+    return twoButtons([buttons.ok, buttons.cancel], [buttons.ok, buttons.cancel]);
   }
-  const { ok } = buttons;
-  return { labels: [ok], defaultId: 0, cancelId: 0, resultFor: () => ok };
+  return oneButton(buttons.ok, buttons.ok);
+}
+
+export function resolveMessageButtons(buttons: MessageDialogButtons | undefined): ResolvedButtons {
+  const preset = presetButtons(buttons);
+  if (preset !== undefined) return preset;
+  return resolveCustomButtons(buttons as Exclude<MessageDialogButtons, string>);
 }
 
 // ============================================================================
@@ -173,40 +183,61 @@ export function resolveMessageButtons(buttons: MessageDialogButtons | undefined)
 // `shellTools.ts` uses, and the reason neither file needs a fake `ipcMain` to
 // test its actual behavior.
 
-export async function dialogOpen(
-  deps: DialogDeps,
-  args: Commands["dialog_open"]["args"]
-): Promise<Commands["dialog_open"]["result"]> {
+function openProperties(
+  args: Commands["dialog_open"]["args"],
+): NonNullable<ElectronOpenDialogOptions["properties"]> {
   const properties: NonNullable<ElectronOpenDialogOptions["properties"]> = [
     args.directory === true ? "openDirectory" : "openFile",
   ];
   if (args.room === true && !properties.includes("openDirectory")) properties.push("openDirectory");
-  if (args.multiple === true) {
-    properties.push("multiSelections");
-  }
-  if (args.canCreateDirectories !== false) {
-    properties.push("createDirectory");
-  }
-  const options: ElectronOpenDialogOptions = {
+  if (args.multiple === true) properties.push("multiSelections");
+  if (args.canCreateDirectories !== false) properties.push("createDirectory");
+  return properties;
+}
+
+function openDialogOptions(args: Commands["dialog_open"]["args"]): ElectronOpenDialogOptions {
+  return {
     title: args.title,
     defaultPath: args.defaultPath,
     message: args.message,
     buttonLabel: args.buttonLabel,
     filters: args.filters,
-    properties,
+    properties: openProperties(args),
   };
+}
+
+interface OpenDialogResult {
+  canceled: boolean;
+  filePaths: string[];
+}
+
+async function showOpenDialog(
+  deps: DialogDeps,
+  options: ElectronOpenDialogOptions,
+): Promise<OpenDialogResult> {
   const win = deps.getMainWindow();
-  const result = win
-    ? await deps.dialog.showOpenDialog(win, options)
-    : await deps.dialog.showOpenDialog(options);
+  if (win) return deps.dialog.showOpenDialog(win, options);
+  return deps.dialog.showOpenDialog(options);
+}
+
+function selectedOpenPath(
+  result: OpenDialogResult,
+  multiple: boolean | undefined,
+): Commands["dialog_open"]["result"] {
   // `canceled` is Electron's own answer; the empty-list check is the same
   // answer arrived at a second way, and matters because a `multiple` open that
   // came back with nothing selected must not resolve to an empty array a
   // caller would read as "the user picked zero files on purpose".
-  if (result.canceled || result.filePaths.length === 0) {
-    return null;
-  }
-  return args.multiple === true ? result.filePaths : (result.filePaths[0] ?? null);
+  if (result.canceled || result.filePaths.length === 0) return null;
+  return multiple === true ? result.filePaths : (result.filePaths[0] ?? null);
+}
+
+export async function dialogOpen(
+  deps: DialogDeps,
+  args: Commands["dialog_open"]["args"]
+): Promise<Commands["dialog_open"]["result"]> {
+  const result = await showOpenDialog(deps, openDialogOptions(args));
+  return selectedOpenPath(result, args.multiple);
 }
 
 export async function dialogSave(
@@ -296,50 +327,74 @@ function readKind(kind: unknown): MessageDialogKind | undefined {
  * value becomes `undefined`, which {@link resolveMessageButtons} already reads
  * as the `Ok` default. A cast would let `{ok: 42}` through to Electron, whose
  * `buttons` must be strings. */
-function readButtons(buttons: unknown): MessageDialogButtons | undefined {
-  if (
-    buttons === "Ok" ||
-    buttons === "OkCancel" ||
-    buttons === "YesNo" ||
-    buttons === "YesNoCancel"
-  ) {
-    return buttons;
+function presetButtonValue(buttons: unknown): MessageDialogButtons | undefined {
+  switch (buttons) {
+    case "Ok":
+    case "OkCancel":
+    case "YesNo":
+    case "YesNoCancel":
+      return buttons;
+    default:
+      return undefined;
   }
-  if (typeof buttons !== "object" || buttons === null) {
+}
+
+function buttonRecord(buttons: unknown): Record<string, unknown> | undefined {
+  return typeof buttons === "object" && buttons !== null ? buttons as Record<string, unknown> : undefined;
+}
+
+function threeCustomButtons(buttons: Record<string, unknown>): MessageDialogButtons | undefined {
+  if (typeof buttons.yes !== "string" || typeof buttons.no !== "string" || typeof buttons.cancel !== "string") {
     return undefined;
   }
-  const b = buttons as Record<string, unknown>;
-  if (typeof b.yes === "string" && typeof b.no === "string" && typeof b.cancel === "string") {
-    return { yes: b.yes, no: b.no, cancel: b.cancel };
-  }
-  if (typeof b.ok === "string" && typeof b.cancel === "string") {
-    return { ok: b.ok, cancel: b.cancel };
-  }
-  if (typeof b.ok === "string") {
-    return { ok: b.ok };
-  }
-  return undefined;
+  return { yes: buttons.yes, no: buttons.no, cancel: buttons.cancel };
+}
+
+function okCancelCustomButtons(buttons: Record<string, unknown>): MessageDialogButtons | undefined {
+  if (typeof buttons.ok !== "string" || typeof buttons.cancel !== "string") return undefined;
+  return { ok: buttons.ok, cancel: buttons.cancel };
+}
+
+function oneCustomButton(buttons: Record<string, unknown>): MessageDialogButtons | undefined {
+  return typeof buttons.ok === "string" ? { ok: buttons.ok } : undefined;
+}
+
+function readCustomButtons(buttons: Record<string, unknown>): MessageDialogButtons | undefined {
+  return threeCustomButtons(buttons)
+    ?? okCancelCustomButtons(buttons)
+    ?? oneCustomButton(buttons);
+}
+
+function readButtons(buttons: unknown): MessageDialogButtons | undefined {
+  const preset = presetButtonValue(buttons);
+  if (preset !== undefined) return preset;
+  const custom = buttonRecord(buttons);
+  return custom === undefined ? undefined : readCustomButtons(custom);
 }
 
 /** `DialogFilter[]`, validated the same way — a filter whose `extensions` is
  * not an array of strings is dropped rather than handed to a native panel. */
+type DialogFilters = NonNullable<Commands["dialog_open"]["args"]["filters"]>;
+type DialogFilter = DialogFilters[number];
+
+function readFilter(entry: unknown): DialogFilter | undefined {
+  if (typeof entry !== "object" || entry === null) return undefined;
+  const filter = entry as Record<string, unknown>;
+  if (typeof filter.name !== "string" || !Array.isArray(filter.extensions)) return undefined;
+  return {
+    name: filter.name,
+    extensions: filter.extensions.filter((extension): extension is string => typeof extension === "string"),
+  };
+}
+
+function definedFilter(filter: DialogFilter | undefined): filter is DialogFilter {
+  return filter !== undefined;
+}
+
 function readFilters(filters: unknown): Commands["dialog_open"]["args"]["filters"] {
-  if (!Array.isArray(filters)) {
-    return undefined;
-  }
-  const out: NonNullable<Commands["dialog_open"]["args"]["filters"]> = [];
-  for (const entry of filters) {
-    if (typeof entry !== "object" || entry === null) {
-      continue;
-    }
-    const f = entry as Record<string, unknown>;
-    if (typeof f.name !== "string" || !Array.isArray(f.extensions)) {
-      continue;
-    }
-    const extensions = f.extensions.filter((e): e is string => typeof e === "string");
-    out.push({ name: f.name, extensions });
-  }
-  return out.length === 0 ? undefined : out;
+  if (!Array.isArray(filters)) return undefined;
+  const valid = filters.map(readFilter).filter(definedFilter);
+  return valid.length === 0 ? undefined : valid;
 }
 
 function readOpenArgs(args: unknown): Commands["dialog_open"]["args"] {

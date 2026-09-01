@@ -11,6 +11,27 @@
 import { describe, expect, it } from "vitest";
 import { loadPageScript } from "./pageScriptHarness.js";
 
+describe("keyboard escape hatch", () => {
+  it("latches only a timely double Escape, resets on other events, and reports it once", () => {
+    const h = loadPageScript("<main>Fake page</main>", { now: 1_000 });
+    const info = () => h.call("info", {}) as { leaveRequested: boolean };
+
+    h.dispatchKey("Escape");
+    h.dispatchKey("x", 10);
+    h.dispatchKey(null, 10);
+    expect(info().leaveRequested).toBe(false);
+
+    h.dispatchKey("Escape", 10);
+    h.dispatchKey("Escape", 700);
+    expect(info().leaveRequested).toBe(true);
+    expect(info().leaveRequested).toBe(false);
+
+    h.dispatchKey("Escape", 1);
+    h.dispatchKey("Escape", 701);
+    expect(info().leaveRequested).toBe(false);
+  });
+});
+
 describe("password fencing (PRIVACY invariant)", () => {
   it("excludes a password field from the snapshot but counts it as a secret", () => {
     const { call } = loadPageScript(
@@ -140,6 +161,23 @@ describe("visibility (display:none exclusion)", () => {
   });
 });
 
+describe("cross-origin frame reporting", () => {
+  it("counts only opaque frames while leaving same-origin frames to their own page script", () => {
+    const h = loadPageScript('<iframe id="same"></iframe><iframe id="opaque"></iframe>');
+    const same = h.document.getElementById("same") as unknown as { contentDocument?: unknown };
+    const opaque = h.document.getElementById("opaque") as unknown as { contentDocument?: unknown };
+    Object.defineProperty(same, "contentDocument", { configurable: true, value: {} });
+    Object.defineProperty(opaque, "contentDocument", {
+      configurable: true,
+      get() {
+        throw new Error("fabricated cross-origin frame");
+      },
+    });
+
+    expect((h.call("snapshot", {}) as { crossOriginFrames: number }).crossOriginFrames).toBe(1);
+  });
+});
+
 describe("the disabled trap — a control alive at snapshot time can die before the click lands", () => {
   it("resolves fine but doOne refuses a click on a NOW-disabled control", () => {
     const h = loadPageScript('<button id="submit">Submit</button>');
@@ -200,6 +238,131 @@ describe("readMarkdown renders headings, paragraphs and links", () => {
     expect(text).toContain("Hello world.");
     expect(text).toContain("[There](https://example.com/there)");
   });
+
+  it("renders every supported content shape while skipping browser chrome and hidden data", () => {
+    const h = loadPageScript(
+      "<main><h2>Title</h2><blockquote>Quoted words</blockquote>" +
+        "<ul><li>First</li><li>Second</li></ul><pre>const answer = 42;\n</pre>" +
+        '<a href="/there">There</a><br><table><tr><th>Name</th><th>Value</th></tr>' +
+        "<tr><td>One</td><td>1</td></tr></table><img alt='A diagram'>" +
+        "<div>Trailing text</div><nav>Navigation</nav><p aria-hidden='true'>Hidden</p>" +
+        "<script>ignored()</script><div data-arcelle-ui='1'>Agent chrome</div></main>",
+      { url: "https://example.com/base" },
+    );
+
+    const text = h.internals.readMarkdown("main");
+
+    expect(text).toContain("## Title");
+    expect(text).toContain("> Quoted words");
+    expect(text).toContain("- First");
+    expect(text).toContain("- Second");
+    expect(text).toContain("```\nconst answer = 42;\n```");
+    expect(text).toContain("[There](https://example.com/there)");
+    expect(text).toContain("| Name | Value |");
+    expect(text).toContain("| --- | --- |");
+    expect(text).toContain("| One | 1 |");
+    expect(text).toContain("![A diagram]");
+    expect(text).toContain("Trailing text");
+    expect(text).not.toContain("Navigation");
+    expect(text).not.toContain("Hidden");
+    expect(text).not.toContain("ignored");
+    expect(text).not.toContain("Agent chrome");
+  });
+
+  it("falls back to plain text when walking a malformed DOM throws", () => {
+    const h = loadPageScript("<main>Safe fallback text</main>");
+    const main = h.document.querySelector("main") as unknown as { childNodes: unknown; textContent: string };
+    Object.defineProperty(main, "childNodes", {
+      configurable: true,
+      get() {
+        throw new Error("broken child list");
+      },
+    });
+
+    expect(h.internals.readMarkdown("full")).toBe("Safe fallback text");
+  });
+});
+
+describe("doOne routes every supported browser action", () => {
+  it("preserves action results, protections, and form-control side effects", () => {
+    const h = loadPageScript(
+      "<button aria-label='Target'>Target</button><input aria-label='Search'>" +
+        "<select aria-label='Size'><option value='small'>Small</option><option value='medium'>Medium choice</option></select>" +
+        "<form id='form'><input aria-label='Submit field'></form><div aria-label='Note' contenteditable='true'>Old</div>" +
+        "<input id='secret' type='password'>",
+    );
+    const snap = h.call("snapshot", {}) as { elements: Array<{ ref: string; label: string }> };
+    const refFor = (label: string) => snap.elements.find((element) => element.label === label)?.ref as string;
+    const target = h.document.querySelector("button") as unknown as { click: () => void };
+    const secret = h.document.getElementById("secret");
+    const pointDocument = h.document as unknown as {
+      elementFromPoint: (x: number, y: number) => unknown;
+    };
+    const submittedInput = h.document.querySelector("form input") as unknown as {
+      form: { requestSubmit?: () => void; submit?: () => void };
+    };
+    const form = h.document.getElementById("form") as unknown as {
+      requestSubmit?: () => void;
+      submit?: () => void;
+    };
+    const editable = h.document.querySelector("[contenteditable]") as unknown as {
+      isContentEditable: boolean;
+      textContent: string;
+    };
+    let submits = 0;
+
+    Object.defineProperty(submittedInput, "form", { configurable: true, value: form });
+    form.requestSubmit = () => {
+      submits++;
+    };
+    Object.defineProperty(editable, "isContentEditable", { configurable: true, value: true });
+
+    expect(h.internals.doOne({ scroll: "top" })).toMatchObject({ ok: true, did: "scrolled top" });
+    expect(h.internals.doOne({ scroll: "bottom" })).toMatchObject({ ok: true, did: "scrolled bottom" });
+    expect(h.internals.doOne({ scroll: { dir: "up" } })).toMatchObject({ ok: true, did: "scrolled up" });
+    expect(h.internals.doOne({ scroll: "down" })).toMatchObject({ ok: true, did: "scrolled down" });
+    expect(h.internals.doOne({ scroll: { to: refFor("Target") } })).toMatchObject({
+      ok: true,
+      did: `scrolled to ${refFor("Target")}`,
+    });
+    expect(h.internals.doOne({ scroll: { to: "missing" } })).toMatchObject({ ok: false });
+
+    expect(h.internals.doOne({ click_at: { x: "bad", y: 2 } })).toMatchObject({ ok: false });
+    pointDocument.elementFromPoint = () => null;
+    expect(h.internals.doOne({ click_at: { x: 3, y: 4 } })).toMatchObject({ ok: false });
+    pointDocument.elementFromPoint = () => secret;
+    expect(h.internals.doOne({ click_at: { x: 3, y: 4 } })).toMatchObject({ ok: false, error: expect.stringContaining("fenced") });
+    pointDocument.elementFromPoint = () => target;
+    expect(h.internals.doOne({ click_at: { x: 3.2, y: 4.8 } })).toMatchObject({
+      ok: true,
+      did: expect.stringContaining("clicked (3, 5)"),
+    });
+
+    target.click = () => {
+      throw new Error("native click unavailable");
+    };
+    expect(h.internals.doOne({ click: refFor("Target") })).toMatchObject({ ok: true });
+    expect(h.internals.doOne({ type: { ref: refFor("Search"), text: "Ada", clear: true } })).toMatchObject({
+      ok: true,
+    });
+    expect(h.internals.doOne({ type: { ref: refFor("Note"), text: "New", clear: true } })).toMatchObject({
+      ok: true,
+    });
+    expect(editable.textContent).toBe("New");
+    expect(h.internals.doOne({ type: { ref: refFor("Submit field"), text: "go", submit: true } })).toMatchObject({
+      ok: true,
+      did: expect.stringContaining("and submitted"),
+    });
+    expect(submits).toBe(1);
+
+    expect(h.internals.doOne({ select: { ref: refFor("Size"), value: "medium" } })).toMatchObject({ ok: true });
+    expect(h.internals.doOne({ select: { ref: refFor("Size"), value: "absent" } })).toMatchObject({ ok: false });
+    expect(h.internals.doOne({ key: "Escape" })).toEqual({ ok: true, did: "pressed Escape" });
+    expect(h.internals.doOne({ back: true })).toEqual({ ok: true, did: "went back" });
+    expect(h.internals.doOne({ forward: true })).toEqual({ ok: true, did: "went forward" });
+    expect(h.internals.doOne({ unknown: true })).toMatchObject({ ok: false, error: expect.stringContaining("Unknown action") });
+    expect(h.internals.doOne(null as unknown as Record<string, unknown>)).toMatchObject({ ok: false });
+  });
 });
 
 describe("find searches the CURRENT numbering without re-snapshotting", () => {
@@ -208,5 +371,126 @@ describe("find searches the CURRENT numbering without re-snapshotting", () => {
     h.call("snapshot", {});
     const result = h.call("find", { text: "save" }) as { matches: Array<{ label: string }> };
     expect(result.matches.map((m) => m.label)).toEqual(["Save changes"]);
+  });
+});
+
+describe("public protocol dispatch", () => {
+  async function takeEventually(h: ReturnType<typeof loadPageScript>, ticket: string) {
+    let taken = h.call("take", { ticket }) as {
+      ok: boolean;
+      done: boolean;
+      value?: Record<string, unknown>;
+    };
+    for (let attempt = 0; !taken.done && attempt < 15; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      taken = h.call("take", { ticket }) as typeof taken;
+    }
+    return taken;
+  }
+
+  it("executes badge rendering plus the read and capture response paths", () => {
+    const h = loadPageScript(`<main>${"Readable page. ".repeat(30)}</main><button>Save</button>`);
+
+    const snap = h.call("snapshot", { badges: true }) as { count: number };
+    expect(snap.count).toBe(1);
+    expect(h.document.getElementById("__arcelle_som_layer")).not.toBeNull();
+
+    const read = h.call("read", { mode: "main", offset: 0 }) as {
+      ok: boolean;
+      mode: string;
+      text: string;
+      nextOffset: number;
+    };
+    expect(read).toMatchObject({ ok: true, mode: "main" });
+    expect(read.text).toContain("Readable page.");
+    expect(read.nextOffset).toBe(read.text.length);
+
+    const page = h.call("capture", {}) as { ok: boolean; what: string; html: string };
+    expect(page).toMatchObject({ ok: true, what: "page" });
+    expect(page.html).toContain("<!doctype html>");
+    expect(h.call("capture", { what: "selection" })).toEqual({
+      ok: false,
+      error: "Nothing is selected on the page.",
+    });
+  });
+
+  it("keeps async action and wait failures ticketed instead of throwing", async () => {
+    const h = loadPageScript('<button id="save">Save</button><video id="media"></video>');
+    Object.defineProperty(h.document, "readyState", { configurable: true, value: "complete" });
+    const media = h.document.getElementById("media") as unknown as {
+      getBoundingClientRect: () => { width: number; height: number; top: number; bottom: number };
+    };
+    media.getBoundingClientRect = () => ({ width: 80, height: 80, top: 0, bottom: 80 });
+    expect((h.call("info", {}) as { mediaAreas: number }).mediaAreas).toBe(1);
+
+    const snap = h.call("snapshot", {}) as { elements: Array<{ ref: string }> };
+    const started = h.call("begin", {
+      op: "act",
+      args: {
+        actions: [
+          { click: snap.elements[0]?.ref, settle_ms: 1 },
+          { wait_for: { gone: "e404", timeout_ms: 1 } },
+        ],
+      },
+    }) as { ok: boolean; ticket: string };
+    expect(started.ok).toBe(true);
+
+    const taken = await takeEventually(h, started.ticket);
+    expect(taken).toMatchObject({ ok: true, done: true });
+    expect(taken.value).toMatchObject({ ok: false });
+    expect((taken.value?.results as Array<{ ok: boolean; error?: string }>)[1]).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("not one of this page's refs"),
+    });
+    expect(h.call("not-an-op", {})).toEqual({ ok: false, error: "Unknown op: not-an-op" });
+  });
+
+  it("keeps successful waits, navigation, and settled tickets on their protocol paths", async () => {
+    const h = loadPageScript('<button id="save">Save</button><p>Ready</p>');
+    Object.defineProperty(h.document, "readyState", { configurable: true, value: "complete" });
+    Object.defineProperty(h.document.body, "innerText", { configurable: true, value: "Ready" });
+    const first = h.call("snapshot", {}) as { elements: Array<{ ref: string }> };
+    h.document.getElementById("save")?.remove();
+    const waited = h.call("begin", {
+      op: "act",
+      args: {
+        actions: [
+          { wait_for: { text: "ready", timeout_ms: 1 }, settle_ms: 1 },
+          { wait_for: { gone: first.elements[0]?.ref, timeout_ms: 1 }, settle_ms: 1 },
+        ],
+      },
+    }) as { ticket: string };
+    expect((await takeEventually(h, waited.ticket)).value).toMatchObject({ ok: true });
+
+    const settled = h.call("begin", { op: "settle", args: { budget_ms: 1 } }) as { ticket: string };
+    expect((await takeEventually(h, settled.ticket)).value).toMatchObject({ ok: true, settled: false });
+
+    const annotation = h.call("begin", { op: "annotate", args: {} }) as { ticket: string };
+    expect((await takeEventually(h, annotation.ticket)).value).toMatchObject({ ok: false });
+
+    const navigating = loadPageScript('<button id="go">Go</button>');
+    Object.defineProperty(navigating.document, "readyState", { configurable: true, value: "complete" });
+    const snap = navigating.call("snapshot", {}) as { elements: Array<{ ref: string }> };
+    setTimeout(() => {
+      navigating.location.href = "https://example.com/next";
+    }, 10);
+    const moved = navigating.call("begin", {
+      op: "act",
+      args: { actions: [{ click: snap.elements[0]?.ref, settle_ms: 1 }, { key: "Escape" }] },
+    }) as { ticket: string };
+    expect((await takeEventually(navigating, moved.ticket)).value).toMatchObject({ navigated: true });
+    expect(h.call("ping", {})).toMatchObject({ ok: true });
+  });
+
+  it("retains modal ordering and surrogate-safe read boundaries", () => {
+    const modalButtons = Array.from({ length: 81 }, (_, index) => `<button>Choice ${index}</button>`).join("");
+    const modal = loadPageScript(`<dialog open>${modalButtons}</dialog>`);
+    expect(modal.call("snapshot", {})).toMatchObject({ count: 80, overflow: 1 });
+
+    const low = loadPageScript(`<main>😀${"x".repeat(40010)}</main>`);
+    expect(low.call("read", { offset: 1 })).toMatchObject({ offset: 0 });
+
+    const high = loadPageScript(`<main>${"x".repeat(39999)}😀tail</main>`);
+    expect(high.call("read", { offset: 0 })).toMatchObject({ nextOffset: 39999 });
   });
 });

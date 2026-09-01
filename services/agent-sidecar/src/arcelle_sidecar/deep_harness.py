@@ -7,84 +7,105 @@ process that can touch live files. LocalShellBackend is intentionally absent.
 
 from __future__ import annotations
 
-import json
-import posixpath
 import re
 from dataclasses import dataclass
-from typing import Any, Protocol, TypedDict
+from typing import Any, TypeGuard, TypedDict
 
 from deepagents import CompiledSubAgent, FilesystemPermission, create_deep_agent
-from deepagents.backends import BackendProtocol, StateBackend
-from deepagents.backends.protocol import (
-    DeleteResult,
-    EditResult,
-    GlobResult,
-    GrepResult,
-    LsResult,
-    ReadResult,
-    WriteResult,
-)
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
-from langchain_core.tools import BaseTool, StructuredTool
+from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.graph import END, START, StateGraph
 from pydantic import ConfigDict, Field
 
 from .agents import REGISTRY, get_agent
 from .config import RunRequest
+from .deep_harness_workspace import (
+    SAFE_WORKSPACE_FAILURE as SAFE_WORKSPACE_FAILURE,
+    ArcelleStateBackend as ArcelleStateBackend,
+    ArcelleToolBackend as ArcelleToolBackend,
+    ArcelleWorkspaceBackend as ArcelleWorkspaceBackend,
+    McpWorkspaceBridge as McpWorkspaceBridge,
+    WorkspaceBridge as WorkspaceBridge,
+    _safe_virtual_path as _safe_virtual_path,
+    _workspace_mutation_tools as _workspace_mutation_tools,
+)
 from .graph import Deps
 from .graphs import graph_for, recursion_limit_for
 from .llm import capabilities as ollama_capabilities
-from .mcp_client import McpClient
 from .messages import Message
 from .privacy import is_nonlocal_model
 
 MODEL_SEPARATOR = ":" * 2
-SAFE_WORKSPACE_FAILURE = "Workspace operation failed. Raw diagnostics were omitted to protect room data."
 
 
 def _text(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "\n".join(
-            str(block.get("text", ""))
-            for block in content
-            if isinstance(block, dict) and block.get("type") == "text"
-        )
+        return _text_blocks(content)
     return str(content or "")
+
+
+def _text_blocks(content: list[Any]) -> str:
+    return "\n".join(str(block.get("text", "")) for block in content if _is_text_block(block))
+
+
+def _is_text_block(block: Any) -> TypeGuard[dict[str, Any]]:
+    return isinstance(block, dict) and block.get("type") == "text"
+
+
+def _text_message(role: str, message: BaseMessage) -> Message:
+    return {"role": role, "content": _text(message.content)}
+
+
+def _tool_message(message: ToolMessage) -> Message:
+    return {
+        "role": "tool",
+        "content": _text(message.content),
+        "tool_name": message.name or "tool",
+        "tool_call_id": message.tool_call_id,
+    }
+
+
+def _raw_tool_calls(message: AIMessage) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": call.get("id", ""),
+            "type": "function",
+            "function": {"name": call.get("name", ""), "arguments": call.get("args", {})},
+        }
+        for call in message.tool_calls
+    ]
+
+
+def _assistant_message(message: AIMessage) -> Message:
+    item: Message = _text_message("assistant", message)
+    raw_calls = _raw_tool_calls(message)
+    if raw_calls:
+        item["tool_calls"] = raw_calls
+    return item
+
+
+def _arcelle_message(message: BaseMessage) -> Message | None:
+    if isinstance(message, SystemMessage):
+        return _text_message("system", message)
+    if isinstance(message, HumanMessage):
+        return _text_message("user", message)
+    if isinstance(message, ToolMessage):
+        return _tool_message(message)
+    if isinstance(message, AIMessage):
+        return _assistant_message(message)
+    return None
 
 
 def _arcelle_messages(messages: list[BaseMessage]) -> list[Message]:
     out: list[Message] = []
     for message in messages:
-        if isinstance(message, SystemMessage):
-            out.append({"role": "system", "content": _text(message.content)})
-        elif isinstance(message, HumanMessage):
-            out.append({"role": "user", "content": _text(message.content)})
-        elif isinstance(message, ToolMessage):
-            out.append(
-                {
-                    "role": "tool",
-                    "content": _text(message.content),
-                    "tool_name": message.name or "tool",
-                    "tool_call_id": message.tool_call_id,
-                }
-            )
-        elif isinstance(message, AIMessage):
-            raw_calls = [
-                {
-                    "id": call.get("id", ""),
-                    "type": "function",
-                    "function": {"name": call.get("name", ""), "arguments": call.get("args", {})},
-                }
-                for call in message.tool_calls
-            ]
-            item: Message = {"role": "assistant", "content": _text(message.content)}
-            if raw_calls:
-                item["tool_calls"] = raw_calls
+        item = _arcelle_message(message)
+        if item is not None:
             out.append(item)
     return out
 
@@ -114,7 +135,9 @@ class ArcelleHarnessModelAdapter(BaseChatModel):
             update={"bound_tools": [convert_to_openai_tool(tool) for tool in tools]}
         )
 
-    def _generate(self, messages: list[BaseMessage], stop: list[str] | None = None, **kwargs: Any) -> ChatResult:
+    def _generate(
+        self, messages: list[BaseMessage], stop: list[str] | None = None, **kwargs: Any
+    ) -> ChatResult:
         del messages, stop, kwargs
         raise RuntimeError("Arcelle's harness model is async-only.")
 
@@ -187,18 +210,40 @@ async def select_deep_harness(req: RunRequest) -> DeepHarnessDecision:
     duplicate protection and final synthesis behavior for weak models.
     """
     small = is_small_parameter_model(req.model)
+    if decision := _base_harness_decision(req, small):
+        return decision
+    if decision := _provider_or_engine_decision(req, small):
+        return decision
+    return await _ollama_harness_decision(req, small)
+
+
+def _base_harness_decision(req: RunRequest, small: bool) -> DeepHarnessDecision | None:
     if req.harness != "deep":
         return DeepHarnessDecision("deterministic", "The classic harness was requested.", small)
     if req.mcp is None:
-        return DeepHarnessDecision("deterministic", "No authenticated workspace bridge is available.", small)
+        return DeepHarnessDecision(
+            "deterministic", "No authenticated workspace bridge is available.", small
+        )
+    return None
+
+
+def _provider_decision(supports_tools: bool, small: bool) -> DeepHarnessDecision:
+    if supports_tools:
+        return DeepHarnessDecision("deep", "The provider declares tool support.", small)
+    return DeepHarnessDecision(
+        "deterministic", "The provider does not support tool calling.", small
+    )
+
+
+def _provider_or_engine_decision(req: RunRequest, small: bool) -> DeepHarnessDecision | None:
     if req.provider is not None:
-        if req.provider.supports_tools:
-            return DeepHarnessDecision("deep", "The provider declares tool support.", small)
-        return DeepHarnessDecision("deterministic", "The provider does not support tool calling.", small)
+        return _provider_decision(req.provider.supports_tools, small)
     # Native Codex/Claude own their rich harnesses. Requests that reach this
     # compatibility endpoint stay on the proven deterministic adapter.
     if MODEL_SEPARATOR in req.model:
-        return DeepHarnessDecision("deterministic", "This engine uses its native or compatibility harness.", small)
+        return DeepHarnessDecision(
+            "deterministic", "This engine uses its native or compatibility harness.", small
+        )
     # A tool-capability bit says the API accepts tool schemas; it does not say a
     # small model can reliably complete a multi-step filesystem loop. Arcelle's
     # existing 4B protections are the deterministic specialist graph, which
@@ -210,6 +255,10 @@ async def select_deep_harness(req: RunRequest) -> DeepHarnessDecision:
             "Small Ollama models use Arcelle's deterministic workspace harness.",
             True,
         )
+    return None
+
+
+async def _ollama_harness_decision(req: RunRequest, small: bool) -> DeepHarnessDecision:
     caps = await ollama_capabilities(req.model, req.ollama_base_url)
     if "tools" not in {str(cap).casefold() for cap in caps}:
         location = "cloud" if is_nonlocal_model(req.model) else "local"
@@ -219,293 +268,6 @@ async def select_deep_harness(req: RunRequest) -> DeepHarnessDecision:
             small,
         )
     return DeepHarnessDecision("deep", "The Ollama model declares tool support.", small)
-
-
-class WorkspaceBridge(Protocol):
-    async def call(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]: ...
-
-
-@dataclass(slots=True)
-class McpWorkspaceBridge:
-    """Language-neutral workspace protocol carried over Arcelle MCP tools."""
-
-    mcp: McpClient
-
-    async def call(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        result = await self.mcp.call_tool(f"workspace_{operation}", arguments)
-        if result.is_error:
-            return {"error": SAFE_WORKSPACE_FAILURE}
-        try:
-            payload = json.loads(result.text)
-        except json.JSONDecodeError:
-            return {"error": "The workspace bridge returned an invalid response."}
-        return payload if isinstance(payload, dict) else {"error": "Invalid workspace response."}
-
-
-def _safe_virtual_path(value: str) -> str:
-    parts = [part for part in value.replace("\\", "/").split("/") if part not in ("", ".")]
-    if any(part == ".." for part in parts):
-        raise ValueError("Workspace paths cannot leave the room.")
-    if parts and parts[0].casefold() == ".arcelle":
-        raise ValueError("The .arcelle directory is private.")
-    return "/" + "/".join(parts)
-
-
-class ArcelleWorkspaceBackend(BackendProtocol):
-    """Deep Agents filesystem backend that delegates every byte to Electron."""
-
-    def __init__(self, bridge: WorkspaceBridge, *, write_enabled: bool, cancel: Any = None) -> None:
-        self.bridge = bridge
-        self.write_enabled = write_enabled
-        self.cancel = cancel
-        # One run, one backend. Repeated byte-identical mutations are model
-        # retries, not a reason to write/trash twice. Reads stay live.
-        self._mutations: dict[str, dict[str, Any]] = {}
-
-    async def _call(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        if self.cancel is not None and self.cancel.cancelled:
-            return {"error": "This run was cancelled."}
-        try:
-            payload = await self.bridge.call(operation, arguments)
-            if payload.get("error"):
-                return {"error": SAFE_WORKSPACE_FAILURE}
-            return payload
-        except Exception:  # noqa: BLE001 - raw bridge errors can contain private data
-            return {"error": SAFE_WORKSPACE_FAILURE}
-
-    async def _mutate(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        key = f"{operation}:{json.dumps(arguments, sort_keys=True, separators=(',', ':'))}"
-        cached = self._mutations.get(key)
-        if cached is not None:
-            return cached
-        payload = await self._call(operation, arguments)
-        # A failed operation may become valid after the user resolves a conflict;
-        # only successful commits are safe to suppress as duplicates.
-        if not payload.get("error"):
-            self._mutations[key] = payload
-        return payload
-
-    async def als(self, path: str) -> LsResult:
-        try:
-            safe = _safe_virtual_path(path)
-        except ValueError as exc:
-            return LsResult(error=str(exc))
-        payload = await self._call("list", {"path": safe})
-        return LsResult(error=payload.get("error"), entries=payload.get("entries"))
-
-    async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
-        try:
-            safe = _safe_virtual_path(file_path)
-        except ValueError as exc:
-            return ReadResult(error=str(exc))
-        payload = await self._call("read", {"path": safe, "offset": offset, "limit": limit})
-        if payload.get("error"):
-            return ReadResult(error=payload["error"])
-        return ReadResult(
-            file_data=payload.get("file_data"),
-            total_lines=payload.get("total_lines"),
-            start_line=payload.get("start_line"),
-            end_line=payload.get("end_line"),
-            next_offset=payload.get("next_offset"),
-        )
-
-    async def awrite(self, file_path: str, content: str) -> WriteResult:
-        if not self.write_enabled:
-            return WriteResult(error="This run is read-only.")
-        try:
-            safe = _safe_virtual_path(file_path)
-        except ValueError as exc:
-            return WriteResult(error=str(exc))
-        payload = await self._mutate("write", {"path": safe, "content": content})
-        return WriteResult(error=payload.get("error"), path=payload.get("path"))
-
-    async def aedit(
-        self,
-        file_path: str,
-        old_string: str,
-        new_string: str,
-        replace_all: bool = False,
-    ) -> EditResult:
-        if not self.write_enabled:
-            return EditResult(error="This run is read-only.")
-        try:
-            safe = _safe_virtual_path(file_path)
-        except ValueError as exc:
-            return EditResult(error=str(exc))
-        payload = await self._mutate(
-            "edit",
-            {
-                "path": safe,
-                "old_string": old_string,
-                "new_string": new_string,
-                "replace_all": replace_all,
-            },
-        )
-        return EditResult(
-            error=payload.get("error"),
-            path=payload.get("path"),
-            occurrences=payload.get("occurrences"),
-        )
-
-    async def adelete(self, file_path: str) -> DeleteResult:
-        if not self.write_enabled:
-            return DeleteResult(error="This run is read-only.")
-        try:
-            safe = _safe_virtual_path(file_path)
-        except ValueError as exc:
-            return DeleteResult(error=str(exc))
-        payload = await self._mutate("delete", {"path": safe})
-        return DeleteResult(error=payload.get("error"), path=payload.get("path"))
-
-    async def amove(self, source_path: str, destination_path: str) -> dict[str, Any]:
-        """Move one normal workspace file without reading or rewriting its bytes."""
-        if not self.write_enabled:
-            return {"error": "This run is read-only."}
-        try:
-            source = _safe_virtual_path(source_path)
-            destination = _safe_virtual_path(destination_path)
-        except ValueError as exc:
-            return {"error": str(exc)}
-        return await self._mutate(
-            "move", {"source_path": source, "destination_path": destination}
-        )
-
-    async def arename(self, file_path: str, new_name: str) -> dict[str, Any]:
-        """Rename one normal workspace file in place without touching its bytes."""
-        if not self.write_enabled:
-            return {"error": "This run is read-only."}
-        try:
-            source = _safe_virtual_path(file_path)
-        except ValueError as exc:
-            return {"error": str(exc)}
-        requested = new_name.strip()
-        if (
-            requested in {"", ".", ".."}
-            or "/" in requested
-            or "\\" in requested
-            or requested.casefold() == ".arcelle"
-        ):
-            return {"error": "The new name must be one safe file name."}
-        destination = posixpath.join(posixpath.dirname(source), requested)
-        return await self._mutate(
-            "rename",
-            {"source_path": source, "new_name": requested, "destination_path": destination},
-        )
-
-    async def aglob(self, pattern: str, path: str | None = None) -> GlobResult:
-        try:
-            safe = _safe_virtual_path(path or "/")
-        except ValueError as exc:
-            return GlobResult(error=str(exc))
-        payload = await self._call("glob", {"path": safe, "pattern": pattern})
-        return GlobResult(
-            error=payload.get("error"),
-            matches=payload.get("matches"),
-            truncated=bool(payload.get("truncated", False)),
-        )
-
-    async def agrep(
-        self,
-        pattern: str,
-        path: str | None = None,
-        glob: str | None = None,
-        *,
-        max_count: int | None = None,
-    ) -> GrepResult:
-        try:
-            safe = _safe_virtual_path(path or "/")
-        except ValueError as exc:
-            return GrepResult(error=str(exc))
-        payload = await self._call(
-            "grep", {"path": safe, "pattern": pattern, "glob": glob, "max_count": max_count}
-        )
-        return GrepResult(
-            error=payload.get("error"),
-            matches=payload.get("matches"),
-            truncated=bool(payload.get("truncated", False)),
-        )
-
-
-class ArcelleStateBackend(StateBackend):
-    """Named Deep Agents state backend for temporary plans and spill files."""
-
-
-@dataclass(slots=True)
-class ArcelleToolBackend:
-    """Restricted adapter for Arcelle special tools; no shell or raw paths."""
-
-    mcp: McpClient
-
-    async def call(self, name: str, arguments: dict[str, Any]) -> str:
-        result = await self.mcp.call_tool(name, arguments)
-        if result.is_error:
-            raise RuntimeError(result.text)
-        return result.text
-
-
-def _workspace_mutation_tools(backend: ArcelleWorkspaceBackend) -> list[BaseTool]:
-    """Tools missing from Deep Agents' text-focused filesystem middleware."""
-
-    async def workspace_delete(path: str) -> str:
-        """Move one normal workspace file to recoverable Arcelle Trash.
-
-        Use this tool when the user asks to delete a file. Do not simulate a
-        deletion by renaming or moving the file to another workspace folder.
-        Arcelle permits the operation only after a rollback baseline exists.
-        """
-        result = await backend.adelete(path)
-        return json.dumps(
-            {
-                key: value
-                for key, value in {"error": result.error, "path": result.path}.items()
-                if value is not None
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-
-    async def workspace_move(source_path: str, destination_path: str) -> str:
-        """Move or rename a normal workspace file to an exact virtual path.
-
-        This moves the filesystem entry directly, so it also works for PDFs,
-        recordings, images, sketches, spreadsheets, and other binary files.
-        Arcelle permits the operation only after a rollback baseline exists.
-        """
-        return json.dumps(
-            await backend.amove(source_path, destination_path),
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-
-    async def workspace_rename(source_path: str, new_name: str) -> str:
-        """Rename a normal workspace file while keeping it in its current folder.
-
-        Give only the new file name, including its extension. Arcelle moves the
-        filesystem entry directly and requires an authorized rollback baseline.
-        """
-        return json.dumps(
-            await backend.arename(source_path, new_name),
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-
-    return [
-        StructuredTool.from_function(
-            name="workspace_delete",
-            description=workspace_delete.__doc__ or "Move a workspace file to Arcelle Trash.",
-            coroutine=workspace_delete,
-        ),
-        StructuredTool.from_function(
-            name="workspace_move",
-            description=workspace_move.__doc__ or "Move a workspace file.",
-            coroutine=workspace_move,
-        ),
-        StructuredTool.from_function(
-            name="workspace_rename",
-            description=workspace_rename.__doc__ or "Rename a workspace file.",
-            coroutine=workspace_rename,
-        ),
-    ]
 
 
 class _SubagentState(TypedDict):
@@ -634,7 +396,9 @@ def build_deep_agent(
     subagents = [adapter.compile(spec.id) for spec in REGISTRY if spec.id != "chat.answer"]
     permissions = [
         FilesystemPermission(operations=["read"], paths=["/.arcelle/**"], mode="deny"),
-        FilesystemPermission(operations=["write"], paths=["/**"], mode="allow" if write_enabled else "deny"),
+        FilesystemPermission(
+            operations=["write"], paths=["/**"], mode="allow" if write_enabled else "deny"
+        ),
     ]
     return create_deep_agent(
         model=ArcelleHarnessModelAdapter(inner=deps.chat, cancel=deps.cancel),

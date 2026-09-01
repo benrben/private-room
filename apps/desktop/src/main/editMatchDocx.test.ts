@@ -86,6 +86,23 @@ describe("replaceInTextNodes", () => {
     expect(out.xml).toContain("<w:tab/>");
   });
 
+  it("keeps scanning valid runs before malformed text markup", () => {
+    const xml = '<w:p><w:t>ofﬁ\u200bce</w:t><w:tab/><w:t data-empty="yes"/><w:t broken';
+    const out = replaceInTextNodes(xml, "office", "suite");
+    expect(out.count).toBe(1);
+    expect(out.xml).toContain("suite");
+    expect(out.xml).toContain('<w:t data-empty="yes"/>');
+    expect(out.xml).toContain("<w:t broken");
+  });
+
+  it("keeps parsed runs editable when a later text node is unclosed", () => {
+    const xml = "<w:p><w:t>office</w:t><w:t>unfinished";
+    const out = replaceInTextNodes(xml, "office", "suite");
+    expect(out.count).toBe(1);
+    expect(out.xml).toContain("suite");
+    expect(out.xml).toContain("<w:t>unfinished");
+  });
+
   it("spans formatting runs (a sentence split across many <w:t> nodes)", () => {
     // Word splits a sentence into many runs (spellcheck, formatting, rsid
     // churn), so a match may span several nodes.
@@ -104,6 +121,11 @@ describe("replaceInTextNodes", () => {
     const out = replaceInTextNodes("<w:p><w:t>Payment due within 30 days.</w:t></w:p>", "due  within\n30 days", "due within 45 days");
     expect(out.count).toBe(1);
     expect(out.xml).toContain("due within 45 days");
+  });
+
+  it("folds a ligature in the searched text before matching ordinary runs", () => {
+    const out = replaceInTextNodes("<w:p><w:t>office</w:t></w:p>", "ofﬁce", "suite");
+    expect(out).toEqual({ xml: "<w:p><w:t>suite</w:t></w:p>", count: 1 });
   });
 
   it("does not match across paragraphs", () => {

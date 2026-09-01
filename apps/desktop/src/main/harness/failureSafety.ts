@@ -9,13 +9,18 @@ export function safeProviderFailure(
   phase: "run" | "tool" | "startup" = "run",
   exitCode?: number | null,
 ): string {
-  const label = source === "ollama-local" ? "Local Ollama"
-    : source === "ollama-cloud" ? "Ollama Cloud"
-      : source === "openrouter" ? "OpenRouter"
-        : source === "codex" ? "Codex"
-          : source === "claude" ? "Claude"
-            : "The model provider";
-  const action = phase === "tool" ? "tool failed" : phase === "startup" ? "runtime could not start" : "run failed";
+  const label = {
+    "ollama-local": "Local Ollama",
+    "ollama-cloud": "Ollama Cloud",
+    openrouter: "OpenRouter",
+    codex: "Codex",
+    claude: "Claude",
+  }[source] ?? "The model provider";
+  const action = {
+    tool: "tool failed",
+    startup: "runtime could not start",
+    run: "run failed",
+  }[phase];
   const code = typeof exitCode === "number" && Number.isInteger(exitCode) ? ` (exit ${exitCode})` : "";
   return `${label} ${action}${code}. Provider diagnostics were omitted to protect room data.`;
 }

@@ -153,30 +153,36 @@ export function createMediaStreams(): MediaStreams {
 export function stageMediaBytes(streams: MediaStreams, bytes: Buffer, mime: string): string {
   const seq = streams.next++;
   const token = `${seq}-${randomUUID()}`;
-  const staged = bytes.length;
-  for (;;) {
-    let held = 0;
-    for (const m of streams.map.values()) {
-      held += m.bytes.length;
-    }
-    if (streams.map.size < MAX_STAGED && held + staged <= MAX_STAGED_BYTES) {
-      break;
-    }
-    let oldestKey: string | undefined;
-    let oldestSeq = Number.POSITIVE_INFINITY;
-    for (const [key, m] of streams.map) {
-      if (m.seq < oldestSeq) {
-        oldestSeq = m.seq;
-        oldestKey = key;
-      }
-    }
-    if (oldestKey === undefined) {
-      break; // nothing left to evict: the newest entry stands
-    }
-    streams.map.delete(oldestKey);
-  }
+  evictMediaForBytes(streams, bytes.length);
   streams.map.set(token, { bytes, mime, seq });
   return token;
+}
+
+function stagedMediaBytes(streams: MediaStreams): number {
+  let held = 0;
+  for (const staged of streams.map.values()) held += staged.bytes.length;
+  return held;
+}
+
+function oldestMediaToken(streams: MediaStreams): string | null {
+  let oldestToken: string | null = null;
+  let oldestSeq = Number.POSITIVE_INFINITY;
+  for (const [token, staged] of streams.map) {
+    if (staged.seq < oldestSeq) {
+      oldestSeq = staged.seq;
+      oldestToken = token;
+    }
+  }
+  return oldestToken;
+}
+
+function evictMediaForBytes(streams: MediaStreams, stagedBytes: number): void {
+  for (;;) {
+    if (streams.map.size < MAX_STAGED && stagedMediaBytes(streams) + stagedBytes <= MAX_STAGED_BYTES) return;
+    const oldest = oldestMediaToken(streams);
+    if (oldest === null) return; // nothing left to evict: the newest entry stands
+    streams.map.delete(oldest);
+  }
 }
 
 /** Stage a trusted stream factory without copying a normal workspace file
@@ -234,6 +240,22 @@ const M4A_LIKE_MIMES: ReadonlySet<string> = new Set([
   "audio/aac",
 ]);
 
+const PLAYABLE_EXTENSION_MIMES: ReadonlyMap<string, string> = new Map([
+  ["mov", "video/quicktime"],
+  ["mp3", "audio/mpeg"],
+  ["wav", "audio/wav"],
+  ["flac", "audio/flac"],
+  ["ogg", "audio/ogg"],
+  ["opus", "audio/ogg"],
+]);
+
+function playableExtensionMime(ext: string, video: boolean): string {
+  const knownMime = PLAYABLE_EXTENSION_MIMES.get(ext);
+  if (knownMime !== undefined) return knownMime;
+  if (ext === "webm") return video ? "video/webm" : "audio/webm";
+  return video ? "video/mp4" : "audio/mp4";
+}
+
 /**
  * The Content-Type the media element will actually play for this file.
  * RETURNS THE LOWERCASED MIME on the passthrough branch — see this module's
@@ -247,23 +269,7 @@ export function playableMediaMime(mime: string, ext: string, video: boolean): st
   if (m !== "" && m !== "application/octet-stream") {
     return m;
   }
-  switch (ext) {
-    case "mov":
-      return "video/quicktime";
-    case "webm":
-      return video ? "video/webm" : "audio/webm";
-    case "mp3":
-      return "audio/mpeg";
-    case "wav":
-      return "audio/wav";
-    case "flac":
-      return "audio/flac";
-    case "ogg":
-    case "opus":
-      return "audio/ogg";
-    default:
-      return video ? "video/mp4" : "audio/mp4";
-  }
+  return playableExtensionMime(ext, video);
 }
 
 // -------------------------------------------------------------------- range
@@ -313,48 +319,42 @@ function parseU64(s: string): number | null {
  * quirks (first-dash split, suffix form) worth calling out explicitly.
  */
 export function parseRange(header: string, len: number): [number, number] | null {
-  if (len === 0) {
-    return null;
-  }
+  if (len === 0) return null;
+  const range = rangeTexts(header);
+  if (range === null) return null;
+  return range.start === "" ? suffixRange(range.end, len) : explicitRange(range.start, range.end, len);
+}
+
+type RangeTexts = { start: string; end: string };
+
+function rangeTexts(header: string): RangeTexts | null {
   const trimmed = header.trim();
-  if (!trimmed.startsWith("bytes=")) {
-    return null;
-  }
+  if (!trimmed.startsWith("bytes=")) return null;
   const spec = trimmed.slice("bytes=".length);
   const dash = spec.indexOf("-");
-  if (dash === -1) {
-    return null;
-  }
-  const startS = spec.slice(0, dash).trim();
-  const endS = spec.slice(dash + 1).trim();
+  if (dash === -1) return null;
+  return { start: spec.slice(0, dash).trim(), end: spec.slice(dash + 1).trim() };
+}
 
-  if (startS === "") {
-    // Suffix form: "bytes=-N" — the final N bytes.
-    const n = parseU64(endS);
-    if (n === null || !(n > 0)) {
-      return null;
-    }
-    const clamped = Math.min(n, len);
-    return [len - clamped, len - 1];
-  }
+function suffixRange(end: string, len: number): [number, number] | null {
+  const count = parseU64(end);
+  if (count === null) return null;
+  if (count <= 0) return null;
+  const clamped = Math.min(count, len);
+  return [len - clamped, len - 1];
+}
 
-  const start = parseU64(startS);
-  if (start === null || start >= len) {
-    return null;
-  }
-  let end: number;
-  if (endS === "") {
-    end = len - 1;
-  } else {
-    const parsedEnd = parseU64(endS);
-    if (parsedEnd === null) {
-      return null;
-    }
-    end = Math.min(parsedEnd, len - 1);
-  }
-  if (end < start) {
-    return null;
-  }
+function explicitRangeEnd(end: string, len: number): number | null {
+  if (end === "") return len - 1;
+  const parsed = parseU64(end);
+  return parsed === null ? null : Math.min(parsed, len - 1);
+}
+
+function explicitRange(startText: string, endText: string, len: number): [number, number] | null {
+  const start = parseU64(startText);
+  if (start === null || start >= len) return null;
+  const end = explicitRangeEnd(endText, len);
+  if (end === null || end < start) return null;
   return [start, end];
 }
 
@@ -451,22 +451,78 @@ async function rangeStream(
     let position = 0;
     try {
       for await (const raw of source) {
-        const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
-        const chunkStart = position;
-        const chunkEnd = position + chunk.length - 1;
-        position += chunk.length;
-        if (chunkEnd < start) continue;
-        if (chunkStart > end) break;
-        const from = Math.max(0, start - chunkStart);
-        const to = Math.min(chunk.length, end - chunkStart + 1);
-        if (to > from) yield chunk.subarray(from, to);
-        if (chunkEnd >= end) break;
+        const selection = selectedMediaChunk(raw, position, start, end);
+        position += selection.length;
+        if (selection.bytes !== null) yield selection.bytes;
+        if (selection.done) break;
       }
     } finally {
       source.destroy();
     }
   }
   return Readable.toWeb(Readable.from(selected())) as ReadableStream<Uint8Array>;
+}
+
+type MediaChunkSelection = { bytes: Buffer | null; done: boolean; length: number };
+
+function selectedMediaChunk(raw: unknown, position: number, start: number, end: number): MediaChunkSelection {
+  const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
+  const chunkEnd = position + chunk.length - 1;
+  if (chunkEnd < start) return { bytes: null, done: false, length: chunk.length };
+  if (position > end) return { bytes: null, done: true, length: chunk.length };
+  const from = Math.max(0, start - position);
+  const to = Math.min(chunk.length, end - position + 1);
+  return { bytes: to > from ? chunk.subarray(from, to) : null, done: chunkEnd >= end, length: chunk.length };
+}
+
+function streamableMedia(staged: StagedMedia | undefined): StagedMedia | null {
+  if (staged === undefined) return null;
+  return staged.openStream === undefined || staged.sizeBytes === undefined ? null : staged;
+}
+
+function mediaHeaders(mime: string): MediaHeader[] {
+  return [
+    ["Content-Type", mime],
+    ["Accept-Ranges", "bytes"],
+    ["Cache-Control", "no-store"],
+    ALLOW_ORIGIN,
+  ];
+}
+
+async function fullStreamingResponse(
+  staged: StagedMedia,
+  base: MediaHeader[],
+): Promise<StreamingMediaHttpResponse> {
+  const stream = await staged.openStream!();
+  const len = staged.sizeBytes!;
+  return {
+    status: 200,
+    headers: [...base, ["Content-Length", String(len)]],
+    body: await rangeStream(stream, 0, Math.max(0, len - 1)),
+  };
+}
+
+async function rangedStreamingBody(staged: StagedMedia, start: number, end: number): Promise<ReadableStream<Uint8Array>> {
+  if (staged.openRange === undefined) return rangeStream(await staged.openStream!(), start, end);
+  return rangeStream(await staged.openRange(start, end), 0, end - start);
+}
+
+async function rangedStreamingResponse(
+  staged: StagedMedia,
+  base: MediaHeader[],
+  len: number,
+  start: number,
+  end: number,
+): Promise<StreamingMediaHttpResponse> {
+  return {
+    status: 206,
+    headers: [
+      ...base,
+      ["Content-Length", String(end - start + 1)],
+      ["Content-Range", `bytes ${start}-${end}/${len}`],
+    ],
+    body: await rangedStreamingBody(staged, start, end),
+  };
 }
 
 /** Async protocol response used for normal workspace files. Legacy staged
@@ -477,24 +533,14 @@ export async function mediaStreamingResponse(
   range: string | null | undefined,
 ): Promise<StreamingMediaHttpResponse> {
   const token = path.replace(/^\/+/, "");
-  const staged = streams.map.get(token);
-  if (staged?.openStream === undefined || staged.sizeBytes === undefined) {
+  const staged = streamableMedia(streams.map.get(token));
+  if (staged === null) {
     return mediaResponse(streams, path, range);
   }
-  const len = staged.sizeBytes;
-  const base: MediaHeader[] = [
-    ["Content-Type", staged.mime],
-    ["Accept-Ranges", "bytes"],
-    ["Cache-Control", "no-store"],
-    ALLOW_ORIGIN,
-  ];
+  const len = staged.sizeBytes!;
+  const base = mediaHeaders(staged.mime);
   if (range === null || range === undefined) {
-    const stream = await staged.openStream();
-    return {
-      status: 200,
-      headers: [...base, ["Content-Length", String(len)]],
-      body: await rangeStream(stream, 0, Math.max(0, len - 1)),
-    };
+    return fullStreamingResponse(staged, base);
   }
   const parsed = parseRange(range, len);
   if (parsed === null) {
@@ -505,18 +551,5 @@ export async function mediaStreamingResponse(
     };
   }
   const [start, end] = parsed;
-  const stream = staged.openRange === undefined
-    ? await staged.openStream()
-    : await staged.openRange(start, end);
-  return {
-    status: 206,
-    headers: [
-      ...base,
-      ["Content-Length", String(end - start + 1)],
-      ["Content-Range", `bytes ${start}-${end}/${len}`],
-    ],
-    body: staged.openRange === undefined
-      ? await rangeStream(stream, start, end)
-      : await rangeStream(stream, 0, end - start),
-  };
+  return rangedStreamingResponse(staged, base, len, start, end);
 }

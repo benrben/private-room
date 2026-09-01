@@ -217,6 +217,32 @@ export type ParsedServerMessage =
   | { kind: "event"; event: RecSessionEvent }
   | { kind: "sys-tap-request"; request: SysTapRequest };
 
+function parseJsonObject(raw: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value !== "" ? value : null;
+}
+
+function sysTapRequestFrom(obj: Record<string, unknown>): SysTapRequest | null {
+  const fileId = nonEmptyString(obj.fileId);
+  const action = obj.action;
+  if (fileId === null || (action !== "start" && action !== "stop")) return null;
+  return { fileId, action };
+}
+
+function eventMessage(type: string, obj: Record<string, unknown>): ParsedServerMessage {
+  // Spread, not Object.assign — see the module doc's prototype-pollution note.
+  return { kind: "event", event: { type, payload: { ...obj } } };
+}
+
 /**
  * Parse one server→client text frame. `null` for anything that doesn't read as
  * a JSON object with a non-empty string `"type"` (bad JSON, an array, a bare
@@ -230,29 +256,15 @@ export type ParsedServerMessage =
  * drops what it does not recognize the same way.
  */
 export function parseServerMessage(raw: string): ParsedServerMessage | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return null;
-  }
-  const obj = parsed as Record<string, unknown>;
-  const type = obj.type;
-  if (typeof type !== "string" || type === "") {
-    return null;
-  }
+  const obj = parseJsonObject(raw);
+  if (obj === null) return null;
+  const type = nonEmptyString(obj.type);
+  if (type === null) return null;
   if (type === "sys-tap-request") {
-    const fileId = obj.fileId;
-    const action = obj.action;
-    if (typeof fileId !== "string" || fileId === "") return null;
-    if (action !== "start" && action !== "stop") return null;
-    return { kind: "sys-tap-request", request: { fileId, action } };
+    const request = sysTapRequestFrom(obj);
+    return request === null ? null : { kind: "sys-tap-request", request };
   }
-  // Spread, not Object.assign — see the module doc's prototype-pollution note.
-  return { kind: "event", event: { type, payload: { ...obj } } };
+  return eventMessage(type, obj);
 }
 
 // =============================================================================

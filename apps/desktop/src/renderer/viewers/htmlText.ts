@@ -30,7 +30,9 @@ const TEXT_SKIP = new Set(["script", "style", "noscript", "template"]);
  */
 export function isHiddenMarkup(el: Element): boolean {
   if (el.hasAttribute("hidden")) return true;
-  const style = (el.getAttribute("style") ?? "").toLowerCase().replace(/\s+/g, "");
+  const style = (el.getAttribute("style") ?? "")
+    .toLowerCase()
+    .replace(/\s+/g, "");
   return (
     style.includes("display:none") ||
     style.includes("visibility:hidden") ||
@@ -41,10 +43,37 @@ export function isHiddenMarkup(el: Element): boolean {
 /** Elements that start their own line. Without these the whole page arrives
  * as one paragraph with words fused across every tag boundary. */
 const TEXT_BLOCK = new Set([
-  "address", "article", "aside", "blockquote", "dd", "div", "dl", "dt",
-  "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3",
-  "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre",
-  "section", "table", "tr", "ul",
+  "address",
+  "article",
+  "aside",
+  "blockquote",
+  "dd",
+  "div",
+  "dl",
+  "dt",
+  "fieldset",
+  "figcaption",
+  "figure",
+  "footer",
+  "form",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "header",
+  "hr",
+  "li",
+  "main",
+  "nav",
+  "ol",
+  "p",
+  "pre",
+  "section",
+  "table",
+  "tr",
+  "ul",
 ]);
 
 /**
@@ -71,41 +100,69 @@ export function textOf(html: string): string {
   }
 
   const out: string[] = [];
-  /** One blank line between blocks, never a stack of them. */
-  const newline = () => {
-    let run = 0;
-    for (let i = out.length - 1; i >= 0 && out[i] === "\n"; i--) run++;
-    if (run < 2) out.push("\n");
-  };
 
-  const walk = (node: Node, inPre: boolean): void => {
-    if (node.nodeType === Node.TEXT_NODE) {
-      const raw = node.nodeValue ?? "";
-      if (inPre) {
-        out.push(raw);
-        return;
-      }
-      const collapsed = raw.replace(/\s+/g, " ");
-      // A lone space straight after a line break is layout, not text.
-      if (collapsed === " " && (out.length === 0 || out[out.length - 1] === "\n")) return;
-      if (collapsed) out.push(collapsed);
-      return;
-    }
-    if (node.nodeType !== Node.ELEMENT_NODE) return;
-    const tag = (node as Element).tagName.toLowerCase();
-    if (TEXT_SKIP.has(tag)) return;
-    if (isHiddenMarkup(node as Element)) return;
-    if (tag === "br") {
-      out.push("\n");
-      return;
-    }
-    const block = TEXT_BLOCK.has(tag);
-    if (block) newline();
-    const pre = inPre || tag === "pre";
-    for (const child of Array.from(node.childNodes)) walk(child, pre);
-    if (block) newline();
-  };
-
-  walk(doc.body ?? doc.documentElement, false);
+  walk(doc.body ?? doc.documentElement, false, out);
   return out.join("").trim();
+}
+
+/** One blank line between blocks, never a stack of them. */
+function appendNewline(out: string[]): void {
+  let run = 0;
+  for (
+    let index = out.length - 1;
+    index >= 0 && out[index] === "\n";
+    index += -1
+  ) {
+    run += 1;
+  }
+  if (run < 2) out.push("\n");
+}
+
+function isLayoutWhitespace(value: string, out: string[]): boolean {
+  return value === " " && (out.length === 0 || out[out.length - 1] === "\n");
+}
+
+function appendText(node: Node, inPre: boolean, out: string[]): void {
+  const raw = node.nodeValue ?? "";
+  if (inPre) {
+    out.push(raw);
+    return;
+  }
+  const collapsed = raw.replace(/\s+/g, " ");
+  // A lone space straight after a line break is layout, not text.
+  if (isLayoutWhitespace(collapsed, out)) return;
+  if (collapsed) out.push(collapsed);
+}
+
+function readableElement(node: Node): Element | null {
+  if (node.nodeType !== Node.ELEMENT_NODE) return null;
+  const element = node as Element;
+  const tag = element.tagName.toLowerCase();
+  if (TEXT_SKIP.has(tag) || isHiddenMarkup(element)) return null;
+  return element;
+}
+
+function walkChildren(element: Element, inPre: boolean, out: string[]): void {
+  for (const child of Array.from(element.childNodes)) walk(child, inPre, out);
+}
+
+function walkElement(element: Element, inPre: boolean, out: string[]): void {
+  const tag = element.tagName.toLowerCase();
+  if (tag === "br") {
+    out.push("\n");
+    return;
+  }
+  const block = TEXT_BLOCK.has(tag);
+  if (block) appendNewline(out);
+  walkChildren(element, inPre || tag === "pre", out);
+  if (block) appendNewline(out);
+}
+
+function walk(node: Node, inPre: boolean, out: string[]): void {
+  if (node.nodeType === Node.TEXT_NODE) {
+    appendText(node, inPre, out);
+    return;
+  }
+  const element = readableElement(node);
+  if (element) walkElement(element, inPre, out);
 }

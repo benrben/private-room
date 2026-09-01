@@ -33,7 +33,18 @@
  * the trap `html.rs`'s own `ascii_lower` comment warns about.
  */
 
-import { asciiLower, decodeBasicEntities, foldEditChar, isUnicodeWhitespace, stripTags } from "./editMatchExtraction.js";
+import { asciiLower, decodeBasicEntities, foldEditChar, stripTags } from "./editMatchExtraction.js";
+import {
+  BLOCK_SENTINEL,
+  commentEndAt,
+  SENTINEL_RUN,
+  scanHtmlRuns,
+  tagNameEnd,
+  trimStartUnicode,
+  type HtmlTextRun,
+} from "./editMatchHtmlScanner.js";
+
+export { scanHtmlRuns, type HtmlTextRun } from "./editMatchHtmlScanner.js";
 
 // ============================================================ html.rs
 
@@ -44,50 +55,81 @@ import { asciiLower, decodeBasicEntities, foldEditChar, isUnicodeWhitespace, str
  * Ported verbatim from `html::strip_html`.
  */
 export function stripHtml(html: string): string {
-  let s = html;
+  const readable = readableContainer(html);
+  const separated = separateReadableBlocks(readable);
+  return stripTags(removeChromeBodies(separated));
+}
+
+function readableContainer(html: string): string {
   for (const tag of ["<main", "<article"]) {
-    const lower = asciiLower(s);
-    const open = lower.indexOf(tag);
-    if (open !== -1) {
-      const close = `</${tag.slice(1)}>`;
-      const rel = lower.lastIndexOf(close);
-      // A malformed page can put the closing tag BEFORE the opening one;
-      // slicing backwards would be nonsensical, so leave `s` whole.
-      if (rel !== -1 && rel >= open) {
-        s = s.slice(open, rel + close.length);
-        break;
-      }
+    const selected = completeContainer(html, tag);
+    if (selected !== null) {
+      return selected;
     }
   }
-  for (const tag of ["</p>", "</div>", "</li>", "</h1>", "</h2>", "</h3>", "</h4>", "</tr>", "<br>", "<br/>", "<br />"]) {
-    s = s.split(tag).join(`${tag}\n`);
+  return html;
+}
+
+function completeContainer(html: string, openTag: string): string | null {
+  const lower = asciiLower(html);
+  const open = lower.indexOf(openTag);
+  if (open === -1) {
+    return null;
   }
-  const chromePairs: ReadonlyArray<readonly [string, string]> = [
-    ["<script", "</script>"],
-    ["<style", "</style>"],
-    ["<nav", "</nav>"],
-    ["<header", "</header>"],
-    ["<footer", "</footer>"],
-    ["<aside", "</aside>"],
-    ["<form", "</form>"],
-    ["<noscript", "</noscript>"],
-    ["<svg", "</svg>"],
-  ];
-  for (const [openTag, closeTag] of chromePairs) {
-    for (;;) {
-      const lower = asciiLower(s);
-      const start = lower.indexOf(openTag);
-      if (start === -1) {
-        break;
-      }
-      const relEnd = lower.indexOf(closeTag, start);
-      if (relEnd === -1) {
-        break;
-      }
-      s = s.slice(0, start) + s.slice(relEnd + closeTag.length);
+  const close = `</${openTag.slice(1)}>`;
+  const closeStart = lower.lastIndexOf(close);
+  return closeStart >= open ? html.slice(open, closeStart + close.length) : null;
+}
+
+function separateReadableBlocks(html: string): string {
+  let separated = html;
+  for (const tag of BLOCK_TEXT_TAGS) {
+    separated = separated.split(tag).join(`${tag}\n`);
+  }
+  return separated;
+}
+
+const BLOCK_TEXT_TAGS = ["</p>", "</div>", "</li>", "</h1>", "</h2>", "</h3>", "</h4>", "</tr>", "<br>", "<br/>", "<br />"];
+
+const CHROME_PAIRS: ReadonlyArray<readonly [string, string]> = [
+  ["<script", "</script>"],
+  ["<style", "</style>"],
+  ["<nav", "</nav>"],
+  ["<header", "</header>"],
+  ["<footer", "</footer>"],
+  ["<aside", "</aside>"],
+  ["<form", "</form>"],
+  ["<noscript", "</noscript>"],
+  ["<svg", "</svg>"],
+];
+
+function removeChromeBodies(html: string): string {
+  let withoutChrome = html;
+  for (const pair of CHROME_PAIRS) {
+    withoutChrome = removeChromePair(withoutChrome, pair);
+  }
+  return withoutChrome;
+}
+
+function removeChromePair(html: string, [openTag, closeTag]: readonly [string, string]): string {
+  let result = html;
+  for (;;) {
+    const range = chromeBodyRange(result, openTag, closeTag);
+    if (range === null) {
+      return result;
     }
+    result = result.slice(0, range[0]) + result.slice(range[1]);
   }
-  return stripTags(s);
+}
+
+function chromeBodyRange(html: string, openTag: string, closeTag: string): readonly [number, number] | null {
+  const lower = asciiLower(html);
+  const start = lower.indexOf(openTag);
+  if (start === -1) {
+    return null;
+  }
+  const closeStart = lower.indexOf(closeTag, start);
+  return closeStart === -1 ? null : [start, closeStart + closeTag.length];
 }
 
 // ============================================================ docs_html.rs
@@ -102,260 +144,6 @@ export function htmlEscape(s: string): string {
 
 // ============================================================ html_edit.rs
 
-/** One matchable run of text between tags, with the range in the RAW markup
- * it decoded from. Never spans a tag; `<script>`/`<style>`/comment bodies and
- * tag interiors (including attribute values) never become a run. Ported from
- * `html_edit::HtmlTextRun`. */
-export interface HtmlTextRun {
-  /** Absolute `[start, end)` range in the source HTML this run occupies. */
-  readonly span: readonly [number, number];
-  /** Decoded characters (entities resolved). */
-  readonly chars: readonly string[];
-  /** Absolute range per char of `chars` — char i decoded from `charSpans[i]`
-   * in the source. An entity like `&amp;` is one char mapping to a 5-unit
-   * source range. */
-  readonly charSpans: ReadonlyArray<readonly [number, number]>;
-}
-
-/** Tags whose CLOSE marks a boundary a match may never cross — moving between
- * block-level containers (paragraphs, headings, list items, table rows and
- * cells, lists) must never silently splice two block elements together.
- * Inline tags (`<b>`, `<i>`, `<span>`, `<a>`, `<em>`, `<strong>`, `<code>`,
- * and anything not in this list) get no boundary — a quote MAY span them.
- * Ported verbatim from `html_edit::BLOCK_CLOSE_TAGS`. */
-const BLOCK_CLOSE_TAGS: ReadonlySet<string> = new Set([
-  "p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "td", "th", "ul", "ol", "table",
-  "blockquote", "section", "article", "header", "footer", "nav", "aside", "figure",
-  "figcaption", "pre", "body", "html",
-]);
-
-/** Unmatchable separator between runs joined by a block boundary — the same
- * NUL convention as `editMatchFuzzy.ts`'s paragraph sentinel and docx's
- * paragraph marker. `foldEditChar(NUL)` is `drop`, so a needle can never
- * contain one and therefore can never match across it. Built with
- * `String.fromCharCode` so no raw NUL sits in this source file. Ported from
- * `html_edit::BLOCK_SENTINEL`. */
-const BLOCK_SENTINEL = String.fromCharCode(0);
-
-/** Sentinel entries in the flattened map point at no real run — Rust uses
- * `usize::MAX`; a negative index is the JS equivalent. A needle can never
- * contain the sentinel character, so a real match's endpoints never land on
- * one and this is never dereferenced. */
-const SENTINEL_RUN = -1;
-
-/** The entity table the position-preserving SCANNER uses. Deliberately
- * distinct from `editMatchExtraction.ts`'s display-only `NAMED_ENTITIES`
- * (whose `nbsp` is a plain space): this one produces a real U+00A0, matching
- * `html_edit::decode_entity_body`, because the fold table then turns it into
- * a matchable space while the SOURCE span still covers the whole `&nbsp;`. */
-const SCANNER_ENTITIES: ReadonlyMap<string, string> = new Map([
-  ["amp", "&"],
-  ["lt", "<"],
-  ["gt", ">"],
-  ["quot", '"'],
-  ["apos", "'"],
-  ["#39", "'"],
-  ["nbsp", " "],
-]);
-
-function isScalarValue(code: number): boolean {
-  return Number.isInteger(code) && code >= 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff);
-}
-
-/** Ported verbatim from `html_edit::decode_entity_body`. */
-function decodeEntityBody(body: string): string | null {
-  const named = SCANNER_ENTITIES.get(body);
-  if (named !== undefined) {
-    return named;
-  }
-  if (body.startsWith("#x") || body.startsWith("#X")) {
-    const hex = body.slice(2);
-    if (!/^[0-9a-fA-F]+$/.test(hex)) {
-      return null;
-    }
-    const code = Number.parseInt(hex, 16);
-    return isScalarValue(code) ? String.fromCodePoint(code) : null;
-  }
-  if (body.startsWith("#")) {
-    const dec = body.slice(1);
-    if (!/^[0-9]+$/.test(dec)) {
-      return null;
-    }
-    const code = Number.parseInt(dec, 10);
-    return isScalarValue(code) ? String.fromCodePoint(code) : null;
-  }
-  return null;
-}
-
-/**
- * Decode one entity or literal char starting at `html[i]`, returning the
- * decoded char and how many source code units it consumed. An unrecognized or
- * malformed `&…;` sequence is treated as a literal `&` (1 unit) — safe, and
- * the rest scans normally as text. Ported verbatim from
- * `html_edit::decode_html_unit`, INDEXING rather than re-slicing the tail on
- * every character (slicing per character would make a whole-page scan
- * quadratic).
- */
-function decodeHtmlUnit(html: string, i: number): { ch: string; len: number } {
-  if (html[i] === "&") {
-    const restStart = i + 1;
-    // Cap the lookahead (Rust: `rest.find(';').filter(|&i| i <= 32)`) so a
-    // stray `&` followed by a long run of non-`;` text doesn't scan for a
-    // terminator that was never coming. Bounding the SEARCH to the first 33
-    // positions is behaviourally identical to finding the first `;` anywhere
-    // and rejecting it past index 32.
-    let semi = -1;
-    for (let k = 0; k <= 32 && restStart + k < html.length; k++) {
-      if (html[restStart + k] === ";") {
-        semi = k;
-        break;
-      }
-    }
-    if (semi !== -1) {
-      const body = html.slice(restStart, restStart + semi);
-      const decoded = decodeEntityBody(body);
-      if (decoded !== null) {
-        return { ch: decoded, len: 1 + body.length + 1 };
-      }
-    }
-  }
-  const cp = html.codePointAt(i);
-  if (cp === undefined) {
-    // Unreachable from `scanHtmlRuns` (its loop guard is `i < n`); ported
-    // defensively rather than assumed, exactly as the Rust source does.
-    return { ch: "�", len: 1 };
-  }
-  const ch = String.fromCodePoint(cp);
-  return { ch, len: ch.length };
-}
-
-/** Where a tag's NAME ends within its (already `<`/`/`-stripped) source: the
- * first Unicode-whitespace character or `/`, else the whole string. Ported
- * from the `.find(|c: char| c.is_whitespace() || c == '/')` expression shared
- * by `scan_html_runs` and `scan_headings`. */
-function tagNameEnd(nameSrc: string): number {
-  let pos = 0;
-  for (const ch of nameSrc) {
-    if (ch === "/" || isUnicodeWhitespace(ch)) {
-      return pos;
-    }
-    pos += ch.length;
-  }
-  return nameSrc.length;
-}
-
-/** Ported from `html_edit.rs`'s use of `str::trim_start()` (Unicode
- * White_Space-aware, not just ASCII `\s`). */
-function trimStartUnicode(s: string): string {
-  let i = 0;
-  for (const ch of s) {
-    if (!isUnicodeWhitespace(ch)) {
-      break;
-    }
-    i += ch.length;
-  }
-  return s.slice(i);
-}
-
-/**
- * Scan `html` into text runs plus a boundary flag between each consecutive
- * pair (`boundaries[i] === true` means a BLOCK boundary separates `runs[i]`
- * and `runs[i + 1]`; `boundaries.length === max(runs.length - 1, 0)`).
- *
- * Malformed markup (an unterminated tag, an unclosed `<script>`/`<style>`)
- * ENDS the scan at that point rather than reading past it — whatever text came
- * before is still editable; nothing after is claimed. Ported verbatim from
- * `html_edit::scan_html_runs`.
- */
-export function scanHtmlRuns(html: string): { runs: HtmlTextRun[]; boundaries: boolean[] } {
-  // Position-preserving lowered copy, computed once: `asciiLower` never
-  // changes a string's length, so an index found in `lower` is a valid index
-  // into `html`.
-  const lower = asciiLower(html);
-  const runs: HtmlTextRun[] = [];
-  const boundaries: boolean[] = [];
-  let pendingBoundary = false;
-  let curStart = -1;
-  let curChars: string[] = [];
-  let curSpans: Array<readonly [number, number]> = [];
-  const n = html.length;
-  let i = 0;
-
-  const flushRun = (): void => {
-    if (curStart !== -1) {
-      if (runs.length > 0) {
-        boundaries.push(pendingBoundary);
-      }
-      pendingBoundary = false;
-      runs.push({ span: [curStart, i], chars: curChars, charSpans: curSpans });
-      curStart = -1;
-      curChars = [];
-      curSpans = [];
-    }
-  };
-
-  while (i < n) {
-    if (html[i] === "<") {
-      flushRun();
-      if (html.startsWith("<!--", i)) {
-        const end = html.indexOf("-->", i);
-        if (end === -1) {
-          break; // unterminated comment — stop scanning safely
-        }
-        i = end + 3;
-        continue;
-      }
-      const peek = lower.slice(i, i + Math.min(n - i, 8));
-      if (peek.startsWith("<script") || peek.startsWith("<style")) {
-        const name = peek.startsWith("<script") ? "script" : "style";
-        const openGt = html.indexOf(">", i);
-        if (openGt === -1) {
-          break; // unterminated open tag
-        }
-        const afterOpen = openGt + 1;
-        const closeStart = lower.indexOf(`</${name}`, afterOpen);
-        if (closeStart === -1) {
-          break; // no closing tag at all — nothing after is safe to claim
-        }
-        const gt2 = html.indexOf(">", closeStart);
-        if (gt2 === -1) {
-          break; // unterminated close tag
-        }
-        i = gt2 + 1;
-        continue;
-      }
-      const gt = html.indexOf(">", i);
-      if (gt === -1) {
-        break; // unterminated tag
-      }
-      const tagSrc = trimStartUnicode(html.slice(i + 1, gt));
-      const isClose = tagSrc.startsWith("/");
-      // EVERY leading slash comes off, not just the first — Rust's
-      // `tag_src.trim_start_matches('/')`. Dropping only one left `<//p>`
-      // with a name of `/p`, whose name ends at the slash, so the tag name
-      // came out EMPTY and the block boundary was never recorded: a quote
-      // could then match straight across it and splice two block elements
-      // together, which is the one thing BLOCK_CLOSE_TAGS exists to prevent.
-      const nameSrc = tagSrc.replace(/^\/+/, "");
-      const tagName = asciiLower(nameSrc.slice(0, tagNameEnd(nameSrc)));
-      if (isClose && BLOCK_CLOSE_TAGS.has(tagName)) {
-        pendingBoundary = true;
-      }
-      i = gt + 1;
-      continue;
-    }
-    if (curStart === -1) {
-      curStart = i;
-    }
-    const { ch, len } = decodeHtmlUnit(html, i);
-    curSpans.push([i, i + len]);
-    curChars.push(ch);
-    i += len;
-  }
-  flushRun();
-  return { runs, boundaries };
-}
-
 /**
  * Fold an `edit_file` quote the SAME way `flattenRuns` folds the document's
  * own text: `foldEditChar`, whitespace runs collapsed to one space, edge
@@ -365,34 +153,50 @@ export function scanHtmlRuns(html: string): { runs: HtmlTextRun[]; boundaries: b
  * keeps `fold_needle`, `collapse_ws` and `normalize_needle` side by side.
  */
 function foldNeedle(s: string): string[] {
-  const out: string[] = [];
-  let lastSpace = true;
+  const state = newNeedleFold();
   for (const c of s) {
-    const fold = foldEditChar(c);
-    switch (fold.kind) {
-      case "space":
-        if (!lastSpace) {
-          out.push(" ");
-          lastSpace = true;
-        }
-        break;
-      case "drop":
-        break;
-      case "char":
-        out.push(fold.c);
-        lastSpace = false;
-        break;
-      case "pair":
-        out.push(fold.a);
-        out.push(fold.b);
-        lastSpace = false;
-        break;
-    }
+    appendNeedleFold(state, c);
   }
-  while (out.length > 0 && out[out.length - 1] === " ") {
-    out.pop();
+  while (state.out.length > 0 && state.out[state.out.length - 1] === " ") {
+    state.out.pop();
   }
-  return out;
+  return state.out;
+}
+
+interface NeedleFold {
+  readonly out: string[];
+  lastSpace: boolean;
+}
+
+function newNeedleFold(): NeedleFold {
+  return { out: [], lastSpace: true };
+}
+
+function appendNeedleFold(state: NeedleFold, source: string): void {
+  const fold = foldEditChar(source);
+  if (fold.kind === "space") {
+    appendNeedleSpace(state);
+    return;
+  }
+  if (fold.kind === "char") {
+    appendNeedleChars(state, [fold.c]);
+    return;
+  }
+  if (fold.kind === "pair") {
+    appendNeedleChars(state, [fold.a, fold.b]);
+  }
+}
+
+function appendNeedleSpace(state: NeedleFold): void {
+  if (!state.lastSpace) {
+    state.out.push(" ");
+    state.lastSpace = true;
+  }
+}
+
+function appendNeedleChars(state: NeedleFold, chars: readonly string[]): void {
+  state.out.push(...chars);
+  state.lastSpace = false;
 }
 
 /**
@@ -407,48 +211,70 @@ function flattenRuns(
   runs: readonly HtmlTextRun[],
   boundaries: readonly boolean[]
 ): { hay: string[]; map: Array<[number, number]> } {
-  const hay: string[] = [];
-  const map: Array<[number, number]> = [];
-  let lastSpace = true;
+  const state = newRunFold();
   for (let ri = 0; ri < runs.length; ri++) {
     if (ri > 0 && boundaries[ri - 1]) {
-      hay.push(BLOCK_SENTINEL);
-      map.push([SENTINEL_RUN, 0]);
-      lastSpace = true;
+      appendBlockSentinel(state);
     }
-    const run = runs[ri]!;
-    for (let ci = 0; ci < run.chars.length; ci++) {
-      const fold = foldEditChar(run.chars[ci]!);
-      switch (fold.kind) {
-        case "space":
-          if (!lastSpace) {
-            hay.push(" ");
-            map.push([ri, ci]);
-            lastSpace = true;
-          }
-          break;
-        case "drop":
-          break;
-        case "char":
-          hay.push(fold.c);
-          map.push([ri, ci]);
-          lastSpace = false;
-          break;
-        case "pair":
-          hay.push(fold.a);
-          map.push([ri, ci]);
-          hay.push(fold.b);
-          map.push([ri, ci]);
-          lastSpace = false;
-          break;
-      }
-    }
+    appendRunFold(state, runs[ri]!, ri);
   }
-  while (hay.length > 0 && hay[hay.length - 1] === " ") {
-    hay.pop();
-    map.pop();
+  while (state.hay.length > 0 && state.hay[state.hay.length - 1] === " ") {
+    state.hay.pop();
+    state.map.pop();
   }
-  return { hay, map };
+  return { hay: state.hay, map: state.map };
+}
+
+interface RunFold {
+  readonly hay: string[];
+  readonly map: Array<[number, number]>;
+  lastSpace: boolean;
+}
+
+function newRunFold(): RunFold {
+  return { hay: [], map: [], lastSpace: true };
+}
+
+function appendBlockSentinel(state: RunFold): void {
+  state.hay.push(BLOCK_SENTINEL);
+  state.map.push([SENTINEL_RUN, 0]);
+  state.lastSpace = true;
+}
+
+function appendRunFold(state: RunFold, run: HtmlTextRun, runIndex: number): void {
+  for (let charIndex = 0; charIndex < run.chars.length; charIndex++) {
+    appendRunCharacter(state, run.chars[charIndex]!, runIndex, charIndex);
+  }
+}
+
+function appendRunCharacter(state: RunFold, source: string, runIndex: number, charIndex: number): void {
+  const fold = foldEditChar(source);
+  if (fold.kind === "space") {
+    appendRunSpace(state, runIndex, charIndex);
+    return;
+  }
+  if (fold.kind === "char") {
+    appendRunChars(state, [fold.c], runIndex, charIndex);
+    return;
+  }
+  if (fold.kind === "pair") {
+    appendRunChars(state, [fold.a, fold.b], runIndex, charIndex);
+  }
+}
+
+function appendRunSpace(state: RunFold, runIndex: number, charIndex: number): void {
+  if (!state.lastSpace) {
+    appendRunChars(state, [" "], runIndex, charIndex);
+    state.lastSpace = true;
+  }
+}
+
+function appendRunChars(state: RunFold, chars: readonly string[], runIndex: number, charIndex: number): void {
+  for (const char of chars) {
+    state.hay.push(char);
+    state.map.push([runIndex, charIndex]);
+  }
+  state.lastSpace = false;
 }
 
 /** Ported verbatim from `html_edit::find_sub`. */
@@ -499,48 +325,92 @@ export function htmlReplaceText(html: string, old: string, newEscaped: string): 
   }
   const { runs, boundaries } = scanHtmlRuns(html);
   const { hay, map } = flattenRuns(runs, boundaries);
-  const matches: Array<[number, number]> = []; // [start, endInclusive] in hay
-  let from = 0;
-  for (;;) {
-    const s = findSub(hay, needle, from);
-    if (s === -1) {
-      break;
-    }
-    const e = s + needle.length - 1;
-    matches.push([s, e]);
-    from = e + 1;
-  }
+  const matches = allMatches(hay, needle);
   if (matches.length === 0) {
     return {
       ok: false,
       error: "Could not find that exact text in the page. Copy it exactly, including spacing and punctuation.",
     };
   }
+  const out = replaceMatches(html, runs, map, matches, newEscaped);
+  return { ok: true, html: out, count: matches.length };
+}
+
+function allMatches(hay: readonly string[], needle: readonly string[]): Array<[number, number]> {
+  const matches: Array<[number, number]> = [];
+  let from = 0;
+  for (;;) {
+    const start = findSub(hay, needle, from);
+    if (start === -1) {
+      return matches;
+    }
+    const end = start + needle.length - 1;
+    matches.push([start, end]);
+    from = end + 1;
+  }
+}
+
+function replaceMatches(
+  html: string,
+  runs: readonly HtmlTextRun[],
+  map: ReadonlyArray<readonly [number, number]>,
+  matches: ReadonlyArray<readonly [number, number]>,
+  newEscaped: string
+): string {
   let out = html;
   // Right-to-left so earlier offsets in `out` stay valid while later
   // (higher-offset) spans are rewritten first.
   for (let mi = matches.length - 1; mi >= 0; mi--) {
-    const [s, e] = matches[mi]!;
-    const [r1, c1] = map[s]!;
-    const [r2, c2] = map[e]!;
-    if (r1 === r2) {
-      const run = runs[r1]!;
-      out = out.slice(0, run.charSpans[c1]![0]) + newEscaped + out.slice(run.charSpans[c2]![1]);
-    } else {
-      // The match is contiguous with no sentinel in between, so it covers:
-      // [c1, end) of r1, ALL of every run strictly between, and [0, c2] of
-      // r2. Splice right-to-left across those spans.
-      const last = runs[r2]!;
-      out = out.slice(0, last.span[0]) + out.slice(last.charSpans[c2]![1]);
-      for (let ri = r2 - 1; ri > r1; ri--) {
-        const run = runs[ri]!;
-        out = out.slice(0, run.span[0]) + out.slice(run.span[1]);
-      }
-      const first = runs[r1]!;
-      out = out.slice(0, first.charSpans[c1]![0]) + newEscaped + out.slice(first.span[1]);
-    }
+    out = replaceMatch(out, runs, map, matches[mi]!, newEscaped);
   }
-  return { ok: true, html: out, count: matches.length };
+  return out;
+}
+
+function replaceMatch(
+  html: string,
+  runs: readonly HtmlTextRun[],
+  map: ReadonlyArray<readonly [number, number]>,
+  [start, end]: readonly [number, number],
+  newEscaped: string
+): string {
+  const [firstRun, firstChar] = map[start]!;
+  const [lastRun, lastChar] = map[end]!;
+  if (firstRun === lastRun) {
+    return replaceWithinRun(html, runs[firstRun]!, firstChar, lastChar, newEscaped);
+  }
+  return replaceAcrossRuns(html, runs, firstRun, firstChar, lastRun, lastChar, newEscaped);
+}
+
+function replaceWithinRun(html: string, run: HtmlTextRun, firstChar: number, lastChar: number, newEscaped: string): string {
+  return html.slice(0, run.charSpans[firstChar]![0]) + newEscaped + html.slice(run.charSpans[lastChar]![1]);
+}
+
+function replaceAcrossRuns(
+  html: string,
+  runs: readonly HtmlTextRun[],
+  firstRun: number,
+  firstChar: number,
+  lastRun: number,
+  lastChar: number,
+  newEscaped: string
+): string {
+  let out = removeLastRunPart(html, runs[lastRun]!, lastChar);
+  for (let runIndex = lastRun - 1; runIndex > firstRun; runIndex--) {
+    out = removeWholeRun(out, runs[runIndex]!);
+  }
+  return replaceFirstRunPart(out, runs[firstRun]!, firstChar, newEscaped);
+}
+
+function removeLastRunPart(html: string, run: HtmlTextRun, lastChar: number): string {
+  return html.slice(0, run.span[0]) + html.slice(run.charSpans[lastChar]![1]);
+}
+
+function removeWholeRun(html: string, run: HtmlTextRun): string {
+  return html.slice(0, run.span[0]) + html.slice(run.span[1]);
+}
+
+function replaceFirstRunPart(html: string, run: HtmlTextRun, firstChar: number, newEscaped: string): string {
+  return html.slice(0, run.charSpans[firstChar]![0]) + newEscaped + html.slice(run.span[1]);
 }
 
 // ------------------------------------------------------------------- headings
@@ -574,52 +444,101 @@ export function scanHeadings(html: string): Heading[] {
   const { runs } = scanHtmlRuns(html);
   const lower = asciiLower(html);
   const out: Heading[] = [];
-  const n = html.length;
   let i = 0;
-  while (i < n) {
-    if (html[i] !== "<") {
-      i += 1;
-      continue;
-    }
-    if (html.startsWith("<!--", i)) {
-      const end = html.indexOf("-->", i);
-      if (end === -1) {
-        break;
-      }
-      i = end + 3;
-      continue;
-    }
-    const gt = html.indexOf(">", i);
-    if (gt === -1) {
+  while (i < html.length) {
+    const next = consumeHeadingMarkup(html, lower, runs, out, i);
+    if (next === null) {
       break;
     }
-    const tagSrc = trimStartUnicode(html.slice(i + 1, gt));
-    if (!tagSrc.startsWith("/")) {
-      const tagName = asciiLower(tagSrc.slice(0, tagNameEnd(tagSrc)));
-      const level = HEADING_LEVELS.get(tagName);
-      if (level !== undefined) {
-        const tagStart = i;
-        const contentStart = gt + 1;
-        const closeStart = lower.indexOf(`</${tagName}`, contentStart);
-        if (closeStart !== -1) {
-          const gt2 = html.indexOf(">", closeStart);
-          if (gt2 !== -1) {
-            const sectionStart = gt2 + 1;
-            const text = runs
-              .filter((r) => r.span[0] >= contentStart && r.span[1] <= closeStart)
-              .flatMap((r) => [...r.chars])
-              .join("")
-              .trim();
-            out.push({ level, text, sectionStart, tagStart });
-            i = sectionStart;
-            continue;
-          }
-        }
-      }
-    }
-    i = gt + 1;
+    i = next;
   }
   return out;
+}
+
+function consumeHeadingMarkup(
+  html: string,
+  lower: string,
+  runs: readonly HtmlTextRun[],
+  headings: Heading[],
+  i: number
+): number | null {
+  if (html[i] !== "<") {
+    return i + 1;
+  }
+  const commentEnd = commentEndAt(html, i);
+  if (commentEnd !== undefined) {
+    return commentEnd;
+  }
+  return consumeHeadingTag(html, lower, runs, headings, i);
+}
+
+function consumeHeadingTag(
+  html: string,
+  lower: string,
+  runs: readonly HtmlTextRun[],
+  headings: Heading[],
+  tagStart: number
+): number | null {
+  const tagEnd = html.indexOf(">", tagStart);
+  if (tagEnd === -1) {
+    return null;
+  }
+  const heading = headingAt(html, lower, runs, tagStart, tagEnd);
+  if (heading !== null) {
+    headings.push(heading);
+    return heading.sectionStart;
+  }
+  return tagEnd + 1;
+}
+
+function headingAt(
+  html: string,
+  lower: string,
+  runs: readonly HtmlTextRun[],
+  tagStart: number,
+  tagEnd: number
+): Heading | null {
+  const name = openingHeadingName(html.slice(tagStart + 1, tagEnd));
+  if (name === null) {
+    return null;
+  }
+  const close = headingCloseRange(html, lower, name.tag, tagEnd + 1);
+  if (close === null) {
+    return null;
+  }
+  return {
+    level: name.level,
+    text: headingText(runs, tagEnd + 1, close[0]),
+    sectionStart: close[1],
+    tagStart,
+  };
+}
+
+function openingHeadingName(source: string): { readonly tag: string; readonly level: number } | null {
+  const tag = trimStartUnicode(source);
+  if (tag.startsWith("/")) {
+    return null;
+  }
+  const name = asciiLower(tag.slice(0, tagNameEnd(tag)));
+  const level = HEADING_LEVELS.get(name);
+  return level === undefined ? null : { tag: name, level };
+}
+
+function headingCloseRange(html: string, lower: string, tag: string, contentStart: number): readonly [number, number] | null {
+  const closeStart = lower.indexOf(`</${tag}`, contentStart);
+  if (closeStart === -1) {
+    return null;
+  }
+  const closeEnd = html.indexOf(">", closeStart);
+  return closeEnd === -1 ? null : [closeStart, closeEnd + 1];
+}
+
+function headingText(runs: readonly HtmlTextRun[], contentStart: number, closeStart: number): string {
+  return runs
+    .filter((run) => run.span[0] >= contentStart && run.span[1] <= closeStart)
+    .flatMap((run) => [...run.chars])
+    .join("")
+    .trim();
 }
 
 /** `Result<Range<usize>, Vec<String>>` — a found range, or every heading the

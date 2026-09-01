@@ -1,5 +1,14 @@
 import { ChatCommand, FileMeta, Folder, SkillSummary, Specialist } from "../api";
 
+export {
+  ambiguousDisplayNames,
+  displayName,
+  fileLabel,
+  formatWhen,
+  isOllamaDown,
+  provenanceLine,
+} from "./composerPresentation";
+
 // ---- "#command" / "/skill" / "*specialist" / "@reference" parsing -------
 
 /** What kind of thing the composer's autocomplete is offering. */
@@ -55,6 +64,88 @@ export function tokenAtCaret(
  *  and folders (longest-name-first so spaces work), returning the collected
  *  file ids and the text with those spans removed. Unmatched "@…" is left as
  *  literal text. */
+type ReferenceCandidate = { label: string; ids: string[] };
+
+function referenceCandidates(
+  files: FileMeta[],
+  folders: Folder[],
+): ReferenceCandidate[] {
+  const folderNames = new Map(folders.map((folder) => [folder.id, folder.name]));
+  return [
+    ...folderFileReferenceCandidates(files, folderNames),
+    ...folderReferenceCandidates(files, folders),
+    ...files.map((file) => ({ label: file.name, ids: [file.id] })),
+  ].sort((a, b) => b.label.length - a.label.length);
+}
+
+function folderFileReferenceCandidates(
+  files: FileMeta[],
+  folderNames: Map<string, string>,
+): ReferenceCandidate[] {
+  const candidates: ReferenceCandidate[] = [];
+  for (const file of files) {
+    const folderName = file.folderId === null ? undefined : folderNames.get(file.folderId);
+    if (folderName !== undefined) {
+      candidates.push({ label: `${folderName}/${file.name}`, ids: [file.id] });
+    }
+  }
+  return candidates;
+}
+
+function folderReferenceCandidates(
+  files: FileMeta[],
+  folders: Folder[],
+): ReferenceCandidate[] {
+  const candidates: ReferenceCandidate[] = [];
+  for (const folder of folders) {
+    const ids = files.filter((file) => file.folderId === folder.id).map((file) => file.id);
+    candidates.push({ label: `${folder.name}/`, ids });
+  }
+  return candidates;
+}
+
+function matchingReference(rest: string, candidates: ReferenceCandidate[]): ReferenceCandidate | undefined {
+  return candidates.find((candidate) =>
+    rest.toLowerCase().startsWith(candidate.label.toLowerCase()),
+  );
+}
+
+function appendReferenceIds(refIds: string[], ids: string[]): void {
+  for (const id of ids) if (!refIds.includes(id)) refIds.push(id);
+}
+
+function removeReferences(
+  text: string,
+  candidates: ReferenceCandidate[],
+): { refIds: string[]; cleaned: string } {
+  const refIds: string[] = [];
+  let cleaned = "";
+  let index = 0;
+  while (index < text.length) {
+    if (text[index] !== "@") {
+      cleaned += text[index];
+      index += 1;
+      continue;
+    }
+    const hit = matchingReference(text.slice(index + 1), candidates);
+    if (!hit) {
+      cleaned += text[index];
+      index += 1;
+      continue;
+    }
+    appendReferenceIds(refIds, hit.ids);
+    index += 1 + hit.label.length;
+  }
+  return { refIds, cleaned };
+}
+
+function tidyReferenceWhitespace(text: string): string {
+  return text
+    .replace(/[^\S\n]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .trim();
+}
+
 export function resolveRefs(
   text: string,
   files: FileMeta[],
@@ -62,55 +153,17 @@ export function resolveRefs(
 ): { refIds: string[]; cleaned: string } {
   // Build match candidates, longest label first (so "Room summary.md" wins over
   // a file literally named "Room").
-  const candidates: { label: string; ids: string[] }[] = [];
   // A file inside a folder is displayed and inserted as `Folder/file.ext`.
   // Add that complete spelling before the folder candidate itself. Otherwise
   // `@Research/findings.md` matches only `Research/`, attaches the whole
   // folder, and leaves the literal `findings.md` behind in a command's args.
   // Longest-first sorting below then makes the complete file reference win
   // while preserving `@Research/` as the explicit whole-folder spelling.
-  const folderNames = new Map(folders.map((folder) => [folder.id, folder.name]));
-  for (const file of files) {
-    const folderName = file.folderId === null ? undefined : folderNames.get(file.folderId);
-    if (folderName !== undefined) {
-      candidates.push({ label: `${folderName}/${file.name}`, ids: [file.id] });
-    }
-  }
-  for (const fo of folders) {
-    const ids = files.filter((f) => f.folderId === fo.id).map((f) => f.id);
-    candidates.push({ label: `${fo.name}/`, ids });
-  }
-  for (const f of files) candidates.push({ label: f.name, ids: [f.id] });
-  candidates.sort((a, b) => b.label.length - a.label.length);
-
-  const refIds: string[] = [];
-  let cleaned = "";
-  let i = 0;
-  while (i < text.length) {
-    if (text[i] === "@") {
-      const rest = text.slice(i + 1);
-      const hit = candidates.find((c) =>
-        rest.toLowerCase().startsWith(c.label.toLowerCase()),
-      );
-      if (hit) {
-        for (const id of hit.ids) if (!refIds.includes(id)) refIds.push(id);
-        i += 1 + hit.label.length;
-        continue;
-      }
-    }
-    cleaned += text[i];
-    i += 1;
-  }
+  const { refIds, cleaned } = removeReferences(text, referenceCandidates(files, folders));
   // Only HORIZONTAL runs collapse — removing an "@name" span leaves a double
   // space behind, and that is all this tidy-up is for. Newlines are the user's
   // structure (a multi-line brief under a #command reaches the model intact).
-  return {
-    refIds,
-    cleaned: cleaned
-      .replace(/[^\S\n]+/g, " ")
-      .replace(/ *\n */g, "\n")
-      .trim(),
-  };
+  return { refIds, cleaned: tidyReferenceWhitespace(cleaned) };
 }
 
 /** The backend only honours an explicit skill when "/name" is the FIRST token
@@ -342,17 +395,7 @@ export function uniqueFileName(name: string, taken: readonly string[]): string {
   return `${base} ${Date.now()}${ext}`;
 }
 
-/** Parse a composed message into a command (if any), its cleaned args, and the
- *  resolved @-file ids. `commandError` is set when "#word" names no command;
- *  `specialistError` when "*word" names no specialist THIS ROOM HAS. */
-export function parseComposer(
-  text: string,
-  commands: ChatCommand[],
-  skills: SkillSummary[],
-  files: FileMeta[],
-  folders: Folder[],
-  specialists: readonly Specialist[] | null = null,
-): {
+type ParsedComposer = {
   command?: string;
   skill?: string;
   specialist?: string;
@@ -365,8 +408,22 @@ export function parseComposer(
    *  All three are read from the FIRST token, so honouring one means silently
    *  dropping the other — which is the one thing that must not happen. */
   tagConflict?: boolean;
-} {
-  const { refIds, cleaned } = resolveRefs(text, files, folders);
+};
+
+function specialistIsAvailable(
+  specialists: readonly Specialist[] | null,
+  key: string,
+): boolean {
+  if (specialists === null) return true;
+  const selected = specialists.find((specialist) => specialist.key === key);
+  return selected !== undefined && selected.capability !== "unavailable";
+}
+
+function parseSpecialistTag(
+  cleaned: string,
+  refIds: string[],
+  specialists: readonly Specialist[] | null,
+): ParsedComposer | undefined {
   // The specialist tag is read FIRST because it owns the same position the
   // skill token does, and its absence must not depend on what follows it.
   //
@@ -388,43 +445,68 @@ export function parseComposer(
   // shown as untagged. The tag's vocabulary is now exactly what the "*" menu
   // inserts, on both sides.
   const tag = /^\*([a-z]+)(?=\s|$)\s*([\s\S]*)$/.exec(cleaned);
-  if (tag) {
-    const key = tag[1].toLowerCase();
-    const rest = tag[2].trim();
-    // A null roster means the menu never loaded — the tag is still the user's
-    // clear instruction, so it travels rather than being refused on a fact we
-    // never established. This is the ONE path on which a tag leaves here
-    // unchecked, and it is safe because the sidecar re-checks every tag it
-    // receives against the live catalog and refuses it BY NAME in the answer
-    // (`prompts.TAG_UNAVAILABLE_ANSWER`) — an unknown tag is never silently
-    // dropped into an ordinary turn on either side of the wire.
-    const selected = specialists?.find((sp) => sp.key === key);
-    if (
-      specialists !== null
-      && (selected === undefined || selected.capability === "unavailable")
-    ) {
-      return { args: cleaned, refIds, specialistError: key };
-    }
-    if (/^[/#][a-z0-9-]+\b/.test(rest)) {
-      return { args: cleaned, refIds, tagConflict: true };
-    }
-    return { specialist: key, args: rest, refIds };
+  if (!tag) return undefined;
+  const key = tag[1].toLowerCase();
+  const rest = tag[2].trim();
+  // A null roster means the menu never loaded — the tag is still the user's
+  // clear instruction, so it travels rather than being refused on a fact we
+  // never established. This is the ONE path on which a tag leaves here
+  // unchecked, and it is safe because the sidecar re-checks every tag it
+  // receives against the live catalog and refuses it BY NAME in the answer
+  // (`prompts.TAG_UNAVAILABLE_ANSWER`) — an unknown tag is never silently
+  // dropped into an ordinary turn on either side of the wire.
+  if (!specialistIsAvailable(specialists, key)) {
+    return { args: cleaned, refIds, specialistError: key };
   }
+  if (/^[/#][a-z0-9-]+\b/.test(rest)) {
+    return { args: cleaned, refIds, tagConflict: true };
+  }
+  return { specialist: key, args: rest, refIds };
+}
+
+function parseSkillRequest(
+  cleaned: string,
+  refIds: string[],
+  skills: SkillSummary[],
+): ParsedComposer | undefined {
   const skill = /^\/([a-z0-9-]+)\b\s*([\s\S]*)$/.exec(cleaned);
-  if (skill) {
-    const name = skill[1].toLowerCase();
-    if (!skills.some((candidate) => candidate.enabled && candidate.name === name)) {
-      return { args: cleaned, refIds, skillError: name };
-    }
-    return { skill: name, args: skill[2].trim(), refIds };
+  if (!skill) return undefined;
+  const name = skill[1].toLowerCase();
+  if (!skills.some((candidate) => candidate.enabled && candidate.name === name)) {
+    return { args: cleaned, refIds, skillError: name };
   }
-  const m = /^#([a-z-]+)\b\s*([\s\S]*)$/.exec(cleaned);
-  if (!m) return { args: cleaned, refIds };
-  const name = m[1];
+  return { skill: name, args: skill[2].trim(), refIds };
+}
+
+function parseCommandRequest(
+  cleaned: string,
+  refIds: string[],
+  commands: ChatCommand[],
+): ParsedComposer {
+  const command = /^#([a-z-]+)\b\s*([\s\S]*)$/.exec(cleaned);
+  if (!command) return { args: cleaned, refIds };
+  const name = command[1];
   if (!commands.some((c) => c.name === name)) {
     return { args: cleaned, refIds, commandError: name };
   }
-  return { command: name, args: m[2].trim(), refIds };
+  return { command: name, args: command[2].trim(), refIds };
+}
+
+/** Parse a composed message into a command (if any), its cleaned args, and the
+ *  resolved @-file ids. `commandError` is set when "#word" names no command;
+ *  `specialistError` when "*word" names no specialist THIS ROOM HAS. */
+export function parseComposer(
+  text: string,
+  commands: ChatCommand[],
+  skills: SkillSummary[],
+  files: FileMeta[],
+  folders: Folder[],
+  specialists: readonly Specialist[] | null = null,
+): ParsedComposer {
+  const { refIds, cleaned } = resolveRefs(text, files, folders);
+  return parseSpecialistTag(cleaned, refIds, specialists)
+    ?? parseSkillRequest(cleaned, refIds, skills)
+    ?? parseCommandRequest(cleaned, refIds, commands);
 }
 
 /** Read a File (pasted image) into base64 without the data: prefix (ADD-8). */
@@ -439,107 +521,4 @@ export function fileToBase64(file: File): Promise<string> {
     r.onerror = () => reject(r.error);
     r.readAsDataURL(file);
   });
-}
-
-/** Friendly file name for the sidebar: drop the extension (the type icon
- * already conveys it) and turn underscores into spaces. The full original
- * name still rides along in a tooltip and on export. */
-export function displayName(name: string): string {
-  // Treat a compressed tar suffix as one extension. Otherwise `sample.tar.gz`
-  // tidies to `sample.tar` while `sample.tar` tidies to `sample`; because the
-  // two tidy labels no longer collide, neither receives its real extension in
-  // `fileLabel`. Giving both the same semantic stem lets the existing
-  // ambiguity rule show the honest originals: `sample.tar` and
-  // `sample.tar.gz`.
-  const compound = /\.tar\.(?:gz|bz2|xz|zst)$/i.exec(name);
-  const dot = compound?.index ?? name.lastIndexOf(".");
-  const base = dot > 0 ? name.slice(0, dot) : name;
-  const cleaned = base.replace(/_+/g, " ").trim();
-  return cleaned || name;
-}
-
-/** Display names that more than one file in the room would answer to.
- *
- * Memoized on the ARRAY IDENTITY rather than recomputed per row: every file row
- * asks, and rebuilding the set each time would be quadratic in the size of the
- * library. `s.files` is replaced wholesale on every change, so identity is
- * exactly the right cache key. */
-let ambiguousFor: { name: string }[] | null = null;
-let ambiguousSet = new Set<string>();
-
-export function ambiguousDisplayNames(files: { name: string }[]): Set<string> {
-  if (files === ambiguousFor) return ambiguousSet;
-  const seen = new Set<string>();
-  const dupes = new Set<string>();
-  for (const f of files) {
-    const key = displayName(f.name).toLowerCase();
-    if (seen.has(key)) dupes.add(key);
-    else seen.add(key);
-  }
-  ambiguousFor = files;
-  ambiguousSet = dupes;
-  return dupes;
-}
-
-/**
- * What to call a file on screen.
- *
- * `displayName` drops the extension, which reads better right up until two
- * files disagree only in that extension. Live QA imported `file-sample_1MB.doc`
- * and `file-sample_1MB.docx` and got two library rows both labelled
- * "file-sample 1MB", with no way to tell which was which — and the tab strip
- * truncated both to "file e…". Where the tidy name is ambiguous, the real
- * filename is the honest one.
- */
-export function fileLabel(name: string, files: { name: string }[]): string {
-  const base = displayName(name);
-  return ambiguousDisplayNames(files).has(base.toLowerCase()) ? name : base;
-}
-
-/** Human-friendly timestamp for a saved version (ADD-2). Spelled-out month so
- * it's never ambiguous between D/M/Y and M/D/Y locales (e.g. "Jul 5, 2026,
- * 12:47 AM"). */
-export function formatWhen(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
-
-/** ART-1: one short line saying what produced a version of a generated
- * artifact — "Written by #minutes · from 2 files".
- *
- * Returns "" when the room recorded nothing worth saying, and the strip then
- * shows NO attribution line at all. That silence is the point: "Ask before AI
- * edits files" is off, so the History strip is where a person finds out an AI
- * wrote something, and a line that appeared for every version would stop
- * carrying that information. A run id alone is not shown — it identifies the
- * write for support, it does not tell the reader anything.
- *
- * Only ids and counts cross this boundary; the source FILES are counted, never
- * named, because their names are room content the strip has no need of. */
-export function provenanceLine(
-  p: { agent?: string; tool?: string; sourceFileIds?: string[] } | null | undefined,
-): string {
-  if (!p) return "";
-  const who = p.agent || p.tool;
-  const n = p.sourceFileIds?.length ?? 0;
-  if (!who && n === 0) return "";
-  const parts: string[] = [];
-  if (who) parts.push(`Written by ${who}`);
-  if (n > 0) parts.push(`from ${n} file${n === 1 ? "" : "s"}`);
-  return parts.join(" · ");
-}
-
-/** The backend reports a stopped local engine two ways: the friendly
- * "isn't running" string (resolve_local_model → None) and the raw
- * "OLLAMA_DOWN" sentinel (a send that fails mid-request). Treat both as down so
- * the "Open Ollama" recovery button appears in either case. */
-export function isOllamaDown(msg: string): boolean {
-  return msg.includes("OLLAMA_DOWN") || msg.includes("isn't running");
 }

@@ -97,6 +97,9 @@ describe("linkStrength / nameStem — the two directly-tested pure helpers", () 
     expect(linkStrength(0.5, GRAPH_KW_FLOOR)).toBeGreaterThan(linkStrength(0.46, GRAPH_VEC_FLOOR));
     // Nothing below its own floor ever reaches the drawable band.
     expect(Math.abs(linkStrength(0.0, GRAPH_VEC_FLOOR) - GRAPH_WEIGHT_MIN)).toBeLessThan(1e-6);
+    // A degenerate scale clamps rather than emitting an invalid weight.
+    expect(linkStrength(-1, 1)).toBe(0);
+    expect(linkStrength(2, 1)).toBe(1);
   });
 
   it("name_stem_drops_the_extension_and_the_rerun_suffix", () => {
@@ -355,6 +358,48 @@ describe("buildRoomGraph", () => {
     const g2 = buildRoomGraph(db);
     expect(g2.edges.filter((e) => e.a.startsWith("mem:")).length).toBe(1);
     expect(g2.nodes.filter((n) => n.kind === "memory").length).toBe(2);
+  });
+
+  it("keeps multiple rare words as evidence for a memory link", () => {
+    const db = freshRoom();
+    const file = add(db, "retreat.md", "The copper zermatt itinerary is final.");
+    addMemory(db, "Remember the copper zermatt itinerary.", null);
+
+    const edge = buildRoomGraph(db).edges.find((candidate) => candidate.a.startsWith("mem:"));
+    expect(edge).toMatchObject({ b: file, kind: EDGE_MENTIONS });
+    expect(edge?.shared).toHaveLength(2);
+    expect(edge?.shared).toContain("copper");
+  });
+
+  it("rejects malformed graph inputs without producing self links", () => {
+    const db = freshRoom();
+    const self = add(db, "self.md", "A self reference must not become an edge.");
+    db.prepare("UPDATE files SET derived_from = ? WHERE id = ?").run(self, self);
+    const invalid = insertFileFromUrl(
+      db, "invalid.md", "text/markdown", Buffer.from("x"), "invalid URL", "web", "not a URL",
+    ).id;
+    const hostless = insertFileFromUrl(
+      db, "mail.md", "text/markdown", Buffer.from("x"), "hostless URL", "web", "mailto:room@example.test",
+    ).id;
+
+    const graph = buildRoomGraph(db);
+    expect(graph.nodes.map((node) => node.id)).toEqual(expect.arrayContaining([self, invalid, hostless]));
+    expect(graph.edges.some((edge) => edge.a === self && edge.b === self)).toBe(false);
+  });
+
+  it("ignores a mixed-width embedding while retaining the usable chunk vector", () => {
+    const db = freshRoom();
+    const file = add(db, "vectors.md", "A graph embedding fixture.");
+    const chunk = db.prepare("SELECT id FROM chunks WHERE file_id = ?").get(file) as { id: string };
+    setChunkEmbedding(db, chunk.id, embeddingToBlob([1, 0]));
+    db.prepare("INSERT INTO chunks(id, file_id, seq, text, embedding) VALUES (?, ?, 1, ?, ?)").run(
+      randomUUID(), file, "incompatible vector", embeddingToBlob([1, 0, 0]),
+    );
+    db.prepare("INSERT INTO chunks(id, file_id, seq, text, embedding) VALUES (?, ?, 2, ?, ?)").run(
+      randomUUID(), file, "matching vector", embeddingToBlob([0, 1]),
+    );
+
+    expect(buildRoomGraph(db).nodes).toContainEqual(expect.objectContaining({ id: file }));
   });
 
   it("a_file_the_room_knows_nothing_about_stays_isolated", () => {

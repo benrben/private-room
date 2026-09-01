@@ -629,6 +629,19 @@ describe("safeValidationDetail", () => {
     expect(safeValidationDetail("plain text")).toBeNull();
     expect(safeValidationDetail(null)).toBeNull();
   });
+
+  it("REGRESSION: keeps valid error order while dropping malformed entries and body from locations", () => {
+    expect(
+      safeValidationDetail({
+        detail: [
+          null,
+          { loc: ["body", "provider", 7], msg: "invalid model", input: "secret" },
+          { loc: "not-an-array", msg: "missing route" },
+          { loc: ["body", "ignored"], msg: 42 },
+        ],
+      })
+    ).toBe("provider: invalid model; missing route");
+  });
 });
 
 // --------------------------------------------------------- 5. streamRun e2e
@@ -803,6 +816,25 @@ describe("streamRun (fake fetch, no network)", () => {
     });
   });
 
+  it("REGRESSION: a valid JSON primitive is ignored rather than ending the stream", async () => {
+    // NDJSON syntax alone is not enough: only object records can carry a
+    // sidecar event. A scalar between two valid records must be a no-op.
+    globalThis.fetch = vi.fn(async () =>
+      ndjsonResponse([
+        JSON.stringify("a future keepalive value"),
+        JSON.stringify({ t: "delta", v: "still fine", run_id: "ask-77" }),
+        JSON.stringify({ t: "final", v: "still fine", run_id: "ask-77" }),
+      ])
+    ) as unknown as typeof fetch;
+
+    await expect(streamRun("http://sidecar", req, { turn: null, onEvent: () => undefined })).resolves.toEqual({
+      kind: "done",
+      text: "still fine",
+      usage: null,
+      plan: null,
+    });
+  });
+
   it("a JSON line split across two stream chunks is reassembled, not dropped", async () => {
     const line = JSON.stringify({ t: "final", v: "reassembled", run_id: "ask-77" }) + "\n";
     const bytes = new TextEncoder().encode(line);
@@ -844,6 +876,19 @@ describe("streamRun (fake fetch, no network)", () => {
     if (outcome.kind !== "failed") throw new Error("expected failed");
     expect(outcome.error).toContain("provider.api_key: Field required");
     expect(outcome.error).not.toContain("do-not-leak");
+  });
+
+  it("a non-JSON /run failure reports only its status", async () => {
+    globalThis.fetch = vi.fn(async () => new Response("upstream proxy failure", { status: 503 })) as unknown as typeof fetch;
+
+    await expect(streamRun("http://sidecar", req, { turn: null, onEvent: () => undefined })).resolves.toEqual({
+      kind: "failed",
+      text: "",
+      error: "sidecar /run status 503",
+      toolRan: false,
+      usage: null,
+      plan: null,
+    });
   });
 
   it("a network failure on the initial POST becomes a failed outcome", async () => {
@@ -1100,6 +1145,34 @@ describe("streamRun: what Stop actually does over the wire", () => {
     } finally {
       errorSpy.mockRestore();
     }
+  }, 10_000);
+
+  it("a failed cancel POST retries and accepts an unreadable 2xx reply", async () => {
+    const controller = new AbortController();
+    let cancelCalls = 0;
+    globalThis.fetch = vi.fn(async (input: unknown) => {
+      const url = typeof input === "string" ? input : String((input as { url: string }).url);
+      if (url.endsWith("/cancel")) {
+        cancelCalls += 1;
+        if (cancelCalls === 1) throw new Error("cancel connection dropped");
+        return new Response("not JSON", { status: 200 });
+      }
+      return new Response(
+        oneDeltaThenSilence([JSON.stringify({ t: "delta", v: "partial", run_id: "ask-77" })]),
+        { status: 200 }
+      );
+    }) as unknown as typeof fetch;
+
+    await expect(
+      streamRun("http://sidecar", req, {
+        turn: new TurnId("ask-77", "chat-a"),
+        signal: controller.signal,
+        onEvent: (event) => {
+          if (event === "ask-delta") controller.abort();
+        },
+      })
+    ).resolves.toEqual({ kind: "done", text: "partial", usage: null, plan: null });
+    expect(cancelCalls).toBe(2);
   }, 10_000);
 
   it("a Stop landing while several lines sit ALREADY BUFFERED takes effect on the next line, not the next network read", async () => {

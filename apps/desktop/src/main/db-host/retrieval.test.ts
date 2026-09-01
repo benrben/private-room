@@ -31,7 +31,7 @@ import path from "node:path";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { createRoom } from "./open.js";
 import { chunksMissingEmbedding, embeddingToBlob, setChunkEmbedding } from "./embeddings.js";
-import { insertFile } from "./files.js";
+import { insertChunks, insertFile } from "./files.js";
 import {
   MAX_CONTEXT_CHUNKS,
   MAX_VECTOR_CANDIDATES,
@@ -42,6 +42,7 @@ import {
   questionTerms,
   retrieveContext,
   retrieveContextExcluding,
+  retrieveContextForFiles,
   retrieveContextLimited,
   selectMemories,
   stripMarkupBlocks,
@@ -202,6 +203,31 @@ describe("makeSnippet", () => {
 // ================================================================= retrieval
 
 describe("retrieveContext", () => {
+  it("uses each named file's first chunk when the question has no FTS match", () => {
+    const db = freshRoom();
+    addFile(db, "notes.md", "A project update with no magic search term.");
+
+    const [chunks, fallback] = retrieveContextForFiles(db, "unfindable keyword", ["notes.md", "NOTES.md"]);
+
+    expect(fallback).toBe(false);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]?.fileName).toBe("notes.md");
+    db.close();
+  });
+
+  it("fills the remaining named-file budget from later chunks", () => {
+    const db = freshRoom();
+    const fileId = addFile(db, "notes.md", "placeholder");
+    db.prepare("DELETE FROM chunks WHERE file_id = ?").run(fileId);
+    insertChunks(db, fileId, "A deliberately unfindable note. ".repeat(600));
+
+    const [chunks] = retrieveContextForFiles(db, "missing keyword", ["notes.md"], 2);
+
+    expect(chunks).toHaveLength(2);
+    expect(chunks.every((chunk) => chunk.fileName === "notes.md")).toBe(true);
+    db.close();
+  });
+
   it("pointed_hebrew_is_searchable_by_plain_query", () => {
     // The Bible bug: nikud'd text indexed under unicode61 shreds into
     // single-letter fragments, so "קהלת" never matched "קֹהֶלֶת". The chunk
@@ -431,6 +457,15 @@ describe("retrieveContext", () => {
 // =========================================================== history / memory
 
 describe("compactHistory", () => {
+  it("drops turns containing only viewer markup", () => {
+    expect(compactHistory([["assistant", "```boxes\nhidden\n```"]], 2_000)).toEqual([]);
+  });
+
+  it("does not return a fragment too small to be useful", () => {
+    const longTurn = "detail ".repeat(100);
+    expect(compactHistory([["assistant", longTurn]], 399)).toEqual([]);
+  });
+
   it("one_early_blank_line_does_not_shrink_a_long_turn_to_nothing", () => {
     // "Here's the summary:" over a list written with single newlines: the
     // only "\n\n" in 70 KB sits at character 19. Cutting there kept 19
@@ -516,6 +551,17 @@ describe("compactHistory", () => {
     // And it never cuts mid-character: re-encoding is lossless.
     const text = hebrewKept[0]?.[1] as string;
     expect(Buffer.from(text, "utf8").toString("utf8")).toBe(text);
+  });
+
+  it("backs a compacted fragment up to a UTF-8 character boundary", () => {
+    const value = `prefix ${"🙂".repeat(500)}`;
+    // The raw cut is byte 964: one byte into the emoji that starts at 963.
+    // The result must back up to that start byte rather than decode a partial
+    // character as U+FFFD.
+    const [[, piece]] = compactHistory([["assistant", value]], 1_004);
+    expect(piece).not.toContain("�");
+    expect(piece).toBe(`prefix ${"🙂".repeat(239)}\n… [rest of this message omitted]`);
+    expect(Buffer.from(piece, "utf8").toString("utf8")).toBe(piece);
   });
 });
 

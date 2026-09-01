@@ -31,6 +31,7 @@ import io
 import struct
 import time
 import zipfile
+from types import SimpleNamespace
 
 import openpyxl
 import pytest
@@ -238,11 +239,68 @@ def test_truncation_note_exact_message_format(monkeypatch: pytest.MonkeyPatch) -
     assert "r3" not in text and "r4" not in text and "r5" not in text
 
 
+def test_text_cap_stops_before_starting_the_next_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The text cap is checked at a row boundary after the sheet header has
+    # already been appended. Keeping that order avoids a partial first row
+    # while still reporting exactly what was not read.
+    data = _workbook_bytes(lambda ws: ws.cell(row=1, column=1, value="hidden"))
+    monkeypatch.setattr(xlsx, "MAX_TEXT_CHARS", 1)
+
+    text = xlsx.extract_xlsx(data)
+
+    assert text is not None
+    assert "hidden" not in text
+    assert '[sheet "Sheet" truncated: read rows 1-0 of 1, columns 1-1 of 1]' in text
+
+
 # ------------------------------------------------------------------- misc
 
 
 def test_non_zip_bytes_return_none() -> None:
     assert xlsx.extract_xlsx(b"not a zip at all") is None
+
+
+def test_valid_zip_that_is_not_a_workbook_returns_none() -> None:
+    # A structurally valid archive clears the size guards but must retain
+    # the parser failure path rather than leaking openpyxl's exception.
+    assert xlsx.extract_xlsx(_fake_office_zip("xl/worksheets/sheet1.xml", "<x/>")) is None
+
+
+def test_zero_declared_extent_skips_the_cell_parser(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A zero extent is the pre-existing cheap skip path; it must not start
+    # the private XML parser for a worksheet that advertises no cells.
+    worksheet = SimpleNamespace(max_row=0, max_column=1, title="Ignored")
+    output = xlsx._TextOutput()
+
+    def parser_must_not_run(_: object):
+        raise AssertionError("zero-extent sheet should not be parsed")
+
+    monkeypatch.setattr(xlsx, "_iter_populated_cells", parser_must_not_run)
+    xlsx._append_worksheet_text(worksheet, output)
+
+    assert output.text() == ""
+
+
+def test_stored_empty_cells_are_skipped_but_still_extend_the_true_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The cell parser can expose empty stored cells and invalid coordinates
+    # even though openpyxl's writer does not normally produce them. They do
+    # not render a row, but their observed coordinates remain part of the
+    # truthful truncation extent.
+    cells = iter(
+        [
+            {"row": 0, "column": 1, "value": "invalid"},
+            {"row": 3, "column": 4, "value": ""},
+            {"row": 4, "column": 2, "value": "kept"},
+        ]
+    )
+    monkeypatch.setattr(xlsx, "_iter_populated_cells", lambda _: cells)
+
+    walk = xlsx._walk_populated_cells(object(), xlsx._TextOutput())
+
+    assert walk.cells == ["", "kept"]
+    assert (walk.max_row_seen, walk.max_col_seen) == (4, 4)
 
 
 def test_lying_dimension_does_not_silently_drop_real_cells() -> None:

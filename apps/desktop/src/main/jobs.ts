@@ -92,504 +92,21 @@
  * siblings`, ported from the Rust test of the same name).
  */
 
-import type Database from "better-sqlite3-multiple-ciphers";
-import type { WorkspaceService } from "./workspace/workspaceService.js";
 import type { CancelFlag } from "./cancel.js";
+import { setJobStatus } from "./db-host/jobs.js";
 import {
-  type Job,
-  dedupeParkedJobs,
-  getJob,
-  markJobParking as dbMarkJobParking,
-  parkJob as dbParkJob,
-  pruneJobHistory,
-  setJobStatus,
-  unfinishedJobs,
-} from "./db-host/jobs.js";
-import { finishWorkflowRunByJob, setWorkflowRunStatusByJob } from "./db-host/workflows.js";
+  crashReason,
+  emitProgress,
+  parkCrashedJob,
+  pinnedDb,
+  type ProgressSink,
+  type RoomSource,
+} from "./jobsLifecycle.js";
 
-// ============================================================================
-// Lane / Step / planDispatch / runPlan — the pure, unit-tested foundation
-// ============================================================================
+export * from "./jobsLifecycle.js";
+export * from "./jobsPlan.js";
 
-/**
- * Where a step runs — decides how many may run at once. Local-model work is
- * serial because only one model is resident; CPU and cloud work fan out.
- * Mirrors the Rust `Lane` enum (`#[serde(rename_all = "snake_case")]`) — these
- * three strings ARE its stored wire form.
- *
- * There is deliberately NO transcription lane: speech-to-text runs entirely
- * outside the job system (`recording.rs`'s own decoder thread), so a `whisper`
- * variant would only ever cost {@link planDispatch} a slot it reserved for
- * nobody.
- */
-export type Lane = "local_llm" | "cpu" | "cloud";
 
-/** Concurrent slots per lane. Local-model work is serial (RAM and a single
- * resident model); CPU threads and remote cloud calls overlap. */
-export const LANE_SLOTS: Readonly<Record<Lane, number>> = {
-  local_llm: 1,
-  cpu: 4,
-  cloud: 4,
-};
-
-/** Every lane, for building a fresh per-lane slot table — the equivalent of
- * Rust's `for lane in [Lane::LocalLlm, Lane::Cpu, Lane::Cloud]`. */
-const ALL_LANES: readonly Lane[] = ["local_llm", "cpu", "cloud"];
-
-/** {@link LANE_SLOTS} as a function — Rust's `Lane::slots(self)`. */
-export function laneSlots(lane: Lane): number {
-  return LANE_SLOTS[lane];
-}
-
-/**
- * One node in a job's plan. `kind`/`params` describe the work; `dependsOn`
- * lists step ids that must finish first.
- *
- * NOT the stored shape. `lane` deliberately IS its stored wire form (Rust's
- * `Lane` is `#[serde(rename_all = "snake_case")]`), and so are `id`/`kind`/
- * `params` — but the Rust `Step` struct carries no `rename_all`, so the field
- * a real room's `jobs.plan` holds is `depends_on`, not `dependsOn`. A
- * `JSON.parse(job.plan).steps as Step[]` therefore compiles and then hands
- * {@link planDispatch} `dependsOn === undefined`, which throws inside a job
- * runner and parks the job as a crash. Whichever future batch first reads a
- * stored plan owes an explicit `depends_on` → `dependsOn` adapter at that one
- * seam; see this module's DEVIATION note.
- */
-export interface Step {
-  id: number;
-  lane: Lane;
-  kind: string;
-  params: unknown;
-  dependsOn: readonly number[];
-}
-
-/** The generic step-DAG envelope {@link runPlan} operates over, in its RUNTIME
- * form — see {@link Step} for why that is not byte-identical to what the `jobs`
- * row's `plan` column holds (which `db-host/jobs.ts` deliberately leaves
- * opaque). Every job kind that has steps (deep_summary, file_pass, workflow —
- * none of which this batch ports) stores a step list plus its own extra fields
- * (`auto`, `reduce`, …). Podcast audio — this batch's one concrete job kind —
- * has no steps: it is a single atomic unit, like Rust's studio and podcast
- * runners, neither of which ever calls {@link runPlan}. */
-export interface Plan {
-  steps: Step[];
-}
-
-/**
- * Pure scheduling decision: given the full step list, the ids already done, and
- * the ids currently running, return the steps that may start NOW —
- * dependencies satisfied and their lane still has a free slot (counting steps
- * already running plus ones chosen earlier in this same call). Deterministic:
- * lower ids win a contested slot, so runs are reproducible.
- */
-export function planDispatch(
-  steps: readonly Step[],
-  done: ReadonlySet<number>,
-  running: ReadonlySet<number>
-): number[] {
-  // Slots left per lane after accounting for what's already running.
-  const free = new Map<Lane, number>(ALL_LANES.map((lane) => [lane, laneSlots(lane)]));
-  for (const s of steps) {
-    if (running.has(s.id)) {
-      free.set(s.lane, Math.max(0, (free.get(s.lane) ?? 0) - 1));
-    }
-  }
-  const chosen: number[] = [];
-  for (const s of steps) {
-    if (done.has(s.id) || running.has(s.id)) {
-      continue;
-    }
-    if (!s.dependsOn.every((d) => done.has(d))) {
-      continue;
-    }
-    const slot = free.get(s.lane) ?? 0;
-    if (slot === 0) {
-      continue;
-    }
-    free.set(s.lane, slot - 1);
-    chosen.push(s.id);
-  }
-  return chosen;
-}
-
-/** True once every step is done — the plan is complete. */
-export function planComplete(steps: readonly Step[], done: ReadonlySet<number>): boolean {
-  return steps.every((s) => done.has(s.id));
-}
-
-/** Detect a plan that can never finish (a dependency cycle or a dangling
- * dependency) — nothing is running yet nothing is dispatchable. Guards the
- * scheduler against an infinite idle loop. */
-export function planIsStuck(
-  steps: readonly Step[],
-  done: ReadonlySet<number>,
-  running: ReadonlySet<number>
-): boolean {
-  return (
-    running.size === 0 &&
-    !planComplete(steps, done) &&
-    planDispatch(steps, done, running).length === 0
-  );
-}
-
-/**
- * Wave 4a [BLOCKER] fix, ported verbatim: the largest CONTIGUOUS done prefix —
- * the smallest id NOT in `done`. A branched multi-lane plan (a workflow) can
- * finish a wave leaving a NON-dense done-set (e.g. `{0,1,3}` while step 2 waits
- * its lane slot); storing `done.size` as the resume cursor would seed a resume
- * as `0..size`, marking step 2 done though it never ran and re-running step 3.
- * The dense prefix is always a valid `0..n` resume seed: every id below it is
- * genuinely finished, and any done-but-above-prefix step simply re-runs — which
- * is only safe because every step's side effects are idempotent (`INSERT OR
- * REPLACE` artifacts, an overwritten one-liner cache). For a single-slot serial
- * plan the prefix always equals the count.
- */
-export function densePrefix(done: ReadonlySet<number>): number {
-  let i = 0;
-  while (done.has(i)) {
-    i += 1;
-  }
-  return i;
-}
-
-/** A step's outcome — Rust's `Result<(), String>`. See the module doc's
- * DEVIATION note on why this is a value, not a thrown exception. */
-export type StepResult = { readonly ok: true } | { readonly ok: false; readonly error: string };
-
-/** Maps a step to real work — the piece `run_plan` is generic over in Rust (its
- * `execute: F where F: FnMut(Step) -> Fut<Result<(), String>>` parameter).
- * Every job kind that has steps supplies its own (`deep_summary`'s per-file
- * one-liner call, `file_pass`'s per-window model call, …), none of which this
- * batch ports. */
-export type ExecuteStep = (step: Step) => Promise<StepResult>;
-
-/** How a plan run ended. */
-export type RunOutcome =
-  | { readonly kind: "done" }
-  /** Cancel flag was set — the job is checkpointed and resumable. */
-  | { readonly kind: "paused" }
-  /** A step failed (its error) — the job is parked resumable. */
-  | { readonly kind: "error"; readonly error: string };
-
-/** The minimal `AtomicBool`-alike {@link runPlan} needs to observe a Stop.
- * `cancel.ts`'s {@link CancelFlag} satisfies this structurally, and so does any
- * test double with a bare `load()`. */
-export interface CancelSignal {
-  load(): boolean;
-}
-
-/**
- * Drive a plan to completion. Plans are built in dependency order (a step's
- * deps always have lower ids). Each wave dispatches every ready step its lanes
- * allow, runs them concurrently, then `checkpoint(done)` persists progress and
- * `progress(done, total)` updates the UI. A set `cancel` flag pauses between
- * waves; a step error parks the job. Generic over `execute` so it is unit-
- * tested without a database or a model.
- *
- * `startDone` is the actual set of finished step ids (seeded `0..cursor` for
- * the serial job kinds, an arbitrary persisted set for a branched workflow),
- * and `checkpoint` receives the whole done SET — not a scalar count — so a
- * workflow spawner can serialize the real done-set for a correct resume, while
- * a serial spawner keeps storing {@link densePrefix} of it.
- *
- * A wave is the unit of durability: `Promise.all` drives every step in it (like
- * Rust's `join_all`), but the first failure returns BEFORE `checkpoint` is
- * called, so a failed wave's succeeded siblings are not persisted and re-run on
- * resume. That is what keeps "done stays a valid prefix" true on a fan-out
- * lane.
- *
- * DEVIATION (from the Rust source's own shape, not a behaviour change):
- * `plan_dispatch` returns step IDs and `run_plan` then indexes `steps[id]`,
- * which is correct only because every plan builder assigns `id = index`. This
- * port resolves the id through a map built from `steps` itself, so a plan whose
- * ids are not their indices runs the step it named rather than silently running
- * a different one. Identical behaviour whenever the invariant holds.
- */
-export async function runPlan(
-  steps: readonly Step[],
-  startDone: ReadonlySet<number>,
-  cancel: CancelSignal,
-  execute: ExecuteStep,
-  checkpoint: (done: ReadonlySet<number>) => void,
-  progress: (done: number, total: number) => void
-): Promise<RunOutcome> {
-  const total = steps.length;
-  const byId = new Map<number, Step>(steps.map((s) => [s.id, s]));
-  const done = new Set<number>(startDone);
-  progress(done.size, total);
-
-  // `run_plan` awaits each wave fully before starting the next, so from this
-  // driver's point of view nothing is ever "still running" — Rust passes an
-  // always-empty `running` set to both calls below, and so does this.
-  const empty: ReadonlySet<number> = new Set();
-
-  while (!planComplete(steps, done)) {
-    if (cancel.load()) {
-      return { kind: "paused" };
-    }
-    if (planIsStuck(steps, done, empty)) {
-      return { kind: "error", error: "job plan cannot make progress" };
-    }
-    const wave = planDispatch(steps, done, empty);
-    const results = await Promise.all(wave.map((id) => execute(byId.get(id) as Step)));
-    for (let i = 0; i < wave.length; i++) {
-      const result = results[i] as StepResult;
-      if (!result.ok) {
-        return { kind: "error", error: result.error };
-      }
-      done.add(wave[i] as number);
-    }
-    checkpoint(done);
-    progress(done.size, total);
-  }
-  return { kind: "done" };
-}
-
-// ============================================================================
-// progress events / the room pin
-// ============================================================================
-
-/** The `job-progress` event payload — the union of every field ANY runner in
- * `jobs.rs` sends through its `serde_json::json!({...})` literals; a given
- * event sets only the ones relevant to it, exactly as those macros do. */
-export interface JobProgressPayload {
-  jobId: string;
-  label: string;
-  done: number;
-  total: number;
-  finished?: boolean;
-  paused?: boolean;
-  failed?: boolean;
-  fileId?: string | null;
-}
-
-/** Where `job-progress` events go — Rust's `window.emit("job-progress", …)`.
- * No Electron `BrowserWindow` wiring exists in this rewrite yet; a future
- * batch's implementation is a thin `webContents.send("job-progress", payload)`
- * adapter (or a one-line bridge to `turn.ts`'s existing `EventSender`), and
- * tests use a recording stub. */
-export interface ProgressSink {
-  emit(payload: JobProgressPayload): void;
-}
-
-/** Emit the job's live progress. `label` is human ("Reading part 4 of 17");
- * `done`/`total` drive the bar. */
-export function emitProgress(
-  sink: ProgressSink,
-  jobId: string,
-  label: string,
-  done: number,
-  total: number
-): void {
-  sink.emit({ jobId, label, done, total });
-}
-
-/** One open room, as much of it as this batch's runners need. */
-export interface RoomHandle {
-  db: Database.Database;
-  path: string;
-  /** Present for hybrid rooms whose current bytes are normal files. */
-  workspace?: WorkspaceService;
-}
-
-/**
- * Minimal stand-in for `tauri::State<'_, AppState>`'s room access, scoped to
- * exactly what `jobs.rs`'s runners use it for: reading the CURRENTLY open room
- * so a write can be pinned to the room the job started in ("a room closed or
- * swapped mid-run can never receive this job's writes" — every runner in the
- * Rust source re-checks `room.path == room_path` before every read/write).
- */
-export interface RoomSource {
-  /** The open room, or `null` if none is open. */
-  current(): RoomHandle | null;
-}
-
-/** `room.db` only if the room currently open is STILL the one this job started
- * in — the room-pin discipline every runner in `jobs.rs` applies by hand before
- * every read/write (`guard.as_ref().filter(|r| r.path == room_path)`). */
-export function pinnedDb(rooms: RoomSource, roomPath: string): Database.Database | null {
-  const room = rooms.current();
-  return room !== null && room.path === roomPath ? room.db : null;
-}
-
-// ============================================================================
-// Job-lifecycle housekeeping — DB-only, no AppState/Window needed
-// ============================================================================
-
-/** Why a job stopped when the room was LOCKED (or swapped) under it. The user
- * caused this, but not by pressing Stop, so the card must not read like a pause
- * they chose — "Resume" on a job they never paused is a small lie about who
- * stopped it and why the work is unfinished. */
-export const PARKED_BY_LOCK = "The room was locked while this was still running.";
-
-/** Why a job stopped when the APP went away — a quit, a crash, a forced
- * restart. Detected at the next unlock, because nothing ran at exit to say
- * it. */
-export const PARKED_BY_EXIT = "The app closed while this was still running.";
-
-/**
- * Stamp the parking reason on every live top-level job, WITHOUT stopping any of
- * them. Called from the lock/close drain while the room is still open and the
- * runners are still alive, so whichever way each runner lands a moment later
- * the row can already say what interrupted it. Returns how many rows were
- * stamped.
- *
- * 'running' ONLY. A queued row is never parked by the app —
- * {@link parkRunningJobs} and {@link quiesceStaleJobs} both skip it so the
- * queue pump can auto-start it — and if the pump promotes one to 'running'
- * during the drain, `parkJob` writes the reason itself. So stamping a queued
- * row can never come true, and it does come back to bite: the only way a queued
- * row reaches 'paused' is the user pressing Remove, and `setJobStatus(..,
- * "paused")` deliberately PRESERVES the reason (the running runner's epilogue
- * depends on that), so the card would blame the lock for a removal the user
- * chose, on work that never started.
- */
-export function markJobsParking(db: Database.Database, reason: string): number {
-  let jobs: Job[];
-  try {
-    jobs = unfinishedJobs(db);
-  } catch {
-    return 0;
-  }
-  let count = 0;
-  for (const j of jobs) {
-    if (j.status !== "running") {
-      continue;
-    }
-    try {
-      dbMarkJobParking(db, j.id, reason);
-      count += 1;
-    } catch {
-      // A write that failed did not stamp a row, so it is not counted.
-    }
-  }
-  return count;
-}
-
-/**
- * Park every job still reading as 'running' — the runner is gone, or is about
- * to lose the room it writes to. Returns how many were parked.
- *
- * 'queued' is deliberately left alone: a queued job never started, holds no
- * half-finished work, and the pump auto-resumes it at the next unlock.
- * Demoting it here is exactly the change that once made `pump_on_open` a dead
- * no-op.
- */
-export function parkRunningJobs(db: Database.Database, reason: string): number {
-  let jobs: Job[];
-  try {
-    jobs = unfinishedJobs(db);
-  } catch {
-    return 0;
-  }
-  let parked = 0;
-  for (const j of jobs) {
-    if (j.status !== "running") {
-      continue;
-    }
-    try {
-      dbParkJob(db, j.id, reason);
-    } catch {
-      continue;
-    }
-    // A workflow's run row must stop reading as 'running' too, or its history
-    // line keeps a live green dot for a job that is parked. Harmless (a no-op
-    // UPDATE) for the other job kinds — they have no run row.
-    try {
-      setWorkflowRunStatusByJob(db, j.id, "paused");
-    } catch {
-      // best-effort, mirrors the Rust `let _ = ...`
-    }
-    parked += 1;
-  }
-  return parked;
-}
-
-/**
- * On room open, any job left 'running' belongs to a process that's gone — park
- * those 'paused' so the UI offers Resume instead of a phantom active card. The
- * lock path parks its own jobs before the room handle drops, so what reaches
- * here still reading 'running' is work the app never got to say goodbye to: a
- * quit, a crash, a kill. Naming that is the whole point — "Paused" alone
- * described a deliberate Stop the user never made.
- */
-export function quiesceStaleJobs(db: Database.Database): void {
-  parkRunningJobs(db, PARKED_BY_EXIT);
-  // Those rows became parked JUST NOW — after migrate()'s duplicate sweep had
-  // already run (open_room migrates, then quiesces). A workflow still 'running'
-  // when the app died is exactly the row that superseded the parked attempt
-  // beside it, so without this the user opens the room and still sees two
-  // indistinguishable cards for one workflow. Sweeping again here costs one
-  // scan of a handful of rows and is a no-op on a room that is already clean.
-  try {
-    dedupeParkedJobs(db);
-  } catch {
-    // best-effort, mirrors the Rust `let _ = ...`
-  }
-  // And roll the finished history off the back. Nothing else ever removed a
-  // 'done' job, its artifacts or a closed run row, so an interval-scheduled
-  // workflow grew the encrypted room file without bound. Room open is the one
-  // moment the connection is held with no runner attached to any row.
-  try {
-    pruneJobHistory(db);
-  } catch {
-    // best-effort, mirrors the Rust `let _ = ...`
-  }
-}
-
-/**
- * Park a job whose runner died without reaching its own epilogue.
- *
- * Returns the row's `{cursor, total}` when it actually parked something, and
- * `null` when the row was already off the live statuses — a failure caught in
- * the epilogue AFTER the terminal write must not rewrite a real 'done' as a
- * failure, and a 'paused' row is already resumable and already honest. Only
- * 'running' and 'queued' still read as live work, so only those are parked.
- *
- * Throws (via `getJob`) if the row itself is unreadable, exactly where Rust's
- * `?` propagates: there is nothing to park, so nothing is reported parked.
- */
-export function parkCrashedJob(
-  db: Database.Database,
-  jobId: string,
-  reason: string
-): { cursor: number; total: number } | null {
-  const job = getJob(db, jobId);
-  if (job.status !== "running" && job.status !== "queued") {
-    return null;
-  }
-  setJobStatus(db, jobId, "error", reason);
-  // A workflow job also owns a `workflow_runs` row; the other kinds have none
-  // and this is a no-op for them (same reasoning as `quiesceStaleJobs`).
-  try {
-    finishWorkflowRunByJob(db, jobId, "error", reason);
-  } catch {
-    // best-effort, mirrors the Rust `let _ = ...`
-  }
-  return { cursor: job.cursor, total: job.total };
-}
-
-// ============================================================================
-// crashReason / spawnJobRunner — panic_reason / spawn_job_runner
-// ============================================================================
-
-/**
- * A caught failure as a sentence fit for a job's `error` column. Ported from
- * `panic_reason`: `catch_unwind`'s payload is `Box<dyn Any>`, of which only the
- * `&str`/`String` cases carry a message; the JS equivalent is a caught value of
- * unknown shape, at least as likely to already BE an `Error`. Either way the
- * fallback must still say a CRASH happened rather than leaving the column blank
- * for the Sidebar to render as "Stopped — " explaining nothing.
- */
-export function crashReason(err: unknown): string {
-  const detail =
-    err instanceof Error && err.message.trim() !== ""
-      ? err.message
-      : typeof err === "string" && err.trim() !== ""
-        ? err
-        : null;
-  return detail !== null ? `the job runner crashed: ${detail}` : "the job runner crashed";
-}
 
 /** Everything a job runner needs beyond its own step logic: where the open room
  * is, where progress events go, how to release this job's cancel flag, and how
@@ -609,6 +126,86 @@ export interface JobRunnerDeps {
    * mirroring the Rust layering (`mod queue` is declared alongside
    * `commands/jobs.rs`, not underneath it). */
   onSettled: (jobId: string) => void | Promise<void>;
+}
+
+type ParkedJobProgress = { cursor: number; total: number } | null;
+
+function parkRunnerCrash(deps: JobRunnerDeps, jobId: string, roomPath: string, reason: string): ParkedJobProgress {
+  const db = pinnedDb(deps.rooms, roomPath);
+  if (db === null) {
+    return null;
+  }
+  try {
+    return parkCrashedJob(db, jobId, reason);
+  } catch {
+    return null;
+  }
+}
+
+function removeRunnerCancelFlag(deps: JobRunnerDeps, jobId: string): void {
+  try {
+    deps.removeCancelFlag(jobId);
+  } catch {
+    // The queue must still be pumped if its cancellation registry is gone.
+  }
+}
+
+function emitRunnerCrash(
+  sink: ProgressSink,
+  jobId: string,
+  reason: string,
+  parked: ParkedJobProgress,
+): void {
+  if (parked === null) {
+    return;
+  }
+  try {
+    sink.emit({
+      jobId,
+      label: `Stopped — ${reason}`,
+      done: parked.cursor,
+      total: parked.total,
+      failed: true,
+    });
+  } catch {
+    // A broken renderer channel must not cost the queue its slot.
+  }
+}
+
+async function settleRunner(deps: JobRunnerDeps, jobId: string): Promise<void> {
+  try {
+    await deps.onSettled(jobId);
+  } catch {
+    // Re-throwing from the recovery path would be an unhandled rejection.
+  }
+}
+
+async function handleRunnerCrash(
+  deps: JobRunnerDeps,
+  jobId: string,
+  roomPath: string,
+  err: unknown,
+): Promise<void> {
+  const reason = crashReason(err);
+  // Mirrors the Rust source's own `eprintln!` — the host has no log sink here.
+  console.error(`job ${jobId} runner crashed: ${reason}`);
+  const parked = parkRunnerCrash(deps, jobId, roomPath, reason);
+  removeRunnerCancelFlag(deps, jobId);
+  emitRunnerCrash(deps.sink, jobId, reason, parked);
+  await settleRunner(deps, jobId);
+}
+
+async function runJobRunner(
+  deps: JobRunnerDeps,
+  jobId: string,
+  roomPath: string,
+  body: () => Promise<void>,
+): Promise<void> {
+  try {
+    await body();
+  } catch (err) {
+    await handleRunnerCrash(deps, jobId, roomPath, err);
+  }
 }
 
 /**
@@ -639,55 +236,7 @@ export function spawnJobRunner(
   roomPath: string,
   body: () => Promise<void>
 ): Promise<void> {
-  return (async () => {
-    try {
-      await body(); // the body ran its own epilogue
-      return;
-    } catch (err) {
-      const reason = crashReason(err);
-      // Mirrors the Rust source's own `eprintln!` — the host has no log sink
-      // injected here, and a silent crash is the failure mode being fixed.
-      console.error(`job ${jobId} runner crashed: ${reason}`);
-      const db = pinnedDb(deps.rooms, roomPath);
-      let parked: { cursor: number; total: number } | null = null;
-      if (db !== null) {
-        try {
-          parked = parkCrashedJob(db, jobId, reason);
-        } catch {
-          parked = null;
-        }
-      }
-      try {
-        deps.removeCancelFlag(jobId);
-      } catch {
-        // Nothing above this handler is left to catch a failure here, and the
-        // queue must still be pumped.
-      }
-      if (parked !== null) {
-        // Report the row's OWN checkpointed numbers — a crash knows how far the
-        // job got only from what it managed to persist, and inventing 0/0 would
-        // wipe a progress bar that had honestly advanced.
-        try {
-          deps.sink.emit({
-            jobId,
-            label: `Stopped — ${reason}`,
-            done: parked.cursor,
-            total: parked.total,
-            failed: true,
-          });
-        } catch {
-          // ditto — a broken renderer channel must not cost the queue its slot.
-        }
-      }
-      try {
-        await deps.onSettled(jobId);
-      } catch {
-        // The last statement of the last handler: rethrowing here would be an
-        // unhandled rejection nobody can observe, which is what this whole
-        // wrapper exists to prevent.
-      }
-    }
-  })();
+  return runJobRunner(deps, jobId, roomPath, body);
 }
 
 // ============================================================================
@@ -728,6 +277,88 @@ export interface SpawnPodcastAudioDeps extends JobRunnerDeps {
   render?: RenderPodcastAudio;
 }
 
+type PodcastOutcome =
+  | { readonly kind: "done"; readonly fileId: string }
+  | { readonly kind: "paused" }
+  | { readonly kind: "error"; readonly error: string };
+
+async function renderPodcastOutcome(
+  render: RenderPodcastAudio,
+  scriptFileId: string,
+  cancel: CancelFlag,
+): Promise<PodcastOutcome> {
+  try {
+    const meta = await render(scriptFileId, cancel);
+    return { kind: "done", fileId: meta.id };
+  } catch (err) {
+    if (cancel.load()) {
+      return { kind: "paused" };
+    }
+    return { kind: "error", error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+function podcastOutcomeStatus(outcome: PodcastOutcome): [string, string | null] {
+  if (outcome.kind === "done") {
+    return ["done", null];
+  }
+  if (outcome.kind === "paused") {
+    return ["paused", null];
+  }
+  return ["error", outcome.error];
+}
+
+function savePodcastOutcome(
+  deps: SpawnPodcastAudioDeps,
+  jobId: string,
+  roomPath: string,
+  outcome: PodcastOutcome,
+): void {
+  const db = pinnedDb(deps.rooms, roomPath);
+  if (db !== null) {
+    const [status, error] = podcastOutcomeStatus(outcome);
+    setJobStatus(db, jobId, status, error);
+  }
+}
+
+function emitPodcastOutcome(sink: ProgressSink, jobId: string, outcome: PodcastOutcome): void {
+  if (outcome.kind === "done") {
+    sink.emit({ jobId, label: "Episode ready", done: 1, total: 1, finished: true, fileId: outcome.fileId });
+    return;
+  }
+  if (outcome.kind === "paused") {
+    sink.emit({ jobId, label: "Paused", done: 0, total: 1, paused: true });
+    return;
+  }
+  sink.emit({
+    jobId,
+    label: `Stopped — ${outcome.error}`,
+    done: 0,
+    total: 1,
+    failed: true,
+  });
+}
+
+async function runPodcastAudio(
+  deps: SpawnPodcastAudioDeps,
+  jobId: string,
+  roomPath: string,
+  scriptFileId: string,
+  cancel: CancelFlag,
+  render: RenderPodcastAudio,
+): Promise<void> {
+  const startingDb = pinnedDb(deps.rooms, roomPath);
+  if (startingDb !== null) {
+    setJobStatus(startingDb, jobId, "running", null);
+  }
+  emitProgress(deps.sink, jobId, "Reading the script…", 0, 1);
+  const outcome = await renderPodcastOutcome(render, scriptFileId, cancel);
+  savePodcastOutcome(deps, jobId, roomPath, outcome);
+  deps.removeCancelFlag(jobId);
+  emitPodcastOutcome(deps.sink, jobId, outcome);
+  await deps.onSettled(jobId);
+}
+
 /**
  * Record a podcast script as audio, in the background.
  *
@@ -755,63 +386,6 @@ export function spawnPodcastAudio(
   cancel: CancelFlag
 ): Promise<void> {
   const render = deps.render ?? renderPodcastAudioNotImplemented;
-  return spawnJobRunner(deps, jobId, roomPath, async () => {
-    const startingDb = pinnedDb(deps.rooms, roomPath);
-    if (startingDb !== null) {
-      setJobStatus(startingDb, jobId, "running", null);
-    }
-    emitProgress(deps.sink, jobId, "Reading the script…", 0, 1);
-
-    // done(fileId) = the episode exists; paused = a Stop; error = a real
-    // failure to explain. `RunOutcome`'s own `done` carries no file, so this
-    // runner has its own three-way answer rather than reusing it.
-    let outcome:
-      | { readonly kind: "done"; readonly fileId: string }
-      | { readonly kind: "paused" }
-      | { readonly kind: "error"; readonly error: string };
-    try {
-      const meta = await render(scriptFileId, cancel);
-      outcome = { kind: "done", fileId: meta.id };
-    } catch (err) {
-      // Same convention as the studio runner: any error while the cancel flag
-      // is set is a clean Pause, not a failure to explain.
-      outcome = cancel.load()
-        ? { kind: "paused" }
-        : { kind: "error", error: err instanceof Error ? err.message : String(err) };
-    }
-
-    const finishingDb = pinnedDb(deps.rooms, roomPath);
-    if (finishingDb !== null) {
-      const [status, error]: [string, string | null] =
-        outcome.kind === "done"
-          ? ["done", null]
-          : outcome.kind === "paused"
-            ? ["paused", null]
-            : ["error", outcome.error];
-      setJobStatus(finishingDb, jobId, status, error);
-    }
-    deps.removeCancelFlag(jobId);
-
-    if (outcome.kind === "done") {
-      deps.sink.emit({
-        jobId,
-        label: "Episode ready",
-        done: 1,
-        total: 1,
-        finished: true,
-        fileId: outcome.fileId,
-      });
-    } else if (outcome.kind === "paused") {
-      deps.sink.emit({ jobId, label: "Paused", done: 0, total: 1, paused: true });
-    } else {
-      deps.sink.emit({
-        jobId,
-        label: `Stopped — ${outcome.error}`,
-        done: 0,
-        total: 1,
-        failed: true,
-      });
-    }
-    await deps.onSettled(jobId);
-  });
+  return spawnJobRunner(deps, jobId, roomPath, () =>
+    runPodcastAudio(deps, jobId, roomPath, scriptFileId, cancel, render));
 }

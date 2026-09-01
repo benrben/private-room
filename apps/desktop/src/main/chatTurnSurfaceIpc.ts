@@ -3,12 +3,12 @@
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type { Room, RoomManagerState } from "./roomManager.js";
 import type { EventSender } from "./turn.js";
-import { ask, handoffChat, type AskRequest } from "./turnEngine.js";
+import { ask, handoffChat, type AskDeps, type AskRequest } from "./turnEngine.js";
 import { liveTurnRoomSource } from "./liveContext.js";
 import { createRoomBridge, type RunningBridge } from "./moonshotServer.js";
 import { roomServerDispatcherFactory } from "./roomServerLive.js";
 import { modelSetting, turnEvidencePolicyForQuestion } from "./gatherContext.js";
-import type { ToolDispatcher } from "./mcpBridge.js";
+import type { ToolDispatcher, ToolScope } from "./mcpBridge.js";
 import { runsOnThisMac } from "./capabilities.js";
 import { detectedExternal } from "./externalDetection.js";
 import { chatModelSeesImages, groundingPick } from "./ollamaModels.js";
@@ -24,6 +24,58 @@ import type { LiveAppServices } from "./liveAppServices.js";
 
 function object(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+}
+
+function stringOrEmpty(value: unknown): string {
+  return String(value ?? "");
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+function attachmentNames(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter(isString) : [];
+}
+
+function askRequest(raw: unknown): AskRequest {
+  const args = object(raw);
+  return {
+    chatId: stringOrEmpty(args.chatId),
+    question: stringOrEmpty(args.question),
+    attachments: attachmentNames(args.attachments),
+    askId: stringOrEmpty(args.askId),
+    viewing: isString(args.viewing) ? args.viewing : null,
+    privacyBypass: args.privacyBypass === true,
+  };
+}
+
+function chatTurnScope(model: string): ToolScope {
+  return runsOnThisMac(model) ? { kind: "LocalEngine" } : { kind: "CloudEngine" };
+}
+
+function openChatTurnRoom(state: RoomManagerState): Room {
+  const open = state.room;
+  if (!open) throw new Error("No room is open.");
+  return open;
+}
+
+interface ChatTurnInvocation {
+  state: RoomManagerState;
+  emit: EventSender;
+  mcpRuntime: McpRuntime;
+  services?: LiveAppServices;
+  roomSource: ReturnType<typeof liveTurnRoomSource>;
+}
+
+interface ChatTurnSetup {
+  invocation: ChatTurnInvocation;
+  request: AskRequest;
+  open: Room;
+  scope: ToolScope;
+  evidencePolicy: ReturnType<typeof turnEvidencePolicyForQuestion>;
+  online: boolean;
+  effects: ReturnType<typeof createToolEffects>;
 }
 
 /**
@@ -58,6 +110,86 @@ export function noToolsDispatcher(): ToolDispatcher {
   };
 }
 
+function chatTurnDispatcher(setup: ChatTurnSetup): ToolDispatcher {
+  if (setup.evidencePolicy === "no-tools-no-sources") return noToolsDispatcher();
+  return roomServerDispatcherFactory(setup.invocation.state, setup.invocation.emit, setup.invocation.services)(
+    setup.online,
+    setup.scope,
+    WEB_LANES_ALL,
+    {
+      ...chatTurnBridgeRunOptions(setup.open, setup.request.privacyBypass),
+      sharedEffects: setup.effects,
+    },
+  );
+}
+
+async function groundImage(
+  { model: chatModel, question, image }: Parameters<NonNullable<AskDeps["groundingPass"]>>[0],
+): ReturnType<NonNullable<AskDeps["groundingPass"]>> {
+  const models = await listModels();
+  const visionModel = await groundingPick(models, chatModel);
+  if (visionModel === null) return null;
+  const prepared = await prepareImage(image.bytes);
+  const boxes = await groundPreparedImage(
+    visionModel,
+    chatModel,
+    prepared.bytes,
+    question,
+    prepared.width,
+    prepared.height,
+  );
+  return { fileId: image.fileId, name: image.name, boxes };
+}
+
+function askDependencies(
+  invocation: ChatTurnInvocation,
+  bridge: RunningBridge,
+  effects: ReturnType<typeof createToolEffects>,
+): AskDeps {
+  return {
+    room: invocation.roomSource,
+    cancelState: invocation.state.cancel,
+    send: invocation.emit,
+    mcp: () => ({
+      url: `http://127.0.0.1:${bridge.port}/mcp`,
+      token: bridge.token,
+    }),
+    connectedMcpServers: () => invocation.mcpRuntime.manager.servers
+      .filter((server) => server.status === "connected")
+      .map((server) => server.name),
+    embedQuestion,
+    runsOnThisMac,
+    detectedAdvisors: detectedExternal,
+    privacyActive: () => activePolicy() !== null,
+    privacyPolicy: activePolicy,
+    chatModelSeesImages,
+    effects,
+    groundingPass: groundImage,
+    notifyFilesChanged: () => invocation.emit("room-files-changed", {}),
+  };
+}
+
+async function askThroughBridge(setup: ChatTurnSetup) {
+  const dispatcher = chatTurnDispatcher(setup);
+  let bridge: RunningBridge | null = null;
+  try {
+    bridge = await createRoomBridge({ scope: setup.scope, dispatcher });
+    return await ask(setup.request, askDependencies(setup.invocation, bridge, setup.effects));
+  } finally {
+    await bridge?.stopAndWait().catch(() => {});
+  }
+}
+
+async function runChatTurn(raw: unknown, invocation: ChatTurnInvocation) {
+  const request = askRequest(raw);
+  const open = openChatTurnRoom(invocation.state);
+  const evidencePolicy = turnEvidencePolicyForQuestion(open.conn, request.question);
+  const scope = chatTurnScope(modelSetting(open.conn) ?? "");
+  const online = webAccessEnabled(open.conn);
+  const effects = createToolEffects();
+  return askThroughBridge({ invocation, request, open, scope, evidencePolicy, online, effects });
+}
+
 export function registerChatTurnSurfaceIpc(
   ipcMain: Pick<IpcMain, "handle">,
   state: RoomManagerState,
@@ -66,90 +198,9 @@ export function registerChatTurnSurfaceIpc(
   services?: LiveAppServices,
 ): void {
   const roomSource = liveTurnRoomSource(state);
+  const invocation = { state, emit, mcpRuntime, services, roomSource };
 
-  ipcMain.handle("ask", async (_event: IpcMainInvokeEvent, raw: unknown) => {
-    const args = object(raw);
-    const open = state.room;
-    if (!open) throw new Error("No room is open.");
-    const request: AskRequest = {
-      chatId: String(args.chatId ?? ""),
-      question: String(args.question ?? ""),
-      attachments: Array.isArray(args.attachments)
-        ? args.attachments.filter((value): value is string => typeof value === "string")
-        : [],
-      askId: String(args.askId ?? ""),
-      viewing: typeof args.viewing === "string" ? args.viewing : null,
-      privacyBypass: args.privacyBypass === true,
-    };
-    const evidencePolicy = turnEvidencePolicyForQuestion(open.conn, request.question);
-    const model = modelSetting(open.conn) ?? "";
-    const scope = runsOnThisMac(model)
-      ? { kind: "LocalEngine" as const }
-      : { kind: "CloudEngine" as const };
-    const online = webAccessEnabled(open.conn);
-    // The sidecar calls room tools over this bridge, while turnEngine owns the
-    // provider-bound image queue. They must share one sink or a successful
-    // read_drawing/view_file_image call loses its PNG at the bridge boundary.
-    const effects = createToolEffects();
-    // This bridge exists only for this user-started chat turn. Workspace
-    // writes still go through the path-safe, atomic WorkspaceService and the
-    // factory clamps the grant off when another process owns the room lease.
-    // The same explicit one-turn privacy approval used by ask() must also
-    // reach its file tools; otherwise their results stay redacted mid-turn.
-    const dispatcher = evidencePolicy === "no-tools-no-sources"
-      ? noToolsDispatcher()
-      : roomServerDispatcherFactory(state, emit, services)(
-          online,
-          scope,
-          WEB_LANES_ALL,
-          {
-            ...chatTurnBridgeRunOptions(open, request.privacyBypass),
-            sharedEffects: effects,
-          },
-        );
-    let bridge: RunningBridge | null = null;
-    try {
-      bridge = await createRoomBridge({ scope, dispatcher });
-      const running = bridge;
-      return await ask(request, {
-        room: roomSource,
-        cancelState: state.cancel,
-        send: emit,
-        mcp: () => ({
-          url: `http://127.0.0.1:${running.port}/mcp`,
-          token: running.token,
-        }),
-        connectedMcpServers: () => mcpRuntime.manager.servers
-          .filter((server) => server.status === "connected")
-          .map((server) => server.name),
-        embedQuestion,
-        runsOnThisMac,
-        detectedAdvisors: detectedExternal,
-        privacyActive: () => activePolicy() !== null,
-        privacyPolicy: activePolicy,
-        chatModelSeesImages,
-        effects,
-        groundingPass: async ({ model: chatModel, question, image }) => {
-          const models = await listModels();
-          const visionModel = await groundingPick(models, chatModel);
-          if (visionModel === null) return null;
-          const prepared = await prepareImage(image.bytes);
-          const boxes = await groundPreparedImage(
-            visionModel,
-            chatModel,
-            prepared.bytes,
-            question,
-            prepared.width,
-            prepared.height,
-          );
-          return { fileId: image.fileId, name: image.name, boxes };
-        },
-        notifyFilesChanged: () => emit("room-files-changed", {}),
-      });
-    } finally {
-      await bridge?.stopAndWait().catch(() => {});
-    }
-  });
+  ipcMain.handle("ask", (_event: IpcMainInvokeEvent, raw: unknown) => runChatTurn(raw, invocation));
 
   ipcMain.handle("handoff_chat", (_event: IpcMainInvokeEvent, raw: unknown) =>
     handoffChat(String(object(raw).chatId ?? ""), { room: roomSource }));

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createRoomManagerState, type RoomManagerDeps } from "../roomManager.js";
 import { setRecMeta } from "../db-host/recordings.js";
 import { registerFileRuntimeSurfaceIpc } from "../fileRuntimeSurfaceIpc.js";
@@ -134,6 +134,198 @@ describe("workspace content cutover", () => {
       expect(db.prepare(
         "SELECT phase FROM fs_operations WHERE operation_id = ?",
       ).get(operationId)).toEqual({ phase: "completed" });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("preserves a changed interrupted destination and repairs the blob at a new path", async () => {
+    const { root, db, workspace } = await fixture();
+    const id = "changed-agent-artifact";
+    const name = "Recovered report.md";
+    const recovered = Buffer.from("# Recovered agent output\n");
+    const interrupted = Buffer.from("# User changed this file\n");
+    const hash = createHash("sha256").update(recovered).digest("hex");
+    db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, storage_kind)
+       VALUES (?, ?, 'text/markdown', ?, 'generated', ?, 'blob')`,
+    ).run(id, name, recovered.length, recovered);
+    await writeFile(path.join(root, name), interrupted);
+    const operationId = randomUUID();
+    db.prepare(
+      `INSERT INTO fs_operations(
+         operation_id, operation_type, phase, file_id, new_path, new_hash
+       ) VALUES (?, 'repair_live_blob', 'filesystem_committed', ?, ?, ?)`,
+    ).run(operationId, id, name, hash);
+
+    try {
+      await expect(workspace.materializeLiveBlobFile(id)).resolves.toBe(true);
+      expect(await readFile(path.join(root, name))).toEqual(interrupted);
+      expect(await readFile(path.join(root, "Recovered report (2).md"))).toEqual(recovered);
+      expect(db.prepare(
+        "SELECT phase, error FROM fs_operations WHERE operation_id = ?",
+      ).get(operationId)).toEqual({
+        phase: "failed",
+        error: "Interrupted repair destination changed; preserved it and selected a new path.",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("records an unsafe interrupted path before restoring the blob normally", async () => {
+    const { root, db, workspace } = await fixture();
+    const id = "unsafe-interrupted-agent-artifact";
+    const name = "Unsafe recovery.md";
+    const bytes = Buffer.from("# Recover safely\n");
+    db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, storage_kind)
+       VALUES (?, ?, 'text/markdown', ?, 'generated', ?, 'blob')`,
+    ).run(id, name, bytes.length, bytes);
+    const operationId = randomUUID();
+    db.prepare(
+      `INSERT INTO fs_operations(
+         operation_id, operation_type, phase, file_id, new_path, new_hash
+       ) VALUES (?, 'repair_live_blob', 'filesystem_committed', ?, '../outside.md', 'unused')`,
+    ).run(operationId, id);
+
+    try {
+      await expect(workspace.materializeLiveBlobFile(id)).resolves.toBe(true);
+      expect(await readFile(path.join(root, name))).toEqual(bytes);
+      expect(db.prepare(
+        "SELECT phase, error FROM fs_operations WHERE operation_id = ?",
+      ).get(operationId)).toEqual({
+        phase: "failed",
+        error: "Interrupted repair destination could not be safely adopted; preserved it and selected a new path.",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("removes a published repair when its database commit is rejected", async () => {
+    const { root, db, workspace } = await fixture();
+    const id = "commit-rejected-agent-artifact";
+    const name = "Commit rejected.md";
+    const bytes = Buffer.from("# Recovery must clean up\n");
+    db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, storage_kind)
+       VALUES (?, ?, 'text/markdown', ?, 'generated', ?, 'blob')`,
+    ).run(id, name, bytes.length, bytes);
+    db.exec(
+      `CREATE TRIGGER reject_live_blob_commit BEFORE UPDATE ON files
+       WHEN NEW.id = '${id}' BEGIN SELECT RAISE(FAIL, 'commit rejected'); END`,
+    );
+
+    try {
+      await expect(workspace.materializeLiveBlobFile(id)).rejects.toThrow("commit rejected");
+      await expect(readFile(path.join(root, name))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(db.prepare(
+        "SELECT phase, error FROM fs_operations WHERE file_id = ? ORDER BY rowid DESC LIMIT 1",
+      ).get(id)).toMatchObject({ phase: "failed", error: "commit rejected" });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("uses the legacy folder name when materializing a blob", async () => {
+    const { root, db, workspace } = await fixture();
+    const id = "foldered-agent-artifact";
+    const bytes = Buffer.from("# Foldered recovery\n");
+    db.prepare("INSERT INTO folders(id, name) VALUES ('legacy-folder', 'Recovered output')").run();
+    db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, storage_kind, folder_id)
+       VALUES (?, 'Agent report.md', 'text/markdown', ?, 'generated', ?, 'blob', 'legacy-folder')`,
+    ).run(id, bytes.length, bytes);
+
+    try {
+      await expect(workspace.materializeLiveBlobFile(id)).resolves.toBe(true);
+      expect(await readFile(path.join(root, "Recovered output", "Agent report.md"))).toEqual(bytes);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("fails a repair when blob bytes disappear after validation", async () => {
+    const { root, db, workspace } = await fixture();
+    const id = "lost-bytes-agent-artifact";
+    const name = "Lost bytes.md";
+    const bytes = Buffer.from("# Bytes that disappear\n");
+    db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, storage_kind)
+       VALUES (?, ?, 'text/markdown', ?, 'generated', ?, 'blob')`,
+    ).run(id, name, bytes.length, bytes);
+    const originalPrepare = db.prepare.bind(db);
+    const prepare = vi.spyOn(db, "prepare").mockImplementation((source) => {
+      if (source.startsWith("SELECT substr(original_bytes")) {
+        return { get: () => ({ chunk: null }) } as ReturnType<typeof db.prepare>;
+      }
+      return originalPrepare(source);
+    });
+
+    try {
+      await expect(workspace.materializeLiveBlobFile(id)).rejects.toThrow("bytes disappeared");
+      await expect(readFile(path.join(root, name))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(db.prepare(
+        "SELECT phase, error FROM fs_operations WHERE file_id = ? ORDER BY rowid DESC LIMIT 1",
+      ).get(id)).toMatchObject({ phase: "failed", error: "The database-only file bytes disappeared during recovery." });
+    } finally {
+      prepare.mockRestore();
+      db.close();
+    }
+  });
+
+  it("cleans a repair whose stable blob row changes before commit", async () => {
+    const { root, db, workspace } = await fixture();
+    const id = "changed-row-agent-artifact";
+    const name = "Changed row.md";
+    const bytes = Buffer.from("# Row changed\n");
+    db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, storage_kind)
+       VALUES (?, ?, 'text/markdown', ?, 'generated', ?, 'blob')`,
+    ).run(id, name, bytes.length, bytes);
+    const originalPrepare = db.prepare.bind(db);
+    const prepare = vi.spyOn(db, "prepare").mockImplementation((source) => {
+      if (source.includes("UPDATE files SET name = ?")) {
+        return { run: () => ({ changes: 0 }) } as ReturnType<typeof db.prepare>;
+      }
+      return originalPrepare(source);
+    });
+
+    try {
+      await expect(workspace.materializeLiveBlobFile(id)).rejects.toThrow("changed while it was being restored");
+      await expect(readFile(path.join(root, name))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(db.prepare(
+        "SELECT phase, error FROM fs_operations WHERE file_id = ? ORDER BY rowid DESC LIMIT 1",
+      ).get(id)).toMatchObject({ phase: "failed", error: "The database-only file changed while it was being restored." });
+    } finally {
+      prepare.mockRestore();
+      db.close();
+    }
+  });
+
+  it("refuses a blob repair after every reserved recovery path is occupied", async () => {
+    const { db, workspace } = await fixture();
+    const id = "no-path-agent-artifact";
+    const name = "occupied.md";
+    const bytes = Buffer.from("# No free path\n");
+    const occupy = db.prepare(
+      `INSERT INTO files(id, name, size_bytes, source, storage_kind, relative_path, path_key)
+       VALUES (?, ?, 0, 'generated', 'workspace', ?, ?)`,
+    );
+    db.transaction(() => {
+      for (let number = 1; number <= 10_000; number += 1) {
+        const candidate = number === 1 ? name : `occupied (${number}).md`;
+        occupy.run(`occupied-${number}`, candidate, candidate, candidate);
+      }
+    })();
+    db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, storage_kind)
+       VALUES (?, ?, 'text/markdown', ?, 'generated', ?, 'blob')`,
+    ).run(id, name, bytes.length, bytes);
+
+    try {
+      await expect(workspace.materializeLiveBlobFile(id)).rejects.toThrow("Could not create a unique workspace path");
     } finally {
       db.close();
     }
@@ -456,6 +648,73 @@ describe("workspace content cutover", () => {
     } finally {
       db.close();
     }
+  });
+
+  it("projects every read route and standard move through workspace storage", async () => {
+    const { state, db } = await fixture();
+    const bridge = createWorkspaceMcpBridge(state, true);
+
+    try {
+      expect(await bridge.call("standard_create", { name: "top.txt", content: "top" }))
+        .toMatchObject({ path: "/top.txt", created: true });
+      expect(await bridge.call("standard_create", { name: "nested/entry.txt", content: "one\ntwo" }))
+        .toMatchObject({ path: "/nested/entry.txt", created: true });
+      expect(await bridge.call("standard_move", { name: "entry", folder: "archive" }))
+        .toEqual({ old_path: "/nested/entry.txt", path: "/archive/entry.txt" });
+
+      expect(await bridge.call("list", { path: "/" })).toEqual(expect.objectContaining({
+        entries: expect.arrayContaining([
+          expect.objectContaining({ path: "/archive/", is_dir: true }),
+          expect.objectContaining({ path: "/top.txt", is_dir: false, size: 3 }),
+        ]),
+      }));
+      expect(await bridge.call("read", { path: "/archive/entry.txt", offset: 1, limit: 1 }))
+        .toMatchObject({ file_data: { content: "two" }, total_lines: 2, start_line: 2, end_line: 2, next_offset: null });
+      expect(await bridge.call("glob", { path: "/archive", pattern: "*.txt" }))
+        .toMatchObject({ matches: [{ path: "/archive/entry.txt", is_dir: false }] });
+      expect(await bridge.call("grep", { path: "/archive", pattern: "two", max_count: 1 }))
+        .toMatchObject({ matches: [{ path: "/archive/entry.txt", line: 2, text: "two" }], truncated: true });
+      expect(await bridge.call("standard_unsupported", {})).toEqual({
+        error: "This multi-file or structured edit is not available for workspace rooms yet.",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("returns MCP validation and storage failures without mutating workspace files", async () => {
+    const { root, state, db, workspace } = await fixture();
+    const bridge = createWorkspaceMcpBridge(state, true);
+
+    try {
+      await workspace.createFile("source.pdf", Readable.from([Buffer.from([0xff])]), "agent");
+      expect(await bridge.call("read", { path: "/source.pdf" }))
+        .toEqual({ error: "This workspace tool reads text files only." });
+
+      await workspace.createFile("repeated.txt", Readable.from(["same same"]), "agent");
+      expect(await bridge.call("edit", {
+        path: "/repeated.txt",
+        old_string: "same",
+        new_string: "different",
+      })).toEqual({ error: "The old text is not unique." });
+      expect(await readFile(path.join(root, "repeated.txt"), "utf8")).toBe("same same");
+
+      db.prepare("UPDATE files SET content_sha256 = NULL WHERE relative_path = 'repeated.txt'").run();
+      expect(await bridge.call("standard_write", { name: "repeated.txt", content: "updated" }))
+        .toEqual({ path: "/repeated.txt", occurrences: 1 });
+      expect(await readFile(path.join(root, "repeated.txt"), "utf8")).toBe("updated");
+      expect(await bridge.call("read", { path: "../outside.txt" }))
+        .toEqual({ error: "A file path cannot leave the room." });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("returns unavailable workspace errors from standard create", async () => {
+    const bridge = createWorkspaceMcpBridge(createRoomManagerState(), true);
+
+    expect(await bridge.call("standard_create", { name: "unavailable.txt" }))
+      .toEqual({ error: "This room does not expose normal workspace files." });
   });
 
   it("moves and renames binary workspace files without text conversion", async () => {

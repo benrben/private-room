@@ -25,6 +25,7 @@ from __future__ import annotations
 import pytest
 
 from conftest import FakeChatModel, FakeMCP, Round, call, drive, make_request, specs
+import arcelle_sidecar.planner as planner
 from arcelle_sidecar.agents import (
     ALL_REGISTRY_TOOLS,
     BATCH_TOOL_NAME,
@@ -41,6 +42,15 @@ from arcelle_sidecar.planner import (
     build_plan,
     is_static_visual_intent,
     is_visual_video_intent,
+)
+from arcelle_sidecar.prompts import (
+    PLAN_CALL_BATCH,
+    PLAN_CALL_SINGLE,
+    PLAN_NOTE_TEMPLATE,
+    PLAN_REMAINDER_NOTE,
+    PLAN_REMAINDER_ROOM_HINT,
+    PLAN_UNAVAILABLE_NOTE,
+    plan_note,
 )
 
 # The tiers the Rust bridge really serves (room_mcp::ToolScope), same shape as
@@ -69,6 +79,47 @@ REQUESTS = [
     "open the Room Map",
     "hi there",
 ]
+
+
+def test_plan_note_preserves_complete_section_order_and_formatting() -> None:
+    steps = [
+        ("Web agent", "the web", "find rents", False),
+        ("File agent", "this room", "save findings", True),
+    ]
+
+    expected = PLAN_NOTE_TEMPLATE.format(
+        steps=(
+            "1. Web agent (the web) — find rents\n"
+            "2. File agent (this room) — save findings [needs step 1]"
+        ),
+        call=PLAN_CALL_BATCH.format(batch="ask_agents"),
+    )
+    expected += PLAN_UNAVAILABLE_NOTE.format(parts='Video agent — "inspect clip"')
+    expected += PLAN_REMAINDER_NOTE.format(parts='"say thanks"')
+    expected += PLAN_REMAINDER_ROOM_HINT.format(tool="ask_file_agent")
+
+    assert plan_note(
+        steps,
+        tools=["ask_web_agent", "ask_file_agent"],
+        batch_tool="ask_agents",
+        unavailable=(("Video agent", "inspect clip"),),
+        unplanned=("say thanks",),
+        default_tool="ask_file_agent",
+    ) == expected
+
+
+def test_plan_note_preserves_single_and_empty_edge_cases() -> None:
+    single = [("File agent", "this room", "read lease", False)]
+    assert plan_note(single, tools=["ask_file_agent"], batch_tool="ask_agents") == (
+        PLAN_NOTE_TEMPLATE.format(
+            steps="1. File agent (this room) — read lease",
+            call=PLAN_CALL_SINGLE.format(tool="ask_file_agent"),
+        )
+    )
+    assert plan_note([], tools=[], batch_tool="ask_agents") == ""
+    assert plan_note(
+        [], tools=[], batch_tool="ask_agents", unplanned=("say thanks",)
+    ) == PLAN_REMAINDER_NOTE.format(parts='"say thanks"')
 
 
 @pytest.mark.parametrize(
@@ -367,6 +418,22 @@ def test_a_room_with_no_specialists_is_not_given_a_plan_at_all() -> None:
     assert plan.reason == "no-specialists"
     assert plan.steps == () and plan.unavailable == ()
     assert plan.note == ""
+
+
+def test_a_stale_domain_pick_becomes_an_abstention_not_a_dead_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The defensive remainder path keeps a changed registry from naming a dead tool."""
+    monkeypatch.setattr(planner, "_pick", lambda *_, **__: ("domain", "gone"))
+
+    plan = build_plan(
+        "search the web for rents",
+        web_enabled=True,
+        served_names=set(_EVERYTHING),
+    )
+
+    assert plan.reason == "abstained"
+    assert plan.steps == ()
 
 
 def test_one_broad_lane_word_is_not_a_plan() -> None:

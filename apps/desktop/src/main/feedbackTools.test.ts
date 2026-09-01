@@ -189,6 +189,15 @@ describe("feedbackDraft", () => {
     );
   });
 
+  it("maps even a synchronous injected model-list failure to the unavailable-model sentence", async () => {
+    const listModels = (() => {
+      throw new Error("immediate test double failure");
+    }) as unknown as NonNullable<FeedbackDraftDeps["listModels"]>;
+    await expect(feedbackDraft({ rooms: noRoom, listModels }, "it crashed")).rejects.toThrow(
+      "The local AI (Ollama) isn't running — you can still write the issue yourself."
+    );
+  });
+
   it("no installed models reads as the no-model-installed sentence", async () => {
     await expect(
       feedbackDraft({ rooms: noRoom, listModels: async () => [] }, "it crashed")
@@ -205,6 +214,15 @@ describe("feedbackDraft", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.path).toBe("/feedback_draft");
     expect((calls[0]?.body as { model: string }).model).toBe("qwen3.5:4b-mlx");
+  });
+
+  it("skips embedding and external tags when the tuned default is not installed", async () => {
+    const { post, calls } = fakePost({ kind: "value", value: { title: "t", body: "b" } });
+    await feedbackDraft(
+      { rooms: noRoom, listModels: async () => ["nomic-embed-text", "claude-cli", "llama3.2:3b"], post },
+      "the app crashed on launch"
+    );
+    expect((calls[0]?.body as { model: string }).model).toBe("llama3.2:3b");
   });
 
   it("sends the trimmed text, plus the resolved base_url, on the wire body", async () => {
@@ -299,6 +317,20 @@ describe("feedbackDraft", () => {
     await expect(
       feedbackDraft({ rooms: noRoom, listModels: async () => ["qwen3.5:4b"], post }, "a bug")
     ).rejects.toThrow(/never happen/);
+  });
+
+  it("gives each sidecar call a fresh, unset cancellation flag", async () => {
+    const flags: import("./cancel.js").CancelFlag[] = [];
+    const post: NonNullable<FeedbackDraftDeps["post"]> = async (_path, _body, cancel) => {
+      flags.push(cancel);
+      expect(cancel.load()).toBe(false);
+      return { kind: "value", value: { title: "t", body: "b" } };
+    };
+    const deps = { rooms: noRoom, listModels: async () => ["qwen3.5:4b"], post };
+    await feedbackDraft(deps, "first");
+    await feedbackDraft(deps, "second");
+    expect(flags).toHaveLength(2);
+    expect(flags[0]).not.toBe(flags[1]);
   });
 
   // ------------------------------------------------------------- real wire

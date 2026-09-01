@@ -222,6 +222,41 @@ async def test_non_200_raises() -> None:
             await mcp.list_tools()
 
 
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (httpx.Response(200, content=b"not JSON"), "non-JSON"),
+        (httpx.Response(200, json=[]), "no result"),
+        (httpx.Response(200, json={}), "no result"),
+    ],
+)
+async def test_malformed_rpc_replies_keep_their_protocol_errors(
+    response: httpx.Response, message: str
+) -> None:
+    async with McpClient(URL, TOKEN, client=bridge(lambda request: response)) as mcp:
+        with pytest.raises(McpError, match=message):
+            await mcp._rpc("ping")
+
+
+async def test_a_string_jsonrpc_error_is_preserved() -> None:
+    async with McpClient(
+        URL,
+        TOKEN,
+        client=bridge(lambda request: httpx.Response(200, json={"error": "bridge down"})),
+    ) as mcp:
+        with pytest.raises(McpError, match="bridge down"):
+            await mcp._rpc("ping")
+
+
+async def test_transport_errors_still_propagate_from_httpx() -> None:
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("bridge unavailable", request=request)
+
+    async with McpClient(URL, TOKEN, client=bridge(unreachable)) as mcp:
+        with pytest.raises(httpx.ConnectError, match="bridge unavailable"):
+            await mcp._rpc("ping")
+
+
 async def test_call_ids_increment() -> None:
     http = bridge()
     async with McpClient(URL, TOKEN, client=http) as mcp:

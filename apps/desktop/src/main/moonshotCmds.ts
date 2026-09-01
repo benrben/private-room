@@ -165,16 +165,25 @@ export async function resolveStructuredModel(
   rooms: RoomSource,
   deps: ResolveStructuredModelDeps = {}
 ): Promise<string | undefined> {
-  const room = rooms.currentRoom();
-  const explicit = room !== null ? modelSetting(room.db) : null;
-  if (explicit !== null && isExternalEngine(explicit)) {
-    return explicit;
-  }
+  const explicit = structuredModelSetting(rooms);
+  const external = externalStructuredModel(explicit);
+  if (external !== null) return external;
   const listModels = deps.listModels ?? listModelsReal;
   const models = await listModels();
-  if (models.length === 0) {
-    return undefined;
-  }
+  return resolvedLocalModel(explicit, models);
+}
+
+function structuredModelSetting(rooms: RoomSource): string | null {
+  const room = rooms.currentRoom();
+  return room === null ? null : modelSetting(room.db);
+}
+
+function externalStructuredModel(explicit: string | null): string | null {
+  return explicit !== null && isExternalEngine(explicit) ? explicit : null;
+}
+
+function resolvedLocalModel(explicit: string | null, models: readonly string[]): string | undefined {
+  if (models.length === 0) return undefined;
   return explicit ?? bestLocalDefault(models);
 }
 
@@ -268,32 +277,36 @@ export async function ensureEmbedModel(
   onProgress: PullProgressListener,
   deps: EnsureEmbedModelDeps = {}
 ): Promise<void> {
+  const available = await embedModelAvailable(onProgress, deps);
+  if (available) stampEmbedModel(rooms);
+  startEmbeddingBackfill(deps);
+}
+
+async function embedModelAvailable(
+  onProgress: PullProgressListener,
+  deps: EnsureEmbedModelDeps
+): Promise<boolean> {
   const listModels = deps.listModels ?? listModelsReal;
   const models = await listModels();
-  const present = models.some((m) => m.startsWith(EMBED_MODEL));
+  if (models.some((model) => model.startsWith(EMBED_MODEL))) return true;
+  const pullCancellable = deps.pullCancellable ?? pullCancellableReal;
+  const outcome = await pullCancellable(EMBED_MODEL, new CancelFlag(), onProgress);
+  return outcome.kind === "ok";
+}
 
-  let available: boolean;
-  if (present) {
-    available = true;
-  } else {
-    const pullCancellable = deps.pullCancellable ?? pullCancellableReal;
-    const outcome = await pullCancellable(EMBED_MODEL, new CancelFlag(), onProgress);
-    available = outcome.kind === "ok";
-  }
+function stampEmbedModel(rooms: RoomSource): void {
+  const room = rooms.currentRoom();
+  if (room === null) return;
+  trySetMeta(room.db, "embed_model", EMBED_MODEL);
+  trySetMeta(room.db, "embed_dim", "768");
+}
 
-  if (available) {
-    const room = rooms.currentRoom();
-    if (room !== null) {
-      trySetMeta(room.db, "embed_model", EMBED_MODEL);
-      trySetMeta(room.db, "embed_dim", "768");
-    }
-  }
-
-  if (deps.spawnEmbeddingBackfill) {
+function startEmbeddingBackfill(deps: EnsureEmbedModelDeps): void {
+  if (deps.spawnEmbeddingBackfill !== undefined) {
     deps.spawnEmbeddingBackfill();
-  } else {
-    logSpawnEmbeddingBackfillSkipped();
+    return;
   }
+  logSpawnEmbeddingBackfillSkipped();
 }
 
 /** `let _ = db::set_meta(&room.conn, ...)` — a failed stamp must never make

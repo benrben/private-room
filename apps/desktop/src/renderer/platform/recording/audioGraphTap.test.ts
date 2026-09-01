@@ -79,11 +79,14 @@ describe("openPcmTap — fallback ladder", () => {
   it("falls back to ScriptProcessor when addWorkletModule rejects", async () => {
     const ctx = fakeAudioContext({ sampleRate: 2, workletModuleFailure: "CSP refused the module" });
     const onFrame = vi.fn();
-    await openPcmTap({ audioContext: ctx, firstFrameTimeoutMs: 5 }, fakeMediaStream(), onFrame);
+    const teardown = await openPcmTap({ audioContext: ctx, firstFrameTimeoutMs: 5 }, fakeMediaStream(), onFrame);
     expect(ctx.workletNodes).toHaveLength(0);
     expect(ctx.scriptProcessorNodes).toHaveLength(1);
     ctx.scriptProcessorNodes[0]!.emitProcess(new Float32Array([0.9, 0.8]));
     expect(onFrame).toHaveBeenCalled();
+    teardown();
+    expect(ctx.scriptProcessorNodes[0]!.onaudioprocess).toBeNull();
+    expect(ctx.scriptProcessorNodes[0]!.disconnectCalls).toBe(1);
   });
 
   it("rebuilds on the fallback when the worklet dies after loading, losing no pending batch", async () => {
@@ -189,6 +192,26 @@ function realCtxStub(): {
 }
 
 describe("adaptAudioContext", () => {
+  it("exposes the current fabricated ScriptProcessor and worklet handlers through their Like getters", () => {
+    const stub = realCtxStub();
+    const adapted = adaptAudioContext(stub.ctx as unknown as AudioContext);
+    const script = adapted.createScriptProcessor(4096, 1, 1);
+    const onProcess = vi.fn();
+    expect(script.onaudioprocess).toBeNull();
+    script.onaudioprocess = onProcess;
+    expect(script.onaudioprocess).toBe(onProcess);
+
+    const worklet = adapted.createWorkletNode("fabricated-processor");
+    const onMessage = vi.fn();
+    const onError = vi.fn();
+    expect(worklet.port.onmessage).toBeNull();
+    expect(worklet.onprocessorerror).toBeNull();
+    worklet.port.onmessage = onMessage;
+    worklet.onprocessorerror = onError;
+    expect(worklet.port.onmessage).toBe(onMessage);
+    expect(worklet.onprocessorerror).toBe(onError);
+  });
+
   it("hands a real node's connect() the REAL destination node, never the Like wrapper", async () => {
     const stub = realCtxStub();
     const adapted = adaptAudioContext(stub.ctx as unknown as AudioContext);

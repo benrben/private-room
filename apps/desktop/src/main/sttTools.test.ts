@@ -548,6 +548,27 @@ describe("sttDownloadModelAt", () => {
     return { body, wasCancelled: () => cancelled };
   }
 
+  it("keeps only the first four model bytes while a multi-chunk body continues", async () => {
+    const model = ggmlBody(16);
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(model.subarray(0, 2));
+        controller.enqueue(model.subarray(2, 4));
+        controller.enqueue(model.subarray(4));
+        controller.close();
+      },
+    });
+    const fetchImpl: typeof fetch = async () => Promise.resolve(new Response(body, { status: 200 }));
+    const dest = path.join(scratch, MODEL_FILE);
+
+    await sttDownloadModelAt("https://example.invalid/m", dest, new SttModelState(), undefined, {
+      deps: { exists: () => false, fetchImpl },
+      minBytes: 1,
+    });
+
+    expect(fs.readFileSync(dest)).toEqual(model);
+  });
+
   it("releases the transfer when Stop lands mid-stream, instead of leaving it on the wire", async () => {
     const state = new SttModelState();
     const { body, wasCancelled } = observableBody([new Uint8Array(ggmlBody(64))], {

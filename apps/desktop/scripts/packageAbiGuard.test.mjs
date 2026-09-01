@@ -33,8 +33,10 @@ describe("package.sh native-module ABI guard", () => {
     expect(script).toContain('PACKAGED_APP="$PWD/release/mac-arm64/Arcelle.app"');
     expect(script).toContain('"$PACKAGED_APP/Contents/MacOS/Arcelle" -e');
     expect(script).toContain(
-      'npm run build-release --prefix "../../node_modules/${NATIVE_MODULE}"',
+      'NATIVE_MODULE_DIR="$(node -p "require(\'path\').dirname(require.resolve(\'${NATIVE_MODULE}/package.json\'))")"',
     );
+    expect(script).toContain('npm run build-release --prefix "$NATIVE_MODULE_DIR"');
+    expect(script).not.toContain('npm run build-release --prefix "../../node_modules/${NATIVE_MODULE}"');
     expect(script).not.toContain("npm rebuild");
     // Builder's generic dependency pass must not replace the exact binary the
     // forced electron-rebuild above just proved (the 137-vs-148 regression).
@@ -59,8 +61,10 @@ describe("package.sh native-module ABI guard", () => {
       "SKIP_BUILD=1 npm run e2e:qa -- --spec tests/e2e/qa/cloud-video-privacy.e2e.mjs",
     );
     expect(e2eScript).toContain(
-      'npm run build-release --prefix "../../node_modules/${NATIVE_MODULE}"',
+      'NATIVE_MODULE_DIR="$(node -p "require(\'path\').dirname(require.resolve(\'${NATIVE_MODULE}/package.json\'))")"',
     );
+    expect(e2eScript).toContain('npm run build-release --prefix "$NATIVE_MODULE_DIR"');
+    expect(e2eScript).not.toContain('npm run build-release --prefix "../../node_modules/${NATIVE_MODULE}"');
     expect(e2eScript).not.toContain("npm rebuild");
     expect(e2eScript).toContain("ELECTRON_RUN_AS_NODE=1");
   });

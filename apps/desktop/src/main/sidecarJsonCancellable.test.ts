@@ -26,6 +26,11 @@ import {
   type SidecarError,
 } from "./sidecarJsonCancellable.js";
 
+async function closeServer(server: http.Server): Promise<void> {
+  server.closeAllConnections();
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
 describe("sidecarErrorSentinel", () => {
   // Ported from `SidecarError::sentinel`'s own doc: this is what makes
   // `file_pass.rs`/`summarize.rs`/`vision.rs` match exactly what they
@@ -85,6 +90,7 @@ describe("humanizeEmptyGeneration", () => {
 describe("sidecarJsonCancellable", () => {
   afterEach(() => {
     vi.mocked(ensureUp).mockReset();
+    vi.unstubAllGlobals();
   });
 
   it("checks cancellation before touching the network at all", async () => {
@@ -120,7 +126,7 @@ describe("sidecarJsonCancellable", () => {
       const outcome = await sidecarJsonCancellable("/file_pass_map", { window: 3 }, new CancelFlag());
       expect(outcome).toEqual({ kind: "value", value: { echo: { window: 3 } } });
     } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await closeServer(server);
     }
   });
 
@@ -139,7 +145,7 @@ describe("sidecarJsonCancellable", () => {
         error: { code: "MODEL_MISSING", error: "qwen3.5:4b is not pulled", status: 422 },
       });
     } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await closeServer(server);
     }
   });
 
@@ -158,8 +164,84 @@ describe("sidecarJsonCancellable", () => {
         error: { code: "ENGINE_ERROR", error: "unknown error", status: 500 },
       });
     } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await closeServer(server);
     }
+  });
+
+  it("classifies a refused sidecar connection through its cause chain", async () => {
+    vi.mocked(ensureUp).mockResolvedValue("http://sidecar.test");
+    const refused = Object.assign(new Error("connect ECONNREFUSED"), {
+      cause: { code: "ECONNREFUSED" },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(refused));
+
+    await expect(sidecarJsonCancellable("/file_pass_map", {}, new CancelFlag())).resolves.toEqual({
+      kind: "error",
+      error: { code: "OLLAMA_DOWN", error: "connect ECONNREFUSED", status: 0 },
+    });
+  });
+
+  it("keeps a non-refused, non-Error fetch failure as ENGINE_ERROR", async () => {
+    vi.mocked(ensureUp).mockResolvedValue("http://sidecar.test");
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue("socket closed"));
+
+    await expect(sidecarJsonCancellable("/file_pass_map", {}, new CancelFlag())).resolves.toEqual({
+      kind: "error",
+      error: { code: "ENGINE_ERROR", error: "socket closed", status: 0 },
+    });
+  });
+
+  it("keeps a malformed successful JSON body as an engine error", async () => {
+    vi.mocked(ensureUp).mockResolvedValue("http://sidecar.test");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("not JSON", { status: 200 })));
+
+    await expect(sidecarJsonCancellable("/file_pass_map", {}, new CancelFlag())).resolves.toEqual({
+      kind: "error",
+      error: expect.objectContaining({ code: "ENGINE_ERROR", status: 200 }),
+    });
+  });
+
+  it("turns its deadline abort into the established timeout envelope", async () => {
+    vi.mocked(ensureUp).mockResolvedValue("http://sidecar.test");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("request aborted")));
+        })
+      )
+    );
+
+    await expect(sidecarJsonCancellable("/file_pass_map", {}, new CancelFlag(), 1)).resolves.toEqual({
+      kind: "error",
+      error: {
+        code: "ENGINE_ERROR",
+        error: "The AI engine did not answer within 0s. Try a shorter request, or a faster model in Settings → Model.",
+        status: 0,
+      },
+    });
+  });
+
+  it("stops when cancellation interrupts a non-OK response body", async () => {
+    vi.mocked(ensureUp).mockResolvedValue("http://sidecar.test");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: RequestInit) =>
+        Promise.resolve({
+          ok: false,
+          status: 503,
+          json: () =>
+            new Promise((_resolve, reject) => {
+              init?.signal?.addEventListener("abort", () => reject(new Error("body aborted")));
+            }),
+        } as Response)
+      )
+    );
+    const cancel = new CancelFlag();
+    const result = sidecarJsonCancellable("/file_pass_map", {}, cancel);
+    setTimeout(() => cancel.store(true), 1);
+
+    await expect(result).resolves.toEqual({ kind: "stopped" });
   });
 
   it("flipping the cancel flag mid-request aborts it and resolves stopped, promptly", async () => {
@@ -188,7 +270,7 @@ describe("sidecarJsonCancellable", () => {
       await new Promise((r) => setTimeout(r, 20));
       expect(serverSawAbort).toBe(true);
     } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await closeServer(server);
     }
   });
 
@@ -215,7 +297,7 @@ describe("sidecarJsonCancellable", () => {
       setTimeout(() => cancel.store(true), 30);
       expect(await promise).toEqual({ kind: "stopped" });
     } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await closeServer(server);
     }
   });
 });

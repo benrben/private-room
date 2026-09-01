@@ -1,4 +1,4 @@
-import { FileMeta, fileKind } from "../api";
+import { FileMeta, type FileKind, fileKind } from "../api";
 import { IconProps } from "./types";
 import { Stroke } from "./base";
 
@@ -120,6 +120,19 @@ export function SparkIcon({ size = 16, className }: IconProps) {
   );
 }
 
+const FILE_TYPE_ICONS = {
+  image: ImageIcon,
+  generated: SparkIcon,
+  pdf: PdfIcon,
+  docx: DocxIcon,
+  sheet: SheetIcon,
+  markdown: MarkdownIcon,
+  web: WebIcon,
+  text: TextIcon,
+  recording: RecordingIcon,
+  file: FileIcon,
+} satisfies Record<FileKind, typeof FileIcon>;
+
 export function FileTypeIcon({
   file,
   size = 16,
@@ -127,26 +140,6 @@ export function FileTypeIcon({
   file: FileMeta;
   size?: number;
 }) {
-  switch (fileKind(file)) {
-    case "image":
-      return <ImageIcon size={size} />;
-    case "generated":
-      return <SparkIcon size={size} />;
-    case "pdf":
-      return <PdfIcon size={size} />;
-    case "docx":
-      return <DocxIcon size={size} />;
-    case "sheet":
-      return <SheetIcon size={size} />;
-    case "markdown":
-      return <MarkdownIcon size={size} />;
-    case "web":
-      return <WebIcon size={size} />;
-    case "text":
-      return <TextIcon size={size} />;
-    case "recording":
-      return <RecordingIcon size={size} />;
-    default:
-      return <FileIcon size={size} />;
-  }
+  const Icon = FILE_TYPE_ICONS[fileKind(file)];
+  return <Icon size={size} />;
 }

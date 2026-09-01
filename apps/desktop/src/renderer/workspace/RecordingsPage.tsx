@@ -1,8 +1,29 @@
-import { formatSize, isRecordingFile, type FileMeta, type RoomInfo } from "../api";
+import { formatSize, type FileMeta, type RoomInfo } from "../api";
 import { displayName, formatWhen } from "./composer";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+import {
+  ATTENTION_COPY,
+  ATTENTION_SHOWN,
+  ATTENTION_WORD,
+  CAPTURE_MARK,
+  CAPTURE_WORD,
+  captureDetail,
+  countLabel,
+  recordingOverview,
+  shelfChip,
+  transcribedPhrase,
+  type CaptureNow,
+  type LiveCapture,
+  type RecordingAttention,
+  type RecordingOverview,
+  type SaveDrain,
+  type ShelfChip,
+  type ShelfTally,
+} from "./recordingsOverview";
 import "../styles/recordingsPage.css";
+
+export * from "./recordingsOverview";
 
 /** The Recordings OVERVIEW — the workspace half of the Recordings destination.
  *
@@ -41,420 +62,202 @@ export default function RecordingsPage({
   a: WSActions;
   info: RoomInfo;
 }) {
-  // Newest first: a shelf is read from the most recent tape backwards, and the
-  // library's own sort is a reader preference about browsing, not about this.
-  const recs = s.files
-    .filter(isRecordingFile)
-    .slice()
-    .sort((x, y) => y.createdAt.localeCompare(x.createdAt));
-  const newest = recs[0] ?? null;
-
-  const now = captureNow(s.recLive, s.recSave);
-  const writingUp = transcribingNow(recs, s.sttStatus);
-  // The file the room is busy with is not "waiting on a transcript" — it is
-  // being made right now, and the panel above already says so.
-  const waiting = needsAttention(recs, s.sttStatus, now?.fileId ?? null);
-  const waitingShown = waiting.slice(0, ATTENTION_SHOWN);
-  const tally = shelfTally(recs);
-  // "Most recent" exists to give a way back into the newest tape. When some
-  // other section on this page has already drawn that same tape — it is the
-  // capture in flight, or it is one of the ones waiting — a second card for it
-  // is the page repeating ITSELF, which is the same fault as repeating the
-  // sidebar, one scale down.
-  const newestDrawnElsewhere =
-    newest !== null && newestAlreadyOnPage(newest.id, now, waitingShown);
-
+  const overview = recordingOverview(s);
   return (
     <div className="rec-home">
-      <header className="rec-home-head">
-        <h1 className="rec-home-title">Recordings</h1>
-        {/* The count is a count — hand-circled, which is what the product does
-            with every other number of things in a place. Absent at zero: a
-            circled 0 is a mark drawn around nothing. */}
-        {tally.count > 0 && (
-          <span className="nb-circled nb-sem-saved rec-home-count">
-            {tally.count}
-          </span>
-        )}
-        <p className="nb-subtitle rec-home-sub">
-          Captured here, transcribed here
-        </p>
-      </header>
-
-      {(now || writingUp.length > 0) && (
-        <NowPanel
-          now={now}
-          recSave={s.recSave}
-          writingUp={writingUp}
-          files={recs}
-          onOpen={(id) => void a.viewFile(id)}
-        />
-      )}
-
-      {tally.count === 0 ? (
-        <>
-          {/* A direction, in the margin voice — and ONE way to act on it. The
-              sidebar's two capture rows are still there; a reader who has
-              never recorded anything should not have to find them. */}
-          <p className="nb-note rec-home-empty">
-            Nothing captured yet. Start one here or from the left — or drag in
-            audio and video files, which write themselves up in the background.
-          </p>
-          <div className="rec-over-empty-cta">
-            <button
-              className="rec-record rec-home-action"
-              disabled={s.recLive != null}
-              onClick={() => void a.startLiveRecording()}
-            >
-              <span className="rec-record-ring" aria-hidden>
-                <span className="rec-record-dot" />
-              </span>
-              <span className="rec-home-action-main">
-                <span className="rec-record-word">Start a live recording</span>
-                <span className="rec-home-action-copy">
-                  The mic and the Mac&rsquo;s own audio together, with the
-                  transcript appearing as it runs.
-                </span>
-              </span>
-            </button>
-          </div>
-        </>
-      ) : (
-        <>
-          <SectionHead>What is here</SectionHead>
-          {/* Three figures, each read straight off the file list. See the note
-              at the head of this file about the fourth one a reader might
-              expect and will not find. */}
-          <div className="rec-over-figs">
-            <Figure value={String(tally.count)} label={countLabel(tally.count)} />
-            <Figure
-              value={String(tally.transcribed)}
-              label={transcribedPhrase(tally)}
-            />
-            <Figure value={formatSize(tally.bytes)} label="stored in this room" />
-          </div>
-
-          {newest && !newestDrawnElsewhere && (
-            <>
-              <SectionHead>Most recent</SectionHead>
-              <ul className="rec-home-list nb-list">
-                <RecordingCard
-                  file={newest}
-                  chip={shelfChip(newest, now, s.sttStatus[newest.name])}
-                  current={s.openFile?.id === newest.id}
-                  onOpen={() => void a.viewFile(newest.id)}
-                />
-              </ul>
-            </>
-          )}
-
-          {waiting.length > 0 && (
-            <>
-              <SectionHead>Waiting on a transcript</SectionHead>
-              <ul className="rec-home-list nb-list">
-                {waitingShown.map((w) => (
-                  <AttentionCard
-                    key={w.file.id}
-                    item={w}
-                    current={s.openFile?.id === w.file.id}
-                    onOpen={() => void a.viewFile(w.file.id)}
-                  />
-                ))}
-              </ul>
-              {/* The overflow is NAMED rather than silently cropped — and it
-                  points at the column that lists all of them, instead of
-                  growing a second full list here. Not in the hand: the sentence
-                  carries a computed count (paper.css §3). */}
-              {waiting.length > ATTENTION_SHOWN && (
-                <p className="rec-over-more">
-                  {waiting.length - ATTENTION_SHOWN} more are waiting too — the
-                  list on the left has every one.
-                </p>
-              )}
-            </>
-          )}
-        </>
-      )}
+      <RecordingsHeader tally={overview.tally} />
+      <CurrentRecordingWork
+        now={overview.now}
+        recSave={s.recSave}
+        writingUp={overview.writingUp}
+        files={overview.recs}
+        onOpen={(id) => void a.viewFile(id)}
+      />
+      <RecordingsShelf
+        overview={overview}
+        recLive={s.recLive}
+        sttStatus={s.sttStatus}
+        openFileId={s.openFile?.id}
+        onStart={() => void a.startLiveRecording()}
+        onOpen={(id) => void a.viewFile(id)}
+      />
     </div>
   );
 }
 
-/* ---------- what the room is doing right now ---------- */
-
-/** The live capture session, as the workspace holds it (`WSState.recLive`). */
-export interface LiveCapture {
-  fileId: string;
-  status: string;
-}
-
-/** The stop-to-saved drain (`WSState.recSave`). Its presence means the audio is
- * already durable — that is the whole reason it is surfaced. */
-export interface SaveDrain {
-  stage: "transcribing" | "writing";
-  remaining: number;
-  startedAt: string;
-}
-
-export type CapturePhase = "recording" | "paused" | "saving";
-
-export interface CaptureNow {
-  phase: CapturePhase;
-  /** The recording being made. Always known: a save drain only exists for a
-   * session, and the session carries the id. */
-  fileId: string;
-}
-
-/** Which of the three capture phases the room is in, or null for none.
- *
- * A recording is "being written out" while EITHER signal is up — `recSave` and
- * a `recLive.status` of "saving" arrive a beat apart, and Activity's own
- * counter uses exactly this rule (AiPane's `savingRec`). Reading only one of
- * them makes the panel flicker through a gap where the room looks idle in the
- * middle of a save. */
-export function captureNow(
-  recLive: LiveCapture | null,
-  recSave: SaveDrain | null,
-): CaptureNow | null {
-  if (!recLive) return null;
-  if (recSave != null || recLive.status === "saving") {
-    return { phase: "saving", fileId: recLive.fileId };
-  }
-  if (recLive.status === "paused") return { phase: "paused", fileId: recLive.fileId };
-  return { phase: "recording", fileId: recLive.fileId };
-}
-
-/** The word each phase is announced with. Red (`nb-sem-urgent`) is reserved for
- * the capture that is actually running — the one thing on this page that is
- * happening to the microphone right now. */
-export const CAPTURE_WORD: Record<CapturePhase, string> = {
-  recording: "Recording now",
-  paused: "Paused",
-  saving: "Saving",
-};
-
-export const CAPTURE_MARK: Record<CapturePhase, string> = {
-  recording: "nb-sem-urgent",
-  paused: "nb-sem-pending",
-  saving: "nb-sem-linked",
-};
-
-/** How far along a save is, in the room's own words.
- *
- * The same three sentences the Activity pane uses, and for the same reason: the
- * audio is on disk from the first event, so every one of them has to say so —
- * "Saving" on its own reads as "your recording is not safe yet". */
-export function saveDetail(recSave: SaveDrain | null): string {
-  if (recSave?.stage === "writing") return "Audio saved — writing into the room…";
-  if (recSave && recSave.remaining > 0) {
-    return `Audio saved — transcribing (${recSave.remaining} to go)`;
-  }
-  return "Audio saved — finishing the transcript…";
-}
-
-/** What each phase means, for the reader who did not start it themselves. */
-export function captureDetail(
-  phase: CapturePhase,
-  recSave: SaveDrain | null,
-): string {
-  if (phase === "saving") return saveDetail(recSave);
-  if (phase === "paused") {
-    return "The microphone is closed. Nothing is lost — resume it in the recording itself.";
-  }
-  return "The microphone is open. Open the recording to watch it, stop it, or name a speaker.";
-}
-
-/** Imported audio and video whose transcript is being decoded in the
- * background. Keyed by file NAME because that is what `stt-progress` carries
- * (see effects.ts) — the event has no id to key on. */
-export function transcribingNow(
-  recs: FileMeta[],
-  sttStatus: Record<string, string>,
-): FileMeta[] {
-  return recs.filter((f) => sttStatus[f.name] === "processing");
-}
-
-/* ---------- what still needs a look ---------- */
-
-/** Why one recording has no transcript.
- *
- * `hasText` is the only DURABLE signal — `sttStatus` is filled by events and so
- * is empty after a restart, which is exactly when a reader comes back to find
- * out what happened. So the list is built from `hasText`, and the session's
- * stage only supplies the REASON when it happens to know it. */
-export type AttentionReason = "model-missing" | "failed" | "no-speech" | "not-yet";
-
-export interface RecordingAttention {
-  file: FileMeta;
-  reason: AttentionReason;
-  /** The backend's own explanation of a failure, when it sent one. "" for
-   * every other reason — the app never writes a cause it was not given. */
-  detail: string;
-}
-
-/** Worst first. A missing speech model is room-wide (nothing will transcribe
- * until it is installed), a failure is about this one file, "no speech" is a
- * finished answer rather than a problem, and "not yet" is just the queue. */
-const ATTENTION_RANK: Record<AttentionReason, number> = {
-  "model-missing": 0,
-  failed: 1,
-  "no-speech": 2,
-  "not-yet": 3,
-};
-
-/** How many waiting recordings the centre draws before it defers to the column.
- * A cap, not a crop: the overflow is counted out loud below the list. */
-export const ATTENTION_SHOWN = 5;
-
-export const ATTENTION_WORD: Record<AttentionReason, string> = {
-  "model-missing": "No speech model",
-  failed: "Could not be read",
-  "no-speech": "No speech found",
-  "not-yet": "No transcript yet",
-};
-
-export const ATTENTION_COPY: Record<AttentionReason, string> = {
-  "model-missing":
-    "Install a speech model in Settings and this will transcribe itself.",
-  failed: "Converting the file to a common format usually fixes this.",
-  "no-speech": "The audio was read all the way through and held no speech.",
-  // "read" is the AI findings pass inside the recording; speech→text is
-  // "transcribe" on every screen, so this line may not borrow either word.
-  "not-yet": "Nothing has transcribed it yet. Open it to transcribe it.",
-};
-
-/** The backend sends `failed: <why>`; the why is the half worth showing. */
-export function failureDetail(stage: string | undefined): string {
-  if (!stage?.startsWith("failed")) return "";
-  return stage.slice("failed:".length).trim();
-}
-
-/** Why this one recording is on the waiting list, or null if it is not.
- *
- * `busyFileId` is the session the room is capturing or saving right now: it has
- * no transcript yet because it is still being MADE, which the panel above the
- * fold already says. Listing it here as well would ask the reader to do
- * something about work that is already under way. */
-export function attentionReason(
-  f: FileMeta,
-  stage: string | undefined,
-  busyFileId: string | null,
-): AttentionReason | null {
-  if (f.hasText) return null;
-  if (f.id === busyFileId) return null;
-  if (stage === "processing") return null;
-  if (stage === "model-missing") return "model-missing";
-  if (stage?.startsWith("failed")) return "failed";
-  if (stage === "none") return "no-speech";
-  return "not-yet";
-}
-
-/** Every recording still waiting on a transcript, worst reason first and
- * newest first within a reason. */
-export function needsAttention(
-  recs: FileMeta[],
-  sttStatus: Record<string, string>,
-  busyFileId: string | null,
-): RecordingAttention[] {
-  const waiting: RecordingAttention[] = [];
-  for (const f of recs) {
-    const stage = sttStatus[f.name];
-    const reason = attentionReason(f, stage, busyFileId);
-    if (reason === null) continue;
-    waiting.push({ file: f, reason, detail: failureDetail(stage) });
-  }
-  return waiting.sort(
-    (x, y) =>
-      ATTENTION_RANK[x.reason] - ATTENTION_RANK[y.reason] ||
-      y.file.createdAt.localeCompare(x.file.createdAt),
+function RecordingsHeader({ tally }: { tally: ShelfTally }) {
+  return (
+    <header className="rec-home-head">
+      <h1 className="rec-home-title">Recordings</h1>
+      {/* The count is a count — hand-circled, which is what the product does
+          with every other number of things in a place. Absent at zero: a
+          circled 0 is a mark drawn around nothing. */}
+      {tally.count > 0 && (
+        <span className="nb-circled nb-sem-saved rec-home-count">
+          {tally.count}
+        </span>
+      )}
+      <p className="nb-subtitle rec-home-sub">
+        Captured here, transcribed here
+      </p>
+    </header>
   );
 }
 
-/** Has some other section of this page already drawn the newest recording?
- *
- * The live panel names the capture in flight, and the waiting list names every
- * recording without a transcript. Either one makes a "Most recent" card for the
- * same file a second copy of a row the reader is already looking at — and both
- * of those cards are a way into the file, so nothing is lost by dropping it. */
-export function newestAlreadyOnPage(
-  newestId: string,
-  now: CaptureNow | null,
-  shownWaiting: RecordingAttention[],
-): boolean {
-  if (now?.fileId === newestId) return true;
-  return shownWaiting.some((w) => w.file.id === newestId);
+function CurrentRecordingWork({
+  now,
+  recSave,
+  writingUp,
+  files,
+  onOpen,
+}: {
+  now: CaptureNow | null;
+  recSave: SaveDrain | null;
+  writingUp: FileMeta[];
+  files: FileMeta[];
+  onOpen: (id: string) => void;
+}) {
+  if (!now && writingUp.length === 0) return null;
+  return <NowPanel now={now} recSave={recSave} writingUp={writingUp} files={files} onOpen={onOpen} />;
 }
 
-/** The one status word a recording card carries, and how it is drawn.
- *
- * One function so the card can never contradict the panel above it. The first
- * cut of this page had the card read `hasText` alone, which put "No transcript
- * yet" on the very recording the live panel was announcing as being written up.
- *
- * `loud` is the marker tape rather than the quiet chip, and only a capture that
- * is actually running gets it: red on this page means the microphone is open,
- * and spending it on a status would leave nothing for the one urgent thing. */
-export interface ShelfChip {
-  word: string;
-  mark: string;
-  loud: boolean;
-}
-
-export function shelfChip(
-  file: FileMeta,
-  now: CaptureNow | null,
-  stage: string | undefined,
-): ShelfChip {
-  if (now?.fileId === file.id) {
-    return {
-      word: CAPTURE_WORD[now.phase],
-      mark: CAPTURE_MARK[now.phase],
-      loud: now.phase === "recording",
-    };
+function RecordingsShelf({
+  overview,
+  recLive,
+  sttStatus,
+  openFileId,
+  onStart,
+  onOpen,
+}: {
+  overview: RecordingOverview;
+  recLive: LiveCapture | null;
+  sttStatus: Record<string, string>;
+  openFileId: string | undefined;
+  onStart: () => void;
+  onOpen: (id: string) => void;
+}) {
+  if (overview.tally.count === 0) {
+    return <EmptyShelf recording={recLive != null} onStart={onStart} />;
   }
-  if (stage === "processing") {
-    return { word: "Writing up", mark: "nb-sem-linked", loud: false };
-  }
-  if (file.hasText) {
-    return { word: "Transcribed", mark: "nb-sem-done", loud: false };
-  }
-  return { word: "No transcript yet", mark: "nb-sem-pending", loud: false };
+  return <RecordedShelf overview={overview} sttStatus={sttStatus} openFileId={openFileId} onOpen={onOpen} />;
 }
 
-/* ---------- what the shelf adds up to ---------- */
-
-export interface ShelfTally {
-  count: number;
-  transcribed: number;
-  /** Bytes on disk. The one size the file list can answer for — see the note
-   * at the head of this file about the length it cannot. */
-  bytes: number;
+function EmptyShelf({ recording, onStart }: { recording: boolean; onStart: () => void }) {
+  return (
+    <>
+      <p className="nb-note rec-home-empty">
+        Nothing captured yet. Start one here or from the left — or drag in
+        audio and video files, which write themselves up in the background.
+      </p>
+      <div className="rec-over-empty-cta">
+        <button className="rec-record rec-home-action" disabled={recording} onClick={onStart}>
+          <span className="rec-record-ring" aria-hidden>
+            <span className="rec-record-dot" />
+          </span>
+          <span className="rec-home-action-main">
+            <span className="rec-record-word">Start a live recording</span>
+            <span className="rec-home-action-copy">
+              The mic and the Mac&rsquo;s own audio together, with the transcript appearing as it runs.
+            </span>
+          </span>
+        </button>
+      </div>
+    </>
+  );
 }
 
-export function shelfTally(recs: FileMeta[]): ShelfTally {
-  return {
-    count: recs.length,
-    transcribed: recs.filter((f) => f.hasText).length,
-    bytes: recs.reduce((sum, f) => sum + f.sizeBytes, 0),
-  };
+function RecordedShelf({
+  overview,
+  sttStatus,
+  openFileId,
+  onOpen,
+}: {
+  overview: RecordingOverview;
+  sttStatus: Record<string, string>;
+  openFileId: string | undefined;
+  onOpen: (id: string) => void;
+}) {
+  return (
+    <>
+      <ShelfFigures tally={overview.tally} />
+      <NewestRecording overview={overview} sttStatus={sttStatus} openFileId={openFileId} onOpen={onOpen} />
+      <AttentionShelf overview={overview} openFileId={openFileId} onOpen={onOpen} />
+    </>
+  );
 }
 
-/** The noun under the count, singular when it has to be. */
-export function countLabel(count: number): string {
-  return count === 1 ? "recording" : "recordings";
+function ShelfFigures({ tally }: { tally: ShelfTally }) {
+  return (
+    <>
+      <SectionHead>What is here</SectionHead>
+      <div className="rec-over-figs">
+        <Figure value={String(tally.count)} label={countLabel(tally.count)} />
+        <Figure value={String(tally.transcribed)} label={transcribedPhrase(tally)} />
+        <Figure value={formatSize(tally.bytes)} label="stored in this room" />
+      </div>
+    </>
+  );
 }
 
-/** The label under the transcribed figure. It states the RATIO, because "9"
- * under "transcribed" beside "12" under "recordings" makes a reader do the
- * subtraction — and the interesting number is the three that are not.
- *
- * The word matches the chip on a finished recording ("Transcribed") and the
- * verb inside the recording itself; the shelf used to say "written up" here and
- * "Transcribed" a few pixels away, about the same files. */
-export function transcribedPhrase(t: ShelfTally): string {
-  if (t.count === 0) return "transcribed";
-  if (t.transcribed === t.count) return "transcribed — all of them";
-  if (t.transcribed === 0) return `transcribed — none of ${t.count} yet`;
-  return `transcribed of ${t.count}`;
+function NewestRecording({
+  overview,
+  sttStatus,
+  openFileId,
+  onOpen,
+}: {
+  overview: RecordingOverview;
+  sttStatus: Record<string, string>;
+  openFileId: string | undefined;
+  onOpen: (id: string) => void;
+}) {
+  if (!overview.newest || overview.newestDrawnElsewhere) return null;
+  const file = overview.newest;
+  return (
+    <>
+      <SectionHead>Most recent</SectionHead>
+      <ul className="rec-home-list nb-list">
+        <RecordingCard
+          file={file}
+          chip={shelfChip(file, overview.now, sttStatus[file.name])}
+          current={openFileId === file.id}
+          onOpen={() => onOpen(file.id)}
+        />
+      </ul>
+    </>
+  );
+}
+
+function AttentionShelf({
+  overview,
+  openFileId,
+  onOpen,
+}: {
+  overview: RecordingOverview;
+  openFileId: string | undefined;
+  onOpen: (id: string) => void;
+}) {
+  if (overview.waiting.length === 0) return null;
+  return (
+    <>
+      <SectionHead>Waiting on a transcript</SectionHead>
+      <ul className="rec-home-list nb-list">
+        {overview.waitingShown.map((item) => (
+          <AttentionCard
+            key={item.file.id}
+            item={item}
+            current={openFileId === item.file.id}
+            onOpen={() => onOpen(item.file.id)}
+          />
+        ))}
+      </ul>
+      <AttentionOverflow count={overview.waiting.length - ATTENTION_SHOWN} />
+    </>
+  );
+}
+
+function AttentionOverflow({ count }: { count: number }) {
+  if (count <= 0) return null;
+  return <p className="rec-over-more">{count} more are waiting too — the list on the left has every one.</p>;
 }
 
 /* ---------- pieces ---------- */
@@ -496,51 +299,61 @@ function NowPanel({
   files: FileMeta[];
   onOpen: (id: string) => void;
 }) {
-  // A capture that started seconds ago may not be in the file list yet, so the
-  // name is shown only when the list actually has it. No placeholder: a made-up
-  // title on the one card claiming to describe live work is the worst possible
-  // place for a guess.
-  const named = now ? (files.find((f) => f.id === now.fileId) ?? null) : null;
   return (
     <section className="nb-panel rec-over-now" aria-label="Happening now">
-      {now && (
-        <div className="rec-over-now-line" role="status">
-          <div className="rec-over-now-head">
-            <span className={`nb-tape ${CAPTURE_MARK[now.phase]}`}>
-              {CAPTURE_WORD[now.phase]}
-            </span>
-            {named && (
-              <span className="rec-over-now-title">{displayName(named.name)}</span>
-            )}
-          </div>
-          <p className="rec-over-now-copy">
-            {captureDetail(now.phase, recSave)}
-          </p>
-          <div className="rec-over-now-actions">
-            <button className="nb-btn" onClick={() => onOpen(now.fileId)}>
-              Open the recording
-            </button>
-          </div>
-        </div>
-      )}
-      {writingUp.length > 0 && (
-        <div className="rec-over-now-line" role="status">
-          <div className="rec-over-now-head">
-            <span className="nb-chip nb-sem-linked">Writing up</span>
-            <span className="rec-over-now-title">
-              {writingUp.length === 1
-                ? displayName(writingUp[0].name)
-                : `${writingUp.length} recordings`}
-            </span>
-          </div>
-          <p className="rec-over-now-copy">
-            Being transcribed on this Mac, in the background. They stay usable
-            while it runs.
-          </p>
-        </div>
-      )}
+      {now && <LiveCaptureStatus now={now} recSave={recSave} files={files} onOpen={onOpen} />}
+      {writingUp.length > 0 && <WritingUpStatus files={writingUp} />}
     </section>
   );
+}
+
+function LiveCaptureStatus({
+  now,
+  recSave,
+  files,
+  onOpen,
+}: {
+  now: CaptureNow;
+  recSave: SaveDrain | null;
+  files: FileMeta[];
+  onOpen: (id: string) => void;
+}) {
+  const named = files.find((file) => file.id === now.fileId) ?? null;
+  return (
+    <div className="rec-over-now-line" role="status">
+      <div className="rec-over-now-head">
+        <span className={`nb-tape ${CAPTURE_MARK[now.phase]}`}>
+          {CAPTURE_WORD[now.phase]}
+        </span>
+        {named && <span className="rec-over-now-title">{displayName(named.name)}</span>}
+      </div>
+      <p className="rec-over-now-copy">{captureDetail(now.phase, recSave)}</p>
+      <div className="rec-over-now-actions">
+        <button className="nb-btn" onClick={() => onOpen(now.fileId)}>
+          Open the recording
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function WritingUpStatus({ files }: { files: FileMeta[] }) {
+  return (
+    <div className="rec-over-now-line" role="status">
+      <div className="rec-over-now-head">
+        <span className="nb-chip nb-sem-linked">Writing up</span>
+        <span className="rec-over-now-title">{writingUpName(files)}</span>
+      </div>
+      <p className="rec-over-now-copy">
+        Being transcribed on this Mac, in the background. They stay usable while it runs.
+      </p>
+    </div>
+  );
+}
+
+function writingUpName(files: FileMeta[]): string {
+  if (files.length === 1) return displayName(files[0].name);
+  return `${files.length} recordings`;
 }
 
 /** One tape on the shelf. Every value shown is read off the file list; see the

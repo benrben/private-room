@@ -34,11 +34,14 @@ corresponding fix, before this merge.
 from __future__ import annotations
 
 from bs4 import BeautifulSoup
+import pytest
 
+from arcelle_sidecar.docs import article as article_module
 from arcelle_sidecar.docs.article import (
     MIN_ARTICLE_CHARS,
     ArticleBody,
     PageCapture,
+    _article_text,
     _strip_event_handlers,
     read_page,
     read_page_bytes,
@@ -230,6 +233,36 @@ def test_malformed_html_does_not_raise() -> None:
     assert isinstance(cap, PageCapture)
 
 
+def test_read_page_keeps_declared_metadata_when_readability_rejects_a_real_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingDocument:
+        def __init__(self, *_: object, **__: object) -> None:
+            raise RuntimeError("readability parser rejected the page")
+
+    monkeypatch.setattr(article_module.readability, "Document", FailingDocument)
+
+    cap = read_page(NEWS, "https://marshreview.example/heron")
+    assert cap.article is None
+    assert cap.meta.title == "The Heron Returns — The Marsh Review"
+    assert cap.meta.byline == "Dana Okafor"
+    assert cap.meta.source_url == "https://marshreview.example/heron"
+
+
+def test_read_page_fails_closed_when_the_metadata_parser_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_metadata_parser(html: str, url: str | None) -> PageMeta:
+        assert html == NEWS
+        assert url == "https://marshreview.example/heron"
+        raise RuntimeError("metadata parser rejected the page")
+
+    monkeypatch.setattr(article_module, "extract_page_meta", failing_metadata_parser)
+
+    cap = read_page(NEWS, "https://marshreview.example/heron")
+    assert cap == PageCapture(meta=PageMeta(), article=None)
+
+
 def test_completely_malformed_input_never_raises() -> None:
     cap = read_page("<<<not html at all >>>", "https://example.com/x")
     assert isinstance(cap, PageCapture)
@@ -324,6 +357,34 @@ def test_a_form_and_a_noscript_block_do_not_survive_into_the_article() -> None:
     assert "<noscript" not in cap.article.html.lower(), cap.article.html
     assert "Enable JavaScript" not in cap.article.markdown
     assert "Enable JavaScript" not in cap.article.text
+
+
+def test_article_text_preserves_block_boundaries_without_inline_or_chrome_noise() -> None:
+    # The text copy feeds search indexing, so nested block elements each
+    # need their own paragraph while inline markup remains within its
+    # surrounding prose. This calls the tree walk directly to cover the
+    # branches that a readability-selected article shape need not expose.
+    html = """
+    <article>
+      Introductory prose before the nested blocks.
+      <div>
+        <p>One paragraph with an <a href="/detail">inline link</a>.</p>
+        <script>window.tracker = true</script>
+        <style>.hidden { display: none; }</style>
+        <ul><li>First listed fact</li><li>Second listed fact</li></ul>
+      </div>
+      <!-- A comment is never article prose. -->
+      <span>Trailing inline prose.</span>
+    </article>
+    """
+
+    assert _article_text(html) == (
+        "Introductory prose before the nested blocks.\n\n"
+        "One paragraph with an inline link .\n\n"
+        "First listed fact\n\n"
+        "Second listed fact\n\n"
+        "Trailing inline prose."
+    )
 
 
 # -------------------------------------------- adversarial: _strip_event_handlers

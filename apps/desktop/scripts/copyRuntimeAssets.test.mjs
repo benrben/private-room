@@ -2,7 +2,12 @@ import { access, mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promise
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { copyRuntimeAssets, RUNTIME_ASSETS, SHARED_RUNTIME_ASSETS } from "./copyRuntimeAssets.mjs";
+import {
+  copyRuntimeAssets,
+  RUNTIME_ASSETS,
+  runtimeAssetsOutputRoot,
+  SHARED_RUNTIME_ASSETS,
+} from "./copyRuntimeAssets.mjs";
 
 const roots = [];
 afterEach(async () => {
@@ -10,6 +15,12 @@ afterEach(async () => {
 });
 
 describe("copyRuntimeAssets", () => {
+  it("targets the compiled-main runtime tree when a test build asks for it", () => {
+    expect(runtimeAssetsOutputRoot("/app", ["--output-root", "dist_main"])).toBe("/app/dist_main");
+    expect(runtimeAssetsOutputRoot("/app", [])).toBe("/app/dist_package");
+    expect(() => runtimeAssetsOutputRoot("/app", ["--output-root"])).toThrow("needs a path");
+  });
+
   it("copies every runtime asset to the same path under the package output", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-runtime-assets-"));
     roots.push(root);

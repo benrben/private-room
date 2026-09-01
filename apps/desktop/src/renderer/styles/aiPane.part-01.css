@@ -1,0 +1,497 @@
+/* ---------- the AI column: Studio and Activity ----------
+
+   The right-hand pane's two non-chat tabs. Chat has its own sheets
+   (chat.css / composer.css); the agent graph and the token-budget bar have
+   theirs; this file is the Studio shelf, the Activity journal, and the small
+   amount of pane chrome those two need to survive a narrow column.
+
+   WHAT EACH SURFACE IS
+
+     STUDIO is a shelf of things you can make. Each artefact is an index card
+     drawn on the sheet, with a hand-drawn category mark down the left. The
+     category marks are IDENTITY, not status, which is why they use the hue
+     setters (.nb-mark-*) rather than the semantic ones — see paper.css. The
+     only status on this surface is "a Studio run is in flight", and that gets
+     the pending marker plus the word, at the top where it cannot be missed.
+
+     ACTIVITY is a journal. A ruled log, an entry per event, timestamps and
+     counts in the mono face so a column of them lines up, and short
+     descriptions of what happened in the sans — the app is describing its own
+     work there, and the hand is for words a person wrote. State is a strip of tape
+     carrying a WORD — running / queued / paused / failed / done — because
+     this is the surface a person audits background work from, and an audit
+     that needs colour vision to read is not an audit. Instructions
+     ("review the open consent card"), filenames and error text are in the
+     interface sans too. The one place the hand still speaks on this tab is the
+     empty state, where the app has nothing to report and says so in its own
+     voice.
+
+   WHY THESE SELECTORS ARE TWO CLASSES DEEP
+
+   shell.css owns the original .studio-* / .activity-* rules and loads after
+   everything else in the barrel; this sheet is pulled in from a component, so
+   it lands EARLIER and would lose every tie. Scoping to `.pane-ai` (the AI
+   column, Workspace.tsx) puts these rules a class ahead, so they win on
+   specificity and the load order stops mattering — and the scope is also
+   simply true: nothing here renders anywhere else.
+
+   The same rule explains why a run of text is fully specified here rather than
+   composed from a .nb-* class. paper.css also loses ties to shell.css, so
+   dropping `.nb-hand` onto an element shell.css already sizes would change the
+   family and leave the old size. Where an element is NEW (a tape flag, a
+   figure, the empty state) the primitives are composed in the markup as
+   usual — nothing else styles those, so there is nothing to tie with.
+
+   THE COLUMN IS NARROW. useLayout clamps the AI pane to 0.2 of the grid and it
+   now starts collapsed on reading and recording pages, so the width it has to
+   work at is roughly 180px — every rule below is checked there through the
+   container query at the end of the file. `.pane` sets container-type:
+   inline-size (shell.css), so an unnamed @container here resolves against the
+   column itself. Container queries have been in WebKit since Safari 16 and
+   shell.css already ships two.
+
+   Both themes come from tokens, so there is no light-mode block at the end. */
+
+/* ==========================================================================
+   1. THE TAB STRIP'S ATTENTION FLAG
+   The strip itself is shell.css's and already draws the app-wide marker
+   underline for the active tab. What is fixed here is the flag beside
+   "Activity": two states used to be one 6px dot in two different colours, so
+   "something needs your approval" and "work is running" were told apart by
+   hue alone. They are now different SHAPES — a hand-circled count and a dot —
+   and the count says how many.
+   ========================================================================== */
+
+/* The SELECTED tab keeps its word, whatever the pane's width.
+   shell.css drops `.assistant-tab > span` under 390px so the row falls back to
+   icons, and §24's narrower AI pane now sits below that most of the time — so
+   in practice all three tabs were three unlabelled glyphs, and the marker
+   underline was the only thing saying which page you were on. Naming the
+   current one costs about forty pixels and answers the question the row exists
+   to answer; the other two keep their tooltip and their aria-label.
+   (0,2,1) beats the container query's (0,1,1), so sheet order is irrelevant.) */
+.assistant-tab[aria-selected="true"] > span {
+  display: inline;
+}
+
+/* Both marks restate their `display`, and it is load-bearing: shell.css hides
+   `.assistant-tab > span` in a narrow column so the tabs fall back to icons,
+   and the flag is a direct span child too. The pane now STARTS collapsed on
+   reading pages and clamps to a fifth of the grid, so that rule fires most of
+   the time — dropping the attention signal with the word "Activity" would mean
+   an approval nobody is told about. Two classes beats `.assistant-tab > span`,
+   whatever order the sheets land in. */
+.assistant-tab .ap-tab-count {
+  display: inline-grid;
+  margin-inline-start: 1px;
+}
+/* The busy mark. Blue is "active/connected" product-wide; the pink pen stays
+   reserved for selection, which is what the tab's own underline uses. */
+.assistant-tab .ap-tab-live {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 60% 55% 58% 62% / 58% 62% 55% 60%;
+  background: var(--sem-linked-fill);
+  box-shadow: 0 0 0 1px var(--sem-linked);
+}
+
+/* ==========================================================================
+   2. STUDIO — the shelf
+   ========================================================================== */
+
+.pane-ai .studio-tab-view {
+  padding: var(--sp-4) var(--sp-3) var(--sp-8);
+}
+
+/* Orientation copy, not an aside: the interface sans at reading size. The
+   direction is explicit that instructions are never set small. */
+.pane-ai .studio-intro {
+  margin: 0 2px var(--sp-4);
+  color: var(--muted);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+
+/* The group label above a run of cards, shared by Studio and Activity so the
+   two tabs read as pages of one notebook. The pencil tick in front of it is
+   the only decoration — deterministic, inert, and not hit-testable. */
+.pane-ai .studio-section-title,
+.pane-ai .activity-group-title {
+  margin: var(--sp-6) 2px var(--sp-2);
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.pane-ai .studio-section-title::before,
+.pane-ai .activity-group-title::before {
+  content: "";
+  display: inline-block;
+  width: 13px;
+  height: 2px;
+  margin-inline-end: 7px;
+  vertical-align: 0.24em;
+  border-radius: 2px 3px 2px 3px / 3px 2px 3px 2px;
+  background: var(--rule-strong);
+  pointer-events: none;
+}
+/* First label in a tab has the intro above it already. */
+.pane-ai .studio-shelf > .studio-section-title:first-child {
+  margin-top: 0;
+}
+
+.pane-ai .studio-shelf {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+
+/* ----- the index card -----
+   A frame on the sheet, never a filled box. The border sits at 72% of the pen
+   at rest and goes to full strength on hover — the pen pressing harder rather
+   than a colour change — which is the same recipe .nb-card uses and measures
+   ~6.9:1 dark / ~5.2:1 light, comfortably past the 3:1 a clickable card's
+   boundary owes. */
+.pane-ai .studio-row {
+  width: 100%;
+  min-height: 56px;
+  margin: 0 0 var(--sp-2);
+  padding: var(--sp-3);
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-2);
+  text-align: left;
+  color: var(--text);
+  background: transparent;
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 72%, transparent);
+  /* Drawn, not computed. Four fixed signatures, assigned in the markup by
+     `ap-sig-*` rather than by nth-child, so a card keeps its shape when the
+     shelf grows a row and nothing re-rotates between renders. */
+  border-radius: var(--radius);
+  transition:
+    border-color var(--dur-fast) var(--ease-pen),
+    transform var(--dur-fast) var(--ease-pen),
+    box-shadow var(--dur-fast) var(--ease-pen);
+}
+.pane-ai .studio-row.ap-sig-b {
+  border-radius: var(--radius);
+}
+.pane-ai .studio-row.ap-sig-c {
+  border-radius: var(--radius);
+}
+.pane-ai .studio-row.ap-sig-d {
+  border-radius: var(--radius);
+}
+.pane-ai .studio-row:hover:not(:disabled) {
+  background: transparent;
+  border-color: var(--sketch);
+  transform: translateY(-2px);
+  box-shadow: 0 6px 18px var(--shadow-lift);
+}
+.pane-ai .studio-row:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: none;
+}
+.pane-ai .studio-row:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.pane-ai .studio-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The category mark: the artefact's icon inside a drawn tile washed in that
+   category's marker. The tile's edge is the FULL --mk-ink, not a wash of it —
+   a marker fill measures under 2:1 on ivory paper and this mark carries
+   identity, so the ink stroke is what pays the 3:1 it owes. A card with no
+   category (the whole-room action) mixes to transparent and keeps the pencil
+   edge, which is exactly the distinction wanted: three artefacts, and one
+   action that is about the room itself. */
+.pane-ai .studio-row-icon {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  color: var(--mk-ink, var(--ink-2));
+  background-color: transparent;
+  background-image: linear-gradient(
+    99deg,
+    color-mix(in srgb, var(--mk, transparent) 30%, transparent) 0%,
+    color-mix(in srgb, var(--mk, transparent) 18%, transparent) 58%,
+    color-mix(in srgb, var(--mk, transparent) 26%, transparent) 100%
+  );
+  box-shadow: inset 0 0 0 1.5px var(--mk-ink, var(--rule-strong));
+  border-radius: var(--radius-xs);
+}
+
+.pane-ai .studio-row-text {
+  min-width: 0;
+}
+.pane-ai .studio-row-title {
+  display: block;
+  color: var(--text-strong);
+  font-size: var(--fs-card);
+  font-weight: 500;
+  line-height: 1.25;
+}
+/* Two lines, then ellipsis. The old rule truncated at one, which in a 180px
+   column meant every card said three words and a dot-dot-dot. `-webkit-box`
+   is the only line clamp WebKit has, and WebKit is what this app ships on. */
+.pane-ai .studio-row-copy {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: 1.4;
+  white-space: normal;
+}
+.pane-ai .studio-row-state {
+  align-self: center;
+  color: var(--faint);
+  font-size: var(--fs-meta);
+  white-space: nowrap;
+}
+/* A card whose work is in flight. The word does the telling; the marker only
+   reinforces it. */
+.pane-ai .studio-row-state.is-working {
+  color: var(--ink);
+  font-size: var(--fs-micro);
+}
+
+/* ----- a Studio run in flight -----
+   The tab used to show nothing at all while a deck or a mind map was being
+   written — the step name went only to Activity, so pressing Create on a local
+   model looked like pressing nothing for several minutes. */
+.pane-ai .studio-running {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  margin: 0 0 var(--sp-4);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid color-mix(in srgb, var(--sem-pending) 55%, transparent);
+  border-radius: var(--radius);
+}
+/* A LOCAL stage — "a local model can take a few minutes…" — is the app saying
+   where a job has got to. Machine progress, so the sans. */
+.pane-ai .studio-running-step {
+  min-width: 0;
+  flex: 1 1 auto;
+  color: var(--ink-2);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+/* …and a CLOUD stage is the opposite: it says room content is leaving this
+   Mac. Sans, at reading size, in the reading ink, with the caution marker on
+   its edge — the same treatment chat.css gives .chat-route-cloud for exactly
+   the same fact, and the same reason: a privacy consequence must never be
+   decoration wearing the clothes of the product's core promise. Which one applies comes from the event's `local` flag, never from
+   reading the sentence. */
+.pane-ai .studio-running-cloud {
+  min-width: 0;
+  flex: 1 1 auto;
+  padding: 6px 11px;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  border: 1px solid var(--sem-pending);
+  border-radius: var(--radius-sm);
+  box-shadow: inset 3px 0 0 var(--sem-pending-fill);
+}
+
+/* ----- the privacy note -----
+   A note stuck to the page (the tape strip comes from .nb-taped in the
+   markup), not a filled panel: it sits IN the sheet like everything else on
+   this tab. */
+.pane-ai .studio-note {
+  margin-top: var(--sp-8);
+  padding: var(--sp-3);
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+.pane-ai .studio-note strong {
+  color: var(--sem-done);
+  font-weight: 600;
+}
+
+/* ==========================================================================
+   3. ACTIVITY — the journal
+   ========================================================================== */
+
+.pane-ai .activity-view {
+  padding: var(--sp-4) var(--sp-3) var(--sp-8);
+}
+.pane-ai .activity-summary {
+  margin: 0 2px var(--sp-3);
+  color: var(--muted);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+
+/* ----- an entry -----
+   Ruled like a log: the pencil line goes ABOVE each entry and fades at both
+   ends, drawn as a background gradient rather than a border so it can taper.
+   The first entry under a heading goes without, so the log never opens with a
+   rule hanging off nothing. */
+.pane-ai .activity-row {
+  padding: var(--sp-3) 2px;
+  border-bottom: 0;
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+.pane-ai .activity-group-title + .activity-row,
+.pane-ai .activity-live > .activity-row:first-child {
+  background-image: none;
+}
+
+.pane-ai .activity-row-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.pane-ai .activity-row-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-strong);
+  font-size: var(--fs-body);
+  line-height: 1.3;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+/* The state tape, in the row head next to the title. */
+.pane-ai .activity-flag {
+  flex: none;
+}
+/* Anything temporal — elapsed time, the moment a job finished. The mono face
+   with tabular figures, so a column of them lines up and a running clock does
+   not jitter as it counts. */
+.pane-ai .activity-state {
+  flex: none;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Directive copy — what a consent card wants, which file is being read. Sans,
+   because a person is being asked to do something. */
+.pane-ai .activity-copy {
+  margin: var(--sp-1) 0 0;
+  min-width: 0;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+/* …and the descriptive half: what a job is doing, how far it got, why it
+   stopped. Every word of it is the app describing its own work, so the sans. */
+.pane-ai .activity-copy.ap-note {
+  color: var(--ink-2);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+
+/* ----- progress -----
+   A marker stroke wiped across the page inside a pencil outline, the same
+   recipe .nb-progress uses: the fill is a marker and a marker is never
+   legible on its own, so the --mk-ink hairline is what makes the bar
+   meaningful non-text at 3:1. The count beside it is not optional — length
+   and colour alone never state a quantity here. */
+.pane-ai .activity-meter {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+.pane-ai .activity-meter .activity-progress {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+}
+.pane-ai .activity-figure {
+  flex: none;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+}
+.pane-ai .activity-progress {
+  height: 8px;
+  margin: var(--sp-2) 0 0;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rule) 70%, transparent);
+  border-radius: 999px 999px 999px 999px / 8px 6px 8px 6px;
+  overflow: hidden;
+}
+.pane-ai .activity-progress span {
+  background-color: transparent;
+  background-image: linear-gradient(
+    99deg,
+    color-mix(in srgb, var(--sem-linked-fill) 72%, transparent) 0%,
+    color-mix(in srgb, var(--sem-linked-fill) 52%, transparent) 46%,
+    color-mix(in srgb, var(--sem-linked-fill) 68%, transparent) 88%,
+    color-mix(in srgb, var(--sem-linked-fill) 46%, transparent) 100%
+  );
+  box-shadow: inset 0 0 0 1px var(--sem-linked);
+  border-radius: inherit;
+  transition: width var(--dur-slow) var(--ease-pen);
+}
+/* A job that stopped is not making progress; the bar says so by going to
+   pencil rather than staying a live marker under a "Paused" tape. */
+.pane-ai .activity-row.job.paused .activity-progress span,
+.pane-ai .activity-row.job.error .activity-progress span {
+  background-image: none;
+  background-color: color-mix(in srgb, var(--rule) 55%, transparent);
+  box-shadow: inset 0 0 0 1px var(--rule-strong);
+}
+
+.pane-ai .activity-row-actions,
+.pane-ai .activity-row-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+.pane-ai .activity-row-foot .activity-copy {
+  margin: 0;
+}
+/* Every control in a row is still a TARGET: base.css sets `button.subtle` to
+   2px/6px padding, which is a ~20px box. */
+.pane-ai .activity-row-foot .subtle,
+.pane-ai .activity-row-actions .subtle {
+  flex: none;
+  min-height: 24px;
+  padding: 3px 8px;
+  border-radius: var(--radius-xs);
+}
+.pane-ai .activity-row-head .chip-btn {
+  min-width: 24px;
+  min-height: 24px;
+  display: inline-grid;
+  place-items: center;
+}

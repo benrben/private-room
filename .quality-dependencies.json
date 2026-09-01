@@ -1,0 +1,79 @@
+{
+  "modules": [
+    {
+      "name": "shared",
+      "paths": ["apps/desktop/src/shared/**"]
+    },
+    {
+      "name": "preload",
+      "paths": ["apps/desktop/src/preload/**"]
+    },
+    {
+      "name": "main",
+      "paths": ["apps/desktop/src/main/**"]
+    },
+    {
+      "name": "renderer",
+      "paths": ["apps/desktop/src/renderer/**"]
+    },
+    {
+      "name": "sidecar",
+      "paths": ["services/agent-sidecar/src/**"]
+    },
+    {
+      "name": "web-assets",
+      "paths": ["apps/desktop/public/**"]
+    },
+    {
+      "name": "tooling",
+      "paths": [
+        "apps/desktop/cli/roomai.ts",
+        "apps/desktop/electron-builder.config.mjs",
+        "apps/desktop/vite.config.ts",
+        "apps/desktop/vitest.config.ts",
+        "apps/desktop/scripts/afterSign.mjs",
+        "apps/desktop/scripts/afterSignCore.mjs",
+        "apps/desktop/scripts/buildLatestManifest.mjs",
+        "apps/desktop/scripts/bundlePreload.mjs",
+        "apps/desktop/scripts/copyRenderer.mjs",
+        "apps/desktop/scripts/copyRuntimeAssets.mjs",
+        "apps/desktop/scripts/dev.mjs",
+        "apps/desktop/scripts/packTarGz.mjs",
+        "apps/desktop/scripts/versionFiles.mjs",
+        "apps/desktop/scripts/vitest.config.mjs",
+        "scripts/check-layout.mjs",
+        "scripts/clean.mjs",
+        "services/agent-sidecar/devtools/dataset/build.py",
+        "services/agent-sidecar/devtools/dataset/vision.py",
+        "services/agent-sidecar/devtools/draw_agents_doc.py",
+        "services/agent-sidecar/devtools/studio.py",
+        "services/agent-sidecar/devtools/verify_bundle_clean.py",
+        "services/agent-sidecar/launch.py",
+        "services/agent-sidecar/live_image_probe.py",
+        "services/agent-sidecar/live_route_probe.py",
+        "services/agent-sidecar/live_video_probe.py"
+      ]
+    }
+  ],
+  "allow": {
+    "shared": [],
+    "preload": ["shared"],
+    "main": ["shared"],
+    "renderer": ["shared"],
+    "sidecar": [],
+    "web-assets": [],
+    "tooling": ["shared", "main", "renderer", "preload", "sidecar"]
+  },
+  "deny": [
+    { "from": "renderer", "to": "main" },
+    { "from": "renderer", "to": "preload" },
+    { "from": "main", "to": "renderer" },
+    { "from": "preload", "to": "main" },
+    { "from": "preload", "to": "renderer" },
+    { "from": "shared", "to": "main" },
+    { "from": "shared", "to": "renderer" },
+    { "from": "shared", "to": "preload" },
+    { "from": "sidecar", "to": "main" },
+    { "from": "sidecar", "to": "renderer" }
+  ]
+}

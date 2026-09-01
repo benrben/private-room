@@ -239,6 +239,65 @@ async function discard(deps: InstallDeps, dir: string): Promise<void> {
   }
 }
 
+function currentBundleMoveFailure(error: unknown, extractedDir: string, appBundlePath: string): InstallError {
+  if (isPermissionError(error)) {
+    return new InstallError(
+      "permission_denied",
+      `cannot replace ${appBundlePath} without elevated privileges`,
+      buildPrivilegedMoveScript(extractedDir, appBundlePath),
+    );
+  }
+  return new InstallError(
+    "install_failed",
+    `could not move the current app aside: ${(error as Error).message}`,
+  );
+}
+
+async function moveCurrentBundleAside(
+  deps: InstallDeps,
+  extractedDir: string,
+  appBundlePath: string,
+  backupPath: string,
+  backupParent: string,
+): Promise<boolean> {
+  if (!(await deps.fs.pathExists(appBundlePath))) return false;
+  try {
+    await deps.fs.rename(appBundlePath, backupPath);
+    return true;
+  } catch (error) {
+    await discard(deps, backupParent);
+    throw currentBundleMoveFailure(error, extractedDir, appBundlePath);
+  }
+}
+
+async function installFailureOutcome(
+  deps: InstallDeps,
+  movedAside: boolean,
+  backupPath: string,
+  appBundlePath: string,
+  backupParent: string,
+): Promise<string> {
+  if (!movedAside) {
+    await discard(deps, backupParent);
+    return "";
+  }
+  try {
+    await deps.fs.rename(backupPath, appBundlePath);
+    await discard(deps, backupParent);
+    return " The previous version was restored.";
+  } catch {
+    // Deliberately NOT discarded: it now holds the only copy of the app.
+    return ` The previous version is at ${backupPath}.`;
+  }
+}
+
+function newBundleMoveFailure(error: unknown, appBundlePath: string, outcome: string): InstallError {
+  return new InstallError(
+    errnoOf(error) === "EXDEV" ? "cross_device" : "install_failed",
+    `could not move the new app into ${appBundlePath}: ${(error as Error).message}.${outcome}`,
+  );
+}
+
 /**
  * Move an extracted bundle into place at `appBundlePath`.
  *
@@ -264,55 +323,19 @@ export async function installExtractedBundle(
   const backupParent = await deps.fs.mkdtemp("arcelle-update-backup-");
   const backupPath = path.join(backupParent, "current_app");
 
-  let movedAside = false;
-  if (await deps.fs.pathExists(appBundlePath)) {
-    try {
-      await deps.fs.rename(appBundlePath, backupPath);
-      movedAside = true;
-    } catch (e) {
-      await discard(deps, backupParent);
-      if (isPermissionError(e)) {
-        throw new InstallError(
-          "permission_denied",
-          `cannot replace ${appBundlePath} without elevated privileges`,
-          buildPrivilegedMoveScript(extractedDir, appBundlePath),
-        );
-      }
-      throw new InstallError(
-        "install_failed",
-        `could not move the current app aside: ${(e as Error).message}`,
-      );
-    }
-  }
+  const movedAside = await moveCurrentBundleAside(
+    deps,
+    extractedDir,
+    appBundlePath,
+    backupPath,
+    backupParent,
+  );
 
   try {
     await deps.fs.rename(extractedDir, appBundlePath);
-  } catch (e) {
-    let outcome: string;
-    if (!movedAside) {
-      // Nothing was displaced, so there is nothing to put back.
-      await discard(deps, backupParent);
-      outcome = "";
-    } else {
-      let restored = false;
-      try {
-        await deps.fs.rename(backupPath, appBundlePath);
-        restored = true;
-      } catch {
-        // Reported below instead, so the user is told where their app actually is.
-      }
-      if (restored) {
-        await discard(deps, backupParent);
-        outcome = " The previous version was restored.";
-      } else {
-        // Deliberately NOT discarded: it now holds the only copy of the app.
-        outcome = ` The previous version is at ${backupPath}.`;
-      }
-    }
-    throw new InstallError(
-      errnoOf(e) === "EXDEV" ? "cross_device" : "install_failed",
-      `could not move the new app into ${appBundlePath}: ${(e as Error).message}.${outcome}`,
-    );
+  } catch (error) {
+    const outcome = await installFailureOutcome(deps, movedAside, backupPath, appBundlePath, backupParent);
+    throw newBundleMoveFailure(error, appBundlePath, outcome);
   }
 
   try {

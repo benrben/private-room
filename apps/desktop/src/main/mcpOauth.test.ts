@@ -17,11 +17,11 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { connect } from "node:net";
+import { connect, type Socket } from "node:net";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createRoom } from "./db-host/open.js";
 import {
   authMetadataUrls,
@@ -44,7 +44,9 @@ import {
   parseResourceMetadata,
   parseTokenResponse,
   parseWwwAuthenticate,
+  probeWwwAuthenticate,
   redirectTarget,
+  registerClient,
   refreshIfExpiring,
   refreshTokens,
   saveTokens,
@@ -188,6 +190,21 @@ describe("pure parsing", () => {
     expect(url).toContain("resource=https%3A%2F%2Fmcp.example.com%2Fmcp");
     // An endpoint that already carries a query keeps it.
     expect(buildAuthorizeUrl("https://a/authorize?x=1", "c", "r", "ch", "st", "", "res")).toContain("?x=1&response_type");
+  });
+
+  it("authorize URL uses strict RFC 3986 byte encoding for punctuation and UTF-8", () => {
+    const url = buildAuthorizeUrl(
+      "https://auth.example/authorize",
+      "client!*'()é",
+      "http://127.0.0.1/cb",
+      "challenge",
+      "state",
+      "read",
+      "https://resource.example/a?x=!*'()é"
+    );
+    // encodeURIComponent leaves !*'() unescaped; OAuth query values must not.
+    expect(url).toContain("client_id=client%21%2A%27%28%29%C3%A9");
+    expect(url).toContain("resource=https%3A%2F%2Fresource.example%2Fa%3Fx%3D%21%2A%27%28%29%C3%A9");
   });
 
   it("parses_callback_query", () => {
@@ -511,6 +528,131 @@ describe("the loopback callback listener — real TCP", () => {
     await expect(awaitCallback(server, "ST", 150)).rejects.toThrow(/timed out/);
     server.close();
   });
+
+  it("queues a real callback while an earlier speculative socket is still being read", async () => {
+    const { server, redirectUri } = await bindCallback();
+    const port = Number(new URL(redirectUri).port);
+    const waiting = awaitCallback(server, "ST", 10_000);
+    const speculative = await new Promise<Socket>((resolve, reject) => {
+      const socket = connect(port, "127.0.0.1", () => resolve(socket));
+      socket.on("error", reject);
+    });
+    // The listener is still waiting for the speculative socket's request line,
+    // so this redirect must be queued rather than dropped.
+    const redirect = knock(port, "GET /callback?code=queued-code&state=ST");
+    const unusedQueuedSocket = await new Promise<Socket>((resolve, reject) => {
+      const socket = connect(port, "127.0.0.1", () => resolve(socket));
+      socket.on("error", reject);
+    });
+    const unusedSocketClosed = new Promise<void>((resolve) => unusedQueuedSocket.once("close", resolve));
+    speculative.end();
+    await redirect;
+    await expect(waiting).resolves.toBe("queued-code");
+    await unusedSocketClosed;
+    server.close();
+  });
+
+  it("drops an oversized non-callback request before accepting the real redirect", async () => {
+    const { server, redirectUri } = await bindCallback();
+    const port = Number(new URL(redirectUri).port);
+    const waiting = awaitCallback(server, "ST", 10_000);
+    const oversized = await new Promise<Socket>((resolve, reject) => {
+      const socket = connect(port, "127.0.0.1", () => resolve(socket));
+      socket.on("error", reject);
+    });
+    const dropped = new Promise<void>((resolve) => oversized.once("close", resolve));
+    oversized.write("x".repeat(70_000));
+    await dropped;
+    await knock(port, "GET /callback?code=after-large-request&state=ST");
+    await expect(waiting).resolves.toBe("after-large-request");
+    server.close();
+  });
+});
+
+describe("guarded discovery failure ordering", () => {
+  it("continues across an empty PRM and invalid authorization metadata before reporting the final reason", async () => {
+    let base = "";
+    const server = createServer((req, res) => {
+      const pathname = new URL(req.url ?? "/", "http://placeholder").pathname;
+      if (pathname === "/missing") {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({}));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      if (pathname === "/prm-empty") {
+        res.end(JSON.stringify({ authorization_servers: [] }));
+        return;
+      }
+      if (pathname === "/prm-invalid") {
+        res.end(JSON.stringify({ authorization_servers: [base] }));
+        return;
+      }
+      if (pathname === "/prm-unreachable") {
+        res.end(JSON.stringify({ authorization_servers: ["http://127.0.0.1:9"] }));
+        return;
+      }
+      res.end(JSON.stringify({ authorization_endpoint: `${base}/authorize` }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    const port = typeof address === "object" && address !== null ? address.port : 0;
+    base = `http://127.0.0.1:${port}`;
+    try {
+      await expect(discover([`${base}/prm-empty`, `${base}/prm-invalid`], PERMISSIVE_TEST_GUARD)).rejects.toThrow(
+        /is missing required endpoints/
+      );
+      await expect(discover([`${base}/missing`], PERMISSIVE_TEST_GUARD)).rejects.toThrow(/returned HTTP 404/);
+      await expect(discover([`${base}/prm-unreachable`], PERMISSIVE_TEST_GUARD)).rejects.toThrow(
+        /request to .* failed/
+      );
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("preserves no-host, resolver, fetch, and HTTPS-default-port guard failures", async () => {
+    const noHost: OutboundGuard = {
+      checkEndpoint: () => new URL("file:///metadata"),
+      resolveAddr: async () => ({ address: "127.0.0.1", port: 80 }),
+    };
+    await expect(discover(["ignored"], noHost)).rejects.toThrow("ignored has no host — refused.");
+
+    const resolverFailure: OutboundGuard = {
+      checkEndpoint: (url) => new URL(url),
+      resolveAddr: async () => Promise.reject(new Error("DNS check failed")),
+    };
+    await expect(discover(["http://oauth.example/metadata"], resolverFailure)).rejects.toThrow("DNS check failed");
+
+    const unreachable: OutboundGuard = {
+      checkEndpoint: (url) => new URL(url),
+      resolveAddr: async (_host, port) => ({ address: "127.0.0.1", port }),
+    };
+    await expect(discover(["http://127.0.0.1:9/metadata"], unreachable)).rejects.toThrow(/request to .* failed/);
+
+    let resolvedPort = 0;
+    const httpsDefault: OutboundGuard = {
+      checkEndpoint: (url) => new URL(url),
+      resolveAddr: async (_host, port) => {
+        resolvedPort = port;
+        return { address: "127.0.0.1", port };
+      },
+    };
+    await expect(discover(["https://127.0.0.1/metadata"], httpsDefault)).rejects.toThrow(/request to .* failed/);
+    expect(resolvedPort).toBe(443);
+  });
+
+  it("turns an aborted guarded metadata request into the exact timeout error", async () => {
+    const abortError = Object.assign(new Error("aborted"), { name: "AbortError" });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(abortError);
+    try {
+      await expect(discover(["https://oauth.example/metadata"], PERMISSIVE_TEST_GUARD)).rejects.toThrow(
+        "request to https://oauth.example/metadata timed out"
+      );
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
 });
 
 // --------------------------------------------------- real end-to-end wire
@@ -521,6 +663,147 @@ const PERMISSIVE_TEST_GUARD: OutboundGuard = {
   checkEndpoint: (url) => new URL(url),
   resolveAddr: async (host, port) => ({ address: host, port }),
 };
+
+interface OAuthErrorFixture {
+  baseUrl: string;
+  server: Server;
+}
+
+function startOAuthErrorFixture(): Promise<OAuthErrorFixture> {
+  let baseUrl = "";
+  return new Promise((resolve) => {
+    const server = createServer((req, res) => {
+      const pathname = new URL(req.url ?? "/", "http://placeholder").pathname;
+      if (pathname === "/invalid-json") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("not JSON");
+        return;
+      }
+      if (pathname === "/redirect-loop") {
+        res.writeHead(302, { location: `${baseUrl}/redirect-loop` });
+        res.end();
+        return;
+      }
+      if (pathname === "/register-status") {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "registration rejected" }));
+        return;
+      }
+      if (pathname === "/register-missing") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({}));
+        return;
+      }
+      if (pathname === "/token-invalid") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("not JSON");
+        return;
+      }
+      if (pathname === "/token-error") {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid_grant" }));
+        return;
+      }
+      if (pathname === "/token-default") {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({}));
+        return;
+      }
+      if (pathname === "/prm-manual") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ authorization_servers: [baseUrl] }));
+        return;
+      }
+      if (pathname === "/.well-known/oauth-authorization-server") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ authorization_endpoint: `${baseUrl}/authorize`, token_endpoint: `${baseUrl}/token` }));
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({}));
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address !== null ? address.port : 0;
+      baseUrl = `http://127.0.0.1:${port}`;
+      resolve({ baseUrl, server });
+    });
+  });
+}
+
+describe("OAuth protocol failure wire", () => {
+  it("keeps unreadable metadata, redirect exhaustion, and registration failures distinct", async () => {
+    const fixture = await startOAuthErrorFixture();
+    try {
+      expect(redirectTarget(302, "http://[", new URL(`${fixture.baseUrl}/source`))).toBeNull();
+      await expect(discover([`${fixture.baseUrl}/invalid-json`], PERMISSIVE_TEST_GUARD)).rejects.toThrow(/sent invalid JSON/);
+      await expect(discover([`${fixture.baseUrl}/redirect-loop`], PERMISSIVE_TEST_GUARD)).rejects.toThrow(
+        /redirected too many times/
+      );
+      await expect(registerClient("http://127.0.0.1:9/register", "http://127.0.0.1/callback", PERMISSIVE_TEST_GUARD)).rejects.toThrow(
+        /client registration failed/
+      );
+      await expect(registerClient(`${fixture.baseUrl}/register-status`, "http://127.0.0.1/callback", PERMISSIVE_TEST_GUARD)).rejects.toThrow(
+        /client registration returned HTTP 400/
+      );
+      await expect(registerClient(`${fixture.baseUrl}/register-missing`, "http://127.0.0.1/callback", PERMISSIVE_TEST_GUARD)).rejects.toThrow(
+        /registration response had no client_id/
+      );
+    } finally {
+      await closeServer(fixture.server);
+    }
+  });
+
+  it("keeps unreadable and rejected token responses observable without retiring transport failures", async () => {
+    const fixture = await startOAuthErrorFixture();
+    try {
+      await expect(refreshTokens(`${fixture.baseUrl}/token-invalid`, "client", "refresh", PERMISSIVE_TEST_GUARD)).rejects.toMatchObject({
+        rejected: false,
+      });
+      await expect(refreshTokens(`${fixture.baseUrl}/token-error`, "client", "refresh", PERMISSIVE_TEST_GUARD)).rejects.toMatchObject({
+        message: "invalid_grant",
+        rejected: true,
+      });
+      await expect(refreshTokens(`${fixture.baseUrl}/token-default`, "client", "refresh", PERMISSIVE_TEST_GUARD)).rejects.toMatchObject({
+        message: "token request rejected",
+        rejected: true,
+      });
+    } finally {
+      await closeServer(fixture.server);
+    }
+  });
+
+  it("does not open a browser when metadata requires manual client setup", async () => {
+    const fixture = await startOAuthErrorFixture();
+    try {
+      await expect(
+        authorize(`${fixture.baseUrl}/resource`, `Bearer resource_metadata="${fixture.baseUrl}/prm-manual"`, {
+          openBrowser: () => {
+            throw new Error("browser should not open");
+          },
+          guard: PERMISSIVE_TEST_GUARD,
+        })
+      ).rejects.toThrow(/requires manual client setup/);
+    } finally {
+      await closeServer(fixture.server);
+    }
+  });
+
+  it("probes the challenge header and degrades to null for ordinary or failed calls", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response("", { status: 401, headers: { "www-authenticate": "Bearer challenge" } }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockRejectedValueOnce(new Error("offline"));
+    try {
+      await expect(probeWwwAuthenticate("https://mcp.example/one")).resolves.toBe("Bearer challenge");
+      await expect(probeWwwAuthenticate("https://mcp.example/two")).resolves.toBeNull();
+      await expect(probeWwwAuthenticate("https://mcp.example/three")).resolves.toBeNull();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+});
 
 interface OAuthFixture {
   baseUrl: string;

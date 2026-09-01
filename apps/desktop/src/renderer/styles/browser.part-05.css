@@ -1,0 +1,79 @@
+
+
+/* Loading skeletons: the shape of the answer, drawn before the answer. A
+   spinner on an empty pane is indistinguishable from a hang — which is
+   exactly how a slow fan-out was read (owner report 2026-08-01). Drawn as
+   provisional boundaries, which is what a dashed pencil rule means here. */
+.bsearch-fuse i.pending {
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+  animation: bsearch-pulse 1.4s ease-in-out infinite;
+  animation-delay: calc(var(--i) * 90ms);
+}
+
+@keyframes bsearch-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+
+.bsearch-skel {
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-lg);
+  background-image: linear-gradient(
+    100deg,
+    transparent 40%,
+    color-mix(in srgb, var(--ink) 6%, transparent) 50%,
+    transparent 60%
+  );
+  background-size: 200% 100%;
+  animation: bsearch-shimmer 1.4s linear infinite;
+}
+
+.bsearch-skel.feature { height: 172px; }
+.bsearch-skel.duo { height: 190px; }
+.bsearch-skel.row { height: 88px; }
+
+/* ==========================================================================
+   11. NARROW PANE
+   ========================================================================== */
+
+@media (max-width: 720px) {
+  .bsearch { padding: var(--sp-4); }
+  .bsearch-card.feature { grid-template-columns: 1fr; }
+  .bsearch-card.feature .bsearch-img { min-height: 128px; order: -1; }
+  .bsearch-duo { grid-template-columns: 1fr; }
+}
+
+/* ==========================================================================
+   12. REDUCED MOTION
+   Every animation above lands on its finished frame when switched off:
+   nothing here animates INTO a resting state the element does not otherwise
+   have, so the page renders complete rather than half-drawn.
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  .browser-btn,
+  .browser-takeover,
+  .bsearch-ask,
+  .bsearch-summary-ask,
+  .bsearch-card,
+  .bsearch-acts {
+    transition: none;
+  }
+  .browser-btn:active:not(:disabled),
+  .browser-takeover:active:not(:disabled),
+  .bsearch-card:hover {
+    transform: none;
+  }
+  .bsearch-card,
+  .bsearch-fuse i,
+  .bsearch-rel i,
+  .bsearch-peek,
+  .bsearch-img img,
+  .bsearch-mono,
+  .bsearch-img.waiting,
+  .bsearch-skel,
+  .bsearch-fuse i.pending,
+  .bsearch-spin {
+    animation: none;
+  }
+}

@@ -108,20 +108,24 @@ Python side); keep it in sync by hand if the Rust table ever changes.
 
 from __future__ import annotations
 
-import io
 import unicodedata
 
-import olefile
-import xlrd
-from odf.opendocument import load as _odf_load
-from odf.table import Table, TableRow
-
 from arcelle_sidecar.docs import textutil
-
-try:
-    import odf.teletype as _teletype
-except ImportError:  # pragma: no cover - odfpy always ships this module
-    _teletype = None
+from arcelle_sidecar.docs.legacy_common import utf8_len as _utf8_len
+from arcelle_sidecar.docs.legacy_ole import (
+    is_ole_compound as _is_ole_compound,
+    olefile as olefile,
+    read_ole_stream as _read_ole_stream,
+)
+from arcelle_sidecar.docs.legacy_spreadsheet import (
+    _ods_cell_value as _ods_cell_value,
+    _ods_row_values as _ods_row_values,
+    _repeat_count as _repeat_count,
+    _trim_float as _trim_float,
+    _xls_cell_value as _xls_cell_value,
+    extract_legacy_spreadsheet as _extract_legacy_spreadsheet,
+    xlrd as xlrd,
+)
 
 # ------------------------------------------------------------------- shared
 
@@ -129,212 +133,14 @@ except ImportError:  # pragma: no cover - odfpy always ships this module
 # than quietly handing back an unbounded string to the caller.
 MAX_LEGACY_CHARS: int = 8 * 1024 * 1024
 
-# The OLE Compound File magic -- the first eight bytes of every `.doc`,
-# `.xls` and `.ppt` written before the 2007 XML formats.
-_OLE_MAGIC = bytes((0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1))
-
-
-def _utf8_len(s: str) -> int:
-    """Byte length, matching Rust's `String::len()` (UTF-8 bytes), not
-    Python's `len()` (code points). Every MAX_LEGACY_CHARS comparison below
-    checks against this, exactly as the Rust source compares against
-    `out.len()`.
-    """
-    return len(s.encode("utf-8"))
-
-
-def _trim_float(f: float) -> str:
-    """`12.0` reads as `12`, `12.5` stays `12.5` -- a spreadsheet of
-    integers must not fill the search index with trailing zeros.
-
-    `abs(f) < 1e15` is checked before `f == int(f)` so that NaN/infinity
-    (for which `int(f)` raises) never reach the conversion: both already
-    fail the magnitude check (comparisons against NaN are always False) and
-    fall straight to `str(f)`, which is what the "everything else" branch
-    wants for them anyway.
-    """
-    if abs(f) < 1e15 and f == int(f):
-        return str(int(f))
-    return str(f)
-
-
 # ------------------------------------------------------------------ xls / ods
 
 def extract_legacy_spreadsheet(data: bytes, ext: str) -> str | None:
-    """`.xls` (via `xlrd`) and `.ods` (via `odfpy`), sheet by sheet, cell by
-    cell, in the same tab-separated layout regardless of format so search
-    behaves identically across both -- and across the xlsx reader
-    elsewhere in this codebase.
-    """
-    if ext == "xls":
-        sheets = _xls_sheets(data)
-    elif ext == "ods":
-        sheets = _ods_sheets(data)
-    else:
-        return None
-    if sheets is None:
-        return None
-
-    out: list[str] = []
-    total_len = 0
-    for name, rows in sheets:
-        # A sheet with nothing but empty cells contributes nothing -- not
-        # even its own header line.
-        if not any(any(cell.strip() for cell in row) for row in rows):
-            continue
-        header = f"--- {name} ---\n"
-        out.append(header)
-        total_len += _utf8_len(header)
-        for row in rows:
-            # A row of nothing but empty cells contributes nothing.
-            if all(cell.strip() == "" for cell in row):
-                continue
-            line = "\t".join(row) + "\n"
-            out.append(line)
-            total_len += _utf8_len(line)
-            if total_len > MAX_LEGACY_CHARS:
-                out.append("\n… (truncated)\n")
-                result = "".join(out)
-                return result if result.strip() else None
-    result = "".join(out)
-    return result if result.strip() else None
-
-
-def _xls_sheets(data: bytes) -> list[tuple[str, list[list[str]]]] | None:
-    try:
-        # `logfile=io.StringIO()` swallows xlrd's own warnings (it defaults
-        # to printing them to stdout), which this sidecar's parent process
-        # otherwise reads structured output from.
-        book = xlrd.open_workbook(file_contents=data, logfile=io.StringIO())
-    except Exception:
-        return None
-    sheets: list[tuple[str, list[list[str]]]] = []
-    for sheet in book.sheets():
-        rows = [
-            [_xls_cell_value(cell, book.datemode) for cell in sheet.row(r)]
-            for r in range(sheet.nrows)
-        ]
-        sheets.append((sheet.name, rows))
-    return sheets
-
-
-def _xls_cell_value(cell: xlrd.sheet.Cell, datemode: int) -> str:
-    if cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
-        return ""
-    if cell.ctype == xlrd.XL_CELL_NUMBER:
-        return _trim_float(float(cell.value))
-    if cell.ctype == xlrd.XL_CELL_BOOLEAN:
-        # Matches Rust's `Data::Bool(b) => b.to_string()`, which renders
-        # lowercase -- NOT Python's `str(bool(x))`, which capitalizes.
-        return "true" if cell.value else "false"
-    if cell.ctype == xlrd.XL_CELL_DATE:
-        try:
-            return str(xlrd.xldate_as_datetime(cell.value, datemode))
-        except (xlrd.XLDateError, ValueError):
-            return _trim_float(float(cell.value))
-    if cell.ctype == xlrd.XL_CELL_ERROR:
-        return xlrd.error_text_from_code.get(cell.value, str(cell.value))
-    return str(cell.value)
-
-
-# Real .ods files routinely compress a trailing run of identical (usually
-# blank) cells or rows with `table:number-*-repeated` counts running into
-# the tens of thousands (padding out to the sheet's nominal 1,048,576-row /
-# 16,384-column boundary -- see calamine's own `MAX_ROWS`/`MAX_COLUMNS`,
-# which it expands up to). Honouring that literally would turn one blank
-# filler cell/row into a wall of tabs for no benefit, so both are expanded
-# but capped here.
-_MAX_ODS_REPEAT = 1024
-
-
-def _repeat_count(raw: str | None) -> int:
-    if raw is None:
-        return 1
-    try:
-        n = int(raw)
-    except ValueError:
-        return 1
-    return max(1, min(n, _MAX_ODS_REPEAT))
-
-
-def _ods_sheets(data: bytes) -> list[tuple[str, list[list[str]]]] | None:
-    try:
-        doc = _odf_load(io.BytesIO(data))
-    except Exception:
-        return None
-    sheets: list[tuple[str, list[list[str]]]] = []
-    for tbl in doc.getElementsByType(Table):
-        name = tbl.getAttribute("name") or ""
-        rows: list[list[str]] = []
-        for row_el in tbl.getElementsByType(TableRow):
-            cells = _ods_row_values(row_el)
-            repeat = _repeat_count(row_el.getAttribute("numberrowsrepeated"))
-            for _ in range(repeat):
-                rows.append(cells)
-        sheets.append((name, rows))
-    return sheets
-
-
-def _ods_row_values(row) -> list[str]:
-    """One row's cell values, in column order.
-
-    `table:covered-table-cell` (the continuation of a merged cell) counts
-    as a blank cell so a later real cell in the same row keeps its true
-    column position -- walking `row.childNodes` directly (rather than
-    `getElementsByType(TableCell)` alone) is what makes that possible, since
-    odfpy models a covered cell as a distinct element type that a
-    `TableCell`-only search silently skips.
-    `table:number-columns-repeated` is expanded for the same column-position
-    reason -- a common OASIS compression for runs of blank (or identical)
-    cells.
-    """
-    values: list[str] = []
-    for child in row.childNodes:
-        local_name = child.qname[1] if hasattr(child, "qname") else None
-        if local_name not in ("table-cell", "covered-table-cell"):
-            continue
-        value = _ods_cell_value(child)
-        repeat = _repeat_count(child.getAttribute("numbercolumnsrepeated"))
-        values.extend([value] * repeat)
-    return values
-
-
-def _ods_cell_value(cell) -> str:
-    """A cell's value as text: the typed value for numbers/booleans/dates
-    (via the `office:value-type`-keyed attribute ODF stores it under),
-    else the cell's displayed text.
-    """
-    value_type = cell.getAttribute("valuetype")
-    if value_type in ("float", "percentage", "currency"):
-        raw = cell.getAttribute("value")
-        if raw is not None:
-            try:
-                return _trim_float(float(raw))
-            except ValueError:
-                pass
-    elif value_type == "boolean":
-        raw = cell.getAttribute("booleanvalue")
-        if raw is not None:
-            return raw
-    elif value_type == "date":
-        raw = cell.getAttribute("datevalue")
-        if raw is not None:
-            return raw
-    elif value_type == "time":
-        raw = cell.getAttribute("timevalue")
-        if raw is not None:
-            return raw
-    # "string" value-type, no value-type at all (a plain/empty cell), or a
-    # typed attribute that was missing/unparseable: the displayed text IS
-    # the value.
-    return _teletype.extractText(cell) if _teletype is not None else str(cell)
+    """Extract a spreadsheet using the caller's live legacy-size ceiling."""
+    return _extract_legacy_spreadsheet(data, ext, MAX_LEGACY_CHARS)
 
 
 # ------------------------------------------------------------------------ doc
-
-def _is_ole_compound(data: bytes) -> bool:
-    return data.startswith(_OLE_MAGIC)
-
 
 def _is_clean_import(s: str) -> bool:
     """True when textutil's answer reads as an imported DOCUMENT rather
@@ -354,60 +160,6 @@ def _is_clean_import(s: str) -> bool:
         1 for c in s if unicodedata.category(c) == "Cc" and c not in ("\n", "\r", "\t")
     )
     return control * 100 < total
-
-
-# A stream is never read past this many bytes, however large the compound
-# file claims it to be. `olefile`'s `OleStream` reads the entire declared
-# stream into memory up front (there is no lazy/streaming read the way the
-# Rust `cfb` crate's `Stream: Read` impl allows `.take()` to bound), so this
-# slice is applied AFTER materialisation -- bounded in practice by the
-# file's own actual size, since a stream cannot claim more sectors than the
-# file's real FAT provides without `olefile` raising, but peak memory can
-# briefly exceed this cap for a very large legacy file where Rust's
-# `.take(cap)` never would. A real but low-impact library-boundary gap.
-_MAX_OLE_STREAM_BYTES = 200 * 1024 * 1024
-
-
-def _read_ole_stream(data: bytes, names: list[str]) -> bytes | None:
-    """Read the first of `names` that exists in the compound file.
-
-    `data` is always wrapped in `io.BytesIO` before reaching `olefile`:
-    passed raw, `olefile.OleFileIO` treats a `bytes` value SHORTER than its
-    own internal 1536-byte threshold as a file PATH, not file content
-    (confirmed against the installed `olefile` package's own docstring and
-    behaviour) -- exactly the size range a short or malformed input can
-    fall into. No well-formed OLE2 file is ever that small (the mandatory
-    header + FAT sector + directory sector alone total exactly 1536 bytes),
-    so this only ever matters for input that isn't a real compound file
-    anyway -- but without the wrapper, such input would be handed to the
-    filesystem as a path (potentially reading an unrelated file from disk)
-    rather than cleanly failing to parse as one, the way the Rust `cfb`
-    crate always treats its input as bytes regardless of length.
-
-    Stream lookups in both `olefile` and the `cfb` crate are
-    case-INSENSITIVE, per the MS-CFB spec's own name-ordering rule (`cfb`'s
-    `compare_names` upper-cases before comparing; `olefile`'s `_find`
-    lower-cases) -- so plain `exists`/`openstream` on the bare name is
-    already exactly equivalent to the Rust side; no extra case handling
-    needed here.
-    """
-    try:
-        ole = olefile.OleFileIO(io.BytesIO(data))
-    except Exception:
-        return None
-    try:
-        for name in names:
-            if not ole.exists(name):
-                continue
-            try:
-                stream = ole.openstream(name)
-            except Exception:
-                # `exists` is true for a storage too; only a stream opens.
-                continue
-            return stream.read(_MAX_OLE_STREAM_BYTES)
-        return None
-    finally:
-        ole.close()
 
 
 def extract_legacy_doc(name: str, data: bytes) -> str | None:
@@ -431,16 +183,28 @@ def extract_legacy_doc(name: str, data: bytes) -> str | None:
     if not _is_ole_compound(data):
         return None
 
-    imported = textutil.convert(name, data, "txt")
-    if imported is not None and _is_clean_import(imported):
-        resolved = textutil.resolve_field_codes(imported, False)
-        if resolved.strip():
-            return resolved
+    imported = _imported_legacy_doc(name, data)
+    if imported is not None:
+        return imported
 
-    # The sweep, for a file macOS declined. Requiring the `WordDocument`
-    # stream keeps "is this really a .doc" a structural question -- an OLE
-    # file that is something else entirely reads as nothing rather than as
-    # its own innards.
+    return _harvested_legacy_doc(data)
+
+
+def _imported_legacy_doc(name: str, data: bytes) -> str | None:
+    imported = textutil.convert(name, data, "txt")
+    if imported is None or not _is_clean_import(imported):
+        return None
+    resolved = textutil.resolve_field_codes(imported, False)
+    return resolved if resolved.strip() else None
+
+
+def _harvested_legacy_doc(data: bytes) -> str | None:
+    """Fallback prose extraction after textutil declined the document.
+
+    Requiring the `WordDocument` stream keeps "is this really a .doc" a
+    structural question -- an OLE file that is something else entirely
+    reads as nothing rather than as its own innards.
+    """
     stream = _read_ole_stream(data, ["WordDocument"])
     if stream is None:
         return None
@@ -493,33 +257,46 @@ class _PptChunk:
 def _ppt_records_to_text(stream: bytes) -> str:
     chunks: list[_PptChunk] = []
     _walk_ppt_records(stream, chunks, None, 0)
+    return _render_ppt_chunks(chunks)
 
+
+def _render_ppt_chunks(chunks: list[_PptChunk]) -> str:
     out: list[str] = []
     total_len = 0
     slide_no = 0
     for chunk in chunks:
-        body = "\n".join(chunk.lines)
-        # A notes page with nothing but the slide-number placeholder ("*"),
-        # and any bucket with no actual words in it, is not content.
-        if not any(c.isalnum() for c in body):
+        rendered = _renderable_ppt_chunk(chunk, slide_no)
+        if rendered is None:
             continue
-        if chunk.is_notes:
-            # Notes belong to a slide; one arriving before any slide is the
-            # notes MASTER, which is boilerplate like the slide master.
-            if slide_no == 0:
-                continue
-            header = f"[slide {slide_no} notes]\n"
-        else:
-            slide_no += 1
-            header = f"[slide {slide_no}]\n"
-        out.append(header)
-        out.append(body)
-        out.append("\n")
-        total_len += _utf8_len(header) + _utf8_len(body) + 1
+        header, body, slide_no = rendered
+        total_len = _append_ppt_chunk(out, header, body, total_len)
         if total_len > MAX_LEGACY_CHARS:
             out.append("\n… (truncated)\n")
             break
     return "".join(out)
+
+
+def _renderable_ppt_chunk(
+    chunk: _PptChunk, slide_no: int
+) -> tuple[str, str, int] | None:
+    body = "\n".join(chunk.lines)
+    # A notes page with nothing but the slide-number placeholder ("*"),
+    # and any bucket with no actual words in it, is not content.
+    if not any(character.isalnum() for character in body):
+        return None
+    if chunk.is_notes:
+        # Notes belong to a slide; one arriving before any slide is the
+        # notes MASTER, which is boilerplate like the slide master.
+        if slide_no == 0:
+            return None
+        return f"[slide {slide_no} notes]\n", body, slide_no
+    slide_no += 1
+    return f"[slide {slide_no}]\n", body, slide_no
+
+
+def _append_ppt_chunk(out: list[str], header: str, body: str, total_len: int) -> int:
+    out.extend((header, body, "\n"))
+    return total_len + _utf8_len(header) + _utf8_len(body) + 1
 
 
 def _walk_ppt_records(
@@ -536,62 +313,99 @@ def _walk_ppt_records(
     """
     if depth > MAX_RECORD_DEPTH:
         return
-    i = 0
-    n = len(buf)
-    while i + 8 <= n:
-        ver_inst = int.from_bytes(buf[i : i + 2], "little")
-        rec_type = int.from_bytes(buf[i + 2 : i + 4], "little")
-        rec_len = int.from_bytes(buf[i + 4 : i + 8], "little")
-        i += 8
-        # A length past the end of the buffer means the tree is not what it
-        # claims; stop rather than reinterpret the rest as records.
-        if rec_len > n - i:
+    offset = 0
+    while offset < len(buf):
+        record = _ppt_record_at(buf, offset)
+        if record is None:
+            # A short header or a length past the buffer means the tree is
+            # not what it claims. Stop rather than reinterpret the rest as
+            # records.
             return
-        body = buf[i : i + rec_len]
-        i += rec_len
+        ver_inst, rec_type, body, offset = record
+        _visit_ppt_record(ver_inst, rec_type, body, chunks, into, depth)
 
-        if rec_type == RT_MAIN_MASTER:
-            # Boilerplate the deck's author never wrote: skip the whole
-            # subtree.
-            continue
-        if rec_type == RT_SLIDE or rec_type == RT_NOTES:
-            chunks.append(_PptChunk(is_notes=(rec_type == RT_NOTES)))
-            idx = len(chunks) - 1
-            _walk_ppt_records(body, chunks, idx, depth + 1)
-            continue
-        if rec_type == RT_TEXT_CHARS or rec_type == RT_TEXT_BYTES:
-            if into is None:
-                continue
-            if rec_type == RT_TEXT_CHARS:
-                raw = _decode_utf16le_lossy(body)
-            else:
-                raw = "".join(c for c in (_cp1252_char(b) for b in body) if c is not None)
-            text = _ppt_clean(raw)
-            if text.strip():
-                chunks[into].lines.append(text)
-            continue
-        # 0xF in the low nibble marks a container; anything else is an atom
-        # whose payload is not text.
-        if ver_inst & 0x0F == 0x0F:
-            _walk_ppt_records(body, chunks, into, depth + 1)
-        # else: skipped -- body bytes are simply not visited further.
+
+def _ppt_record_at(buf: bytes, offset: int) -> tuple[int, int, bytes, int] | None:
+    """Return the record at ``offset`` only when its full body is present."""
+    if offset + 8 > len(buf):
+        return None
+    ver_inst = int.from_bytes(buf[offset : offset + 2], "little")
+    rec_type = int.from_bytes(buf[offset + 2 : offset + 4], "little")
+    rec_len = int.from_bytes(buf[offset + 4 : offset + 8], "little")
+    body_start = offset + 8
+    if rec_len > len(buf) - body_start:
+        return None
+    body_end = body_start + rec_len
+    return ver_inst, rec_type, buf[body_start:body_end], body_end
+
+
+def _visit_ppt_record(
+    ver_inst: int,
+    rec_type: int,
+    body: bytes,
+    chunks: list[_PptChunk],
+    into: int | None,
+    depth: int,
+) -> None:
+    if rec_type == RT_MAIN_MASTER:
+        # Boilerplate the deck's author never wrote: skip the whole subtree.
+        return
+    if rec_type in (RT_SLIDE, RT_NOTES):
+        _walk_ppt_chunk(rec_type, body, chunks, depth)
+        return
+    if rec_type in (RT_TEXT_CHARS, RT_TEXT_BYTES):
+        _append_ppt_text(rec_type, body, chunks, into)
+        return
+    # 0xF in the low nibble marks a container; anything else is an atom
+    # whose payload is not text.
+    if ver_inst & 0x0F == 0x0F:
+        _walk_ppt_records(body, chunks, into, depth + 1)
+    # else: skipped -- body bytes are simply not visited further.
+
+
+def _walk_ppt_chunk(
+    rec_type: int, body: bytes, chunks: list[_PptChunk], depth: int
+) -> None:
+    chunks.append(_PptChunk(is_notes=(rec_type == RT_NOTES)))
+    _walk_ppt_records(body, chunks, len(chunks) - 1, depth + 1)
+
+
+def _append_ppt_text(
+    rec_type: int, body: bytes, chunks: list[_PptChunk], into: int | None
+) -> None:
+    if into is None:
+        return
+    raw = _ppt_atom_text(rec_type, body)
+    text = _ppt_clean(raw)
+    if text.strip():
+        chunks[into].lines.append(text)
+
+
+def _ppt_atom_text(rec_type: int, body: bytes) -> str:
+    if rec_type == RT_TEXT_CHARS:
+        return _decode_utf16le_lossy(body)
+    return "".join(c for c in (_cp1252_char(b) for b in body) if c is not None)
 
 
 def _ppt_clean(s: str) -> str:
     """PowerPoint's in-text control characters, as a reader sees them: \\r
     ends a paragraph, \\v a line, and \\x0b/\\x0d appear interchangeably.
     """
-    out: list[str] = []
-    for c in s:
-        if c == "\r" or c == "\x0b":
-            out.append("\n")
-        elif c == "\x00" or c == "�":
-            continue
-        elif unicodedata.category(c) == "Cc" and c != "\n" and c != "\t":
-            continue
-        else:
-            out.append(c)
-    return "".join(out).rstrip()
+    return "".join(filter(None, (_ppt_clean_character(character) for character in s))).rstrip()
+
+
+def _ppt_clean_character(character: str) -> str | None:
+    if character in ("\r", "\x0b"):
+        return "\n"
+    if _ppt_character_is_discarded(character):
+        return None
+    return character
+
+
+def _ppt_character_is_discarded(character: str) -> bool:
+    if character in ("\x00", "�"):
+        return True
+    return unicodedata.category(character) == "Cc" and character not in ("\n", "\t")
 
 
 # ------------------------------------------------------------- harvest sweep

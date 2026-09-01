@@ -4,7 +4,7 @@ import path from "node:path";
 import type { EventSender } from "../turn.js";
 import { activePolicy, type PolicyState } from "../privacy.js";
 import { emptyPrivacyReport, type StreamRedactor } from "../privacyRedact.js";
-import type { RoomManagerState } from "../roomManager.js";
+import type { Room, RoomManagerState } from "../roomManager.js";
 import type { LiveAppServices } from "../liveAppServices.js";
 import { runsOnThisMac } from "../capabilities.js";
 import { listModels as listOllamaModels } from "../engineRouting.js";
@@ -44,6 +44,21 @@ import type {
 } from "./types.js";
 import type { HarnessHistoryRun } from "../../shared/harnessTypes.js";
 
+type NativeHarnessProvider = "codex" | "claude";
+type NativeHarnessRoom = Room & {
+  workspace: NonNullable<Room["workspace"]>;
+  descriptor: NonNullable<Room["descriptor"]> & {
+    kind: "workspace-folder";
+    rootPath: string;
+  };
+  readOnly?: false;
+};
+
+interface NativeProviderProbe {
+  sandboxReady: boolean;
+  harness: HarnessRuntime["name"] | null;
+}
+
 export type HarnessProvider = "codex" | "claude" | "ollama-local" | "ollama-cloud" | "openrouter";
 
 export interface HarnessStartRequest {
@@ -75,6 +90,18 @@ interface MirrorRun {
 
 interface PendingMirrorApproval {
   resolve(approved: boolean): void;
+}
+
+interface StartedHarnessRun {
+  runId: string;
+  room: NativeHarnessRoom;
+  runtimePath: string;
+  workspacePath: string;
+}
+
+interface PumpState {
+  terminal: HarnessEvent | null;
+  lastTextEvent: Extract<HarnessEvent, { type: "text_delta" }> | null;
 }
 
 /** Redact provider output at the provider-neutral boundary.
@@ -112,545 +139,73 @@ export interface HarnessControllerOptions {
   validateModelSelection?: typeof validateModelSelection;
 }
 
-/** Trusted bridge between room state, provider runtimes and renderer events. */
-export class HarnessController {
-  private readonly runtimes: Record<HarnessProvider, HarnessRuntime>;
-  private readonly policy: () => PolicyState | null;
-  private readonly flag: (name: WorkspaceHarnessFlag) => boolean;
-  private readonly verifyExposure: NonNullable<HarnessControllerOptions["verifyExposure"]>;
-  private readonly listOllamaModels: () => Promise<string[]>;
-  private readonly validateModelSelection: typeof validateModelSelection;
-  private isolationProven: boolean;
-  private readonly mirrors = new Map<string, MirrorRun>();
-  private readonly pendingMirrorApprovals = new Map<string, PendingMirrorApproval>();
-  private readonly pendingSafetyApprovals = new Map<string, PendingMirrorApproval>();
-  private readonly pumps = new Map<string, Promise<void>>();
-  private readonly runRoots = new Map<string, string>();
-  private orchestrator: HarnessOrchestrator | null = null;
-  private roomId: string | null = null;
-  private workspace: object | null = null;
-
-  constructor(
-    private readonly state: RoomManagerState,
-    private readonly userDataDir: string,
-    private readonly emit: EventSender,
-    options: HarnessControllerOptions = {},
-  ) {
-    const fallbackDispatcher = roomServerDispatcherFactory(state, emit, options.services);
-    const fallbackOptions: LegacyCliRuntimeOptions = {
-      baseDispatcher: (context, workspace) =>
-        fallbackDispatcher(false, { kind: "CloudEngine" }, WEB_LANES_ALL, {
-          workspace,
-          privacyBypass: context.privacyMode === "cloud-direct",
-        }),
-    };
-    const nativeRoomMcp = createNativeRoomMcpFactory(
-      state,
-      (context, workspace) => fallbackDispatcher(
-        false,
-        { kind: "CloudEngine" },
-        WEB_LANES_ALL,
-        {
-          workspace,
-          privacyBypass: context.privacyMode === "cloud-direct",
-        },
-      ),
-    );
-    this.runtimes = {
-      codex: options.runtimes?.codex ?? new RuntimeWithFallback(
-        new CodexAppServerRuntime(undefined, undefined, undefined, undefined, nativeRoomMcp),
-        new RestrictedLegacyCliRuntime("codex", state, fallbackOptions),
-      ),
-      claude: options.runtimes?.claude ?? new RuntimeWithFallback(
-        new ClaudeAgentSdkRuntime(undefined, nativeRoomMcp),
-        new RestrictedLegacyCliRuntime("claude", state, fallbackOptions),
-      ),
-      "ollama-local": options.runtimes?.["ollama-local"] ?? new DeepAgentRuntime(state, emit, options.services),
-      "ollama-cloud": options.runtimes?.["ollama-cloud"] ?? new DeepAgentRuntime(state, emit, options.services),
-      openrouter: options.runtimes?.openrouter ?? new DeepAgentRuntime(state, emit, options.services),
-    };
-    this.policy = options.policy ?? activePolicy;
-    this.flag = options.flag ?? workspaceHarnessFlag;
-    this.listOllamaModels = options.listOllamaModels ?? listOllamaModels;
-    this.validateModelSelection = options.validateModelSelection ?? validateModelSelection;
-    this.verifyExposure = options.verifyExposure ?? (async (workspacePath, provider, runtimePath, writeEnabled) => {
-      const runtime = this.runtimes[provider];
-      if (runtime.verifyExposure !== undefined) {
-        return runtime.verifyExposure(workspacePath, runtimePath, writeEnabled);
-      }
-      return verifyNativeHarnessExecutable({
-        workspacePath,
-        runtimePath,
-        provider,
-        writeEnabled,
-        executable: nativeCliExecutable(provider),
-      }, provider === "codex" ? ["app-server", "--help"] : ["--version"]);
-    });
-    this.isolationProven = options.outsideWorkspaceIsolation ?? nativeWorkspaceSandboxSupported();
-  }
-
-  private runtimeRoot(): string {
-    return path.join(this.userDataDir, "Arcelle Runtime");
-  }
-
-  private ensureOrchestrator(): HarnessOrchestrator {
-    const room = this.state.room;
-    if (room?.workspace === undefined || room.descriptor?.kind !== "workspace-folder") {
-      throw new Error("The unified file harness requires an unlocked workspace room.");
-    }
-    // A lock/unlock or close/reopen creates a new WorkspaceService and opens a
-    // new SQLCipher connection even when the stable room ID is unchanged. An
-    // orchestrator retained for the old service would keep RunProtection
-    // pointed at the closed database and make history/rollback fail after the
-    // room is reopened.
-    if (
-      this.orchestrator !== null
-      && this.roomId === room.descriptor.roomId
-      && this.workspace === room.workspace
-    ) return this.orchestrator;
-    if (this.pumps.size > 0) throw new Error("Wait for the active agent runs to stop before changing rooms.");
-    const protection = new RunProtection(
-      room.workspace,
-      room.descriptor.roomId,
-      () => room.workspaceIndexer?.indexPending() ?? Promise.resolve(),
-      (progress) => this.emit("workspace-operation-progress", progress),
-    );
-    const orchestrator = new HarnessOrchestrator(protection, {
-      beforeFinish: async (runId, status, send) => {
-        const mirrorStatus = await this.finishMirror(runId, status, send);
-        return this.reviewMassChanges(protection, runId, mirrorStatus, send);
-      },
-    });
-    orchestrator.register("codex", this.runtimes.codex);
-    orchestrator.register("claude", this.runtimes.claude);
-    orchestrator.register("ollama-local", this.runtimes["ollama-local"]);
-    orchestrator.register("ollama-cloud", this.runtimes["ollama-cloud"]);
-    orchestrator.register("openrouter", this.runtimes.openrouter);
-    this.orchestrator = orchestrator;
-    this.roomId = room.descriptor.roomId;
-    this.workspace = room.workspace;
-    return orchestrator;
-  }
-
-  async capabilities(): Promise<HarnessCapabilityReport> {
-    const flags = workspaceHarnessCapabilities();
-    for (const name of Object.keys(flags) as WorkspaceHarnessFlag[]) flags[name] = this.flag(name);
-    const provider = async (name: "codex" | "claude", providerFlag: WorkspaceHarnessFlag) => {
-      const installed = flags[providerFlag] ? await this.runtimes[name].available() : false;
-      const room = this.state.room;
-      let sandboxReady = false;
-      let harness: HarnessRuntime["name"] | null = null;
-      if (
-        flags.unified_harness
-        && flags[providerFlag]
-        && this.isolationProven
-        && installed
-        && room?.workspace !== undefined
-        && room.readOnly !== true
-        && room.descriptor?.kind === "workspace-folder"
-        && room.descriptor.rootPath !== null
-      ) {
-        const probePath = path.join(this.runtimeRoot(), room.descriptor.roomId, `capability-${randomUUID()}`);
-        await mkdir(probePath, { recursive: true, mode: 0o700 });
-        try {
-          sandboxReady = await this.verifyExposure(room.descriptor.rootPath, name, probePath, false);
-          harness = this.runtimes[name] instanceof RuntimeWithFallback
-            ? this.runtimes[name].consumeVerifiedHarness(probePath)
-            : sandboxReady ? this.runtimes[name].name : null;
-        }
-        finally { await rm(probePath, { recursive: true, force: true }); }
-      }
-      let reason: string | null = null;
-      if (!flags.unified_harness) reason = "The unified harness feature is disabled.";
-      else if (!flags[providerFlag]) reason = `The ${name} native harness feature is disabled.`;
-      else if (!this.isolationProven) reason = "Outside-workspace process isolation has not passed its security test.";
-      else if (!installed) reason = `The ${name} agent runtime is not installed.`;
-      else if (room?.descriptor?.kind !== "workspace-folder") reason = "Open a workspace room to run the sandbox capability test.";
-      else if (room.readOnly === true) reason = "This workspace is read-only because another Arcelle process owns the writer lease.";
-      else if (!sandboxReady) reason = `The ${name} runtime failed its sandbox capability test.`;
-      else if (harness === "legacy-cli") {
-        reason = `The native ${name} harness failed its startup test. Arcelle will use the restricted CLI fallback.`;
-      }
-      return { enabled: sandboxReady, installed, reason, harness };
-    };
-    const deepProvider = async (name: "ollama-local" | "ollama-cloud" | "openrouter") => {
-      const installed = flags.deep_agent_harness ? await this.runtimes[name].available() : false;
-      const room = this.state.room;
-      let reason: string | null = null;
-      if (!flags.unified_harness) reason = "The unified harness feature is disabled.";
-      else if (!flags.deep_agent_harness) reason = "The Arcelle Deep Harness feature is disabled.";
-      else if (!installed) reason = "The built-in Deep Harness runtime is unavailable.";
-      else if (room?.descriptor?.kind !== "workspace-folder" || room.workspace === undefined) {
-        reason = "Open a workspace room to use the Deep Harness.";
-      }
-      else if (room.readOnly === true) {
-        reason = "This workspace is read-only because another Arcelle process owns the writer lease.";
-      }
-      return {
-        enabled: reason === null,
-        installed,
-        reason,
-        harness: reason === null ? this.runtimes[name].name : null,
-      };
-    };
-    // Provider probes may execute installed CLIs and their sandbox self-tests.
-    // They are independent, so running them serially makes one slow/missing
-    // executable hold every other provider's result behind it (and can turn a
-    // diagnostics refresh into the sum of all probe timeouts).
-    const [codex, claude, ollamaLocal, ollamaCloud, openrouter] = await Promise.all([
-      provider("codex", "codex_app_server"),
-      provider("claude", "claude_agent_sdk"),
-      deepProvider("ollama-local"),
-      deepProvider("ollama-cloud"),
-      deepProvider("openrouter"),
-    ]);
-    return {
-      flags,
-      roomFormat: this.state.room?.descriptor?.kind ?? null,
-      outsideWorkspaceIsolation: this.isolationProven,
-      providers: {
-        codex,
-        claude,
-        "ollama-local": ollamaLocal,
-        "ollama-cloud": ollamaCloud,
-        openrouter,
-      },
-    };
-  }
-
-  async start(request: HarnessStartRequest): Promise<string> {
-    if (!this.flag("unified_harness")) throw new Error("The unified harness feature is disabled.");
-    const native = request.provider === "codex" || request.provider === "claude";
-    let selectedModel = native ? nativeHarnessModel(request.model) ?? "" : request.model.trim();
-    if (request.provider === "ollama-local" || request.provider === "ollama-cloud") {
-      const catalog = await this.listOllamaModels().catch(() => [] as string[]);
-      const exact = catalog.find((model) => model === selectedModel);
-      const folded = exact === undefined
-        ? catalog.filter((model) => model.toLowerCase() === selectedModel.toLowerCase())
-        : [];
-      if (exact !== undefined) selectedModel = exact;
-      else if (folded.length === 1) selectedModel = folded[0]!;
-      // `/api/tags` may return display casing such as
-      // `Gpt-oss:120b-cloud`, but Ollama Cloud removes `-cloud` and proxies
-      // the remaining name case-sensitively. Canonicalize simple cloud tags
-      // after catalog matching; registryName preserves namespaced paths.
-      if (request.provider === "ollama-cloud") selectedModel = registryName(selectedModel);
-    }
-    if (!native && (selectedModel === "" || selectedModel.toLowerCase() === "default")) {
-      throw new Error(`Choose a specific model for the ${request.provider} harness.`);
-    }
-    const providerFlag = request.provider === "codex"
-      ? "codex_app_server"
-      : request.provider === "claude"
-        ? "claude_agent_sdk"
-        : "deep_agent_harness";
-    if (!this.flag(providerFlag)) throw new Error(`The ${request.provider} native harness feature is disabled.`);
-    if (native && !this.isolationProven) {
-      throw new Error("Native harness mode is disabled because outside-workspace isolation is not proven.");
-    }
-    if (native && request.privacyMode === "local") {
-      throw new Error("Codex and Claude are cloud providers. Choose cloud-direct or cloud-redacted privacy mode.");
-    }
-    if (request.provider === "ollama-local" && request.privacyMode !== "local") {
-      throw new Error("Local Ollama uses local privacy mode.");
-    }
-    if (request.provider === "ollama-local" && !runsOnThisMac(selectedModel)) {
-      throw new Error("Choose a model that runs on this Mac for the local Ollama harness.");
-    }
-    if ((request.provider === "ollama-cloud" || request.provider === "openrouter") && request.privacyMode === "local") {
-      throw new Error("This cloud provider requires cloud-direct or cloud-redacted privacy mode.");
-    }
-    if (request.provider === "ollama-cloud" && runsOnThisMac(selectedModel)) {
-      throw new Error("Choose an Ollama cloud model for the Ollama cloud harness.");
-    }
-    const room = this.state.room;
-    if (
-      room?.workspace === undefined
-      || room.descriptor?.kind !== "workspace-folder"
-      || room.descriptor.rootPath === null
-    ) {
-      throw new Error("Open a workspace room before starting this harness.");
-    }
-    if (room.readOnly === true) {
-      throw new Error("Agent runs are unavailable because another Arcelle process owns the workspace writer lease.");
-    }
-    if (!native) {
-      const validation = await this.validateModelSelection(request.provider, selectedModel);
-      if (!validation.selectable) {
-        throw new Error(validation.reason ?? `The exact ${request.provider} model ID is unavailable.`);
-      }
-    }
-    const runId = randomUUID();
-    const runRuntimePath = path.join(this.runtimeRoot(), room.descriptor.roomId, runId);
-    this.runRoots.set(runId, runRuntimePath);
-    let workspacePath = room.descriptor.rootPath;
-    if (request.privacyMode === "cloud-redacted") {
-      if (!this.flag("cloud_redacted_mirror")) throw new Error("Cloud Privacy workspace mirrors are disabled.");
-      const policy = this.policy();
-      if (policy === null) throw new Error("Turn on Cloud Privacy before starting a redacted cloud run.");
-      const mirror = new CloudRedactedMirror(
-        room.workspace,
-        this.runtimeRoot(),
-        room.descriptor.roomId,
-        runId,
-        { redactor: policy.redactor, rules: policy.rules },
-      );
-      const info = await mirror.create();
-      workspacePath = info.workspacePath;
-      this.mirrors.set(runId, { mirror, writeEnabled: request.writeEnabled });
-    } else {
-      await mkdir(runRuntimePath, { recursive: true, mode: 0o700 });
-    }
-    if (native && !(await this.verifyExposure(
-      workspacePath,
-      request.provider as "codex" | "claude",
-      runRuntimePath,
-      request.writeEnabled,
-    ))) {
-      await this.removeRunRuntime(runId);
-      throw new Error("The native harness exposure failed its sandbox self-test.");
-    }
-
-    const orchestrator = this.ensureOrchestrator();
-    try {
-      // ARC-002: output privacy belongs above provider runtimes. Local models
-      // can echo protected workspace values too; only the user's explicit
-      // cloud-direct choice bypasses this deterministic final-output fence.
-      const outputPolicy = request.privacyMode === "cloud-direct" ? null : this.policy();
-      const outputRedactor = outputPolicy?.redactor.stream(emptyPrivacyReport()) ?? null;
-      const started = await orchestrator.start({
-        ...request,
-        model: selectedModel,
-        runId,
-        roomId: room.descriptor.roomId,
-        workspacePath,
-        runtimePath: runRuntimePath,
-        exposureVerified: true,
-      });
-      const pump = (async () => {
-        let terminal: HarnessEvent | null = null;
-        let lastTextEvent: Extract<HarnessEvent, { type: "text_delta" }> | null = null;
-        try {
-          for await (const event of started.events) {
-            if (event.type === "run_started") orchestrator.recordHarness(runId, event.harness);
-            // A terminal event is a lifecycle promise to the renderer: once it
-            // paints Done/Failed/Stopped, the private run directory and mirror
-            // must already be gone. Buffer the one terminal event until cleanup
-            // completes so callers cannot race a room close, test teardown, or
-            // the next run against a still-removing runtime tree.
-            if (event.type === "run_completed" || event.type === "run_failed") {
-              terminal = event;
-            } else {
-              if (event.type === "text_delta") lastTextEvent = event;
-              const visible = redactHarnessTextDelta(event, outputRedactor);
-              if (visible !== null) this.emit("harness-event", visible);
-            }
-          }
-        } finally {
-          try {
-            const tail = outputRedactor?.flush() ?? "";
-            if (tail !== "") {
-              this.emit("harness-event", lastTextEvent === null
-                ? { type: "text_delta", runId, text: tail }
-                : { ...lastTextEvent, text: tail });
-            }
-          } finally {
-            await this.removeRunRuntime(runId);
-            this.pumps.delete(runId);
-          }
-        }
-        if (terminal !== null) this.emit("harness-event", terminal);
-      })();
-      this.pumps.set(runId, pump);
-      return runId;
-    } catch (error) {
-      await this.removeRunRuntime(runId);
-      throw error;
-    }
-  }
-
-  approve(runId: string, requestId: string, decision: ApprovalDecision): Promise<void> {
-    if (requestId === `mass-change-${runId}`) {
-      const pending = this.pendingSafetyApprovals.get(runId);
-      if (pending === undefined) throw new Error("That mass-change approval is no longer pending.");
-      pending.resolve(decision === "allow-once" || decision === "allow-run");
-      return Promise.resolve();
-    }
-    if (this.orchestrator === null) throw new Error("No harness run is active.");
-    return this.orchestrator.approve(runId, requestId, decision);
-  }
-
-  async cancel(runId: string): Promise<void> {
-    this.pendingMirrorApprovals.get(runId)?.resolve(false);
-    this.pendingSafetyApprovals.get(runId)?.resolve(false);
-    await this.orchestrator?.cancel(runId);
-  }
-
-  approveCloudWriteback(runId: string, approved: boolean): void {
-    const pending = this.pendingMirrorApprovals.get(runId);
-    if (pending === undefined) throw new Error("That cloud write-back approval is no longer pending.");
-    pending.resolve(approved);
-  }
-
-  rollback(runId: string): Promise<RollbackResult> {
-    return this.ensureOrchestrator().rollback(runId);
-  }
-
-  restoreBaselineAsCopies(runId: string, paths: string[]): Promise<string[]> {
-    return this.ensureOrchestrator().restoreBaselineAsCopies(runId, paths);
-  }
-
-  listHistory(): Promise<HarnessHistoryRun[]> {
-    const room = this.state.room;
-    if (room?.workspace === undefined || room.descriptor?.kind !== "workspace-folder") {
-      return Promise.resolve([]);
-    }
-    // `runRoots` includes the baseline/runtime preparation window before the
-    // orchestrator marks a run active. A concurrent refresh must not recover
-    // that genuinely live row as interrupted.
-    return this.ensureOrchestrator().listHistory(
-      [...this.runRoots.keys()],
-      room.readOnly !== true,
-    );
-  }
-
-  async stopAll(timeoutMs = 10_000): Promise<void> {
-    const ids = this.orchestrator?.activeRunIds() ?? [];
-    await Promise.allSettled(ids.map((id) => this.cancel(id)));
-    const pumps = [...this.pumps.values()];
-    if (pumps.length > 0) {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([
-        Promise.allSettled(pumps),
-        new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); timer.unref?.(); }),
-      ]);
-      if (timer !== undefined) clearTimeout(timer);
-    }
-    await Promise.allSettled([...this.runRoots.keys()].map((id) => this.removeRunRuntime(id)));
-  }
-
-  /** Forced synchronous teardown: signal providers and remove cloud exposure now. */
-  stopAllNoWait(): void {
-    for (const id of this.orchestrator?.activeRunIds() ?? []) {
-      this.pendingMirrorApprovals.get(id)?.resolve(false);
-      this.pendingSafetyApprovals.get(id)?.resolve(false);
-      void this.orchestrator?.cancel(id).catch(() => undefined);
-    }
-    for (const id of this.runRoots.keys()) void this.removeRunRuntime(id).catch(() => undefined);
-  }
-
-  cleanupAbandoned(): Promise<number> {
-    // No run survives an app process restart, so every existing run folder is
-    // abandoned regardless of age.
-    return CloudRedactedMirror.cleanupAbandoned(this.runtimeRoot(), 0);
-  }
-
-  private async finishMirror(
-    runId: string,
-    status: HarnessFinalStatus,
-    send: (event: HarnessEvent) => void,
-  ): Promise<HarnessFinalStatus> {
-    const entry = this.mirrors.get(runId);
-    if (entry === undefined) return status;
-    try {
-      if (status !== "completed" || !entry.writeEnabled) return status;
-      let result = await entry.mirror.writeBack(false);
-      if (result.requiresReview.length > 0) {
-        send({
-          type: "approval_requested",
-          runId,
-          requestId: `cloud-writeback-${runId}`,
-          tool: "cloud_writeback",
-          detail: "Cloud output duplicated protected placeholders. Review is required before applying it.",
-        });
-        const approved = await new Promise<boolean>((resolve) => {
-          this.pendingMirrorApprovals.set(runId, { resolve });
-        });
-        this.pendingMirrorApprovals.delete(runId);
-        if (!approved) return "cancelled";
-        result = await entry.mirror.writeBack(true);
-      }
-      for (const relativePath of [...result.updated, ...result.created]) {
-        send({ type: "file_changed", runId, relativePath, change: result.created.includes(relativePath) ? "created" : "modified" });
-      }
-      return status;
-    } finally {
-      this.pendingMirrorApprovals.delete(runId);
-      await this.removeMirror(runId);
-    }
-  }
-
-  private async reviewMassChanges(
-    protection: RunProtection,
-    runId: string,
-    status: HarnessFinalStatus,
-    send: (event: HarnessEvent) => void,
-  ): Promise<HarnessFinalStatus> {
-    // Reconciliation is also the authoritative change detector when provider
-    // hooks miss a write. Publish its stable file ids to the renderer before
-    // the terminal event, so an open viewer (especially an autosaving Sketch)
-    // reloads the bytes the agent actually left on disk. Failed/cancelled runs
-    // may leave reviewable changes too, so they need the same refresh.
-    const summary = await protection.captureFinalState(runId);
-    if (status !== "completed" || summary.count <= 20) {
-      this.refreshChangedFiles(summary);
-      return status;
-    }
-    send({
-      type: "approval_requested",
-      runId,
-      requestId: `mass-change-${runId}`,
-      tool: "workspace_mass_change",
-      detail: `The agent changed ${summary.count} files. Approve to keep them, or deny to restore the protected baseline.`,
-    });
-    const approved = await new Promise<boolean>((resolve) => {
-      this.pendingSafetyApprovals.set(runId, { resolve });
-    });
-    this.pendingSafetyApprovals.delete(runId);
-    if (approved) {
-      this.refreshChangedFiles(summary);
-      return status;
-    }
-    await protection.rollback(runId);
-    this.refreshChangedFiles(summary);
-    return "cancelled";
-  }
-
-  private refreshChangedFiles(summary: RunChangeSummary): void {
-    if (summary.count === 0) return;
-    const room = this.state.room;
-    if (room?.workspace === undefined) return;
-    this.emit("room-files-changed", undefined);
-    const present = room.workspace.db.prepare(
-      "SELECT 1 FROM files WHERE id = ? AND trashed_at IS NULL",
-    );
-    for (const change of summary.changedFiles) {
-      // Deleted files have no content to reload. After a denied mass-change,
-      // this same check naturally includes restored baseline files and skips
-      // newly-created files that rollback moved to Arcelle trash.
-      if (present.get(change.fileId) !== undefined) {
-        this.emit("file-updated", change.fileId);
-      }
-    }
-  }
-
-  private async removeMirror(runId: string): Promise<void> {
-    const entry = this.mirrors.get(runId);
-    this.mirrors.delete(runId);
-    if (entry !== undefined) await entry.mirror.cleanup();
-  }
-
-  private async removeRunRuntime(runId: string): Promise<void> {
-    this.pendingSafetyApprovals.delete(runId);
-    const runRoot = this.runRoots.get(runId);
-    this.runRoots.delete(runId);
-    if (this.mirrors.has(runId)) await this.removeMirror(runId);
-    else if (runRoot !== undefined) {
-      // macOS can briefly report ENOTEMPTY while a just-exited provider's file
-      // descriptors settle. Node only retries recursive removal when
-      // maxRetries is explicit; keep this bounded and local to the per-run
-      // directory rather than leaking a transient cleanup race to the UI.
-      await rm(runRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
-    }
-  }
+interface ResolvedControllerOptions {
+  policy: () => PolicyState | null;
+  flag: (name: WorkspaceHarnessFlag) => boolean;
+  verifyExposure: HarnessControllerOptions["verifyExposure"];
+  listOllamaModels: () => Promise<string[]>;
+  validateModelSelection: typeof validateModelSelection;
+  outsideWorkspaceIsolation: boolean;
 }
+
+function resolvedControllerOptions(options: HarnessControllerOptions): ResolvedControllerOptions {
+  return {
+    policy: options.policy ?? activePolicy,
+    flag: options.flag ?? workspaceHarnessFlag,
+    verifyExposure: options.verifyExposure,
+    listOllamaModels: options.listOllamaModels ?? listOllamaModels,
+    validateModelSelection: options.validateModelSelection ?? validateModelSelection,
+    outsideWorkspaceIsolation: options.outsideWorkspaceIsolation ?? nativeWorkspaceSandboxSupported(),
+  };
+}
+
+function configuredRuntime<T extends HarnessRuntime>(provided: T | undefined, fallback: () => T): T {
+  return provided ?? fallback();
+}
+
+function controllerRuntimes(
+  state: RoomManagerState,
+  emit: EventSender,
+  runtimes: HarnessControllerOptions["runtimes"],
+  services: LiveAppServices | undefined,
+): Record<HarnessProvider, HarnessRuntime> {
+  const fallbackDispatcher = roomServerDispatcherFactory(state, emit, services);
+  const fallbackOptions: LegacyCliRuntimeOptions = {
+    baseDispatcher: (context, workspace) =>
+      fallbackDispatcher(false, { kind: "CloudEngine" }, WEB_LANES_ALL, {
+        workspace,
+        privacyBypass: context.privacyMode === "cloud-direct",
+      }),
+  };
+  const nativeRoomMcp = createNativeRoomMcpFactory(
+    state,
+    (context, workspace) => fallbackDispatcher(
+      false,
+      { kind: "CloudEngine" },
+      WEB_LANES_ALL,
+      {
+        workspace,
+        privacyBypass: context.privacyMode === "cloud-direct",
+      },
+    ),
+  );
+  return {
+    codex: configuredRuntime(runtimes?.codex, () => new RuntimeWithFallback(
+      new CodexAppServerRuntime(undefined, undefined, undefined, undefined, nativeRoomMcp),
+      new RestrictedLegacyCliRuntime("codex", state, fallbackOptions),
+    )),
+    claude: configuredRuntime(runtimes?.claude, () => new RuntimeWithFallback(
+      new ClaudeAgentSdkRuntime(undefined, nativeRoomMcp),
+      new RestrictedLegacyCliRuntime("claude", state, fallbackOptions),
+    )),
+    "ollama-local": configuredRuntime(runtimes?.["ollama-local"], () => new DeepAgentRuntime(state, emit, services)),
+    "ollama-cloud": configuredRuntime(runtimes?.["ollama-cloud"], () => new DeepAgentRuntime(state, emit, services)),
+    openrouter: configuredRuntime(runtimes?.openrouter, () => new DeepAgentRuntime(state, emit, services)),
+  };
+}
+export { HarnessController } from "./controllerRuntime.js";
+
+
+export { resolvedControllerOptions, controllerRuntimes, redactHarnessTextDelta };
+
+export type { NativeHarnessProvider, NativeHarnessRoom, NativeProviderProbe, MirrorRun, PendingMirrorApproval, StartedHarnessRun, PumpState };

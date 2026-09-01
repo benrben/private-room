@@ -47,18 +47,34 @@ export function runInteractiveZsh(command: string): Promise<ShellProbeResult> {
 export function parseExternalCliPaths(stdout: string): string[] {
   const found: string[] = [];
   for (const raw of stdout.split(/\r?\n/u)) {
-    const line = raw.trim();
-    if ((line === "claude" || line.endsWith("/claude")) && !found.includes("claude-cli")) {
-      found.push("claude-cli");
-    }
-    if ((line === "codex" || line.endsWith("/codex")) && !found.includes("codex-cli")) {
-      found.push("codex-cli");
-    }
-    if ((line === "agy" || line.endsWith("/agy")) && !found.includes("antigravity-cli")) {
-      found.push("antigravity-cli");
-    }
+    appendExternalCli(found, externalCliForLine(raw.trim()));
   }
   return found;
+}
+
+const EXTERNAL_CLI_NAMES: ReadonlyArray<readonly [string, string]> = [
+  ["claude", "claude-cli"],
+  ["codex", "codex-cli"],
+  ["agy", "antigravity-cli"],
+];
+
+function externalCliForLine(line: string): string | null {
+  for (const [executable, engine] of EXTERNAL_CLI_NAMES) {
+    if (isExecutablePath(line, executable)) {
+      return engine;
+    }
+  }
+  return null;
+}
+
+function isExecutablePath(line: string, executable: string): boolean {
+  return line === executable || line.endsWith(`/${executable}`);
+}
+
+function appendExternalCli(found: string[], engine: string | null): void {
+  if (engine !== null && !found.includes(engine)) {
+    found.push(engine);
+  }
 }
 
 export async function detectExternalWith(

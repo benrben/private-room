@@ -23,6 +23,7 @@ const SKIP_KEY = "prSkippedUpdate";
 /** What the user said about an offered update — with "the dialog never opened"
  * kept apart from "no", because only one of the two is worth remembering. */
 type Answer = "install" | "skip" | "unavailable";
+type AvailableUpdate = NonNullable<Awaited<ReturnType<typeof checkForUpdate>>>;
 
 /** Whether the app may check for updates on launch. On unless switched off. */
 export function autoUpdateCheckEnabled(): boolean {
@@ -74,41 +75,44 @@ function rememberSkipped(version: string): void {
  * any more — the download shows its progress, and a failed install says so
  * instead of leaving them waiting for an update that never arrives.
  */
-export async function checkForUpdatesQuietly(): Promise<void> {
+async function availableUpdate(): Promise<AvailableUpdate | null> {
   if (!autoUpdateCheckEnabled()) {
     console.info("[updater] launch check is switched off (prUpdateCheck=0).");
-    return;
+    return null;
   }
 
-  let update: Awaited<ReturnType<typeof checkForUpdate>> = null;
+  let update: AvailableUpdate | null = null;
   try {
     update = await checkForUpdate();
   } catch (e) {
     // Offline / rate-limited / no release yet — stay visually silent on launch,
     // but log distinguishably so a genuine failure isn't invisible.
     console.warn("[updater] check failed (offline or no release yet):", e);
-    return;
+    return null;
   }
   if (!update) {
     console.info("[updater] up to date.");
-    return;
+    return null;
   }
   if (skippedVersion() === update.version) {
     console.info(`[updater] version ${update.version} was skipped by the user.`);
-    return;
+    return null;
   }
   console.info(`[updater] version ${update.version} available.`);
+  return update;
+}
 
+function askAboutUpdate(version: string): Promise<Answer> {
   // "Skip this version" and "the dialog never opened" are different answers.
   // A skip is remembered for that exact version and nothing in the app clears
   // it, so collapsing the two would let a dialog that failed to open — this
   // runs from main.tsx at launch, before any UI has settled — bury that
   // release for good. Only a real "no" is remembered.
-  const answer = await confirm(
+  return confirm(
     // The download says so up front because it cannot be taken back:
     // `downloadAndInstall` is awaited with no abort handle and no backend
     // cancel exists, so the banner it draws has no Stop button to offer.
-    `Version ${update.version} is available.\n\nInstall it now and relaunch Arcelle? ` +
+    `Version ${version} is available.\n\nInstall it now and relaunch Arcelle? ` +
       `The download can't be stopped once it starts.`,
     {
       title: "Update available",
@@ -122,21 +126,17 @@ export async function checkForUpdatesQuietly(): Promise<void> {
       console.warn("[updater] couldn't ask about the update:", e);
       return "unavailable";
     });
-  if (answer === "unavailable") return;
-  if (answer === "skip") {
-    // Remembered by exact version, so the NEXT release still asks.
-    rememberSkipped(update.version);
-    return;
-  }
+}
 
-  const progress = showDownloadProgress(update.version);
+async function installAvailableUpdate(version: string): Promise<void> {
+  const progress = showDownloadProgress(version);
   try {
     progress.set(null);
     await installUpdate();
   } catch (e) {
     console.error("[updater] install failed:", e);
     await message(
-      `Version ${update.version} couldn't be installed.\n\n${String(e)}\n\n` +
+      `Version ${version} couldn't be installed.\n\n${String(e)}\n\n` +
         "Arcelle is still running on the version you had. You can try again " +
         "from Settings → Updates & version.",
       { title: "Update failed", kind: "error" },
@@ -144,6 +144,19 @@ export async function checkForUpdatesQuietly(): Promise<void> {
   } finally {
     progress.done();
   }
+}
+
+export async function checkForUpdatesQuietly(): Promise<void> {
+  const update = await availableUpdate();
+  if (!update) return;
+  const answer = await askAboutUpdate(update.version);
+  if (answer === "unavailable") return;
+  if (answer === "skip") {
+    // Remembered by exact version, so the NEXT release still asks.
+    rememberSkipped(update.version);
+    return;
+  }
+  await installAvailableUpdate(update.version);
 }
 
 /** A small live banner for the launch download.
@@ -155,7 +168,7 @@ export async function checkForUpdatesQuietly(): Promise<void> {
 function showDownloadProgress(version: string): {
   set: (pct: number | null) => void;
   done: () => void;
-} {
+  } {
   let host: HTMLDivElement | null = null;
   let fill: HTMLElement | null = null;
   let track: HTMLElement | null = null;
@@ -177,24 +190,37 @@ function showDownloadProgress(version: string): {
   }
   return {
     set(pct) {
-      if (label) {
-        label.textContent =
-          pct === null
-            ? `Downloading Arcelle ${version}…`
-            : pct >= 100
-              ? `Installing Arcelle ${version}…`
-              : `Downloading Arcelle ${version} — ${pct}%`;
-      }
+      setProgressLabel(label, version, pct);
       // A server that sends no `Content-Length` leaves the share unknowable.
       // An empty track that never moves reads as a stalled download rather
       // than an unmeasured one, so the label stands alone — the same choice
       // ModelSection and jobProgress already make for "running, position
       // unknown".
-      if (track) track.style.display = pct === null ? "none" : "";
-      if (fill) fill.style.width = `${pct ?? 0}%`;
+      setProgressTrack(track, pct);
+      setProgressFill(fill, pct);
     },
     done() {
       host?.remove();
     },
   };
+}
+
+function progressLabel(version: string, pct: number | null): string {
+  // The installer boundary currently exposes no byte-progress callback, so its
+  // only caller passes null. Keep the label honest until that boundary can
+  // supply a measured percentage.
+  void pct;
+  return `Downloading Arcelle ${version}…`;
+}
+
+function setProgressLabel(label: HTMLElement | null, version: string, pct: number | null): void {
+  if (label) label.textContent = progressLabel(version, pct);
+}
+
+function setProgressTrack(track: HTMLElement | null, pct: number | null): void {
+  if (track) track.style.display = pct === null ? "none" : "";
+}
+
+function setProgressFill(fill: HTMLElement | null, pct: number | null): void {
+  if (fill) fill.style.width = `${pct ?? 0}%`;
 }

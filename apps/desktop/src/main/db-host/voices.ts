@@ -97,19 +97,9 @@ function dot(a: readonly number[], b: readonly number[], n: number): number {
   return sum;
 }
 
-/** `cosine` (diarize.rs:678-689): a plain dot product for two equal-length,
- * already-L2-normalized prints, with the shared-prefix fallback for a length
- * mismatch. Zero across the neural/DSP divide — those two spaces share no
- * geometry at all. */
+/** Dot product for the equal-width neural prints admitted by rawSimilarity. */
 function cosine(a: readonly number[], b: readonly number[]): number {
-  if (isNeural(a) !== isNeural(b)) {
-    return 0;
-  }
-  if (a.length === b.length) {
-    return dot(a, b, a.length);
-  }
-  const n = Math.min(a.length, b.length);
-  return dot(a, b, n) / Math.max(Math.sqrt(dot(a, a, n)) * Math.sqrt(dot(b, b, n)), 1e-6);
+  return dot(a, b, a.length);
 }
 
 /** What cross-recording recognition compares two saved voices on
@@ -139,27 +129,31 @@ export function rawSimilarity(a: readonly number[], b: readonly number[]): numbe
 export function identityPrint(prints: readonly VoicePrint[]): VoicePrint | null {
   const strong = prints.filter((p) => isNeural(p.v) && isStrong(p));
   const first = strong[0];
-  if (first === undefined) {
-    return null;
-  }
-  const dim = first.v.length;
+  if (first === undefined) return null;
+  const frames = totalFrames(strong);
+  if (frames < MIN_IDENTITY_FRAMES) return null;
+  return normalizedMean(strong, first.v.length, frames);
+}
+
+function totalFrames(prints: readonly VoicePrint[]): number {
   let frames = 0;
-  for (const p of strong) {
-    frames += p.f;
-  }
-  if (frames < MIN_IDENTITY_FRAMES) {
-    return null;
-  }
+  for (const print of prints) frames += print.f;
+  return frames;
+}
+
+function normalizedMean(
+  prints: readonly VoicePrint[],
+  dim: number,
+  frames: number,
+): VoicePrint | null {
   const mean = new Array<number>(dim).fill(0);
-  for (const p of strong) {
+  for (const print of prints) {
     for (let i = 0; i < dim; i++) {
-      mean[i] = (mean[i] as number) + (p.v[i] as number);
+      mean[i] = (mean[i] as number) + (print.v[i] as number);
     }
   }
   const norm = Math.sqrt(mean.reduce((sum, x) => sum + x * x, 0));
-  if (norm < 1e-6) {
-    return null; // prints that cancel out define nothing
-  }
+  if (norm < 1e-6) return null; // prints that cancel out define nothing
   return { v: mean.map((x) => x / norm), f: frames };
 }
 
@@ -279,36 +273,61 @@ export function savedVoices(db: Database.Database): SavedVoice[] {
  */
 export function enrollVoice(db: Database.Database, name: string, print: VoicePrint): void {
   const trimmed = name.trim();
-  if (trimmed === "" || isSilent(print)) {
-    return;
-  }
-  const prior = queryOpt(
+  if (trimmed === "" || isSilent(print)) return;
+  const enrollment = nextEnrollment(findPriorVoice(db, trimmed), print);
+  if (enrollment === null) return;
+  saveEnrollment(db, trimmed, enrollment);
+  clearStaleRejects(db, trimmed, print);
+}
+
+type StoredVoice = {
+  emb: Buffer;
+  frames: number;
+  takes: number;
+};
+
+type VoiceEnrollment = {
+  vec: number[];
+  frames: number;
+  takes: number;
+};
+
+function findPriorVoice(db: Database.Database, name: string): StoredVoice | null {
+  return queryOpt(
     db,
     "SELECT emb, frames, takes FROM voice_ids WHERE name = ?",
-    [trimmed],
+    [name],
     (r: Row) => ({ emb: r[0] as Buffer, frames: r[1] as number, takes: r[2] as number })
   );
+}
+
+function nextEnrollment(prior: StoredVoice | null, print: VoicePrint): VoiceEnrollment | null {
   const old = prior === null ? null : fromBlob(prior.emb);
-  let vec: number[];
-  let frames: number;
-  let takes: number;
-  if (prior !== null && old !== null && old.length === print.v.length) {
-    const w = Math.min(prior.takes, MAX_MERGE_WEIGHT);
-    const merged = old.map((a, i) => (a * w + (print.v[i] as number)) / (w + 1));
-    const norm = Math.sqrt(merged.reduce((s, x) => s + x * x, 0));
-    if (norm < 1e-6) {
-      return; // the two prints cancel: keep what we had
-    }
-    vec = merged.map((x) => x / norm);
-    frames = prior.frames + print.f;
-    takes = prior.takes + 1;
-  } else {
+  if (prior === null || old === null || old.length !== print.v.length) {
     // No prior row at all, or one from another embedding generation — either
     // way this print becomes the whole centroid.
-    vec = [...print.v];
-    frames = print.f;
-    takes = 1;
+    return { vec: [...print.v], frames: print.f, takes: 1 };
   }
+  return mergedEnrollment(prior, old, print);
+}
+
+function mergedEnrollment(
+  prior: StoredVoice,
+  old: readonly number[],
+  print: VoicePrint,
+): VoiceEnrollment | null {
+  const weight = Math.min(prior.takes, MAX_MERGE_WEIGHT);
+  const merged = old.map((value, index) => (value * weight + (print.v[index] as number)) / (weight + 1));
+  const norm = Math.sqrt(merged.reduce((sum, value) => sum + value * value, 0));
+  if (norm < 1e-6) return null; // the two prints cancel: keep what we had
+  return {
+    vec: merged.map((value) => value / norm),
+    frames: prior.frames + print.f,
+    takes: prior.takes + 1,
+  };
+}
+
+function saveEnrollment(db: Database.Database, name: string, enrollment: VoiceEnrollment): void {
   executeOne(
     db,
     `INSERT INTO voice_ids(name, emb, frames, takes, updated_at)
@@ -316,8 +335,11 @@ export function enrollVoice(db: Database.Database, name: string, print: VoicePri
      ON CONFLICT(name) DO UPDATE SET
        emb = excluded.emb, frames = excluded.frames,
        takes = excluded.takes, updated_at = excluded.updated_at`,
-    [trimmed, toBlob(vec), frames, takes]
+    [name, toBlob(enrollment.vec), enrollment.frames, enrollment.takes]
   );
+}
+
+function clearStaleRejects(db: Database.Database, name: string, print: VoicePrint): void {
   // A voice can stop being a counter-example: the user has just said this print
   // IS this person, which overrules an older "not them". Matched by SIMILARITY,
   // not by an identical blob — the centroid behind a correction and the
@@ -327,19 +349,19 @@ export function enrollVoice(db: Database.Database, name: string, print: VoicePri
   const stale = queryRows(
     db,
     "SELECT emb FROM voice_rejects WHERE name = ?",
-    [trimmed],
+    [name],
     (r: Row) => r[0] as Buffer
-  ).filter((emb) => {
-    const other = fromBlob(emb);
-    if (other === null) {
-      return false;
-    }
-    const sim = rawSimilarity(print.v, other);
-    return sim !== null && sim >= KNOWN_SAME;
-  });
+  ).filter((emb) => isStaleReject(print, emb));
   for (const emb of stale) {
-    executeOne(db, "DELETE FROM voice_rejects WHERE name = ? AND emb = ?", [trimmed, emb]);
+    executeOne(db, "DELETE FROM voice_rejects WHERE name = ? AND emb = ?", [name, emb]);
   }
+}
+
+function isStaleReject(print: VoicePrint, emb: Buffer): boolean {
+  const other = fromBlob(emb);
+  if (other === null) return false;
+  const similarity = rawSimilarity(print.v, other);
+  return similarity !== null && similarity >= KNOWN_SAME;
 }
 
 /** Record that `print` is NOT `name` — the user corrected a guess. Without this

@@ -7,6 +7,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import {
+  attachDownloadGating,
   handleWillDownload,
   type DownloadGatingDeps,
   type DownloadItemLike,
@@ -90,6 +91,22 @@ function fakeItem(url: string, filename = "report.pdf") {
 }
 
 const willDownloadEvent = () => ({ preventDefault: vi.fn() });
+
+it("attaches the session listener that drives the same download gate", () => {
+  let listener: ((event: ReturnType<typeof willDownloadEvent>, item: DownloadItemLike) => void) | undefined;
+  const session = {
+    on: vi.fn((_event: "will-download", callback: typeof listener) => { listener = callback; }),
+  };
+  const { deps, rec } = fakeDeps();
+  const event = willDownloadEvent();
+
+  attachDownloadGating(session, deps);
+  listener?.(event, fakeItem("http://127.0.0.1/private").item);
+
+  expect(session.on).toHaveBeenCalledWith("will-download", expect.any(Function));
+  expect(event.preventDefault).toHaveBeenCalledOnce();
+  expect(rec.blocked).toEqual(["http://127.0.0.1/private"]);
+});
 
 describe("the_download_path_runs_its_own_url_guard", () => {
   it("refuses a private-network download and cancels it", () => {

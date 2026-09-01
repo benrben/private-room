@@ -35,6 +35,11 @@ def test_a_zip_lists_the_names_inside_it() -> None:
     assert "reports/q2.txt" in text
 
 
+def test_a_zip_listing_skips_directory_entries() -> None:
+    text = extract_zip_listing(_build_zip(["reports/", "reports/q1.txt"]))
+    assert text == "reports/q1.txt\t7\n"
+
+
 def test_unreadable_bytes_read_as_nothing_rather_than_panicking() -> None:
     assert extract_zip_listing(b"not a zip") is None
 

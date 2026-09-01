@@ -56,6 +56,19 @@ def _push_capped(out: list[str], s: str, total_len: list[int]) -> None:
 def extract_ipynb(data: bytes) -> str | None:
     """Prose, code and printed output from a Jupyter notebook, in cell
     order."""
+    cells = _notebook_cells(data)
+    if cells is None:
+        return None
+    out: list[str] = []
+    total_len = [0]
+    for index, cell in enumerate(cells):
+        _append_cell(out, total_len, index, cell)
+    result = "".join(out)
+    return result if result.strip() else None
+
+
+def _notebook_cells(data: bytes) -> list[Any] | None:
+    """Return the cell array from a strictly UTF-8 notebook payload."""
     try:
         # Decode as strict UTF-8 first rather than handing raw bytes to
         # `json.loads`: the latter auto-detects UTF-16/UTF-32 by BOM/null-byte
@@ -71,35 +84,42 @@ def extract_ipynb(data: bytes) -> str | None:
     if not isinstance(nb, dict):
         return None
     cells = nb.get("cells")
-    if not isinstance(cells, list):
-        return None
-    out: list[str] = []
-    total_len = [0]
-    for i, cell in enumerate(cells):
-        if not isinstance(cell, dict):
-            cell = {}
-        kind = cell.get("cell_type")
-        if not isinstance(kind, str):
-            kind = ""
-        source = _joined_source(cell.get("source"))
-        if source.strip():
-            if kind in ("markdown", "raw"):
-                _push_capped(out, source, total_len)
-            else:
-                _push_capped(out, f"[cell {i + 1}]\n", total_len)
-                _push_capped(out, source, total_len)
-            _push_capped(out, "\n\n", total_len)
-        outputs = cell.get("outputs")
-        if isinstance(outputs, list):
-            for output in outputs:
-                if not isinstance(output, dict):
-                    continue
-                text = _output_text(output)
-                if text.strip():
-                    _push_capped(out, text, total_len)
-                    _push_capped(out, "\n", total_len)
-    result = "".join(out)
-    return result if result.strip() else None
+    return cells if isinstance(cells, list) else None
+
+
+def _append_cell(out: list[str], total_len: list[int], index: int, value: Any) -> None:
+    """Append one notebook cell's source and outputs in document order."""
+    cell = value if isinstance(value, dict) else {}
+    kind = cell.get("cell_type")
+    source = _joined_source(cell.get("source"))
+    if source.strip():
+        _append_cell_source(out, total_len, index, kind, source)
+    _append_cell_outputs(out, total_len, cell.get("outputs"))
+
+
+def _append_cell_source(
+    out: list[str], total_len: list[int], index: int, kind: Any, source: str
+) -> None:
+    """Append source, adding labels only for non-prose cells."""
+    if kind in ("markdown", "raw"):
+        _push_capped(out, source, total_len)
+    else:
+        _push_capped(out, f"[cell {index + 1}]\n", total_len)
+        _push_capped(out, source, total_len)
+    _push_capped(out, "\n\n", total_len)
+
+
+def _append_cell_outputs(out: list[str], total_len: list[int], outputs: Any) -> None:
+    """Append readable cell outputs, skipping malformed and binary values."""
+    if not isinstance(outputs, list):
+        return
+    for output in outputs:
+        if not isinstance(output, dict):
+            continue
+        text = _output_text(output)
+        if text.strip():
+            _push_capped(out, text, total_len)
+            _push_capped(out, "\n", total_len)
 
 
 def _joined_source(v: Any) -> str:

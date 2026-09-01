@@ -139,4 +139,56 @@ describe("WorkspaceIndexService", () => {
       db.close();
     }
   });
+
+  it("records an extractor's unsupported result without retaining old search chunks", async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-index-unsupported-"));
+    roots.push(parent);
+    const root = path.join(parent, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Room");
+    try {
+      const workspace = new WorkspaceService(db, root);
+      const file = await workspace.createFile("opaque.bin", Readable.from(["opaque"]), "external");
+      db.prepare("INSERT INTO chunks(id, file_id, seq, text) VALUES ('old', ?, 0, 'old text')")
+        .run(file.fileId);
+      const indexer = new WorkspaceIndexService(workspace, async (_name, stream) => {
+        const bytes = await collect(stream);
+        return { text: null, sha256: digest(bytes), sizeBytes: bytes.length };
+      });
+
+      expect(await indexer.indexPending()).toMatchObject({ unsupported: 1, ready: 0 });
+      expect(db.prepare("SELECT index_state, extracted_text, index_error FROM files WHERE id = ?").get(file.fileId))
+        .toEqual({ index_state: "unsupported", extracted_text: null, index_error: null });
+      expect(db.prepare("SELECT count(*) AS n FROM chunks WHERE file_id = ?").get(file.fileId))
+        .toEqual({ n: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("honors close between candidates while allowing the in-flight candidate to finish", async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-index-close-"));
+    roots.push(parent);
+    const root = path.join(parent, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Room");
+    try {
+      const workspace = new WorkspaceService(db, root);
+      await workspace.createFile("first.txt", Readable.from(["first"]), "external");
+      await workspace.createFile("second.txt", Readable.from(["second"]), "external");
+      let calls = 0;
+      let indexer!: WorkspaceIndexService;
+      indexer = new WorkspaceIndexService(workspace, async (_name, stream) => {
+        calls += 1;
+        const bytes = await collect(stream);
+        indexer.close();
+        return { text: bytes.toString("utf8"), sha256: digest(bytes), sizeBytes: bytes.length };
+      });
+
+      expect(await indexer.indexPending()).toMatchObject({ ready: 1 });
+      expect(calls).toBe(1);
+      expect(db.prepare("SELECT count(*) AS n FROM files WHERE index_state = 'pending'").get())
+        .toEqual({ n: 1 });
+    } finally {
+      db.close();
+    }
+  });
 });

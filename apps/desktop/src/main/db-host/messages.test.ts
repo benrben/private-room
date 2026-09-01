@@ -186,6 +186,20 @@ describe("messagesLike", () => {
 });
 
 describe("insertMessage / insertHandoffMessage", () => {
+  it("drops malformed persisted source/effect JSON instead of leaking invalid shapes", () => {
+    const db = freshRoom();
+    const id = randomUUID();
+    db.prepare(
+      "INSERT INTO messages(id, chat_id, role, content, sources, effects) VALUES (?, 'c1', 'user', 'legacy', ?, ?)",
+    ).run(id, "not-json", "not-json");
+    const malformedJson = listMessages(db, "c1")[0];
+    expect(malformedJson).toMatchObject({ id, sources: [], effects: null });
+
+    db.prepare("UPDATE messages SET sources = ? WHERE id = ?").run('["valid", 42]', id);
+    expect(listMessages(db, "c1")[0]?.sources).toEqual([]);
+    db.close();
+  });
+
   it("insert_message_leaves_kind_null", () => {
     const db = freshRoom();
     const m = insertMessage(db, "c1", "user", "hi", [], null);

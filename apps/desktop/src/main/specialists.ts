@@ -57,31 +57,55 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+const REQUIRED_SPECIALIST_FIELDS = ["key", "tool", "agent", "label", "area", "description"] as const;
+
+type RequiredSpecialistField = (typeof REQUIRED_SPECIALIST_FIELDS)[number];
+type SpecialistRecord = Record<string, unknown> & Record<RequiredSpecialistField, string>;
+
+function hasRequiredSpecialistFields(record: Record<string, unknown>): record is SpecialistRecord {
+  return REQUIRED_SPECIALIST_FIELDS.every((field) => typeof record[field] === "string");
+}
+
+function requiredSpecialist(record: Record<string, unknown>): Specialist | null {
+  if (!hasRequiredSpecialistFields(record)) return null;
+  return {
+    key: record.key,
+    tool: record.tool,
+    agent: record.agent,
+    label: record.label,
+    area: record.area,
+    description: record.description,
+  };
+}
+
+function optionalCapability(value: unknown): Specialist["capability"] | undefined {
+  if (value === "full" || value === "inspect-only" || value === "unavailable") return value;
+  return undefined;
+}
+
+function optionalReason(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.trim() === "") return undefined;
+  return value;
+}
+
+function optionalLocalHandoff(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function decorateSpecialist(specialist: Specialist, record: Record<string, unknown>): Specialist {
+  const capability = optionalCapability(record.capability);
+  if (capability !== undefined) specialist.capability = capability;
+  const reason = optionalReason(record.capabilityReason);
+  if (reason !== undefined) specialist.capabilityReason = reason;
+  const localHandoff = optionalLocalHandoff(record.localHandoff);
+  if (localHandoff !== undefined) specialist.localHandoff = localHandoff;
+  return specialist;
+}
+
 function asSpecialist(v: unknown): Specialist | null {
-  if (!isRecord(v)) {
-    return null;
-  }
-  const { key, tool, agent, label, area, description } = v;
-  if (
-    typeof key === "string" &&
-    typeof tool === "string" &&
-    typeof agent === "string" &&
-    typeof label === "string" &&
-    typeof area === "string" &&
-    typeof description === "string"
-  ) {
-    const out: Specialist = { key, tool, agent, label, area, description };
-    const capability = v.capability;
-    if (capability === "full" || capability === "inspect-only" || capability === "unavailable") {
-      out.capability = capability;
-    }
-    if (typeof v.capabilityReason === "string" && v.capabilityReason.trim() !== "") {
-      out.capabilityReason = v.capabilityReason;
-    }
-    if (typeof v.localHandoff === "boolean") out.localHandoff = v.localHandoff;
-    return out;
-  }
-  return null;
+  if (!isRecord(v)) return null;
+  const specialist = requiredSpecialist(v);
+  return specialist === null ? null : decorateSpecialist(specialist, v);
 }
 
 /**
@@ -145,6 +169,85 @@ export interface ListSpecialistsDeps {
   fetchAgents(body: { web_enabled: boolean; served_names: string[] }): Promise<unknown>;
 }
 
+interface SpecialistRoster {
+  webEnabled: boolean;
+  model: string;
+  served: string[];
+  specialists: Specialist[];
+}
+
+async function initialRoster(
+  room: ListSpecialistsRoomSource,
+  deps: ListSpecialistsDeps,
+): Promise<SpecialistRoster> {
+  const webEnabled = room.webEnabled();
+  const explicit = room.explicitModel();
+  const models = await deps.listModels().catch(() => []);
+  const model = explicit ?? deps.bestDefault(models);
+  const served = deps.servedToolNames(model, webEnabled);
+  const value = await deps.fetchAgents({ web_enabled: webEnabled, served_names: served });
+  return {
+    webEnabled,
+    model,
+    served,
+    specialists: parseSpecialists(isRecord(value) ? value.agents : undefined),
+  };
+}
+
+function removedTools(served: readonly string[], effective: readonly string[]): Set<string> {
+  const effectiveSet = new Set(effective);
+  return new Set(served.filter((name) => !effectiveSet.has(name)));
+}
+
+async function reachableSpecialists(
+  roster: SpecialistRoster,
+  effective: string[],
+  deps: ListSpecialistsDeps,
+): Promise<Set<string>> {
+  const value = await deps.fetchAgents({ web_enabled: roster.webEnabled, served_names: effective });
+  return new Set(
+    parseSpecialists(isRecord(value) ? value.agents : undefined)
+      .filter((specialist) => specialist.capability !== "unavailable")
+      .map((specialist) => specialist.agent),
+  );
+}
+
+function restrictedSpecialist(
+  specialist: Specialist,
+  removed: ReadonlySet<string>,
+  reachable: ReadonlySet<string>,
+  agentToolNames: NonNullable<ListSpecialistsDeps["agentToolNames"]>,
+): Specialist {
+  const affected = agentToolNames(specialist.agent).some((name) => removed.has(name));
+  if (!affected) return specialist;
+  if (reachable.has(specialist.agent)) {
+    return {
+      ...specialist,
+      capability: "inspect-only",
+      capabilityReason: `Cloud Privacy lets *${specialist.key} inspect, but blocks its direct action tools. Switch to On this Mac to use those actions.`,
+      localHandoff: true,
+    };
+  }
+  return {
+    ...specialist,
+    capability: "unavailable",
+    capabilityReason: `Cloud Privacy blocks the action tools required by *${specialist.key}. Switch to On this Mac to use this specialist.`,
+    localHandoff: true,
+  };
+}
+
+async function restrictRoster(
+  roster: SpecialistRoster,
+  effective: string[],
+  deps: ListSpecialistsDeps,
+  agentToolNames: NonNullable<ListSpecialistsDeps["agentToolNames"]>,
+): Promise<Specialist[]> {
+  const removed = removedTools(roster.served, effective);
+  if (removed.size === 0) return roster.specialists;
+  const reachable = await reachableSpecialists(roster, effective, deps);
+  return roster.specialists.map((specialist) => restrictedSpecialist(specialist, removed, reachable, agentToolNames));
+}
+
 /**
  * The specialists THIS room can dispatch to. Ported from `list_specialists`.
  * Errors (rather than resolving to `[]`) when the sidecar cannot be reached —
@@ -155,56 +258,11 @@ export async function listSpecialists(
   room: ListSpecialistsRoomSource,
   deps: ListSpecialistsDeps
 ): Promise<Specialist[]> {
-  const webEnabled = room.webEnabled();
-  const explicit = room.explicitModel();
-  const models = await deps.listModels().catch(() => []);
-  const model = explicit ?? deps.bestDefault(models);
-  const served = deps.servedToolNames(model, webEnabled);
-  const value = await deps.fetchAgents({ web_enabled: webEnabled, served_names: served });
-  const agents = isRecord(value) ? value.agents : undefined;
-  const roster = parseSpecialists(agents);
-  const effective = deps.effectiveServedToolNames?.(model, webEnabled);
-  if (effective === undefined || deps.agentToolNames === undefined) return roster;
-
-  const effectiveSet = new Set(effective);
-  const removed = new Set(served.filter((name) => !effectiveSet.has(name)));
-  if (removed.size === 0) return roster;
-
-  // Ask the same registry a second time with the effective catalog. This is
-  // important for agents such as App whose read and action tools are a paired
-  // runtime requirement: merely seeing one read-like tool in the manifest
-  // does not prove that an inspect-only worker can actually start.
-  const effectiveValue = await deps.fetchAgents({
-    web_enabled: webEnabled,
-    served_names: effective,
-  });
-  const effectiveAgents = parseSpecialists(
-    isRecord(effectiveValue) ? effectiveValue.agents : undefined,
-  );
-  const reachable = new Set(
-    effectiveAgents
-      .filter((specialist) => specialist.capability !== "unavailable")
-      .map((specialist) => specialist.agent),
-  );
-
-  return roster.map((specialist) => {
-    const affected = deps.agentToolNames!(specialist.agent).some((name) => removed.has(name));
-    if (!affected) return specialist;
-    if (!reachable.has(specialist.agent)) {
-      return {
-        ...specialist,
-        capability: "unavailable" as const,
-        capabilityReason: `Cloud Privacy blocks the action tools required by *${specialist.key}. Switch to On this Mac to use this specialist.`,
-        localHandoff: true,
-      };
-    }
-    return {
-      ...specialist,
-      capability: "inspect-only" as const,
-      capabilityReason: `Cloud Privacy lets *${specialist.key} inspect, but blocks its direct action tools. Switch to On this Mac to use those actions.`,
-      localHandoff: true,
-    };
-  });
+  const roster = await initialRoster(room, deps);
+  const effective = deps.effectiveServedToolNames?.(roster.model, roster.webEnabled);
+  const agentToolNames = deps.agentToolNames;
+  if (effective === undefined || agentToolNames === undefined) return roster.specialists;
+  return restrictRoster(roster, effective, deps, agentToolNames);
 }
 
 // -------------------------------------------------------------------- cancel

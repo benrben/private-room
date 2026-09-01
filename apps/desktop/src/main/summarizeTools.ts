@@ -122,6 +122,7 @@ import {
   trashFile,
   updateFileContent,
   type FileMeta,
+  type SummaryFile,
   type TrashActor,
 } from "./db-host/files.js";
 import { listMemories } from "./db-host/memories.js";
@@ -130,7 +131,14 @@ import { createRoomFile, writeRoomFile } from "./workspace/roomContent.js";
 import type { WorkspaceService } from "./workspace/workspaceService.js";
 import { resolvedBaseUrl } from "./engineRouting.js";
 import { htmlDocument, htmlEscape } from "./docsHtml.js";
-import { sidecarErrorSentinel, sidecarJsonCancellable } from "./sidecarJsonCancellable.js";
+import { docHero, fileGlyph } from "./summarizePresentation.js";
+import {
+  sidecarErrorSentinel,
+  sidecarJsonCancellable,
+  type SidecarPostOutcome,
+} from "./sidecarJsonCancellable.js";
+
+export { fileGlyph } from "./summarizePresentation.js";
 
 /** The one canonical, overwrite-in-place summary file (ADD-17). ADD-22: HTML
  * (the "Summarize room" button generates an HTML page rendered in the
@@ -212,12 +220,10 @@ export async function summarizeOneFile(
   if (outcome.kind === "error") {
     throw new Error(sidecarErrorSentinel(outcome.error, model));
   }
-  if (outcome.kind === "stopped") {
-    // Unreachable: the flag above is never handed to anything that could set
-    // it. An honest branch rather than a cast that claims otherwise.
-    throw new Error("STOPPED");
-  }
-  const summary = asRecord(outcome.value)?.summary;
+  // This fresh flag never escapes, so the transport cannot observe it as
+  // stopped; retain that runtime invariant while narrowing the general union.
+  const valueOutcome = outcome as Extract<SidecarPostOutcome, { readonly kind: "value" }>;
+  const summary = asRecord(valueOutcome.value)?.summary;
   return typeof summary === "string" ? summary : "";
 }
 
@@ -260,11 +266,8 @@ export const combineSummary: CombineSummaryFn = async (model, roomName, memories
   if (outcome.kind === "error") {
     throw new Error(sidecarErrorSentinel(outcome.error, model));
   }
-  if (outcome.kind === "stopped") {
-    // Unreachable — see summarizeOneFile's identical comment.
-    throw new Error("STOPPED");
-  }
-  const rec = asRecord(outcome.value);
+  const valueOutcome = outcome as Extract<SidecarPostOutcome, { readonly kind: "value" }>;
+  const rec = asRecord(valueOutcome.value);
   const purpose = typeof rec?.purpose === "string" ? rec.purpose : "";
   const questionsRaw = rec?.questions;
   const questions = Array.isArray(questionsRaw)
@@ -360,96 +363,6 @@ function fileStillFindableById(db: Database.Database, id: string): boolean {
   }
 }
 
-/** An emoji glyph for a file, chosen by extension, so each row of the
- * summary's file list reads at a glance. Ported verbatim from `file_glyph`
- * (`docs_html.rs`) — not ported anywhere else yet (`docsHtml.ts`'s own doc
- * lists it under "STILL NOT PORTED... a different caller"; this is that
- * caller). `pub(crate)` in Rust, so exported here too for a future caller to
- * reuse rather than re-derive. */
-export function fileGlyph(name: string): string {
-  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
-  switch (ext) {
-    case "pdf":
-      return "\u{1F4D5}"; // 📕
-    case "csv":
-    case "tsv":
-    case "xls":
-    case "xlsx":
-    case "numbers":
-      return "\u{1F4CA}"; // 📊
-    case "png":
-    case "jpg":
-    case "jpeg":
-    case "gif":
-    case "webp":
-    case "svg":
-    case "heic":
-    case "tiff":
-      return "\u{1F5BC}\u{FE0F}"; // 🖼️
-    case "mp3":
-    case "m4a":
-    case "wav":
-    case "aac":
-    case "flac":
-    case "ogg":
-    case "aiff":
-      return "\u{1F3A7}"; // 🎧
-    case "mp4":
-    case "mov":
-    case "mkv":
-    case "webm":
-    case "avi":
-      return "\u{1F3AC}"; // 🎬
-    case "html":
-    case "htm":
-      return "\u{1F310}"; // 🌐
-    case "md":
-    case "markdown":
-    case "txt":
-    case "rtf":
-      return "\u{1F4DD}"; // 📝
-    case "json":
-    case "yaml":
-    case "yml":
-    case "toml":
-    case "xml":
-      return "\u{1F5C2}\u{FE0F}"; // 🗂️
-    case "zip":
-    case "tar":
-    case "gz":
-    case "7z":
-      return "\u{1F5DC}\u{FE0F}"; // 🗜️
-    case "doc":
-    case "docx":
-    case "pages":
-      return "\u{1F4D8}"; // 📘
-    case "ppt":
-    case "pptx":
-    case "key":
-      return "\u{1F4FD}\u{FE0F}"; // 📽️
-    default:
-      return "\u{1F4C4}"; // 📄
-  }
-}
-
-/** A polished document header: an uppercase accent eyebrow, a large title, an
- * optional muted subline, and an accent rule. Local copy of `docsHtml.ts`'s
- * own private `docHero` — see this module's own doc for why (that file's doc
- * comment names `commands/summarize.rs` as exactly this future caller, and
- * deliberately leaves it unexported). Ported verbatim from `doc_hero`. */
-function docHero(eyebrow: string, title: string, subHtml: string): string {
-  let h = '<header class="hero">\n';
-  if (eyebrow !== "") {
-    h += `<div class="eyebrow">${htmlEscape(eyebrow)}</div>\n`;
-  }
-  h += `<h1>${htmlEscape(title)}</h1>\n`;
-  if (subHtml.trim() !== "") {
-    h += `<p class="sub">${subHtml}</p>\n`;
-  }
-  h += '<div class="rule"></div>\n</header>\n';
-  return h;
-}
-
 /** {@link writeRoomSummary}'s injectable seams — see this module's own doc
  * for why {@link combineSummary} is injectable despite Rust's own signature
  * having no equivalent parameter. */
@@ -463,6 +376,146 @@ export interface WriteRoomSummaryDeps {
  * arms `write_room_summary` repeats (the initial pass and the capped tail). */
 function displayName(f: { name: string; folder: string | null }): string {
   return f.folder !== null ? `${f.folder}/${f.name}` : f.name;
+}
+
+interface RoomSummaryContext {
+  existingRow: SummaryFile | undefined;
+  legacyMdId: string | null;
+  files: SummaryFile[];
+  memories: string[];
+  roomName: string;
+}
+
+interface SummaryFileList {
+  capped: boolean;
+  fileItems: Array<[string, string | null]>;
+  fileLines: string;
+}
+
+function roomSummaryContext(room: SummaryRoom): RoomSummaryContext {
+  const all = listFilesForSummary(room.db);
+  const existingRow = all.find((f) => f.name === SUMMARY_FILE_NAME && f.source === "generated");
+  const legacyRow = all.find((f) => f.name === "Room summary.md" && f.source === "generated");
+  const files = all.filter((f) => !isSummaryFile(f.name, f.source));
+  const memories = listMemories(room.db).map((m) => m.content);
+  if (files.length === 0) throw new Error("This room has no files to summarize yet.");
+  return { existingRow, legacyMdId: legacyRow?.id ?? null, files, memories, roomName: room.name };
+}
+
+function summaryFileList(files: readonly SummaryFile[]): SummaryFileList {
+  let fileLines = "";
+  const fileItems: Array<[string, string | null]> = [];
+  for (const file of files.slice(0, MAX_SUMMARY_FILES)) {
+    const display = displayName(file);
+    const liner = file.aiSummary !== null ? file.aiSummary.trim() : "";
+    if (liner !== "") {
+      fileLines += `- ${display} — ${liner}\n`;
+      fileItems.push([display, liner]);
+    } else {
+      fileLines += `- ${display} (${file.mime})\n`;
+      fileItems.push([display, null]);
+    }
+  }
+  return { capped: files.length > MAX_SUMMARY_FILES, fileItems, fileLines };
+}
+
+function appendCappedFileNames(files: readonly SummaryFile[], fileItems: Array<[string, string | null]>): void {
+  for (const file of files.slice(MAX_SUMMARY_FILES)) {
+    fileItems.push([displayName(file), null]);
+  }
+}
+
+function summaryPurposeHtml(purpose: string): string {
+  const text = purpose === "" ? "A personal document room." : htmlEscape(purpose);
+  return `<h2>What this room is for</h2>\n<div class="lead-wrap"><p class="lead">${text}</p></div>\n`;
+}
+
+function summaryFileRows(fileItems: ReadonlyArray<[string, string | null]>): string {
+  let rows = `<h2>Files <span class="count">${fileItems.length}</span></h2>\n<ul class="files">\n`;
+  for (const [display, liner] of fileItems) {
+    const icon = fileGlyph(display);
+    if (liner !== null) {
+      rows +=
+        `<li><span class="ic">${icon}</span><div><div class="nm">${htmlEscape(display)}</div>` +
+        `<div class="ds">${htmlEscape(liner)}</div></div></li>\n`;
+    } else {
+      rows += `<li><span class="ic">${icon}</span><div><div class="nm">${htmlEscape(display)}</div></div></li>\n`;
+    }
+  }
+  return `${rows}</ul>\n`;
+}
+
+function summaryQuestionsHtml(questions: readonly string[]): string {
+  if (questions.length === 0) return "";
+  let html = '<h2>Try asking</h2>\n<ol class="asks">\n';
+  for (const question of questions) {
+    html += `<li>${htmlEscape(question)}</li>\n`;
+  }
+  return `${html}</ol>\n`;
+}
+
+function summaryDocument(
+  roomName: string,
+  savedDate: string,
+  purpose: string,
+  questions: readonly string[],
+  fileItems: ReadonlyArray<[string, string | null]>,
+  capped: boolean,
+): string {
+  let body = docHero("Room summary", roomName, `Generated on ${htmlEscape(savedDate)}`);
+  body += summaryPurposeHtml(purpose);
+  body += summaryFileRows(fileItems);
+  if (capped) {
+    body += `<p class="note">Only the first ${MAX_SUMMARY_FILES} files were summarized; the rest are listed by name.</p>\n`;
+  }
+  body += summaryQuestionsHtml(questions);
+  return htmlDocument(`${roomName} — Room summary`, body);
+}
+
+function currentSummaryId(db: Database.Database, existingRow: SummaryFile | undefined): string | null {
+  if (existingRow === undefined) return null;
+  return fileStillFindableById(db, existingRow.id) ? existingRow.id : null;
+}
+
+async function overwriteSummary(
+  room: SummaryRoom,
+  id: string,
+  bytes: Uint8Array,
+  content: string,
+): Promise<FileMeta> {
+  if (room.workspace === undefined) {
+    storeFileBytes(room.db, id, bytes, content, "Summarized");
+    return getFileMeta(room.db, id);
+  }
+  return writeRoomFile(room, id, bytes, content, "Summarized");
+}
+
+async function createSummary(room: SummaryRoom, bytes: Uint8Array, content: string): Promise<FileMeta> {
+  if (room.workspace === undefined) {
+    return insertFile(room.db, SUMMARY_FILE_NAME, "text/html", bytes, content, "generated");
+  }
+  return createRoomFile(room, SUMMARY_FILE_NAME, "text/html", bytes, content, "generated");
+}
+
+async function saveSummary(
+  room: SummaryRoom,
+  existingId: string | null,
+  bytes: Uint8Array,
+  content: string,
+): Promise<FileMeta> {
+  if (existingId !== null) return overwriteSummary(room, existingId, bytes, content);
+  return createSummary(room, bytes, content);
+}
+
+async function trashLegacySummary(room: SummaryRoom, legacyMdId: string | null): Promise<void> {
+  if (legacyMdId === null) return;
+  const actor: TrashActor = { kind: "app", what: "summarize_room" };
+  try {
+    if (room.workspace === undefined) trashFile(room.db, legacyMdId, actor);
+    else await room.workspace.trash(legacyMdId);
+  } catch {
+    // Best-effort, mirrors Rust's `let _ = db::trash_file(...)`.
+  }
 }
 
 /**
@@ -489,121 +542,25 @@ export async function writeRoomSummary(
   deps: WriteRoomSummaryDeps = {}
 ): Promise<FileMeta> {
   const combine = deps.combineSummary ?? combineSummary;
-
   const room0 = pinnedRoom(rooms, pin);
-  const all = listFilesForSummary(room0.db);
-  const existingRow = all.find((f) => f.name === SUMMARY_FILE_NAME && f.source === "generated");
-  const legacyRow = all.find((f) => f.name === "Room summary.md" && f.source === "generated");
-  const legacyMdId = legacyRow?.id ?? null;
-  const files = all.filter((f) => !isSummaryFile(f.name, f.source));
-  const memories = listMemories(room0.db).map((m) => m.content);
-  const roomName = room0.name;
-
-  if (files.length === 0) {
-    throw new Error("This room has no files to summarize yet.");
-  }
-  const capped = files.length > MAX_SUMMARY_FILES;
-
-  // `fileLines` is the text context handed to the reduce step; `fileItems`
-  // (display, one-liner) drives the deterministic HTML file list.
-  let fileLines = "";
-  const fileItems: Array<[string, string | null]> = [];
-  for (const f of files.slice(0, MAX_SUMMARY_FILES)) {
-    const display = displayName(f);
-    const liner = f.aiSummary !== null ? f.aiSummary.trim() : "";
-    if (liner !== "") {
-      fileLines += `- ${display} — ${liner}\n`;
-      fileItems.push([display, liner]);
-    } else {
-      fileLines += `- ${display} (${f.mime})\n`;
-      fileItems.push([display, null]);
-    }
-  }
-
-  // Reduce: purpose paragraph + suggested questions, on ONLY the summarized
-  // files' one-liners — the beyond-cap name-only tail is for the
-  // deterministic "## Files" section and is appended AFTER, so it never
-  // crowds the context the model actually needs here.
-  const [purpose, questions] = await combine(model, roomName, memories, fileLines);
-
-  if (capped) {
-    for (const f of files.slice(MAX_SUMMARY_FILES)) {
-      fileItems.push([displayName(f), null]);
-    }
-  }
-
-  // Re-acquire: the reduce just awaited a model call that can take minutes.
+  const context = roomSummaryContext(room0);
+  const summaryFiles = summaryFileList(context.files);
+  const [purpose, questions] = await combine(model, context.roomName, context.memories, summaryFiles.fileLines);
+  if (summaryFiles.capped) appendCappedFileNames(context.files, summaryFiles.fileItems);
   const savedDate = currentDate(pinnedRoom(rooms, pin).db);
-
-  // ADD-22: assemble a self-contained HTML page (rendered in the sandboxed,
-  // network-blocked viewer). Purpose + questions come from the model as
-  // guaranteed fields; the file list is deterministic. Everything is escaped.
-  let body = docHero("Room summary", roomName, `Generated on ${htmlEscape(savedDate)}`);
-  body += "<h2>What this room is for</h2>\n";
-  body += `<div class="lead-wrap"><p class="lead">${
-    purpose === "" ? "A personal document room." : htmlEscape(purpose)
-  }</p></div>\n`;
-  body += `<h2>Files <span class="count">${fileItems.length}</span></h2>\n<ul class="files">\n`;
-  for (const [display, liner] of fileItems) {
-    const icon = fileGlyph(display);
-    if (liner !== null) {
-      body +=
-        `<li><span class="ic">${icon}</span><div><div class="nm">${htmlEscape(display)}</div>` +
-        `<div class="ds">${htmlEscape(liner)}</div></div></li>\n`;
-    } else {
-      body += `<li><span class="ic">${icon}</span><div><div class="nm">${htmlEscape(display)}</div></div></li>\n`;
-    }
-  }
-  body += "</ul>\n";
-  if (capped) {
-    body += `<p class="note">Only the first ${MAX_SUMMARY_FILES} files were summarized; the rest are listed by name.</p>\n`;
-  }
-  if (questions.length > 0) {
-    body += '<h2>Try asking</h2>\n<ol class="asks">\n';
-    for (const q of questions) {
-      body += `<li>${htmlEscape(q)}</li>\n`;
-    }
-    body += "</ol>\n";
-  }
-  const content = htmlDocument(`${roomName} — Room summary`, body);
-
-  // Phase 3 (locked): write the ONE canonical summary file — overwrite in
-  // place (ADD-2 keeps the previous versions) or create it the first time.
-  // Re-acquire once more, immediately before the write.
+  const content = summaryDocument(
+    context.roomName,
+    savedDate,
+    purpose,
+    questions,
+    summaryFiles.fileItems,
+    summaryFiles.capped,
+  );
   const room1 = pinnedRoom(rooms, pin);
-  // `existingRow` was read BEFORE the reduce, which awaits the model for
-  // minutes — long enough for the user to delete the old summary in the
-  // Library. A by-id write would happily fill the trashed row, and the
-  // metadata read that follows is trash-aware and would then fail: an error
-  // on screen over a file that was silently rewritten where nobody can see
-  // it. Ask again, the same trash-aware way, and write a new summary when
-  // the old one is gone.
-  const existingId =
-    existingRow !== undefined && fileStillFindableById(room1.db, existingRow.id) ? existingRow.id : null;
+  const existingId = currentSummaryId(room1.db, context.existingRow);
   const bytes = Buffer.from(content, "utf8");
-  let meta: FileMeta;
-  if (existingId !== null) {
-    meta = room1.workspace === undefined
-      ? (storeFileBytes(room1.db, existingId, bytes, content, "Summarized"), getFileMeta(room1.db, existingId))
-      : await writeRoomFile(room1, existingId, bytes, content, "Summarized");
-  } else {
-    meta = room1.workspace === undefined
-      ? insertFile(room1.db, SUMMARY_FILE_NAME, "text/html", bytes, content, "generated")
-      : await createRoomFile(room1, SUMMARY_FILE_NAME, "text/html", bytes, content, "generated");
-  }
-  // ADD-22: drop the legacy Markdown summary so only the HTML one remains.
-  // Trashed, not destroyed, and labelled with the command that did it: this
-  // is the app removing a file the user never asked it to remove, which is
-  // precisely the case the trash exists to make visible and undoable.
-  if (legacyMdId !== null) {
-    const actor: TrashActor = { kind: "app", what: "summarize_room" };
-    try {
-      if (room1.workspace === undefined) trashFile(room1.db, legacyMdId, actor);
-      else await room1.workspace.trash(legacyMdId);
-    } catch {
-      // Best-effort, mirrors Rust's `let _ = db::trash_file(...)`.
-    }
-  }
+  const meta = await saveSummary(room1, existingId, bytes, content);
+  await trashLegacySummary(room1, context.legacyMdId);
   emitSafely(deps.emit, "room-files-changed", undefined);
   return meta;
 }

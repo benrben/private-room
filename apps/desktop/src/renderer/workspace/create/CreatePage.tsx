@@ -1,23 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
-  formatSize,
   type CreateCatalog,
   type CreateModel,
   type RoomPicture,
-  type ShotPlan,
 } from "../../api";
-import { clock } from "./clock";
-import { CheckIcon, CreateIcon, LockIcon } from "../../icons";
 import { WSState } from "../state";
 import { WSActions } from "../actions";
 import { isCreationFile } from "../types";
-import { Attached, PicturePicker } from "./PicturePicker";
-import { StoryTab } from "./StoryTab";
+import { CreateLayout, CreatePageBody, addPictureReference } from "./CreateSurface";
+import { type BenchProps } from "./CreateBench";
 import {
-  emptyReason,
-  emptyShelfLine,
-  legalSeconds,
   selectedModel,
   takesFirstFrame,
   tallies,
@@ -26,7 +19,88 @@ import {
 } from "./selectors";
 
 /** What the page is showing: a shelf of models, or the story surface. */
-type Surface = CreateKind | "story";
+export type Surface = CreateKind | "story";
+
+function surfaceKind(surface: Surface): CreateKind {
+  return surface === "story" ? "image" : surface;
+}
+
+function dropsSelectedFrame(kind: CreateKind, selected: CreateModel | null): boolean {
+  if (kind !== "video" || !selected) return false;
+  return !takesFirstFrame(selected);
+}
+
+type CreationRequest = {
+  prompt: string;
+  model: CreateModel;
+  kind: "image" | "video";
+  variations: number;
+  seconds: number | null;
+  resolution: string;
+  aspectRatio: string;
+  refs: RoomPicture[];
+  frame: RoomPicture | null;
+};
+
+function canGenerate(
+  selected: CreateModel | null,
+  kind: "image" | "video",
+  prompt: string,
+  frame: RoomPicture | null,
+): boolean {
+  return Boolean(selected) && (Boolean(prompt.trim()) || (kind === "video" && Boolean(frame)));
+}
+
+function createJobRequest(request: CreationRequest) {
+  return {
+    prompt: request.prompt.trim(),
+    model: request.model.model,
+    kind: request.kind,
+    variations: request.variations,
+    seconds: request.kind === "video" ? request.seconds : null,
+    resolution: request.resolution,
+    aspectRatio: request.aspectRatio,
+    referenceFileIds: request.refs.map((picture) => picture.fileId),
+    frameFileId: request.kind === "video" ? (request.frame?.fileId ?? null) : null,
+    referencesAck: request.refs.length > 0 || Boolean(request.frame),
+  };
+}
+
+function generationNotice(kind: "image" | "video", variations: number): string {
+  const single = {
+    image: "Making it — it will open when it is ready.",
+    video: "Filming — a clip takes a few minutes.",
+  };
+  return variations > 1 ? `Making ${variations} — they will open when they are ready.` : single[kind];
+}
+
+async function generateCreation({
+  request,
+  busy,
+  canGo,
+  refreshJobs,
+  pushToast,
+  setBusy,
+}: {
+  request: CreationRequest;
+  busy: boolean;
+  canGo: boolean;
+  refreshJobs: () => Promise<void>;
+  pushToast: WSState["pushToast"];
+  setBusy: (busy: boolean) => void;
+}) {
+  if (!canGo || busy) return;
+  setBusy(true);
+  try {
+    await api.startCreateJob(createJobRequest(request));
+    await refreshJobs();
+    pushToast("info", generationNotice(request.kind, request.variations));
+  } catch (error) {
+    pushToast("error", String(error));
+  } finally {
+    setBusy(false);
+  }
+}
 
 /** The Create page: pictures and video, made by whichever connected model can
  * actually make one.
@@ -114,7 +188,7 @@ export function CreatePage({ s, a }: { s: WSState; a: WSActions }) {
   const counts = tallies(catalog);
   // The Story tab has no shelf of its own; it borrows the whole catalogue and
   // narrows per shot. `kind` is only meaningful for the two model tabs.
-  const kind: CreateKind = surface === "story" ? "image" : surface;
+  const kind = surfaceKind(surface);
 
   const visible = useMemo(
     () => visibleModels(models, kind, query),
@@ -139,7 +213,7 @@ export function CreatePage({ s, a }: { s: WSState; a: WSActions }) {
   // showed. Dropped on the video bench only — the frame slot is video's, and
   // clearing it because the reader glanced at the Images tab would throw away
   // an attachment they never touched.
-  const dropsFrame = kind === "video" && !!selected && !takesFirstFrame(selected);
+  const dropsFrame = dropsSelectedFrame(kind, selected);
   useEffect(() => {
     if (dropsFrame) setFrame(null);
   }, [dropsFrame]);
@@ -164,948 +238,89 @@ export function CreatePage({ s, a }: { s: WSState; a: WSActions }) {
   // A clip may be made from a picture alone — several models animate a still
   // with no words at all, and the API marks the prompt optional for exactly
   // that. A still always needs words: there is nothing else to draw from.
-  const canGo =
-    !!selected && (!!prompt.trim() || (kind === "video" && !!frame));
-
-  async function generate() {
-    if (!selected || !canGo || busy) return;
-    setBusy(true);
-    try {
-      await api.startCreateJob({
-        prompt: prompt.trim(),
-        model: selected.model,
+  const canGo = canGenerate(selected, kind, prompt, frame);
+  const generate = () => {
+    if (!selected) return;
+    void generateCreation({
+      request: {
+        prompt,
+        model: selected,
         kind,
         variations,
-        seconds: kind === "video" ? seconds : null,
+        seconds,
         resolution,
         aspectRatio,
-        referenceFileIds: refs.map((r) => r.fileId),
-        frameFileId: kind === "video" ? (frame?.fileId ?? null) : null,
-        // Set here and nowhere else: the pictures are on screen, named, above
-        // a button that says they will be sent. That is what makes this
-        // consent rather than a setting — see `videogen.guard`.
-        referencesAck: refs.length > 0 || !!frame,
-      });
-      await a.refreshJobs();
-      s.pushToast(
-        "info",
-        variations > 1
-          ? `Making ${variations} — they will open when they are ready.`
-          : kind === "video"
-            ? "Filming — a clip takes a few minutes."
-            : "Making it — it will open when it is ready.",
-      );
-    } catch (e) {
-      s.pushToast("error", String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
+        refs,
+        frame,
+      },
+      busy,
+      canGo,
+      refreshJobs: a.refreshJobs,
+      pushToast: s.pushToast,
+      setBusy,
+    });
+  };
 
+  const bench: BenchProps = {
+    models: visible,
+    selected,
+    onPickModel: setPickedModel,
+    query,
+    onQuery: setQuery,
+    total: kind === "video" ? counts.video : counts.image,
+    kind,
+    prompt,
+    onPrompt: setPrompt,
+    variations,
+    onVariations: setVariations,
+    frame,
+    refs,
+    seconds,
+    onSeconds: setSeconds,
+    resolution,
+    onResolution: setResolution,
+    aspectRatio,
+    onAspectRatio: setAspectRatio,
+    onTakeToStory: () => {
+      setHandoff(prompt);
+      setSurface("story");
+    },
+    onPickFrame: () => setPicking("frame"),
+    onPickRef: () => setPicking("ref"),
+    onClearFrame: () => setFrame(null),
+    onClearRef: (id) => setRefs((current) => current.filter((picture) => picture.fileId !== id)),
+    busy,
+    canGo,
+    onGenerate: generate,
+  };
   return (
-    <div className="cr-page">
-      <header className="cr-head">
-        <div>
-          <h1 className="cr-title">Create</h1>
-          <div className="nb-subtitle">
-            pictures and video, made by whoever in this room can hold the pen
-          </div>
-        </div>
-      </header>
-
-      <div className="cr-body">
-        {loading ? (
-          <div className="cr-note">Reading what this room’s models can do…</div>
-        ) : (
-          <>
-            {/* A catalogue we could not read is a line at the top, not the
-                whole page: it says what failed while everything that needs no
-                catalogue — the cast, the shot list — stays where it was. */}
-            {loadError && (
-              <div className="cr-note cr-note-bad">
-                Could not read the model list: {loadError}
-              </div>
-            )}
-            <Ledger
-              catalog={catalog}
-              counts={counts}
-              open={whyOpen}
-              onToggle={() => setWhyOpen((v) => !v)}
-            />
-
-            {/* The tabs sit ABOVE the empty shelf, not inside it. A cast and a
-                shot list are work already stored in this room; hiding the
-                whole page behind the model shelf made them unreachable the
-                moment a catalogue failed to load — offline, key removed, the
-                room's internet switch off — for surfaces that need no
-                provider to read or edit. The shelf is the Images/Video
-                worktable's own empty state; Story reports a bare catalogue
-                through its per-shot model pickers. */}
-            <div className="cr-controls">
-              <div className="cr-tabs" role="tablist" aria-label="What to make">
-                {/* No catalogue means the count is UNKNOWN, not zero. Past the
-                    loading branch a null catalog is a fetch that failed, and
-                    "Images 0" beside it states a fact about this room's
-                    providers that nothing here has read — so the number is
-                    left off, the way the sidebar leaves off a badge it cannot
-                    count. */}
-                <Tab
-                  label="Images"
-                  count={catalog ? counts.image : undefined}
-                  on={surface === "image"}
-                  mark="var(--mk-blue)"
-                  onPick={() => setSurface("image")}
-                />
-                <Tab
-                  label="Video"
-                  count={catalog ? counts.video : undefined}
-                  on={surface === "video"}
-                  mark="var(--mk-green)"
-                  onPick={() => setSurface("video")}
-                />
-                <Tab
-                  label="Story"
-                  on={surface === "story"}
-                  mark="var(--mk-yellow)"
-                  onPick={() => setSurface("story")}
-                />
-              </div>
-              {/* The model filter lives on the bench, under the dropdown it
-                  filters. A second copy up here was bound to the same state —
-                  two boxes typing into each other, two controls with one
-                  accessible name — and it filtered a gallery that is no longer
-                  on this page. */}
-            </div>
-
-            {surface === "story" ? (
-              <StoryTab
-                s={s}
-                a={a}
-                models={models}
-                handoff={handoff}
-                onHandoffUsed={() => setHandoff(null)}
-              />
-            ) : models.length === 0 ? (
-              <EmptyShelf catalog={catalog} />
-            ) : (
-              <>
-                <div className="cr-worktable">
-                  {/* THE WORKSPACE. This used to be a grid of model cards —
-                      forty of them, filling the page, to make one choice
-                      that is made once and then not thought about again.
-                      The models are a dropdown on the bench now, and the
-                      room's own work gets the space instead. */}
-                  <Canvas
-                    s={s}
-                    a={a}
-                    kind={kind}
-                    activeJobs={activeJobs}
-                    failedJobs={failedJobs}
-                    made={made}
-                    onDismiss={(id) => void a.dismissJob(id)}
-                  />
-
-                  <Bench
-                    models={visible}
-                    selected={selected}
-                    onPickModel={setPickedModel}
-                    query={query}
-                    onQuery={setQuery}
-                    total={kind === "video" ? counts.video : counts.image}
-                    kind={kind}
-                    prompt={prompt}
-                    onPrompt={setPrompt}
-                    variations={variations}
-                    onVariations={setVariations}
-                    frame={frame}
-                    refs={refs}
-                    seconds={seconds}
-                    onSeconds={setSeconds}
-                    resolution={resolution}
-                    onResolution={setResolution}
-                    aspectRatio={aspectRatio}
-                    onAspectRatio={setAspectRatio}
-                    onTakeToStory={() => {
-                      setHandoff(prompt);
-                      setSurface("story");
-                    }}
-                    onPickFrame={() => setPicking("frame")}
-                    onPickRef={() => setPicking("ref")}
-                    onClearFrame={() => setFrame(null)}
-                    onClearRef={(id) => setRefs((r) => r.filter((p) => p.fileId !== id))}
-                    busy={busy}
-                    canGo={canGo}
-                    onGenerate={() => void generate()}
-                  />
-                </div>
-
-                <PicturePicker
-                  open={picking !== null}
-                  title={
-                    picking === "frame"
-                      ? "Which picture does the clip start on?"
-                      : "Which picture should it look like?"
-                  }
-                  onClose={() => setPicking(null)}
-                  onPick={(p) => {
-                    if (picking === "frame") setFrame(p);
-                    else
-                      setRefs((current) =>
-                        current.some((x) => x.fileId === p.fileId)
-                          ? current
-                          : [...current, p],
-                      );
-                  }}
-                />
-              </>
-            )}
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/** The gate, stated as a number. */
-function Ledger({
-  catalog,
-  counts,
-  open,
-  onToggle,
-}: {
-  catalog: CreateCatalog | null;
-  counts: ReturnType<typeof tallies>;
-  open: boolean;
-  onToggle: () => void;
-}) {
-  if (!catalog) return null;
-  const { can, cannot } = counts;
-  return (
-    <section className="nb-panel cr-ledger">
-      <div className="cr-ledger-top">
-        <div className="cr-ledger-count">
-          <span className="cr-ledger-big">{can}</span>
-          <div className="cr-ledger-text">
-            <b>
-              of {counts.scanned} model{counts.scanned === 1 ? "" : "s"}
-            </b>{" "}
-            in this room can actually make a picture
-            <span>
-              Read live from each provider’s own catalogue — never a list kept
-              in the app.
-            </span>
-          </div>
-        </div>
-        <div className="cr-tally">
-          <Tally n={counts.image} label="Images" mark="var(--mk-blue)" />
-          <Tally n={counts.video} label="Video" mark="var(--mk-green)" />
-          <Tally n={cannot} label="Can’t" mark="var(--mk-red)" />
-        </div>
-      </div>
-
-      {catalog.excluded.length > 0 && (
-        <div className="cr-why">
-          <button
-            className="cr-why-toggle"
-            aria-expanded={open}
-            onClick={onToggle}
-            type="button"
-          >
-            <span className={`cr-why-chevron${open ? " is-open" : ""}`} aria-hidden>
-              ›
-            </span>
-            Why the other {cannot} aren’t here
-          </button>
-          {open && (
-            <div className="cr-why-body">
-              {catalog.excluded.map((row) => (
-                <div className="cr-why-row" key={`${row.engineLabel}-${row.reason}`}>
-                  <span className="cr-why-who">
-                    {row.engineLabel}
-                    <span className="nb-num cr-dim"> · {row.count}</span>
-                  </span>
-                  <span className="cr-why-reason">
-                    {row.reason}
-                    {row.examples.length > 0 && (
-                      <span className="cr-why-eg"> {row.examples.join(", ")}</span>
-                    )}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function Tally({ n, label, mark }: { n: number; label: string; mark: string }) {
-  return (
-    <div className="cr-tally-item">
-      <span className="cr-tally-n">{n}</span>
-      <span className="cr-tally-l">
-        <span className="cr-tally-dot" style={{ background: mark }} aria-hidden />
-        {label}
-      </span>
-    </div>
-  );
-}
-
-function Tab({
-  label,
-  count,
-  on,
-  mark,
-  onPick,
-}: {
-  label: string;
-  /** Absent for a tab that is not a shelf of models — Story counts nothing. */
-  count?: number;
-  on: boolean;
-  mark: string;
-  onPick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={on}
-      className={`cr-tab${on ? " is-active nb-underline" : ""}`}
-      style={on ? ({ "--mk": mark } as React.CSSProperties) : undefined}
-      onClick={onPick}
-    >
-      {label}
-      {count !== undefined && <span className="nb-num cr-dim"> {count}</span>}
-    </button>
-  );
-}
-
-/** The workspace: what this room has actually made.
- *
- * This is the space the model gallery used to occupy. Forty index cards is a
- * lot of screen to spend on a choice made once per session — and it pushed the
- * pictures, the ones the page exists to produce, below the fold and into a
- * list of filenames. The models are a dropdown on the bench now; the work goes
- * here, at a size where you can see it. */
-function Canvas({
-  s,
-  a,
-  kind,
-  activeJobs,
-  failedJobs,
-  made,
-  onDismiss,
-}: {
-  s: WSState;
-  a: WSActions;
-  kind: "image" | "video";
-  activeJobs: WSState["jobs"];
-  failedJobs: WSState["jobs"];
-  made: WSState["files"];
-  onDismiss: (id: string) => void;
-}) {
-  const [thumbs, setThumbs] = useState<Record<string, string>>({});
-
-  // Pre-shrunk previews, read once and re-read whenever the room's files
-  // change. Streaming the real bytes to draw a 160px tile would cost hundreds
-  // of megabytes for a page of pictures.
-  useEffect(() => {
-    let live = true;
-    api
-      .storyPictures()
-      .then((all) => {
-        if (!live) return;
-        const next: Record<string, string> = {};
-        for (const p of all) next[p.fileId] = p.thumbB64;
-        setThumbs(next);
-      })
-      .catch(() => undefined);
-    return () => {
-      live = false;
-    };
-  }, [made.length]);
-
-  return (
-    <section className="cr-canvas">
-      {failedJobs.map((j) => (
-        <div key={j.id} className="nb-card cr-job cr-job-bad" role="alert">
-          <span className="cr-job-text">
-            <span className="cr-job-title">{j.title} — nothing was made</span>
-            {/* The provider's own words, verbatim. A generation is a paid
-                call, so "it failed" without the reason is not enough to
-                decide whether to spend another. */}
-            <span className="cr-job-why">{j.error || "The reason was not recorded."}</span>
-          </span>
-          <button
-            className="cr-job-dismiss"
-            onClick={() => onDismiss(j.id)}
-            aria-label="Dismiss this failure"
-            title="Dismiss"
-          >
-            ✕
-          </button>
-        </div>
-      ))}
-
-      {/* No bar and no figure. `done` only moves at a VARIATION boundary, so
-          the ordinary one-picture job reported 0% from its first event to its
-          last — a determinate meter stuck at zero for three minutes, which
-          says something false about a paid call. The provider's own percentage
-          is already in the label when there is one, and the label says no
-          number when there is not. */}
-      {activeJobs.map((j) => {
-        const live = s.jobProgress[j.id];
-        return (
-          <div key={j.id} className="nb-card cr-job" role="status">
-            <span className="cr-job-dot" aria-hidden="true" />
-            <span className="cr-job-text">
-              <span className="cr-job-title">{j.title}</span>
-              <span className="cr-job-sub">
-                {live?.label ?? (j.status === "queued" ? "Queued" : "Working…")}
-              </span>
-            </span>
-          </div>
-        );
-      })}
-
-      {made.length === 0 ? (
-        <div className="cr-empty cr-canvas-empty">
-          <CreateIcon size={26} />
-          <h2>Nothing made here yet</h2>
-          <p>
-            {kind === "video"
-              ? "Describe a clip on the right — or start it from a picture that is already in this room."
-              : "Describe a picture on the right. Anything you make lands in this room like any other file."}
-          </p>
-        </div>
-      ) : (
-        <>
-          <div className="cr-sec-head">
-            <span className="nb-subtitle">made in this room</span>
-            <span className="nb-num cr-dim">
-              {made.length} file{made.length === 1 ? "" : "s"}
-            </span>
-          </div>
-          <div className="cr-canvas-grid">
-            {made.map((f) => (
-              <button
-                key={f.id}
-                className="cr-tile"
-                onClick={() => void a.viewFile(f.id)}
-                title={`Open ${f.name}`}
-              >
-                {thumbs[f.id] ? (
-                  <img src={`data:image/jpeg;base64,${thumbs[f.id]}`} alt="" />
-                ) : (
-                  // No preview, and WHY matters. A clip has no still to show;
-                  // anything else generated here is not a picture at all.
-                  // Labelling a document "clip" — which is what a single
-                  // fallback did — states something false about the file.
-                  <span className="cr-tile-clip">
-                    <CreateIcon size={20} />
-                    <span>{f.mimeType?.startsWith("video/") ? "clip" : "file"}</span>
-                  </span>
-                )}
-                <span className="cr-tile-name">{f.name}</span>
-                <span className="nb-num cr-dim">{formatSize(f.sizeBytes)}</span>
-              </button>
-            ))}
-          </div>
-        </>
-      )}
-    </section>
-  );
-}
-
-/** Which model, as one line instead of forty cards.
- *
- * The cards carried more than a name — engine, medium, whether it leaves the
- * Mac — and none of that may be lost just because the control got smaller. So
- * the facts move under the dropdown, for the ONE model actually chosen, which
- * is the only one they were ever needed for. */
-function ModelPicker({
-  models,
-  selected,
-  onPick,
-  query,
-  onQuery,
-  kind,
-  total,
-}: {
-  models: CreateModel[];
-  selected: CreateModel | null;
-  onPick: (model: string) => void;
-  query: string;
-  onQuery: (v: string) => void;
-  kind: CreateKind;
-  /** How many this tab has BEFORE the filter — the difference between "your
-   *  filter matched nothing" and "the catalogue served nothing", which have
-   *  different fixes and must not share a sentence. */
-  total: number;
-}) {
-  const limits = selected?.limits ?? null;
-
-  return (
-    <div className="cr-picker">
-      <label className="cr-field-label" htmlFor="cr-model">
-        Which model
-      </label>
-      <select
-        id="cr-model"
-        className="cr-field cr-select cr-model-select"
-        value={selected?.model ?? ""}
-        onChange={(e) => onPick(e.target.value)}
-      >
-        {models.length === 0 && <option value="">no model available</option>}
-        {models.map((m) => (
-          <option key={m.model} value={m.model}>
-            {m.label}
-          </option>
-        ))}
-      </select>
-
-      {(total > 8 || query.trim()) && (
-        <input
-          type="search"
-          className="cr-field cr-model-filter"
-          value={query}
-          placeholder={`Filter ${total} models…`}
-          aria-label="Filter models by name"
-          onChange={(e) => onQuery(e.target.value)}
-        />
-      )}
-
-      {models.length === 0 && (
-        <p className="cr-hint">{emptyShelfLine(kind, query)}</p>
-      )}
-
-      {selected && (
-        <div className="cr-picker-facts">
-          <span className="cr-bench-slug">{selected.slug}</span>
-          <span className="cr-picker-tags">
-            <span className="nb-tape" style={{ "--mk": "var(--mk-blue)" } as React.CSSProperties}>
-              {selected.engineLabel}
-            </span>
-            {!selected.local && (
-              <span
-                className="nb-tape"
-                style={{ "--mk": "var(--mk-yellow)" } as React.CSSProperties}
-              >
-                Leaves room
-              </span>
-            )}
-            {limits?.generateAudio && (
-              <span
-                className="nb-tape"
-                style={{ "--mk": "var(--mk-green)" } as React.CSSProperties}
-              >
-                With sound
-              </span>
-            )}
-          </span>
-          {selected.description && (
-            <p className="cr-picker-desc">{selected.description}</p>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** The compose panel. */
-function Bench({
-  models,
-  selected,
-  onPickModel,
-  query,
-  onQuery,
-  total,
-  kind,
-  prompt,
-  onPrompt,
-  variations,
-  onVariations,
-  frame,
-  refs,
-  seconds,
-  onSeconds,
-  resolution,
-  onResolution,
-  aspectRatio,
-  onAspectRatio,
-  onTakeToStory,
-  onPickFrame,
-  onPickRef,
-  onClearFrame,
-  onClearRef,
-  busy,
-  canGo,
-  onGenerate,
-}: {
-  models: CreateModel[];
-  selected: CreateModel | null;
-  onPickModel: (model: string) => void;
-  query: string;
-  onQuery: (v: string) => void;
-  /** The tab's count before filtering. */
-  total: number;
-  kind: "image" | "video";
-  prompt: string;
-  onPrompt: (v: string) => void;
-  variations: number;
-  onVariations: (v: number) => void;
-  frame: RoomPicture | null;
-  refs: RoomPicture[];
-  seconds: number | null;
-  onSeconds: (v: number | null) => void;
-  resolution: string;
-  onResolution: (v: string) => void;
-  aspectRatio: string;
-  onAspectRatio: (v: string) => void;
-  onTakeToStory: () => void;
-  onPickFrame: () => void;
-  onPickRef: () => void;
-  onClearFrame: () => void;
-  onClearRef: (fileId: string) => void;
-  busy: boolean;
-  canGo: boolean;
-  onGenerate: () => void;
-}) {
-  const lengths = legalSeconds(selected);
-  const framesOk = takesFirstFrame(selected);
-  const maxRefs = selected?.limits?.maxReferences ?? null;
-  const sending = refs.length + (kind === "video" && frame ? 1 : 0);
-  // Only what this model publishes. An empty list is the provider declining to
-  // say, so the control disappears rather than offering invented values.
-  const sizes = selected?.limits?.resolutions ?? [];
-  const shapes = selected?.limits?.aspectRatios ?? [];
-
-  return (
-    <aside className="nb-panel cr-bench" aria-label="Compose">
-      <div className="cr-bench-head">
-        <h2>The bench</h2>
-        <span className="nb-num cr-dim">{kind === "video" ? "moving" : "still"}</span>
-      </div>
-
-      <ModelPicker
+    <CreateLayout>
+      <CreatePageBody
+        s={s}
+        a={a}
+        catalog={catalog}
+        loading={loading}
+        loadError={loadError}
+        counts={counts}
+        surface={surface}
+        onSurface={setSurface}
+        whyOpen={whyOpen}
+        onToggleWhy={() => setWhyOpen((open) => !open)}
         models={models}
-        selected={selected}
-        onPick={onPickModel}
-        query={query}
-        onQuery={onQuery}
+        handoff={handoff}
+        onHandoffUsed={() => setHandoff(null)}
         kind={kind}
-        total={total}
+        activeJobs={activeJobs}
+        failedJobs={failedJobs}
+        made={made}
+        bench={bench}
+        picking={picking}
+        onClosePicker={() => setPicking(null)}
+        onPickPicture={(picture) => {
+          if (picking === "frame") setFrame(picture);
+          else setRefs((current) => addPictureReference(current, picture));
+        }}
       />
-
-      <div>
-        <label className="cr-field-label" htmlFor="cr-prompt">
-          Describe it
-        </label>
-        <textarea
-          id="cr-prompt"
-          className="cr-field"
-          value={prompt}
-          rows={3}
-          placeholder={
-            kind === "video"
-              ? "The boat pulls away, the light going out of the sky"
-              : "A lighthouse at dusk, the storm still an hour out"
-          }
-          onChange={(e) => onPrompt(e.target.value)}
-        />
-        <WholeScriptNotice prompt={prompt} kind={kind} onTakeToStory={onTakeToStory} />
-      </div>
-
-      {/* Pictures from this room. The frame slot is video-only and is a
-          genuinely different thing from a reference: the clip BEGINS on that
-          picture, rather than merely resembling it. */}
-      {kind === "video" && (
-        <div>
-          <span className="cr-field-label">Start from a picture</span>
-          {!framesOk ? (
-            <p className="cr-hint">
-              {selected?.slug} makes a clip from words alone — it takes no
-              starting picture, so attaching one would do nothing.
-            </p>
-          ) : frame ? (
-            <Attached picture={frame} role="first frame" onClear={onClearFrame} />
-          ) : (
-            <button type="button" className="nb-btn cr-attach" onClick={onPickFrame}>
-              Use a picture from this room
-            </button>
-          )}
-        </div>
-      )}
-
-      <div>
-        <span className="cr-field-label">
-          {kind === "video" ? "Make it look like" : "Look like these"}
-        </span>
-        <div className="cr-attach-row">
-          {refs.map((p) => (
-            <Attached
-              key={p.fileId}
-              picture={p}
-              role="reference"
-              onClear={() => onClearRef(p.fileId)}
-            />
-          ))}
-          {(maxRefs === null || refs.length < maxRefs) && (
-            <button type="button" className="nb-btn cr-attach" onClick={onPickRef}>
-              {refs.length === 0 ? "Attach a picture" : "Attach another"}
-            </button>
-          )}
-        </div>
-        {maxRefs !== null && refs.length >= maxRefs && (
-          <p className="cr-hint">
-            {selected?.slug} looks at {maxRefs} picture{maxRefs === 1 ? "" : "s"} at
-            most.
-          </p>
-        )}
-      </div>
-
-      {kind === "video" && lengths.length > 0 && (
-        <div>
-          <span className="cr-field-label">How long</span>
-          <div className="cr-opts">
-            {/* Only the lengths this model publishes. An illegal number does
-                not produce a shorter clip — it produces a refusal, and on the
-                models with a per-generation floor, a charge for nothing. */}
-            {lengths.map((v) => (
-              <button
-                key={v}
-                type="button"
-                aria-pressed={seconds === v}
-                className={`cr-opt${seconds === v ? " is-on pick-on" : ""}`}
-                onClick={() => onSeconds(seconds === v ? null : v)}
-              >
-                {seconds === v && <CheckIcon size={12} />}
-                {v}s
-              </button>
-            ))}
-          </div>
-          {seconds === null && (
-            <p className="cr-hint">
-              Nothing chosen — it will use {Math.min(...lengths)}s, the shortest
-              this model makes.
-            </p>
-          )}
-        </div>
-      )}
-
-      {/* Size and shape, from the model's OWN published lists. These were
-          being sent all along and quietly dropped — the image seam had no
-          field for them at all — so the page never offered them. */}
-      {(sizes.length > 0 || shapes.length > 0) && (
-        <div className="cr-shape-knobs">
-          {shapes.length > 0 && (
-            <label className="cr-knob">
-              <span>Frame shape</span>
-              <select
-                className="cr-field cr-select"
-                value={aspectRatio}
-                onChange={(e) => onAspectRatio(e.target.value)}
-              >
-                <option value="">model’s own</option>
-                {shapes.map((v) => (
-                  <option key={v} value={v}>
-                    {v}
-                  </option>
-                ))}
-              </select>
-            </label>
-          )}
-          {sizes.length > 0 && (
-            <label className="cr-knob">
-              <span>Size</span>
-              <select
-                className="cr-field cr-select"
-                value={resolution}
-                onChange={(e) => onResolution(e.target.value)}
-              >
-                <option value="">model’s own</option>
-                {sizes.map((v) => (
-                  <option key={v} value={v}>
-                    {v}
-                  </option>
-                ))}
-              </select>
-            </label>
-          )}
-        </div>
-      )}
-
-      <div>
-        <span className="cr-field-label">How many</span>
-        <div className="cr-opts">
-          {[1, 2, 4].map((n) => (
-            <button
-              key={n}
-              type="button"
-              aria-pressed={variations === n}
-              className={`cr-opt${variations === n ? " is-on pick-on" : ""}`}
-              onClick={() => onVariations(n)}
-            >
-              {variations === n && <CheckIcon size={12} />}
-              {n}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* The seam. Every generation model in the catalogue today is a trip off
-          this Mac, and a prompt is room content — so the page says so before
-          the button rather than after the bill. When pictures are attached it
-          says HOW MANY: consent that does not name what is being sent is not
-          consent, and this is the only thing that opens the privacy door. */}
-      {selected && !selected.local && (
-        <div className="cr-seam">
-          <LockIcon size={14} />
-          <p>
-            This runs on {selected.engineLabel}, so the words you type leave this
-            Mac — the room’s privacy door redacts them first.
-            {sending > 0 && (
-              <>
-                {" "}
-                <b>
-                  The {sending} picture{sending === 1 ? "" : "s"} above will be
-                  sent as well
-                </b>
-                , un-redacted, because a picture cannot be. Remove them to keep
-                them here.
-              </>
-            )}
-          </p>
-        </div>
-      )}
-
-      <button
-        className="nb-btn nb-btn-primary cr-go"
-        type="button"
-        disabled={busy || !canGo}
-        onClick={onGenerate}
-      >
-        {/* The quantity belongs on the button that spends it. "How many" is
-            chosen in one control and was disclosed only in the toast fired
-            after the press — up to four paid calls behind a word that says
-            one. */}
-        {busy
-          ? "Starting…"
-          : sending > 0
-            ? `Send and make ${variations === 1 ? "it" : variations}`
-            : `Make ${variations === 1 ? "it" : variations}`}
-      </button>
-      <p className="cr-bench-hint">
-        {kind === "video"
-          ? "A clip takes a few minutes. It runs in the background and lands in this room when it is ready."
-          : "Runs in the background — it opens here when it is ready, and lands in this room like any other file."}
-      </p>
-    </aside>
-  );
-}
-
-/** The bench makes ONE picture or ONE clip. Say so when it has been handed a
- * whole episode.
- *
- * This is the answer to a real report: a five-minute script pasted here and
- * "it only made 15 seconds". Nothing was broken — the bench did exactly what
- * it is for, once — but a control that silently uses the first fifteen seconds
- * of a five-minute script and discards the rest has not told the truth about
- * what it did, and the person watching has no way to tell that apart from a
- * model that ignored them.
- *
- * The numbers come from the SAME local splitter the Story tab uses, so they
- * are the real ones rather than an estimate: no model is asked, nothing leaves
- * the Mac, and it costs nothing to run on every pause in typing. */
-function WholeScriptNotice({
-  prompt,
-  kind,
-  onTakeToStory,
-}: {
-  prompt: string;
-  kind: "image" | "video";
-  onTakeToStory: () => void;
-}) {
-  const [plan, setPlan] = useState<ShotPlan | null>(null);
-  const text = prompt.trim();
-
-  useEffect(() => {
-    // Only worth asking about something long enough to be a script. A short
-    // prompt is one shot, which is what this bench is for.
-    if (text.length < 400) {
-      setPlan(null);
-      return;
-    }
-    let live = true;
-    const timer = setTimeout(() => {
-      api
-        .storyPlanSplit(text, 5, 15)
-        .then((next) => live && setPlan(next))
-        .catch(() => live && setPlan(null));
-    }, 300);
-    return () => {
-      live = false;
-      clearTimeout(timer);
-    };
-  }, [text]);
-
-  // Only when the script SAYS it is one — timestamped chunks of its own. For
-  // anything else, "this looks like a script" would be a guess, and a guess
-  // that nags is worse than silence.
-  if (!plan?.fromScript || plan.parts < 2) return null;
-
-  const total = plan.totalSeconds;
-  return (
-    <div className="cr-note cr-note-warn cr-script-note">
-      <p>
-        This marks its own <b>{plan.parts} chunks</b> — {clock(total)} in all.
-        The bench makes <b>one</b> {kind === "video" ? "clip" : "picture"}, so
-        it would use all of this text for a single{" "}
-        {kind === "video" ? "clip" : "picture"} and the other{" "}
-        {plan.parts - 1} chunks would not be made.
-      </p>
-      <button type="button" className="nb-btn" onClick={onTakeToStory}>
-        Take it to Story — {plan.parts} parts
-      </button>
-    </div>
-  );
-}
-
-/** Nothing can draw. Which of the three reasons matters a great deal — see
- * `emptyReason`, which is where the choice actually lives. */
-function EmptyShelf({ catalog }: { catalog: CreateCatalog | null }) {
-  const reason = emptyReason(catalog);
-  if (reason === null || reason === "loading") return null;
-  if (reason === "error") {
-    return (
-      <div className="cr-note cr-note-bad">
-        Connected, but the catalogue would not load: {catalog?.error}
-      </div>
-    );
-  }
-  if (reason === "no-provider") {
-    return (
-      <div className="cr-empty">
-        <CreateIcon size={26} />
-        <h2>No provider is connected</h2>
-        <p>
-          Nothing that runs on this Mac can make a picture yet — Ollama serves
-          chat models, and a drawing model is not reachable over its chat API.
-          Connect a provider in Settings → AI providers and the models it
-          offers will appear here.
-        </p>
-      </div>
-    );
-  }
-  return (
-    <div className="cr-empty">
-      <CreateIcon size={26} />
-      <h2>Nothing here can draw</h2>
-      <p>
-        The connected provider’s catalogue lists {catalog?.scanned ?? 0} models
-        and none of them produces pictures.
-      </p>
-    </div>
+    </CreateLayout>
   );
 }

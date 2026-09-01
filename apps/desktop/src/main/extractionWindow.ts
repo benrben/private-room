@@ -111,17 +111,17 @@ function wordishCount(line: string): number {
 
 /** Rust's `str::chars().count()` — codepoints, not UTF-16 code units, without
  * materializing the array `Array.from(line).length` would build. */
+function isSurrogatePairAt(s: string, index: number): boolean {
+  const high = s.charCodeAt(index);
+  const low = s.charCodeAt(index + 1);
+  return high >= 0xd800 && high <= 0xdbff && low >= 0xdc00 && low <= 0xdfff;
+}
+
 function codePointCount(s: string): number {
   let n = 0;
   for (let i = 0; i < s.length; i += 1) {
     n += 1;
-    const hi = s.charCodeAt(i);
-    if (hi >= 0xd800 && hi <= 0xdbff && i + 1 < s.length) {
-      const lo = s.charCodeAt(i + 1);
-      if (lo >= 0xdc00 && lo <= 0xdfff) {
-        i += 1;
-      }
-    }
+    if (isSurrogatePairAt(s, i)) i += 1;
   }
   return n;
 }
@@ -169,6 +169,39 @@ function pushOmittedNote(out: string[], omitted: { n: number }): void {
   omitted.n = 0;
 }
 
+interface FilterState {
+  prevLine: string;
+  run: number;
+  blankRun: number;
+  omitted: { n: number };
+}
+
+function retainBlankLine(out: string[], state: FilterState): void {
+  pushOmittedNote(out, state.omitted);
+  state.blankRun += 1;
+  if (state.blankRun === 1) out.push("\n");
+}
+
+function isOmittedRepeatedLine(out: string[], state: FilterState, line: string): boolean {
+  if (line !== state.prevLine) {
+    pushOmittedNote(out, state.omitted);
+    state.run = 1;
+    return false;
+  }
+  state.run += 1;
+  if (state.run <= MAX_IDENTICAL_RUN) return false;
+  state.omitted.n += 1;
+  return true;
+}
+
+function retainTextLine(out: string[], state: FilterState, line: string): void {
+  state.blankRun = 0;
+  if (isOmittedRepeatedLine(out, state, line) || looksLikeNoise(line)) return;
+  out.push(line);
+  out.push("\n");
+  state.prevLine = line;
+}
+
 /**
  * Drop the low-signal lines a 20 MB extraction is full of — binary/base64
  * junk, runs of blank lines, a boilerplate line repeated past all meaning —
@@ -177,39 +210,16 @@ function pushOmittedNote(out: string[], omitted: { n: number }): void {
  */
 export function smartFilter(text: string): string {
   const out: string[] = [];
-  let prevLine = "";
-  let run = 0;
-  const omitted = { n: 0 };
-  let blankRun = 0;
+  const state: FilterState = { prevLine: "", run: 0, omitted: { n: 0 }, blankRun: 0 };
   for (const rawLine of rustLines(text)) {
     const trimmed = trimEnd(rawLine);
     if (isBlank(trimmed)) {
-      pushOmittedNote(out, omitted);
-      blankRun += 1;
-      if (blankRun === 1) {
-        out.push("\n");
-      }
+      retainBlankLine(out, state);
       continue;
     }
-    blankRun = 0;
-    if (trimmed === prevLine) {
-      run += 1;
-      if (run > MAX_IDENTICAL_RUN) {
-        omitted.n += 1;
-        continue;
-      }
-    } else {
-      pushOmittedNote(out, omitted);
-      run = 1;
-    }
-    if (looksLikeNoise(trimmed)) {
-      continue;
-    }
-    out.push(trimmed);
-    out.push("\n");
-    prevLine = trimmed;
+    retainTextLine(out, state, trimmed);
   }
-  pushOmittedNote(out, omitted);
+  pushOmittedNote(out, state.omitted);
   return out.join("");
 }
 

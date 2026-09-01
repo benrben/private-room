@@ -66,6 +66,18 @@ function isIpv4(text: string): boolean {
   return parts.every((p) => p.length <= 3 && /^[0-9]+$/.test(p));
 }
 
+function forcedSearch(text: string): Address | null {
+  const query = text.slice(1).trim();
+  return query === "" ? null : search(query);
+}
+
+function guessedUrl(text: string): Address | null {
+  if (isHostish(text) || isIpv4(text) || isHostPort(text)) {
+    return url(`https://${text}`);
+  }
+  return null;
+}
+
 /**
  * Decide what the text meant. `null` means "nothing to do" (empty input).
  *
@@ -81,8 +93,7 @@ export function classify(input: string): Address | null {
 
   // "?query" — force a search for text that would otherwise look like a host.
   if (text.startsWith("?")) {
-    const query = text.slice(1).trim();
-    return query === "" ? null : search(query);
+    return forcedSearch(text);
   }
 
   // An explicit scheme is a decision the caller already made.
@@ -97,9 +108,8 @@ export function classify(input: string): Address | null {
     return search(text);
   }
 
-  if (isHostish(text) || isIpv4(text) || isHostPort(text)) {
-    return url(`https://${text}`);
-  }
+  const destination = guessedUrl(text);
+  if (destination !== null) return destination;
 
   // A bare word: "weather", "בנק ישראל". Nothing about it addresses a host.
   return search(text);

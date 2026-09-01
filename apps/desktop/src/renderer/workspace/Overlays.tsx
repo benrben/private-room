@@ -8,38 +8,16 @@ import {
 } from "react";
 import { useFocusTrap } from "../settings/useFocusTrap";
 import { api } from "../api";
-import {
-  CheckIcon,
-  CloseIcon,
-  DownloadIcon,
-  GlobeIcon,
-  MicIcon,
-  ScriptIcon,
-  ShieldIcon,
-} from "../icons";
+import { CloseIcon, MicIcon } from "../icons";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
-import DiffPreview from "../viewers/DiffPreview";
-import { languageForFile } from "../viewers/languages";
 import { LayoutApi } from "../shell/useLayout";
 import { toggleTheme } from "../theme";
-import { SCRIPT_POWERS, SCRIPT_WORKSPACE_NOTE } from "./scriptTrust";
 import { newItemLabel, newItemOf } from "./destinations";
 import type { WorkArea } from "./types";
 import SealedExportDialog from "./SealedExportDialog";
-import {
-  applyFindFilters,
-  DEFAULT_FILTERS,
-  flattenShown,
-  highlightTerms,
-  kindsPresentOf,
-  SearchFiltersBar,
-  SearchIdlePanel,
-  SearchQueryActions,
-  SearchResultRows,
-  useRecentAndSaved,
-  type FindFilters,
-} from "./SearchExpanded";
+import { ApprovalOverlays, ContextMenuOverlay, DragOverlay, MoveMenuOverlay } from "./OverlayMenus";
+import { SearchOverlay } from "./OverlaySearch";
 
 /** Human name for whoever owns the shared dictation mic right now. */
 const CAPTURE_OWNER_LABEL: Record<string, string> = {
@@ -56,9 +34,8 @@ const CAPTURE_OWNER_LABEL: Record<string, string> = {
  * was LIVE while the screen showed nothing. This pill names every phase —
  * Preparing → Recording (red dot + timer + Stop) → Transcribing — and is
  * fixed above the composer so it survives menu closes and view switches. */
-function CaptureDock({ s }: { s: WSState }) {
+function useCaptureElapsed(recording: boolean) {
   const [elapsed, setElapsed] = useState(0);
-  const recording = s.dictState === "recording";
   useEffect(() => {
     if (!recording) {
       setElapsed(0);
@@ -67,46 +44,77 @@ function CaptureDock({ s }: { s: WSState }) {
     const t = window.setInterval(() => setElapsed((e) => e + 1), 1000);
     return () => window.clearInterval(t);
   }, [recording]);
-  if (s.dictState === "idle") return null;
-  const who = CAPTURE_OWNER_LABEL[s.dictOwner ?? ""] ?? "Recording";
+  return elapsed;
+}
+
+function captureOwner(s: WSState) {
+  return CAPTURE_OWNER_LABEL[s.dictOwner ?? ""] ?? "Recording";
+}
+
+function CapturePreparing() {
+  return (
+    <span className="capture-label">
+      <MicIcon size={14} /> Preparing the microphone…
+    </span>
+  );
+}
+
+function CaptureBusy({ owner }: { owner: string }) {
+  return (
+    <span className="capture-label">
+      <MicIcon size={14} /> {owner} — transcribing on this Mac…
+    </span>
+  );
+}
+
+function CapturePartial({ s }: { s: WSState }) {
+  if (!s.dictPartial || s.dictOwner === "composer") return null;
+  return (
+    <span className="capture-partial" dir="auto">
+      {s.dictPartial}
+    </span>
+  );
+}
+
+function CaptureRecording({ s, elapsed, owner }: { s: WSState; elapsed: number; owner: string }) {
   const mm = Math.floor(elapsed / 60);
   const ss = String(elapsed % 60).padStart(2, "0");
   return (
+    <>
+      <span className="capture-label rec">
+        <span className="rec-dot pulsing" /> {owner} · {mm}:{ss}
+      </span>
+      {/* Live partial transcript for the non-composer mics (the composer
+          paints its partials into the box itself). Voice notes have no
+          partials — the span just stays empty for them. */}
+      <CapturePartial s={s} />
+      <button
+        className="capture-stop"
+        onClick={() => {
+          // Voice notes still run on MediaRecorder; streaming dictation
+          // stops through its session ref. Only one is ever active.
+          s.recorderRef.current?.stop();
+          s.dictStreamRef.current?.();
+        }}
+      >
+        Stop &amp; save
+      </button>
+    </>
+  );
+}
+
+function CaptureDock({ s }: { s: WSState }) {
+  const elapsed = useCaptureElapsed(s.dictState === "recording");
+  if (s.dictState === "idle") return null;
+  const owner = captureOwner(s);
+  const contents = {
+    preparing: <CapturePreparing />,
+    busy: <CaptureBusy owner={owner} />,
+    recording: <CaptureRecording s={s} elapsed={elapsed} owner={owner} />,
+  }[s.dictState];
+  return (
     <div className={`capture-dock ${s.dictState}`} role="status">
-      {s.dictState === "preparing" ? (
-        <span className="capture-label">
-          <MicIcon size={14} /> Preparing the microphone…
-        </span>
-      ) : s.dictState === "busy" ? (
-        <span className="capture-label">
-          <MicIcon size={14} /> {who} — transcribing on this Mac…
-        </span>
-      ) : (
-        <>
-          <span className="capture-label rec">
-            <span className="rec-dot pulsing" /> {who} · {mm}:{ss}
-          </span>
-          {/* Live partial transcript for the non-composer mics (the composer
-              paints its partials into the box itself). Voice notes have no
-              partials — the span just stays empty for them. */}
-          {s.dictPartial && s.dictOwner !== "composer" && (
-            <span className="capture-partial" dir="auto">
-              {s.dictPartial}
-            </span>
-          )}
-          <button
-            className="capture-stop"
-            onClick={() => {
-              // Voice notes still run on MediaRecorder; streaming dictation
-              // stops through its session ref. Only one is ever active.
-              s.recorderRef.current?.stop();
-              s.dictStreamRef.current?.();
-            }}
-          >
-            Stop &amp; save
-          </button>
-        </>
-      )}
+      {contents}
     </div>
   );
 }
@@ -117,7 +125,25 @@ function CaptureDock({ s }: { s: WSState }) {
  * took no focus and answered no arrow keys, which put Rename, Move to… and
  * Remove — which exist nowhere else — out of reach for keyboard and
  * screen-reader users. Same behaviour the QuickActions menu already has. */
-function useMenuKeys(
+const MENU_INDEXERS: Record<string, (index: number, count: number) => number> = {
+  ArrowDown: (index, count) => (index + 1) % count,
+  ArrowUp: (index, count) => (index - 1 + count) % count,
+  Home: () => 0,
+  End: (_index, count) => count - 1,
+};
+
+function moveMenuFocus(
+  key: string,
+  count: number,
+  setFocusIdx: (value: (index: number) => number) => void,
+) {
+  const indexer = MENU_INDEXERS[key];
+  if (!indexer) return false;
+  setFocusIdx((index) => indexer(index, count));
+  return true;
+}
+
+export function useMenuKeys(
   open: boolean,
   onClose: () => void,
   ref: RefObject<HTMLDivElement | null>,
@@ -143,27 +169,16 @@ function useMenuKeys(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, focusIdx, revision]);
   const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
-    const count =
-      ref.current?.querySelectorAll('[role="menuitem"]:not(:disabled)').length ??
-      0;
+    const count = ref.current?.querySelectorAll('[role="menuitem"]:not(:disabled)').length ?? 0;
     if (count === 0) return;
-    if (e.key === "ArrowDown") {
+    if (moveMenuFocus(e.key, count, setFocusIdx)) {
       e.preventDefault();
-      setFocusIdx((i) => (i + 1) % count);
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      setFocusIdx((i) => (i - 1 + count) % count);
-    } else if (e.key === "Home") {
-      e.preventDefault();
-      setFocusIdx(0);
-    } else if (e.key === "End") {
-      e.preventDefault();
-      setFocusIdx(count - 1);
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      e.stopPropagation();
-      onClose();
+      return;
     }
+    if (e.key !== "Escape") return;
+    e.preventDefault();
+    e.stopPropagation();
+    onClose();
   };
   return { onKeyDown };
 }
@@ -184,7 +199,7 @@ function useMenuKeys(
  * Mounted per REQUEST (`key`), so the next card in the queue is a fresh
  * component and the trap's move-focus-in effect runs again for it.
  */
-function ApproveCard({
+export function ApproveCard({
   onDecline,
   label,
   wide,
@@ -230,7 +245,7 @@ type PaletteAction = {
 };
 
 /** Every palette command is a real handler — the same ones the chrome uses. */
-function buildPaletteActions(
+export function buildPaletteActions(
   s: WSState,
   a: WSActions,
   layout: LayoutApi | undefined,
@@ -488,14 +503,6 @@ function ShortcutsSheet({
 
 /** Host of a URL, for the consent card's "on <site>" phrasing. Falls back to
  *  the raw string so a malformed URL still reads sensibly rather than blank. */
-function hostOf(url: string): string {
-  try {
-    return new URL(url).host || url;
-  } catch {
-    return url || "this page";
-  }
-}
-
 /** The fixed-position overlays that sit above everything: the MCP tool-call
  * approval card, the file context menu, the "Move to…" menu, the Finder-drop
  * highlight, and the ⌘K search/command palette. */
@@ -508,801 +515,17 @@ export default function Overlays({
   a: WSActions;
   layout?: LayoutApi;
 }) {
-  const pendingApproval = s.mcpApprovals[0];
-  const pendingBrowse = s.browseConsents[0];
-  const pendingEdit = s.editApprovals[0];
-  const pendingScript = s.scriptApprovals[0];
   const [showSealedExport, setShowSealedExport] = useState(false);
-
-  // ---- ⌘K: the expanded results (P1-2) ----
-  // The room used to have a second, full-page "Find" area for exactly this —
-  // filters, previews, saved/recent searches. That page is retired; its
-  // internals now live in SearchExpanded.tsx and render here, once a real
-  // query has real results, instead of on a separate pane.
-  const searchResults = s.searchResults;
-  const trimmedQuery = s.searchQuery.trim();
-  const [filters, setFilters] = useState<FindFilters>(DEFAULT_FILTERS);
-  // A fresh open starts from a clean filter set: carrying "PDFs only, past
-  // week" over from the last time ⌘K was open would silently narrow a search
-  // the reader never asked to narrow.
-  useEffect(() => {
-    if (s.showSearch) setFilters(DEFAULT_FILTERS);
-  }, [s.showSearch]);
-  const fileById = useMemo(() => new Map(s.files.map((f) => [f.id, f])), [s.files]);
-  // The ONE narrowing pass. The keyboard selection below and the rows drawn
-  // near the bottom of this component both read `shown` — never the raw
-  // `searchResults` — so a filtered view and what Enter actually activates
-  // can never disagree about which row is which.
-  const shown = useMemo(
-    () => applyFindFilters(searchResults, filters, fileById),
-    [searchResults, filters, fileById],
-  );
-  const flatShown = useMemo(() => flattenShown(shown), [shown]);
-  const kindsPresent = useMemo(() => kindsPresentOf(searchResults, fileById), [searchResults, fileById]);
-  const terms = useMemo(() => highlightTerms(trimmedQuery), [trimmedQuery]);
-  // Changing a filter is a deliberate act, and the list it points into just
-  // changed shape — the selection resets to the top rather than keep an index
-  // that, once Commands are appended after it, could now land on the WRONG
-  // command entirely.
-  useEffect(() => {
-    s.setSearchSel(0);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filters]);
-
-  const { recent, saved, noteSearch, toggleSaved, removeSaved, clearRecent } = useRecentAndSaved();
-  // Recorded once per COMPLETED search, not once per keystroke: effects.ts
-  // cancels every keystroke's request but the last, so `searchResults`
-  // changing identity is exactly "a search finished".
-  useEffect(() => {
-    if (trimmedQuery && searchResults) noteSearch(trimmedQuery);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchResults]);
-  const isSavedSearch = saved.some((sv) => sv.q === trimmedQuery);
-
-  // Commands that match the query (all of them at rest — the palette's
-  // resting state lists what the room can do instead of a blank panel).
-  const q = s.searchQuery.trim().toLowerCase();
-  const actions = buildPaletteActions(s, a, layout, () => setShowSealedExport(true)).filter(
-    (x) => !q || x.label.toLowerCase().includes(q) || x.hint.toLowerCase().includes(q),
-  );
-  const actOffset = flatShown.length;
-  const totalItems = flatShown.length + actions.length;
-  // Unfiltered totals, for the ONE question filters must never answer wrong:
-  // "is there really nothing here" vs "these filters are hiding something
-  // that IS here". Swapping the filtered counts into that message would tell
-  // someone their room has nothing matching a word that, in fact, thirty
-  // messages contain — just not the ones the current filters let through.
-  const totalRaw = searchResults
-    ? searchResults.files.length + searchResults.messages.length + searchResults.memories.length
-    : 0;
-  const totalItemsRaw = totalRaw + actions.length;
-  const totalShown = shown.files.length + shown.messages.length + shown.memories.length;
-  const narrowedToZero = totalRaw > 0 && totalShown === 0;
-  const expanded = trimmedQuery !== "" && searchResults != null && !s.searchError;
-  const runSel = (idx: number) => {
-    if (idx < flatShown.length) {
-      a.activateResult(flatShown[idx], layout);
-      return;
-    }
-    const act = actions[idx - actOffset];
-    if (act && !act.disabled) {
-      s.setShowSearch(false);
-      act.run();
-    }
-  };
-  const ctxKeys = useMenuKeys(
-    s.ctxMenu !== null,
-    () => s.setCtxMenu(null),
-    s.ctxMenuElRef,
-    // Arming/disarming the delete confirm is the one thing that rewrites this
-    // menu's items while it is open.
-    s.confirmDelete,
-  );
-  const moveKeys = useMenuKeys(
-    s.moveMenuFor !== null,
-    () => s.setMoveMenuFor(null),
-    s.moveMenuElRef,
-  );
-  // The highlight has to drag the list along with it: arrow-keying past the
-  // fold otherwise leaves you pressing Enter on a row you cannot see. Same
-  // treatment the composer's own suggestion list already has.
-  const keepVisible = (idx: number) => (el: HTMLButtonElement | null) => {
-    if (idx === s.searchSel) el?.scrollIntoView({ block: "nearest" });
-  };
-  const onPaletteKey = (e: ReactKeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      s.setSearchSel((sel) => Math.min(sel + 1, Math.max(totalItems - 1, 0)));
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      s.setSearchSel((sel) => Math.max(sel - 1, 0));
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      runSel(s.searchSel);
-    }
-  };
   return (
     <>
       <CaptureDock s={s} />
-      {showSealedExport && (
-        <SealedExportDialog
-          onClose={() => setShowSealedExport(false)}
-          pushToast={s.pushToast}
-        />
-      )}
-      {s.showShortcuts && (
-        <ShortcutsSheet
-          area={s.area}
-          webOn={s.webOn}
-          onClose={() => s.setShowShortcuts(false)}
-        />
-      )}
-      {pendingScript && (
-        // Wave 5 (Idea 13): the script-run consent card. Same data-agent-blocked
-        // surface as the MCP/edit cards — the UI-driving agent must never approve
-        // its own script. The two honest sentences state the real trust class.
-        <ApproveCard
-          key={pendingScript.id}
-          label="Run a script from this room?"
-          onDecline={() => a.resolveScriptApproval(pendingScript, "deny")}
-        >
-          <>
-            {/* The marker category label: what CLASS of decision this is,
-                before the sentence that asks it. Yellow is "needs review"
-                product-wide, and these three cards are all the same kind of
-                ask — a program wants to run. The deletion card below uses the
-                red "urgent" marker instead, because it is the one that
-                destroys something. */}
-            <div className="approve-kind">
-              <span className="nb-cat nb-sem-pending">Permission</span>
-            </div>
-            <div className="approve-title">
-              <ScriptIcon size={16} /> Run a script from this room?
-            </div>
-            <p className="approve-body">
-              <strong>{pendingScript.name}</strong> is a real program:{" "}
-              <strong>{SCRIPT_POWERS}</strong> {SCRIPT_WORKSPACE_NOTE}
-            </p>
-            <pre className="approve-args">{pendingScript.interpreterLine}</pre>
-            {pendingScript.deps.length > 0 && (
-              <div className="script-approve-line">
-                <span className="script-approve-key">Installs</span>
-                <pre className="approve-args">{pendingScript.deps.join(", ")}</pre>
-              </div>
-            )}
-            {pendingScript.inputs.length > 0 && (
-              <div className="script-approve-line">
-                <span className="script-approve-key">Reads</span>
-                <pre className="approve-args">{pendingScript.inputs.join(", ")}</pre>
-              </div>
-            )}
-            {pendingScript.outputs.length > 0 && (
-              <div className="script-approve-line">
-                <span className="script-approve-key">Writes back</span>
-                <pre className="approve-args">{pendingScript.outputs.join(", ")}</pre>
-              </div>
-            )}
-            <p className="approve-body caption">
-              <strong>Allow once</strong> runs it this one time and keeps it marked “Needs review”.
-              <br />
-              <strong>Always allow this exact script</strong> approves this version — it stops asking
-              and can be scheduled. Any edit to the script asks again.
-            </p>
-            <div className="approve-actions">
-              <button
-                className="primary"
-                onClick={() => a.resolveScriptApproval(pendingScript, "once")}
-              >
-                Allow once
-              </button>
-              <button onClick={() => a.resolveScriptApproval(pendingScript, "always")}>
-                Always allow this exact script
-              </button>
-              <button
-                className="danger"
-                onClick={() => a.resolveScriptApproval(pendingScript, "deny")}
-              >
-                Don't run
-              </button>
-            </div>
-          </>
-        </ApproveCard>
-      )}
-      {pendingApproval?.confirm && (
-        // Audit #505: an agent-initiated DELETION. Its own card, because the
-        // tool-call one below asks the wrong question (nothing is being run,
-        // and nothing may be "always allowed" — there is no trash for a
-        // connector, so this card IS the undo). Same data-agent-blocked
-        // surface: the agent must never click its own confirmation.
-        <ApproveCard
-          key={pendingApproval.id}
-          label={`Delete the ${pendingApproval.tool} “${pendingApproval.server}”?`}
-          onDecline={() => a.resolveMcpApproval(pendingApproval, "deny")}
-        >
-          <>
-            <div className="approve-kind">
-              <span className="nb-cat nb-sem-urgent">Deletion</span>
-            </div>
-            <div className="approve-title">
-              <ShieldIcon size={16} /> Delete the {pendingApproval.tool}{" "}
-              &ldquo;{pendingApproval.server}&rdquo;?
-            </div>
-            <p className="approve-body">
-              The AI asked to delete this {pendingApproval.tool}.{" "}
-              {pendingApproval.confirm}
-            </p>
-            <div className="approve-actions">
-              <button
-                className="danger"
-                onClick={() => a.resolveMcpApproval(pendingApproval, "once")}
-              >
-                Delete it
-              </button>
-              <button
-                className="primary"
-                onClick={() => a.resolveMcpApproval(pendingApproval, "deny")}
-              >
-                Keep it
-              </button>
-            </div>
-          </>
-        </ApproveCard>
-      )}
-      {pendingApproval && !pendingApproval.confirm && (
-        // ADD-25: consent surface — the agent must never be able to click its
-        // own tool-call approval ("Allow"), so the driver can't see it.
-        <ApproveCard
-          key={pendingApproval.id}
-          label="Allow a connected tool to run?"
-          onDecline={() => a.resolveMcpApproval(pendingApproval, "deny")}
-        >
-          <>
-            <div className="approve-kind">
-              <span className="nb-cat nb-sem-pending">Permission</span>
-            </div>
-            <div className="approve-title">
-              <GlobeIcon size={16} /> Allow a connected tool to run?
-            </div>
-            <p className="approve-body">
-              The AI wants to use{" "}
-              <strong>{pendingApproval.tool}</strong> from the{" "}
-              <strong>{pendingApproval.server}</strong> connector. This is a
-              separate program that can reach the internet — what the AI sends
-              it leaves this room.
-            </p>
-            {pendingApproval.args && pendingApproval.args !== "{}" && (
-              <pre className="approve-args">{pendingApproval.args}</pre>
-            )}
-            <div className="approve-actions">
-              <button
-                className="primary"
-                onClick={() => a.resolveMcpApproval(pendingApproval, "once")}
-              >
-                Allow once
-              </button>
-              <button
-                onClick={() => a.resolveMcpApproval(pendingApproval, "always")}
-              >
-                Always allow this connector
-              </button>
-              <button
-                className="danger"
-                onClick={() => a.resolveMcpApproval(pendingApproval, "deny")}
-              >
-                Don't allow
-              </button>
-            </div>
-          </>
-        </ApproveCard>
-      )}
-      {pendingBrowse && (
-        // BROWSE-1: the OUTBOUND door — room content about to be typed into a
-        // web page. `data-agent-blocked` for the same reason as every other
-        // consent surface: the agent must never be able to click its own
-        // approval. Shown with the REAL values, because the point is that the
-        // user is deciding about their own data.
-        //
-        // The browser's native webview is parked to 1x1 while this is open
-        // (BrowserView) — it floats above the whole window, so a modal cannot
-        // otherwise be seen.
-        <ApproveCard
-          key={pendingBrowse.id}
-          label="Type this into the page?"
-          onDecline={() => a.resolveBrowseConsent(pendingBrowse, false)}
-        >
-          <>
-            {/* Red, not yellow: nothing is being deleted, but this is the one
-                card where saying yes puts room content OUTSIDE the room, and
-                that is irreversible in exactly the way a deletion is. */}
-            <div className="approve-kind">
-              <span className="nb-cat nb-sem-urgent">Leaves this room</span>
-            </div>
-            <div className="approve-title">
-              <ShieldIcon size={16} /> Type this into the page?
-            </div>
-            <p className="approve-body">
-              The assistant wants to type this into{" "}
-              <strong>{pendingBrowse.field}</strong> on{" "}
-              <strong>{hostOf(pendingBrowse.url)}</strong>.{" "}
-              {pendingBrowse.entities.length > 0
-                ? "It matches information you asked to keep private."
-                : /* No entity map for this room, so the door matched nothing —
-                     and "nothing matched" is not "nothing private". Saying
-                     which of the two happened is the whole point of the card. */
-                  "This room has no list of protected details, so Arcelle cannot check it against one."}{" "}
-              Once it is typed, that site has it.
-            </p>
-            <pre className="approve-args">{pendingBrowse.text}</pre>
-            {pendingBrowse.entities.length > 0 && (
-              <p className="approve-body">
-                Recognised: {pendingBrowse.entities.join(", ")}
-              </p>
-            )}
-            <div className="approve-actions">
-              <button
-                className="primary"
-                onClick={() => a.resolveBrowseConsent(pendingBrowse, true)}
-              >
-                Type it
-              </button>
-              <button
-                className="danger"
-                onClick={() => a.resolveBrowseConsent(pendingBrowse, false)}
-              >
-                Don't
-              </button>
-            </div>
-          </>
-        </ApproveCard>
-      )}
-      {pendingEdit && (
-        // Wave 2 (Idea 6): the diff-preview approval card. Same data-agent-blocked
-        // consent surface as the MCP card — the UI-driving agent must never be
-        // able to approve its own edit.
-        <ApproveCard
-          key={pendingEdit.id}
-          wide
-          label="Apply this change?"
-          onDecline={() => a.resolveEditApproval(pendingEdit, "deny")}
-        >
-          <>
-            <div className="approve-kind">
-              <span className="nb-cat nb-sem-pending">File change</span>
-            </div>
-            <div className="approve-title">
-              Apply {pendingEdit.files.length > 1 ? "these changes" : "this change"} to{" "}
-              {pendingEdit.files.length === 1 ? (
-                <em>{pendingEdit.files[0].name}</em>
-              ) : (
-                <strong>{pendingEdit.files.length} files</strong>
-              )}
-              ?
-            </div>
-            {/* Only the head of the queue is drawn — two cards would overlap in
-                this fixed layer — so a second request (a background job editing
-                while a chat turn also edits) was invisible here. The deadline is
-                named because it is real and it is NOT reset by reaching the
-                front: edit_gate.rs gives every request 180s from the moment it
-                was raised and declines it on the way out. */}
-            {s.editApprovals.length > 1 && (
-              <p className="approve-body">
-                {s.editApprovals.length - 1} more change
-                {s.editApprovals.length > 2 ? "s are" : " is"} waiting behind
-                this one. Each is asked in turn, and declines itself three
-                minutes after it was raised.
-              </p>
-            )}
-            <div className="approve-diffs">
-              {pendingEdit.files.slice(0, 5).map((f, i) => (
-                <div className="approve-diff-file" key={`${f.name}-${i}`}>
-                  {pendingEdit.files.length > 1 && (
-                    <div className="approve-diff-name">{f.name}</div>
-                  )}
-                  <DiffPreview
-                    before={f.before}
-                    after={f.after}
-                    clipped={f.clipped}
-                    language={languageForFile(f.name)}
-                  />
-                </div>
-              ))}
-              {pendingEdit.files.length > 5 && (
-                <div className="approve-diff-more">
-                  …and {pendingEdit.files.length - 5} more file(s) in this change.
-                </div>
-              )}
-            </div>
-            <div className="approve-actions">
-              <button
-                className="primary"
-                onClick={() => a.resolveEditApproval(pendingEdit, "once")}
-              >
-                Apply
-              </button>
-              {pendingEdit.allowTurn && (
-                <button onClick={() => a.resolveEditApproval(pendingEdit, "turn")}>
-                  Apply for the rest of this answer
-                </button>
-              )}
-              <button onClick={() => void a.alwaysAllowEdits(pendingEdit)}>
-                Always allow in this room
-              </button>
-              <button
-                className="danger"
-                onClick={() => a.resolveEditApproval(pendingEdit, "deny")}
-              >
-                Don't apply
-              </button>
-            </div>
-          </>
-        </ApproveCard>
-      )}
-      {s.ctxMenu && (
-        <>
-          <div className="ctx-backdrop" onMouseDown={() => s.setCtxMenu(null)} onContextMenu={(e) => { e.preventDefault(); s.setCtxMenu(null); }} />
-          <div
-            ref={s.ctxMenuElRef}
-            className="ctx-menu"
-            role="menu"
-            aria-label={`Actions for ${s.ctxMenu.file.name}`}
-            onKeyDown={ctxKeys.onKeyDown}
-            style={{ top: s.ctxMenu.y, left: s.ctxMenu.x }}
-          >
-            {/* MANY vs ONE. When the right-clicked row is part of the
-                selection, `files` is the whole selection and every label says
-                so — a menu that reads "Move to…" while it is about to move
-                seven files is the bug this count prevents. The single-subject
-                items (Open, Rename) stay on `file`, which is the row actually
-                clicked, so they never have to guess. */}
-            {s.ctxMenu.files.length > 1 && (
-              <div className="ctx-heading">
-                <span className="nb-cat nb-sem-linked">
-                  {s.ctxMenu.files.length} files selected
-                </span>
-              </div>
-            )}
-            {s.ctxMenu.files.length === 1 && (
-              <>
-                <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { a.viewFile(s.ctxMenu!.file.id); s.setCtxMenu(null); }}>Open</button>
-                <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { a.toggleAttach(s.ctxMenu!.file); s.setCtxMenu(null); }}>{s.attachments.some((x) => x.id === s.ctxMenu!.file.id) ? "Detach from chat" : "Attach to chat"}</button>
-                <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { s.setRenamingFile({ id: s.ctxMenu!.file.id, name: s.ctxMenu!.file.name, where: "library" }); s.setCtxMenu(null); }}>Rename…</button>
-              </>
-            )}
-            {s.ctxMenu.files.length > 1 && (
-              <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { a.attachFiles(s.ctxMenu!.files); s.setCtxMenu(null); }}>Attach {s.ctxMenu.files.length} to chat</button>
-            )}
-            <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { s.setMoveMenuFor({ ids: s.ctxMenu!.files.map((f) => f.id), x: s.ctxMenu!.x, y: s.ctxMenu!.y }); s.setCtxMenu(null); }}>
-              {s.ctxMenu.files.length > 1 ? `Move ${s.ctxMenu.files.length} files to…` : "Move to…"}
-            </button>
-            <button role="menuitem" tabIndex={-1} className="ctx-item" onClick={() => { const fs = s.ctxMenu!.files; s.setCtxMenu(null); if (fs.length > 1) void a.exportFiles(fs); else a.exportOne(fs[0].id, fs[0].name); }}>
-              {s.ctxMenu.files.length > 1 ? `Export ${s.ctxMenu.files.length} copies…` : "Export a copy…"}
-            </button>
-            {(s.aiActionDefs ?? []).some((x) => x.scope === "file") && (
-              <>
-                {/* .nb-rule is the tapered pencil stroke from paper.css — it
-                    thins toward both ends instead of butting into the menu's
-                    edges, which is the difference between a drawn separator
-                    and a hairline border. */}
-                <div className="ctx-sep nb-rule" />
-                <div className="ctx-heading">
-                  <span className="nb-cat nb-sem-saved">
-                    {/* An action over seven files must not be introduced as
-                        "this file" — the heading is what tells the reader how
-                        much material the run is about to read. */}
-                    AI actions ·{" "}
-                    {s.ctxMenu.files.length > 1
-                      ? `these ${s.ctxMenu.files.length} files`
-                      : "this file"}
-                  </span>
-                </div>
-                {(s.aiActionDefs ?? [])
-                  .filter((x) => x.scope === "file")
-                  .map((x) => (
-                    <button
-                      key={x.id}
-                      role="menuitem"
-                      tabIndex={-1}
-                      className="ctx-item"
-                      title={x.description}
-                      onClick={() => {
-                        // `refs` already takes a LIST, so a multi-file AI action
-                        // needed no new plumbing — only the ids the user picked.
-                        const ids = s.ctxMenu!.files.map((f) => f.id);
-                        s.setCtxMenu(null);
-                        a.openAiAction(x, null, ids);
-                      }}
-                    >
-                      {x.title}
-                    </button>
-                  ))}
-              </>
-            )}
-            <div className="ctx-sep nb-rule" />
-            {s.confirmDelete === `ctx-remove-${s.ctxMenu.file.id}` ? (
-              // ADD-25: the agent driver must not be able to click ✓ on a
-              // removal it didn't earn.
-              <div className="ctx-confirm" data-agent-blocked>
-                {/* Say what actually happens. This IS a trash can now: the
-                    file leaves the library, the counts and the AI's search,
-                    and waits in Library → Trash with its versions and its
-                    transcript intact until someone destroys it there. The
-                    wording this replaced ("Delete permanently, with its
-                    history?") described the pre-trash behaviour and would now
-                    be a false warning. */}
-                <span className="ctx-confirm-q">
-                  {s.ctxMenu.files.length > 1
-                    ? `Move ${s.ctxMenu.files.length} files to the trash?`
-                    : "Move to the trash?"}
-                </span>
-                <button
-                  role="menuitem"
-                  tabIndex={-1}
-                  className="ctx-item danger btn-ic"
-                  onClick={() => {
-                    const ids = s.ctxMenu!.files.map((f) => f.id);
-                    a.cancelConfirm();
-                    s.setCtxMenu(null);
-                    // One command for many, the single-file one for one — so a
-                    // lone removal keeps its existing toast wording exactly.
-                    if (ids.length > 1) void a.removeFiles(ids);
-                    else void a.removeFile(ids[0]);
-                  }}
-                >
-                  <CheckIcon size={14} /> Move to trash
-                </button>
-                <button
-                  role="menuitem"
-                  tabIndex={-1}
-                  className="ctx-item btn-ic"
-                  onClick={a.cancelConfirm}
-                >
-                  <CloseIcon size={14} /> Keep
-                </button>
-              </div>
-            ) : (
-              <button
-                role="menuitem"
-                tabIndex={-1}
-                className="ctx-item danger"
-                onClick={() => a.askConfirm(`ctx-remove-${s.ctxMenu!.file.id}`)}
-              >
-                {s.ctxMenu.files.length > 1
-                  ? `Remove ${s.ctxMenu.files.length} files from room`
-                  : "Remove from room"}
-              </button>
-            )}
-          </div>
-        </>
-      )}
-      {s.moveMenuFor && (
-        <>
-          <div
-            className="ctx-backdrop"
-            onMouseDown={() => s.setMoveMenuFor(null)}
-            onContextMenu={(e) => { e.preventDefault(); s.setMoveMenuFor(null); }}
-          />
-          <div
-            ref={s.moveMenuElRef}
-            className="ctx-menu"
-            role="menu"
-            aria-label="Move to a folder"
-            onKeyDown={moveKeys.onKeyDown}
-            style={{ top: s.moveMenuFor.y, left: s.moveMenuFor.x }}
-          >
-            <div className="ctx-heading">
-              <span className="nb-cat nb-sem-linked">
-                {s.moveMenuFor.ids.length > 1
-                  ? `Move ${s.moveMenuFor.ids.length} files to…`
-                  : "Move to…"}
-              </span>
-            </div>
-            {(() => {
-              const ids = s.moveMenuFor!.ids;
-              const moving = s.files.filter((f) => ids.includes(f.id));
-              // A destination is only "where they already are" when EVERY file
-              // is there. Disabling on the first file's folder would grey out a
-              // real move for the other six.
-              const allIn = (folderId: string | null) =>
-                moving.length > 0 &&
-                moving.every((f) => (f.folderId ?? null) === folderId);
-              return (
-                <>
-                  <button
-                    role="menuitem"
-                    tabIndex={-1}
-                    className="ctx-item"
-                    disabled={allIn(null)}
-                    onClick={() => { void a.moveFiles(ids, null); }}
-                  >
-                    No folder
-                  </button>
-                  {s.folders.map((fo) => (
-                    <button
-                      key={fo.id}
-                      role="menuitem"
-                      tabIndex={-1}
-                      className="ctx-item"
-                      disabled={allIn(fo.id)}
-                      onClick={() => { void a.moveFiles(ids, fo.id); }}
-                    >
-                      {fo.name}
-                    </button>
-                  ))}
-                  {s.folders.length === 0 && (
-                    // An empty state names what would fill it and where the
-                    // action lives. "No folders yet" on its own left a dead
-                    // menu with no route out of it — the only place a folder
-                    // can be made is the Library's "Add page or source" menu,
-                    // and this is the moment somebody wants to know that.
-                    <div className="ctx-empty">
-                      No folders yet — make one from &ldquo;Add page or
-                      source&rdquo; in the Library.
-                    </div>
-                  )}
-                </>
-              );
-            })()}
-          </div>
-        </>
-      )}
-      {s.dragOver && (
-        <div className="drop-overlay">
-          <div className="drop-overlay-inner">
-            <DownloadIcon size={28} />
-            <span>Drop to add to this room</span>
-          </div>
-        </div>
-      )}
-      {s.showSearch && (
-        <div
-          className="search-overlay"
-          onMouseDown={(e) => {
-            if (e.target === e.currentTarget) s.setShowSearch(false);
-          }}
-        >
-          <div className={`search-panel${expanded ? " is-expanded" : ""}`}>
-            <input
-              className="search-input"
-              autoFocus
-              dir="auto"
-              placeholder="Search this room, or run a command…"
-              aria-label="Search this room or run a command"
-              value={s.searchQuery}
-              onChange={(e) => {
-                s.setSearchQuery(e.target.value);
-                s.setSearchSel(0);
-              }}
-              onKeyDown={onPaletteKey}
-            />
-            <div className="search-results">
-              {/* A failed search clears its results, so this is the only thing
-                  on screen — the previous query's hits never linger under a
-                  query that never ran. */}
-              {s.searchError && (
-                <div className="find-error nb-frame nb-sem-urgent nb-edge" role="alert">
-                  <strong className="find-error-head">This room could not be searched</strong>
-                  <span className="find-error-body">{s.searchError}</span>
-                </div>
-              )}
-              {/* Genuinely nothing — not a filtered view of something that IS
-                  there. Reads the UNFILTERED total plus commands, same gate
-                  the plain palette always used, so turning a filter on can
-                  never make this message start lying. */}
-              {trimmedQuery !== "" && searchResults && totalItemsRaw === 0 && (
-                <div className="search-empty">
-                  Nothing matches “{trimmedQuery}” — not in files, chats,
-                  memories, or commands.
-                </div>
-              )}
-              {expanded && (
-                <>
-                  <SearchQueryActions
-                    query={trimmedQuery}
-                    isSaved={isSavedSearch}
-                    onToggleSaved={() => toggleSaved(trimmedQuery, filters)}
-                    onAsk={(question) => {
-                      s.setShowSearch(false);
-                      s.setQuestion(question);
-                      a.focusComposer(layout);
-                    }}
-                  />
-                  <SearchFiltersBar
-                    filters={filters}
-                    onChange={setFilters}
-                    results={searchResults}
-                    kindsPresent={kindsPresent}
-                    messagesOrMemoriesShown={shown.messages.length > 0 || shown.memories.length > 0}
-                    showSort={shown.files.length > 0}
-                  />
-                  {/* A live region, mounted for every completed search: a
-                      screen reader hears the count change as the reader
-                      types or narrows a filter — including down to zero,
-                      which a div that simply stopped rendering never would
-                      announce. */}
-                  <p className="find-count" role="status">
-                    {totalShown === 0
-                      ? `No results for “${trimmedQuery}”`
-                      : totalShown !== totalRaw
-                        ? `${totalShown} of ${totalRaw} results for “${trimmedQuery}”`
-                        : `${totalShown} result${totalShown === 1 ? "" : "s"} for “${trimmedQuery}”`}
-                  </p>
-                  {totalShown > 0 && (
-                    <p className="find-breakdown">
-                      {shown.files.length} file{shown.files.length === 1 ? "" : "s"} ·{" "}
-                      {shown.messages.length} message{shown.messages.length === 1 ? "" : "s"} ·{" "}
-                      {shown.memories.length} memor{shown.memories.length === 1 ? "y" : "ies"}
-                    </p>
-                  )}
-                  {narrowedToZero ? (
-                    <div className="find-empty">
-                      <p className="find-empty-line">
-                        Nothing matches “{trimmedQuery}” with these filters — {totalRaw}{" "}
-                        result{totalRaw === 1 ? " is" : "s are"} hidden by them.
-                      </p>
-                      <div className="find-empty-actions">
-                        <button type="button" className="nb-btn" onClick={() => setFilters(DEFAULT_FILTERS)}>
-                          Clear filters
-                        </button>
-                      </div>
-                    </div>
-                  ) : (
-                    <SearchResultRows
-                      shown={shown}
-                      files={s.files}
-                      fileById={fileById}
-                      terms={terms}
-                      selectedIndex={s.searchSel}
-                      registerRowRef={keepVisible}
-                      onSelectIndex={(idx) => s.setSearchSel(idx)}
-                      onOpenResult={(r) => a.activateResult(r, layout)}
-                      onOpenFile={(id) => void a.viewFile(id)}
-                    />
-                  )}
-                </>
-              )}
-              {trimmedQuery === "" && (
-                <SearchIdlePanel
-                  recent={recent}
-                  saved={saved}
-                  onRunRecent={(query) => s.setSearchQuery(query)}
-                  onRunSaved={(sv) => {
-                    setFilters(sv.filters);
-                    s.setSearchQuery(sv.q);
-                  }}
-                  onRemoveSaved={removeSaved}
-                  onClearRecent={clearRecent}
-                />
-              )}
-              {actions.length > 0 && (
-                <div className="search-group">
-                  <div className="search-group-head">
-                    Commands <span className="search-count">{actions.length}</span>
-                  </div>
-                  {actions.map((act, i) => {
-                    const idx = actOffset + i;
-                    return (
-                      <button
-                        key={act.id}
-                        ref={keepVisible(idx)}
-                        className={`search-result action ${s.searchSel === idx ? "sel" : ""}`}
-                        disabled={act.disabled}
-                        onMouseEnter={() => s.setSearchSel(idx)}
-                        onClick={() => runSel(idx)}
-                      >
-                        <span className="search-result-title">{act.label}</span>
-                        <span className="search-result-snippet">{act.hint}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-            <div className="search-hint">
-              ↑↓ to move · Enter to run · Esc to close
-            </div>
-          </div>
-        </div>
-      )}
+      {showSealedExport && <SealedExportDialog onClose={() => setShowSealedExport(false)} pushToast={s.pushToast} />}
+      {s.showShortcuts && <ShortcutsSheet area={s.area} webOn={s.webOn} onClose={() => s.setShowShortcuts(false)} />}
+      <ApprovalOverlays s={s} a={a} />
+      <ContextMenuOverlay s={s} a={a} />
+      <MoveMenuOverlay s={s} a={a} />
+      <DragOverlay active={s.dragOver} />
+      <SearchOverlay s={s} a={a} layout={layout} openSealedExport={() => setShowSealedExport(true)} />
     </>
   );
 }

@@ -1,0 +1,491 @@
+/* ---------- settings ----------
+   The densest text surface in the product, and the one place a person goes to
+   find out what this room does with their data. Almost every word on it is an
+   instruction or a consequence, so the notebook direction shows up here as
+   TYPOGRAPHY AND STRUCTURE rather than as decoration: no handwriting on
+   anything that instructs, no marker on anything that is not saying something.
+
+   What this file does, and why:
+
+     ONE SHEET        the modal is a floating surface, so it is opaque (that is
+                      paper.css section 9's rule) — but it carries the same
+                      dotted grid as the app canvas, and every settings group
+                      inside it is a FRAME DRAWN ON THAT SHEET rather than
+                      another filled box. Panes stay transparent; only the
+                      sheet itself has a fill.
+
+     THE INDEX        the left rail is a real index: bigger type, a drawn edge
+                      instead of a hairline border, the marker underline as the
+                      active mark (the app's one active idiom), and a tape
+                      badge on any page holding unsaved work.
+
+     TYPE             instruction copy was set at 12px and metadata at 11px.
+                      Both are now on the scale: a section's lead runs at
+                      --fs-lead, every other explanation at --fs-body, and
+                      nothing on this surface is below --fs-meta. The type
+                      scale's own comment says instructions are never set
+                      small; this is the surface that was breaking that.
+
+     NOTES            a consequence is drawn as a note attached to the control
+                      that decides it. Quiet (a pencil edge) when the state in
+                      force is the safe one, MARKED (a marker edge in the
+                      meaning's ink plus a wash of the same hue) when a door is
+                      open. Same recipe as the Connectors page and Room Home's
+                      attention strips, so "look at this" looks the same
+                      everywhere in the product.
+
+     DISCLOSURE       the mechanics behind a setting move into a native
+                      <details>. Nothing is deleted and nothing is reworded —
+                      every word stays in the DOM and in the accessibility
+                      tree, one Enter away.
+
+   MARKER MEANINGS USED HERE (product-wide, from tokens.css — never local):
+     green  --sem-done      saved, installed, connected, verified
+     yellow --sem-pending   unsaved, caution, needs your attention
+     red    --sem-urgent    this room's content leaves this Mac
+     pink   --sem-saved     the current selection (the pen)
+
+   Colour never travels alone anywhere on this surface: every marked note
+   carries its own sentence, every tape badge carries a word taken verbatim
+   from the copy it labels, and every table mark has screen-reader text.
+
+   THREE MODALS SHARE THESE CLASSES. `.settings-backdrop`, `.settings`,
+   `.settings-head`, `.settings-body` and `.settings-actions` are also used by
+   workspace/SettingsModals.tsx for the connector-approval and add-link sheets.
+   Anything that would be wrong at 460px — the width, the index, the group
+   frames, the section type scale — is scoped to `.settings-sheet`, a class
+   only the real Settings modal carries.
+
+   Nothing below names a colour. Both themes fall out of tokens.css, so there
+   is deliberately no light-mode block at the end of this file. */
+
+/* ==========================================================================
+   1. THE MODAL SHELL — shared by all three .settings modals
+   ========================================================================== */
+
+/* A literal rgba rather than a token, for the reason gate.css states about
+   its own backdrop: a veil has to darken BOTH themes, and every paper and ink
+   token inverts between them. */
+.settings-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 30;
+}
+
+.settings {
+  width: min(560px, 90vw);
+  max-height: 86vh;
+  background: var(--panel);
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius-lg);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow:
+    0 24px 60px var(--shadow),
+    0 2px 6px var(--shadow-lift);
+}
+
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-6);
+  font-weight: 600;
+  /* Masthead (P0-3): the "Settings" title and the close button, not content —
+     same idiom as .pane-header in shell.css. */
+  user-select: none;
+  /* The rule under the head drawn the way .nb-rule draws one — thinning at
+     both ends — but as a background, so it costs no element and gives a
+     screen reader nothing extra to walk past. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line) 3%,
+    var(--line) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+
+.settings-head > span {
+  color: var(--text-strong);
+  font-size: var(--fs-card);
+  letter-spacing: -0.005em;
+}
+
+.settings-body {
+  overflow-y: auto;
+  padding: var(--sp-4) var(--sp-6) var(--sp-8);
+}
+
+.settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin-top: var(--sp-4);
+}
+
+/* ==========================================================================
+   2. THE SETTINGS SHEET
+   Wider, and drawn on paper of its own. `.settings-sheet` is on the real
+   Settings modal only — see the ownership note at the top of the file.
+   ========================================================================== */
+
+/* 1040px puts a ~64ch reading column beside the 210px index, which is the
+   whole argument for the width: the old 720px left about 44ch for privacy copy
+   once the nav and the padding were paid for, and a 44ch column of
+   instructions is a column nobody finishes. Specificity, not source order,
+   is what beats
+   shell.css's `.settings` here, and it has to: shell.css loads LAST, so a
+   single-class selector of mine would lose the tie no matter what it said.
+   Every rule in this section is written as `.settings.settings-sheet` for
+   that reason — including the background, which shell.css sets with the
+   `background` SHORTHAND and would therefore reset the grid image to none.
+
+   The sheet itself is opaque because it floats and must occlude the app under
+   it, and dotted because it is still a page of the same notebook. Same recipe
+   as the canvas in paper.css — a plain radial-gradient with a literal rgba
+   dot, no color-mix percentage arithmetic (WebKit rejects calc() inside
+   color-mix()'s percentage, which is how the app's grid vanished once
+   already) and no background-attachment: fixed, which is what made a gradient
+   stack stutter on scroll. The grid is painted on the modal, which never
+   scrolls; the body inside it is transparent and scrolls over it, exactly as
+   the app's panes scroll over the canvas. */
+.settings.settings-sheet {
+  width: min(1040px, 94vw);
+  /* A CONSTANT size, not a cap: the base `.settings` rule below only sets
+     max-height, which lets the box shrink to whatever the active page's
+     content measures. All six pages share one flex column (.settings-main →
+     .settings-body, both min-height:0 / flex:1, see misc.css and section 2's
+     `.settings-sheet .settings-body`), so a fixed `height` here is what makes
+     the frame occupy the same rect on every tab instead of resizing and
+     re-centering under the backdrop each time. Scrolling still happens only
+     inside `.settings-body`. Repeating `max-height` at the same value beats
+     the base rule's 86vh cap, which would otherwise still clip a viewport
+     shorter than 900px. */
+  height: min(900px, 90vh);
+  max-height: min(900px, 90vh);
+  /* NO PAPER TEXTURE, as of the visual pass, and this is the one surface in
+     the app where that is a statement rather than an omission. Settings is a
+     modal sheet — it FLOATS above the notebook rather than being a page of it,
+     which is why it is the only thing here with an opaque fill at all (see
+     paper.css's opening note). Printing the page's tooth onto something
+     stacked on top of the page is the single place the metaphor contradicted
+     itself, and it did so on the densest, most label-heavy surface the app
+     has, where the grain costs the most and reads as least deliberate. */
+  background-color: var(--raised);
+}
+
+.settings-sheet .settings-head {
+  padding: var(--sp-4) var(--sp-6);
+}
+
+/* The reading column beside the index. `min-width: 0` is what lets a long
+   table or a mono config string scroll inside its own box instead of pushing
+   the whole flex row wider than the sheet. */
+.settings-sheet .settings-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* The masthead. --fs-section is the section-title rung; --fs-page is Room
+   Home's alone. */
+.settings-sheet .settings-head-title {
+  font-size: var(--fs-section);
+  font-family: var(--display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+  color: var(--text-strong);
+}
+
+/* ----- the unsaved strip -----
+   Raised only by a close the user just attempted, so it sits where their eye
+   already is rather than as a second modal over a modal. Drawn as a marked
+   note in the pending hue: the words say what happened, the mark says it
+   matters, and the glyph means the state survives being read in greyscale. */
+.settings-unsaved {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-6);
+  color: var(--text);
+  font-size: var(--fs-body);
+  font-weight: 400;
+  line-height: var(--lh-body);
+  box-shadow: inset 0 -1px 0 var(--line-soft);
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--sem-pending-fill) 20%, transparent) 0%,
+    color-mix(in srgb, var(--sem-pending-fill) 10%, transparent) 62%,
+    color-mix(in srgb, var(--sem-pending-fill) 15%, transparent) 100%
+  );
+}
+
+.settings-unsaved span {
+  flex: 1;
+  min-width: 16ch;
+}
+
+.settings-unsaved svg {
+  flex: none;
+  color: var(--sem-pending);
+}
+
+/* ==========================================================================
+   3. THE INDEX
+   A page selector, so it takes the app's one active idiom: the marker
+   underline (paper.css section 2 — rail items, tabs, chips, pane headers and
+   this nav all use it rather than a mix of spines, fills and border swaps).
+   ========================================================================== */
+
+/* 210px because the labels are now --fs-body and the longest of them has to
+   sit beside a state badge. The edge is a drawn vertical rule, not a flat
+   border — same stroke as .nb-rule-v, painted as a background so it needs no
+   element. */
+.settings-sheet .settings-nav {
+  flex: 0 0 210px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-6) var(--sp-3);
+  border-right: 0;
+  overflow-y: auto;
+  /* Index (P0-3): the page-selector labels are app copy, not content — same
+     idiom as .pane-header in shell.css. */
+  user-select: none;
+  background-image: linear-gradient(
+    180deg,
+    transparent 0%,
+    var(--line) 4%,
+    var(--line) 94%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 1px 100%;
+  background-position: right top;
+}
+
+.settings-sheet .settings-nav-item {
+  display: flex;
+  align-items: center;
+  align-content: center;
+  /* The state badge drops to a second line rather than squeezing the label,
+     for whichever label ends up longest after translation or a font change.
+     No measurement, no JS — the flex line breaks by itself. */
+  flex-wrap: wrap;
+  gap: 2px var(--sp-2);
+  position: relative;
+  min-height: 34px;
+  padding: var(--sp-2) var(--sp-3);
+  text-align: left;
+  font-size: var(--fs-body);
+  color: var(--muted);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  transition:
+    color var(--dur-fast) var(--ease-pen),
+    background-color var(--dur-fast) var(--ease-pen);
+}
+
+.settings-sheet .settings-nav-item:hover {
+  color: var(--text);
+  background-color: var(--hover);
+  border-color: transparent;
+}
+
+.settings-sheet .settings-nav-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Active: full-strength ink, a heavier weight, and the pen stroke under the
+   label. The underline is drawn under the LABEL, not the button box, so it
+   reads as a mark on the word rather than as a filled tab. `aria-current` in
+   the markup carries the same fact for anyone not seeing the stroke. */
+.settings-sheet .settings-nav-item.is-active {
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+.settings-nav-label {
+  position: relative;
+}
+
+.settings-sheet .settings-nav-item.is-active .settings-nav-label::after {
+  content: "";
+  position: absolute;
+  left: -2px;
+  right: -2px;
+  bottom: -4px;
+  height: 3px;
+  border-radius: 2px 3px 2px 4px / 3px 2px 4px 2px;
+  background: linear-gradient(
+    92deg,
+    var(--accent-fill) 0%,
+    color-mix(in srgb, var(--accent-fill) 72%, transparent) 68%,
+    color-mix(in srgb, var(--accent-fill) 28%, transparent) 100%
+  );
+  pointer-events: none;
+}
+
+/* The unsaved badge. It is a .nb-tape from paper.css, so the word rides on a
+   34% wash of the pending marker and carries the meaning by itself — the hue
+   only reinforces it. Pushed to the trailing edge so a run of pages reads as
+   a column of labels with flags in the margin. */
+.settings-nav-flag {
+  margin-left: auto;
+  flex: none;
+  padding: 1px 6px;
+  font-weight: 400;
+}
+
+/* ==========================================================================
+   4. PAGES AND GROUPS
+   One page at a time; each settings group is an outlined sheet of paper on
+   the dotted ground, not a slab of fill with a divider under it.
+   ========================================================================== */
+
+.settings-page[hidden] {
+  display: none;
+}
+
+.settings-sheet .settings-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+}
+
+/* Repeated because the rule above raises the specificity of `display` on the
+   same element and a hidden page must stay hidden regardless of order. */
+.settings-sheet .settings-page[hidden] {
+  display: none;
+}
+
+.settings-sheet .settings-page > section {
+  position: relative;
+  padding: var(--sp-4) var(--sp-4) var(--sp-6);
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 62%, transparent);
+  border-radius: var(--radius);
+  /* Transparent: the group is a FRAME on the sheet, so the dots keep running
+     through it. This is the difference between the notebook and a stack of
+     grey boxes. */
+  background: transparent;
+  /* A deep-linked section is scrolled to with block:"start"; without this the
+     frame's own top edge lands hard against the body's top padding. */
+  scroll-margin-top: var(--sp-4);
+}
+
+/* Four fixed corner signatures rotated by position, the same way
+   .nb-frame-set does it, so a column of six groups does not look stamped from
+   one template. Deterministic — a frame draws identically on every render. */
+.settings-sheet .settings-page > section:nth-of-type(4n + 2) {
+  border-radius: var(--radius);
+}
+.settings-sheet .settings-page > section:nth-of-type(4n + 3) {
+  border-radius: var(--radius);
+}
+.settings-sheet .settings-page > section:nth-of-type(4n + 4) {
+  border-radius: var(--radius);
+}
+
+/* Deep-link flash: when the status-bar trust chip (or any jump) opens Settings
+   straight to a section, mark its edge so the eye lands on the right place.
+
+   A LOCATOR, not a UI transition. It runs once, it fades rather than blinks,
+   and it is deliberately longer than the 160-260ms interaction budget — a
+   200ms mark on a 900px sheet is a flicker nobody catches. The caller removes
+   the class after 1400ms. */
+.settings-body section.settings-section-flash {
+  animation: settings-section-flash 800ms var(--ease-pen);
+}
+@keyframes settings-section-flash {
+  0% {
+    box-shadow: inset 0 0 0 2px var(--accent);
+  }
+  100% {
+    box-shadow: inset 0 0 0 0 transparent;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .settings-body section.settings-section-flash {
+    animation: none;
+    /* Without the pulse the section still has to be findable, so the mark
+       becomes a state rather than a movement. */
+    box-shadow: inset 0 0 0 2px var(--accent);
+  }
+}
+
+/* ==========================================================================
+   5. TYPE
+   The whole reason this surface was hard to read. Nothing here is below
+   --fs-meta, and no instruction is below --fs-body.
+   ========================================================================== */
+
+/* The group's title, with the same fading hairline the Connectors page draws
+   under its section heads. Not uppercase: at 16px, letter-spaced caps read as
+   shouting and cost legibility on the one surface that can least afford it. */
+.settings-body h3 {
+  margin: 0 0 var(--sp-3);
+  padding-bottom: var(--sp-2);
+  font-size: var(--fs-card);
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  text-transform: none;
+  color: var(--text-strong);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 1%,
+    var(--line-soft) 97%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+
+/* A second heading inside one group (Settings → App carries Updates and Logs
+   in a single section) needs air above it. */
+.settings-body h3 ~ h3 {
+  margin-top: var(--sp-6);
+}
+
+/* Explanation copy. It used to be 12px in --text-dim, which is what made
+   Settings read as one undifferentiated wall. */
+.settings-hint {
+  color: var(--muted);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  margin: var(--sp-2) 0 var(--sp-3);
+  max-width: 74ch;
+}
+
+/* The section's LEAD — the paragraph directly under the heading, which says
+   what the whole group is for. Promoted to --fs-lead and full ink, purely by
+   position, so fifteen section components did not each need an extra class to
+   say the obvious. The type scale's own comment is explicit that instruction
+   copy is never set small; this is the one paragraph in a group that always
+   is instruction copy. */
+.settings-body section > h3 + .settings-hint {
+  color: var(--text);
+  font-size: var(--fs-lead);
+  margin-top: 0;
+  margin-bottom: var(--sp-4);
+}
+
+.settings-hint code {
+  overflow-wrap: anywhere;
+}

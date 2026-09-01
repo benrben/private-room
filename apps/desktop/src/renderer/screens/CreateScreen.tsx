@@ -20,163 +20,220 @@ type CreateScreenProps = {
   onBack: () => void;
 };
 
-export function CreateScreen({
-  roomName,
-  setRoomName,
+function clearError(error: string, setError: (value: string) => void) {
+  if (error) setError("");
+}
+
+function PasswordFeedback({ password }: { password: string }) {
+  const strength = passwordStrength(password);
+  return (
+    <div
+      className={`pw-feedback${password ? "" : " reserved"}`}
+      aria-hidden={!password}
+    >
+      <div className={`pw-meter ${strength.level}`}>
+        <div className="pw-meter-track">
+          <div className="pw-meter-fill" />
+        </div>
+        <span className="pw-meter-label">{strength.label}</span>
+      </div>
+      <ul className="pw-criteria">
+        {passwordCriteria(password).map((criterion) => (
+          <li
+            key={criterion.label}
+            className={criterion.met ? "met" : undefined}
+          >
+            {criterion.met ? "✓" : "○"} {criterion.label}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function TemplatePicker({
   templateKey,
   setTemplateKey,
+}: Pick<CreateScreenProps, "templateKey" | "setTemplateKey">) {
+  const selected = ROOM_TEMPLATES.find(
+    (template) => template.key === templateKey,
+  );
+  return (
+    <div className="tpl-picker">
+      <div className="tpl-label">Start from a template</div>
+      <div className="tpl-chips">
+        {ROOM_TEMPLATES.map((template) => (
+          <button
+            key={template.key}
+            type="button"
+            className={`nb-chip nb-chip-btn tpl-chip${templateKey === template.key ? " is-on" : ""}`}
+            aria-pressed={templateKey === template.key}
+            onClick={() => setTemplateKey(template.key)}
+          >
+            {template.label}
+          </button>
+        ))}
+      </div>
+      <p className="tpl-blurb">{selected?.blurb}</p>
+    </div>
+  );
+}
+
+function RolePicker({
   roles,
   roleId,
   setRoleId,
+}: Pick<CreateScreenProps, "roles" | "roleId" | "setRoleId">) {
+  if (roles.length === 0) return null;
+  const selected = roles.find((role) => role.id === roleId);
+  return (
+    <div className="tpl-picker">
+      <div className="tpl-label">Give it a role (optional)</div>
+      <select
+        value={roleId}
+        onChange={(event) => setRoleId(event.target.value)}
+      >
+        {roles.map((role) => (
+          <option key={role.id} value={role.id}>
+            {role.name}
+          </option>
+        ))}
+      </select>
+      <p className="tpl-blurb">{selected?.blurb}</p>
+    </div>
+  );
+}
+
+function PasswordFields({
   password,
   setPassword,
   confirm,
   setConfirm,
   error,
   setError,
-  busy,
-  onSubmit,
-  onBack,
-}: CreateScreenProps) {
-  const strength = passwordStrength(password);
+}: Pick<
+  CreateScreenProps,
+  "password" | "setPassword" | "confirm" | "setConfirm" | "error" | "setError"
+>) {
   const tooShort = password.length > 0 && password.length < MIN_PASSWORD;
   const mismatch = confirm.length > 0 && password !== confirm;
-
   return (
-    <form
-      className="gate-form"
-      onSubmit={(e) => {
-        e.preventDefault();
-        onSubmit();
-      }}
-    >
-      <p className="gate-sub">Name your room</p>
-      <input
-        type="text"
-        placeholder="e.g. Personal, Work, Journal"
-        value={roomName}
-        autoFocus
-        onChange={(e) => setRoomName(e.target.value)}
-      />
-      <div className="tpl-picker">
-        <div className="tpl-label">Start from a template</div>
-        <div className="tpl-chips">
-          {ROOM_TEMPLATES.map((tpl) => (
-            /* The chip and its circled "selected" treatment are the shared
-               .nb-chip primitives; `is-on` is the class that primitive reads.
-               aria-pressed is what actually carries the state — the ring is
-               the visible half of the same fact. */
-            <button
-              key={tpl.key}
-              type="button"
-              className={`nb-chip nb-chip-btn tpl-chip${
-                templateKey === tpl.key ? " is-on" : ""
-              }`}
-              aria-pressed={templateKey === tpl.key}
-              onClick={() => setTemplateKey(tpl.key)}
-            >
-              {tpl.label}
-            </button>
-          ))}
-        </div>
-        <p className="tpl-blurb">
-          {ROOM_TEMPLATES.find((t) => t.key === templateKey)?.blurb}
-        </p>
-      </div>
-      {roles.length > 0 && (
-        <div className="tpl-picker">
-          <div className="tpl-label">Give it a role (optional)</div>
-          <select
-            value={roleId}
-            onChange={(e) => setRoleId(e.target.value)}
-          >
-            {roles.map((r) => (
-              <option key={r.id} value={r.id}>
-                {r.name}
-              </option>
-            ))}
-          </select>
-          <p className="tpl-blurb">
-            {roles.find((r) => r.id === roleId)?.blurb}
-          </p>
-        </div>
-      )}
+    <>
       <input
         type="password"
         placeholder="Choose a password"
         className={tooShort ? "invalid" : undefined}
         aria-invalid={tooShort}
         value={password}
-        onChange={(e) => {
-          setPassword(e.target.value);
-          if (error) setError("");
+        onChange={(event) => {
+          setPassword(event.target.value);
+          clearError(error, setError);
         }}
       />
-      {/* Always mounted so the meter appearing on the first keystroke doesn't
-          shove the "Repeat password" field down mid-type. It just reserves its
-          space (invisible) until the user starts typing. */}
-      <div className={`pw-feedback${password ? "" : " reserved"}`} aria-hidden={!password}>
-        <div className={`pw-meter ${strength.level}`}>
-          <div className="pw-meter-track">
-            <div className="pw-meter-fill" />
-          </div>
-          <span className="pw-meter-label">{strength.label}</span>
-        </div>
-        <ul className="pw-criteria">
-          {passwordCriteria(password).map((c) => (
-            <li
-              key={c.label}
-              className={c.met ? "met" : undefined}
-            >
-              {c.met ? "✓" : "○"} {c.label}
-            </li>
-          ))}
-        </ul>
-      </div>
+      <PasswordFeedback password={password} />
       <input
         type="password"
         placeholder="Repeat password"
         className={mismatch ? "invalid" : undefined}
         aria-invalid={mismatch}
         value={confirm}
-        onChange={(e) => {
-          setConfirm(e.target.value);
-          if (error) setError("");
+        onChange={(event) => {
+          setConfirm(event.target.value);
+          clearError(error, setError);
         }}
       />
-      {mismatch && !error && (
-        <div className="gate-error" role="alert">
-          <span className="gate-error-ic" aria-hidden="true">!</span>
-          Passwords do not match.
-        </div>
-      )}
-      {error && (
-        <div className="gate-error" role="alert">
-          <span className="gate-error-ic" aria-hidden="true">!</span>
-          {error}
-        </div>
-      )}
-      <div className="gate-actions">
-        <button
-          className="primary"
-          type="submit"
-          disabled={
-            busy ||
-            password.length < MIN_PASSWORD ||
-            password !== confirm
-          }
-        >
-          {busy ? "Creating…" : "Create & Enter"}
-        </button>
-        <button type="button" onClick={onBack}>
-          Back
-        </button>
+      <PasswordError mismatch={mismatch} error={error} />
+    </>
+  );
+}
+
+function PasswordError({
+  mismatch,
+  error,
+}: {
+  mismatch: boolean;
+  error: string;
+}) {
+  if (error)
+    return (
+      <div className="gate-error" role="alert">
+        <span className="gate-error-ic" aria-hidden="true">
+          !
+        </span>
+        {error}
       </div>
-      {/* The password seals the room permanently, and this is the screen where
-        * it is chosen — "longer is stronger" alone read as ordinary
-        * password-strength advice. There is no reset: saying so HERE, not one
-        * screen later beside a "Skip for now" button, is the only place the
-        * warning can still change what the user types. */}
+    );
+  if (!mismatch) return null;
+  return (
+    <div className="gate-error" role="alert">
+      <span className="gate-error-ic" aria-hidden="true">
+        !
+      </span>
+      Passwords do not match.
+    </div>
+  );
+}
+
+function CreateActions({
+  busy,
+  password,
+  confirm,
+  onBack,
+}: Pick<CreateScreenProps, "busy" | "password" | "confirm" | "onBack">) {
+  const unavailable =
+    busy || password.length < MIN_PASSWORD || password !== confirm;
+  return (
+    <div className="gate-actions">
+      <button className="primary" type="submit" disabled={unavailable}>
+        {busy ? "Creating…" : "Create & Enter"}
+      </button>
+      <button type="button" onClick={onBack}>
+        Back
+      </button>
+    </div>
+  );
+}
+
+export function CreateScreen(props: CreateScreenProps) {
+  return (
+    <form
+      className="gate-form"
+      onSubmit={(event) => {
+        event.preventDefault();
+        props.onSubmit();
+      }}
+    >
+      <p className="gate-sub">Name your room</p>
+      <input
+        type="text"
+        placeholder="e.g. Personal, Work, Journal"
+        value={props.roomName}
+        autoFocus
+        onChange={(event) => props.setRoomName(event.target.value)}
+      />
+      <TemplatePicker
+        templateKey={props.templateKey}
+        setTemplateKey={props.setTemplateKey}
+      />
+      <RolePicker
+        roles={props.roles}
+        roleId={props.roleId}
+        setRoleId={props.setRoleId}
+      />
+      <PasswordFields
+        password={props.password}
+        setPassword={props.setPassword}
+        confirm={props.confirm}
+        setConfirm={props.setConfirm}
+        error={props.error}
+        setError={props.setError}
+      />
+      <CreateActions
+        busy={props.busy}
+        password={props.password}
+        confirm={props.confirm}
+        onBack={props.onBack}
+      />
       <p className="gate-note gate-note-warn">
         Longer is stronger. There is no password reset — if you forget this
         password, only the one-time recovery code on the next screen can reopen

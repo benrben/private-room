@@ -107,6 +107,10 @@ describe("applyParagraphEdits (ported from docx_edit.rs's apply_paragraph_edits 
     expect(out).toBeNull();
   });
 
+  it("an empty document and empty editor are an unchanged save", () => {
+    expect(applyParagraphEdits(doc([]), "", "")).toBeNull();
+  });
+
   it("a whitespace-only change is a no-op, not a failed save", () => {
     // The reported repro: a trailing space and a blank line, nothing else.
     const bytes = doc(["Alpha", "Beta"]);
@@ -163,6 +167,18 @@ describe("updateDocxText (real fixture room)", () => {
     const [, , storedBytes] = getFileFull(db, meta.id);
     expect(Buffer.compare(storedBytes!, bytes)).toBe(0);
     expect(emit).toHaveBeenCalledWith("room-files-changed", undefined);
+  });
+
+  it("does not turn an event-listener failure into a failed save", () => {
+    const db = freshRoom();
+    const bytes = doc(["Unchanged"]);
+    const text = extractText("c.docx", bytes)!;
+    const meta = insertFile(db, "c.docx", "application/vnd.openxmlformats", bytes, text, "upload");
+
+    expect(() => updateDocxText(db, meta.id, text, () => {
+      throw new Error("fabricated listener failure");
+    })).not.toThrow();
+    expect(getFileFull(db, meta.id)[3]).toBe(text);
   });
 
   it("refuses a non-docx file by name", () => {

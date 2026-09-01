@@ -17,8 +17,9 @@
  * and answers a command through the same `commands` table either way. So this
  * checker asks the same question of two different "what the host registers"
  * lists: `src-tauri/src/lib.rs`'s `generate_handler!` (the default), and
- * `apps/desktop/src/shared/ipc-contract.ts`'s `Commands` (`--bridge=electron`). What
- * it must NEVER do is invent a third list of its own.
+ * `apps/desktop/src/shared/ipc-contract.ts`'s `Commands` facade and the domain
+ * interfaces it extends (`--bridge=electron`). What it must NEVER do is invent
+ * a third list of its own.
  *
  * FAILS (exit 1) on drift, which is always a genuine defect:
  *   - the frontend invokes a command the Rust host does not register
@@ -94,12 +95,17 @@ function mockBody(src) {
   throw new Error("unterminated commands object");
 }
 
-/** The `Commands` interface body in the Electron migration's
- * `ipc-contract.ts`, by the same brace matching `handlerBody`/`mockBody` use. */
-function contractBody(src) {
-  const open = src.indexOf("export interface Commands {");
-  if (open < 0) throw new Error("no `export interface Commands {` in ipc-contract.ts");
-  let i = open + "export interface Commands {".length;
+/** One exported interface body, by the same brace matching
+ * `handlerBody`/`mockBody` use. The opening brace may follow an `extends`
+ * clause, as it does in the split Electron command-contract facade. */
+function interfaceBody(src, interfaceName, sourceName) {
+  const declaration = src.indexOf(`export interface ${interfaceName}`);
+  if (declaration < 0) {
+    throw new Error(`no \`export interface ${interfaceName}\` in ${sourceName}`);
+  }
+  const open = src.indexOf("{", declaration);
+  if (open < 0) throw new Error(`no opening brace for ${interfaceName} in ${sourceName}`);
+  let i = open + 1;
   const start = i;
   for (let depth = 0; i < src.length; i++) {
     if (src[i] === "{") depth++;
@@ -108,7 +114,56 @@ function contractBody(src) {
       depth--;
     }
   }
-  throw new Error("unterminated Commands interface");
+  throw new Error(`unterminated ${interfaceName} interface in ${sourceName}`);
+}
+
+/** Resolve `Commands` through the facade's actual `extends` imports. This
+ * keeps ipc-contract.ts authoritative without copying its domain list here. */
+function electronCommands(contract) {
+  const contractSrc = fs.readFileSync(contract, "utf8");
+  const sourceName = path.relative(root, contract);
+  const declaration = contractSrc.match(
+    /export\s+interface\s+Commands(?:\s+extends\s+([^{]+))?\s*\{/,
+  );
+  if (!declaration) throw new Error(`no \`export interface Commands\` in ${sourceName}`);
+
+  const imports = new Map();
+  for (const match of contractSrc.matchAll(
+    /import\s+type\s*\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\s+from\s+["']([^"']+)["']/g,
+  )) {
+    imports.set(match[1], match[2]);
+  }
+
+  const commandBodies = [interfaceBody(contractSrc, "Commands", sourceName)];
+  const parents = (declaration[1] ?? "")
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+  for (const parent of parents) {
+    const specifier = imports.get(parent);
+    if (!specifier) {
+      throw new Error(`${sourceName} extends ${parent}, but does not import that interface`);
+    }
+    const sourcePath = path.resolve(
+      path.dirname(contract),
+      specifier.replace(/\.js$/, ".ts"),
+    );
+    if (!fs.existsSync(sourcePath)) {
+      throw new Error(
+        `${sourceName} imports ${parent} from missing ${path.relative(root, sourcePath)}`,
+      );
+    }
+    const parentSourceName = path.relative(root, sourcePath);
+    commandBodies.push(
+      interfaceBody(fs.readFileSync(sourcePath, "utf8"), parent, parentSourceName),
+    );
+  }
+
+  return new Set(
+    commandBodies.flatMap((body) =>
+      [...body.matchAll(/^ {2}([A-Za-z_][A-Za-z0-9_]*):/gm)].map((match) => match[1]),
+    ),
+  );
 }
 
 /** Every command name qa-mock.js answers, however it was reached. Shared by
@@ -147,7 +202,7 @@ const isRead = (c) => /^(list|get|read|load|fetch)_/.test(c) || READ_LIKE.has(c)
 /* ============================================================================
  * --bridge=electron
  * ============================================================================
- * `src/shared/ipc-contract.ts`'s `Commands` interface is the migration's
+ * `src/shared/ipc-contract.ts`'s `Commands` facade is the migration's
  * authoritative renderer/host command list. Runtime registration completeness
  * is enforced by the Electron registry tests; this report answers the separate
  * QA question: which commands does qa-mock.js have a fixture for?
@@ -172,11 +227,7 @@ function electronReport() {
     );
     process.exit(1);
   }
-  const registered = new Set(
-    [...contractBody(fs.readFileSync(contract, "utf8")).matchAll(/^ {2}([A-Za-z_][A-Za-z0-9_]*):/gm)].map(
-      (m) => m[1],
-    ),
-  );
+  const registered = electronCommands(contract);
   const mocked = mockedCommands(fs.readFileSync(path.join(root, "tests/support/qa-mock.js"), "utf8"));
   const sorted = (set) => [...set].sort();
   const uncovered = sorted(registered).filter((c) => !mocked.has(c));

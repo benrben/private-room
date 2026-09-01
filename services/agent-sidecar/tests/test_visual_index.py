@@ -9,7 +9,9 @@ import json
 import os
 import tempfile
 import time
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 
 import pytest
@@ -59,6 +61,13 @@ def _source(tmp_path: Path, data: bytes = b"video source") -> Path:
     source = tmp_path / "video.mp4"
     source.write_bytes(data)
     return source
+
+
+def _write_image(path: Path, image_format: str = "JPEG") -> None:
+    image = Image.new("RGB", (64, 36), (30, 40, 90))
+    encoded = io.BytesIO()
+    image.save(encoded, format=image_format)
+    write_private(path, encoded.getvalue())
 
 
 def test_partial_final_second_is_addressable() -> None:
@@ -184,6 +193,73 @@ def test_lru_pruning_bounds_old_content_hash_indexes_and_keeps_recent(
     assert len([entry for entry in root.iterdir() if entry.name[0].isalnum()]) == 2
 
 
+def test_manifest_validation_rejects_each_untrusted_contract_boundary() -> None:
+    index_id = "a" * 64 + f".{PROFILE.id}"
+    manifest = {
+        "schema_version": 1,
+        "index_id": index_id,
+        "source": {"sha256": "a" * 64, "size": 4},
+        "profile": {
+            "id": PROFILE.id,
+            "fps": PROFILE.fps,
+            "max_dimension": PROFILE.max_dimension,
+            "jpeg_quality": PROFILE.jpeg_quality,
+            "mime": PROFILE.mime,
+        },
+        "frame_count": 1,
+        "first_second": 0,
+        "last_second": 0,
+        "width": 1,
+        "height": 1,
+        "total_bytes": 4,
+    }
+    assert VisualIndexStore._valid_manifest(index_id, manifest)
+
+    bad_source = {**manifest, "source": {"sha256": "b" * 64}}
+    bad_timeline = {**manifest, "last_second": 1}
+    bad_size = {**manifest, "total_bytes": "not-a-number"}
+    assert not VisualIndexStore._valid_manifest(index_id, bad_source)
+    assert not VisualIndexStore._valid_manifest(index_id, bad_timeline)
+    assert not VisualIndexStore._valid_manifest(index_id, bad_size)
+
+
+def test_prune_skips_active_indexes_and_ignores_unreadable_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "cache"
+    root.mkdir()
+    first_id = "a" * 64 + f".{PROFILE.id}"
+    second_id = "b" * 64 + f".{PROFILE.id}"
+    first = root / first_id
+    second = root / second_id
+    first.mkdir()
+    second.mkdir()
+    (root / "not-an-index").mkdir()
+    os.utime(first, ns=(1, 1))
+    os.utime(second, ns=(2, 2))
+    store = VisualIndexStore(root, FakeCapture(), max_indexes=1)
+    with store._active(first_id):
+        store._prune()
+    assert first.is_dir()
+    assert not second.exists()
+
+    unreadable = root / ("c" * 64 + f".{PROFILE.id}")
+    unreadable.mkdir()
+
+    def unreadable_size(_directory: Path) -> int:
+        raise OSError("unreadable index")
+
+    monkeypatch.setattr(store, "_index_size", unreadable_size)
+    assert store._prune_candidates() == []
+
+    class UnreadableRoot:
+        def iterdir(self) -> list[Path]:
+            raise OSError("unreadable cache")
+
+    store.root = UnreadableRoot()  # type: ignore[assignment]
+    assert store._prune_candidates() == []
+
+
 def test_crash_orphans_expire_but_an_active_build_is_protected(tmp_path: Path) -> None:
     root = tmp_path / "cache"
     root.mkdir()
@@ -243,6 +319,156 @@ def test_optional_ffmpeg_is_version_checked_before_use(
     assert visual_index_mod._validated_ffmpeg() is None
 
 
+def test_optional_ffmpeg_skips_unusable_duplicates_and_failed_fake_probes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = tmp_path / "missing"
+    unusable = tmp_path / "unusable"
+    unusable.write_text("placeholder")
+    unusable.chmod(0o600)
+    first = tmp_path / "first"
+    first.write_text("placeholder")
+    first.chmod(0o700)
+    duplicate = tmp_path / "duplicate"
+    duplicate.symlink_to(first)
+    verified = tmp_path / "verified"
+    verified.write_text("placeholder")
+    verified.chmod(0o700)
+    calls: list[str] = []
+
+    def fake_run(args: list[str], **_kwargs: object) -> object:
+        calls.append(args[0])
+        if args[0] == str(first.resolve()):
+            raise OSError("fake probe failure")
+        return visual_index_mod.subprocess.CompletedProcess(
+            args, 0, stdout=b"ffmpeg version 7.1 fake\n"
+        )
+
+    monkeypatch.setattr(visual_index_mod.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        visual_index_mod,
+        "_FFMPEG_CANDIDATES",
+        (missing, unusable, first, duplicate, verified),
+    )
+    monkeypatch.setattr(visual_index_mod.subprocess, "run", fake_run)
+
+    assert visual_index_mod._validated_ffmpeg() == verified.resolve()
+    assert calls == [str(first.resolve()), str(verified.resolve())]
+
+
+def test_ffmpeg_duration_checks_avfoundation_and_reads_the_video_timing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    monkeypatch.setattr(visual_index_mod, "_AVFOUNDATION_AVAILABLE", False)
+    with pytest.raises(VisualIndexError, match="AVFoundation is unavailable"):
+        visual_index_mod._ffmpeg_duration(source)
+
+    seen: list[object] = []
+    monkeypatch.setattr(visual_index_mod, "_AVFOUNDATION_AVAILABLE", True)
+    monkeypatch.setattr(
+        visual_index_mod,
+        "objc",
+        SimpleNamespace(autorelease_pool=nullcontext),
+    )
+    monkeypatch.setattr(
+        visual_index_mod,
+        "Foundation",
+        SimpleNamespace(
+            NSURL=SimpleNamespace(fileURLWithPath_=lambda path: seen.append(path) or "url")
+        ),
+    )
+    monkeypatch.setattr(
+        visual_index_mod,
+        "AVFoundation",
+        SimpleNamespace(
+            AVURLAsset=SimpleNamespace(
+                URLAssetWithURL_options_=lambda url, options: seen.append((url, options)) or "asset"
+            )
+        ),
+    )
+    monkeypatch.setattr(visual_index_mod, "_video_timing", lambda asset: (0.0, 2.25))
+
+    assert visual_index_mod._ffmpeg_duration(source) == 2.25
+    assert seen == [str(source), ("url", None)]
+
+
+def test_ffmpeg_capture_builds_and_verifies_the_pinned_timeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    destination = tmp_path / "frames"
+    destination.mkdir()
+    calls: list[tuple[list[str], object]] = []
+    monkeypatch.setattr(visual_index_mod, "_ffmpeg_duration", lambda _source: 2.25)
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        calls.append((command, kwargs["timeout"]))
+        for second in range(3):
+            _write_image(destination / f"frame-{second:06d}.jpg")
+        return visual_index_mod.subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(visual_index_mod.subprocess, "run", fake_run)
+    info = visual_index_mod.capture_frames_ffmpeg(
+        source, destination, PROFILE, tmp_path / "ffmpeg"
+    )
+
+    assert info == CaptureInfo(duration_secs=2.25, frame_count=3, width=64, height=36)
+    assert calls[0][1] == 30.0
+    command = calls[0][0]
+    assert command[command.index("-vf") + 1] == (
+        "setpts=PTS-STARTPTS,fps=1:eof_action=pass,"
+        "scale=320:320:force_original_aspect_ratio=decrease:flags=area"
+    )
+    assert all(path.stat().st_mode & 0o077 == 0 for path in destination.iterdir())
+
+
+@pytest.mark.parametrize("failure", [OSError("no decoder"), 1])
+def test_ffmpeg_capture_reports_process_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: object
+) -> None:
+    source = _source(tmp_path)
+    destination = tmp_path / "frames"
+    destination.mkdir()
+    monkeypatch.setattr(visual_index_mod, "_ffmpeg_duration", lambda _source: 1.0)
+
+    def fake_run(command: list[str], **_kwargs: object) -> object:
+        if isinstance(failure, Exception):
+            raise failure
+        return visual_index_mod.subprocess.CompletedProcess(command, int(failure))
+
+    monkeypatch.setattr(visual_index_mod.subprocess, "run", fake_run)
+    with pytest.raises(VisualIndexError, match="accelerated video decode failed"):
+        visual_index_mod.capture_frames_ffmpeg(source, destination, PROFILE, tmp_path / "ffmpeg")
+
+
+def test_ffmpeg_capture_rejects_incomplete_or_non_jpeg_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    destination = tmp_path / "frames"
+    destination.mkdir()
+    monkeypatch.setattr(visual_index_mod, "_ffmpeg_duration", lambda _source: 1.0)
+    monkeypatch.setattr(
+        visual_index_mod.subprocess,
+        "run",
+        lambda command, **_kwargs: visual_index_mod.subprocess.CompletedProcess(command, 0),
+    )
+    with pytest.raises(VisualIndexError, match="incomplete timeline"):
+        visual_index_mod.capture_frames_ffmpeg(source, destination, PROFILE, tmp_path / "ffmpeg")
+
+    _write_image(destination / "frame-000000.jpg", "PNG")
+    with pytest.raises(VisualIndexError, match="video frames are invalid"):
+        visual_index_mod.capture_frames_ffmpeg(source, destination, PROFILE, tmp_path / "ffmpeg")
+
+    (destination / "frame-000000.jpg").unlink()
+    _write_image(destination / "frame-000000.jpg")
+    write_private(destination / "frame-000001.jpg", b"bad")
+    monkeypatch.setattr(visual_index_mod, "_ffmpeg_duration", lambda _source: 2.0)
+    with pytest.raises(VisualIndexError, match="video frames are invalid"):
+        visual_index_mod.capture_frames_ffmpeg(source, destination, PROFILE, tmp_path / "ffmpeg")
+
+
 def test_failed_optional_accelerator_cleans_partial_output_and_falls_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -279,6 +505,89 @@ def test_mutation_during_capture_is_never_published(tmp_path: Path) -> None:
         VisualIndexStore(root, FakeCapture(on_capture=mutate)).warm(source)
     assert not list(root.glob("[0-9a-f]*"))
     assert not list(root.glob(".building-*"))
+
+
+def test_warm_rejects_a_source_changed_before_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    first = visual_index_mod._snapshot(source)
+    changed = visual_index_mod.SourceSnapshot(
+        device=first.device,
+        inode=first.inode,
+        size=first.size + 1,
+        mtime_ns=first.mtime_ns,
+    )
+    snapshots = [first, changed]
+    store = VisualIndexStore(tmp_path / "cache", FakeCapture())
+    monkeypatch.setattr(visual_index_mod, "_snapshot", lambda _source: snapshots.pop(0))
+    monkeypatch.setattr(visual_index_mod, "_sha256_file", lambda _source: "a" * 64)
+
+    with pytest.raises(SourceChangedError):
+        store._source_identity(source)
+
+
+def test_warm_rejects_inconsistent_or_missing_capture_output(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+
+    def inconsistent(_source: Path, _stage: Path, _profile: object) -> CaptureInfo:
+        return CaptureInfo(duration_secs=1.0, frame_count=2, width=64, height=36)
+
+    with pytest.raises(VisualIndexError, match="frame count is inconsistent"):
+        VisualIndexStore(tmp_path / "count", inconsistent).warm(source)
+
+    def missing(_source: Path, _stage: Path, _profile: object) -> CaptureInfo:
+        return CaptureInfo(duration_secs=1.0, frame_count=1, width=64, height=36)
+
+    with pytest.raises(VisualIndexError, match="missing frame 0"):
+        VisualIndexStore(tmp_path / "missing", missing).warm(source)
+
+
+def test_warm_wraps_unexpected_capture_errors_and_cleans_its_stage(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+
+    def broken(_source: Path, _stage: Path, _profile: object) -> CaptureInfo:
+        raise RuntimeError("decoder exploded")
+
+    root = tmp_path / "cache"
+    with pytest.raises(VisualIndexError, match="could not be built") as caught:
+        VisualIndexStore(root, broken).warm(source)
+    assert caught.value.code == "VISUAL_INDEX_FAILED"
+    assert not list(root.glob(".building-*"))
+
+
+def test_publish_reuses_an_index_that_another_warm_completed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = VisualIndexStore(tmp_path / "cache", FakeCapture())
+    store.root.mkdir()
+    index_id = "a" * 64 + f".{PROFILE.id}"
+    manifest = {
+        "schema_version": 1,
+        "index_id": index_id,
+        "source": {"sha256": "a" * 64, "size": 4},
+        "profile": {
+            "id": PROFILE.id,
+            "fps": PROFILE.fps,
+            "max_dimension": PROFILE.max_dimension,
+            "jpeg_quality": PROFILE.jpeg_quality,
+            "mime": PROFILE.mime,
+        },
+        "duration_secs": 1.0,
+        "frame_count": 1,
+        "first_second": 0,
+        "last_second": 0,
+        "width": 64,
+        "height": 36,
+        "total_bytes": 4,
+    }
+    stage = store.root / ".building-test"
+    stage.mkdir()
+    monkeypatch.setattr(store, "_complete", lambda _index_id: manifest)
+    monkeypatch.setattr(store, "_touch_and_prune", lambda _index_id: None)
+
+    assert store._publish_stage(stage, index_id, manifest)["reused"] is True
+    assert stage.is_dir()
 
 
 def test_frame_returns_verified_jpeg_and_clamps_to_final_partial_second(

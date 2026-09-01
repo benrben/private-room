@@ -51,7 +51,7 @@ installed, the only platform this sidecar ships on) this branch never runs.
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Callable
 
 import pymupdf
 
@@ -100,6 +100,37 @@ MAX_PAGE_PIXELS: float = 40_000_000.0
 MAX_PAGE_EDGE: float = 20_000.0
 
 
+def _area_capped_scale(page_w: float, page_h: float) -> float:
+    """Apply the total-pixel cap before checking either individual edge."""
+    scale = PDF_RENDER_SCALE
+    pixels = page_w * page_h * scale * scale
+    if pixels > MAX_PAGE_PIXELS:
+        scale *= math.sqrt(MAX_PAGE_PIXELS / pixels)
+    return scale
+
+
+def _edge_capped_scale(scale: float, page_w: float, page_h: float) -> float:
+    """Independently limit both dimensions after the area cap."""
+    # Then clamp each edge on its own, so a degenerate media box can't slip
+    # an enormous single dimension past the area cap.
+    for edge in (page_w, page_h):
+        if edge * scale > MAX_PAGE_EDGE:
+            scale = MAX_PAGE_EDGE / edge
+    return scale
+
+
+def _raster_dimensions(page_w: float, page_h: float, scale: float) -> tuple[int, int]:
+    """Round a capped page size without allowing edge-cap overshoot."""
+    edge_px = int(MAX_PAGE_EDGE)
+    # `min()` rather than a bare check: rounding up can leave the product a
+    # hair over the clamp, and clipping a sub-pixel is better than refusing
+    # a legitimately poster-sized page.
+    return (
+        min(math.ceil(page_w * scale), edge_px),
+        min(math.ceil(page_h * scale), edge_px),
+    )
+
+
 def page_raster_size(page_w: float, page_h: float) -> tuple[int, int, float] | None:
     """Bitmap size (and the scale that produced it) for one page's media
     box, or `None` when there is nothing drawable. Pure, so both caps are
@@ -110,23 +141,10 @@ def page_raster_size(page_w: float, page_h: float) -> tuple[int, int, float] | N
     through, since area bounds neither edge on its own), THEN each edge is
     clamped independently. This is ported verbatim from the Rust source.
     """
-    scale = PDF_RENDER_SCALE
-    pixels = page_w * page_h * scale * scale
-    if pixels > MAX_PAGE_PIXELS:
-        scale *= math.sqrt(MAX_PAGE_PIXELS / pixels)
-    # Then clamp each edge on its own, so a degenerate media box can't slip
-    # an enormous single dimension past the area cap.
-    for edge in (page_w, page_h):
-        if edge * scale > MAX_PAGE_EDGE:
-            scale = MAX_PAGE_EDGE / edge
+    scale = _edge_capped_scale(_area_capped_scale(page_w, page_h), page_w, page_h)
     if not math.isfinite(scale) or scale <= 0.0:
         return None
-    edge_px = int(MAX_PAGE_EDGE)
-    # `min()` rather than a bare check: rounding up can leave the product a
-    # hair over the clamp, and clipping a sub-pixel is better than refusing
-    # a legitimately poster-sized page.
-    width = min(math.ceil(page_w * scale), edge_px)
-    height = min(math.ceil(page_h * scale), edge_px)
+    width, height = _raster_dimensions(page_w, page_h, scale)
     if width == 0 or height == 0:
         return None
     return (width, height, scale)
@@ -168,56 +186,85 @@ WANTED_LANGUAGE_PREFIXES: tuple[str, ...] = (
 )
 
 
-def _available_languages(request: Any) -> list[str]:
-    """The subset of `WANTED_LANGUAGE_PREFIXES` this Mac actually supports,
-    as its own identifiers, in our priority order."""
+def _supported_recognition_ids(request: Any) -> list[str]:
+    """Ask Vision for its device-specific language identifiers, fail closed."""
     try:
         supported, error = request.supportedRecognitionLanguagesAndReturnError_(None)
     except Exception:  # noqa: BLE001 - treat any Vision-side refusal as "nothing supported"
         return []
     if error is not None or not supported:
         return []
-    ids = [str(s) for s in supported]
+    return [str(s) for s in supported]
+
+
+def _append_matching_languages(want: str, ids: list[str], chosen: list[str]) -> None:
+    """Append every supported variant for one preferred language prefix."""
+    for lang_id in ids:
+        base = lang_id.split("-", 1)[0]
+        if base == want and lang_id not in chosen:
+            chosen.append(lang_id)
+
+
+def _available_languages(request: Any) -> list[str]:
+    """The subset of `WANTED_LANGUAGE_PREFIXES` this Mac actually supports,
+    as its own identifiers, in our priority order."""
+    ids = _supported_recognition_ids(request)
     chosen: list[str] = []
     for want in WANTED_LANGUAGE_PREFIXES:
-        for lang_id in ids:
-            base = lang_id.split("-", 1)[0]
-            if base == want and lang_id not in chosen:
-                chosen.append(lang_id)
+        _append_matching_languages(want, ids, chosen)
     return chosen
 
 
-def run_recognition(handler: Any) -> str | None:
-    """Configure a text-recognition request (accurate level, every script
-    this Mac can read), run it against `handler`, and collect the best
-    candidate per text block."""
+def _new_recognition_request() -> Any:
+    """Configure the accurate, language-aware Vision recognition request."""
     request = Vision.VNRecognizeTextRequest.new()
     request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
     request.setUsesLanguageCorrection_(True)
     # Let Vision work out which script it is looking at rather than being
     # told it is always English; the list below is the priority hint.
     request.setAutomaticallyDetectsLanguage_(True)
+    return request
+
+
+def _recognition_observations(handler: Any, request: Any) -> Any | None:
+    """Run a configured Vision request, returning only successful results."""
+    success, _error = handler.performRequests_error_([request], None)
+    return request.results() if success else None
+
+
+def _observation_line(observation: Any) -> str | None:
+    """Extract one nonblank best candidate from a Vision observation."""
+    candidates = observation.topCandidates_(1)
+    if not candidates or len(candidates) == 0:
+        return None
+    line = str(candidates[0].string())
+    return line if line.strip() else None
+
+
+def _recognition_lines(observations: Any) -> list[str]:
+    """Keep a best nonblank line for every recognized text block."""
+    lines: list[str] = []
+    for observation in observations:
+        line = _observation_line(observation)
+        if line is not None:
+            lines.append(line)
+    return lines
+
+
+def run_recognition(handler: Any) -> str | None:
+    """Configure a text-recognition request (accurate level, every script
+    this Mac can read), run it against `handler`, and collect the best
+    candidate per text block."""
+    request = _new_recognition_request()
     langs = _available_languages(request)
     if langs:
         request.setRecognitionLanguages_(langs)
 
-    success, _error = handler.performRequests_error_([request], None)
-    if not success:
-        return None
-
-    observations = request.results()
+    observations = _recognition_observations(handler, request)
     if not observations:
         return None
-    lines: list[str] = []
-    for observation in observations:
-        candidates = observation.topCandidates_(1)
-        if candidates and len(candidates) > 0:
-            line = str(candidates[0].string())
-            if line.strip():
-                lines.append(line)
-    if not lines:
-        return None
-    return "\n".join(lines)
+    lines = _recognition_lines(observations)
+    return "\n".join(lines) if lines else None
 
 
 # ----------------------------------------------------------- image / pdf
@@ -266,6 +313,57 @@ def _render_pdf_page_png(doc: Any, page_number: int) -> bytes | None:
         return None
 
 
+def _collect_pdf_text(
+    doc: Any,
+    pages: int,
+    render_page: Callable[[Any, int], bytes | None],
+    recognize_image: Callable[[bytes], str | None],
+) -> tuple[list[str], int]:
+    """Read the attempted pages with injectable raster and OCR boundaries."""
+    out_parts: list[str] = []
+    unrendered = 0
+    for page_number in range(pages):
+        png = render_page(doc, page_number)
+        if png is None:
+            # A damaged page object or a rasterizer allocation this Mac
+            # refused. Counted, not swallowed: the pages that DID render
+            # must not be handed on as the whole document.
+            unrendered += 1
+            continue
+        _append_recognized_page(out_parts, recognize_image(png))
+    return out_parts, unrendered
+
+
+def _append_recognized_page(out_parts: list[str], text: str | None) -> None:
+    """Keep only nonblank text; blank pages remain intentionally invisible."""
+    if text is not None and text.strip():
+        out_parts.append(text)
+
+
+def _completed_pdf_text(
+    out_parts: list[str], total_pages: int, pages: int, unrendered: int
+) -> str | None:
+    """Attach any partial-read disclosure after confirming OCR found text."""
+    out = "\n".join(out_parts)
+    if not out.strip():
+        return None
+    return out + unread_notes(total_pages, pages, unrendered)
+
+
+def _ocr_pdf_document(
+    doc: Any,
+    render_page: Callable[[Any, int], bytes | None],
+    recognize_image: Callable[[bytes], str | None],
+) -> str | None:
+    """OCR one open document without owning its close lifecycle."""
+    total_pages = doc.page_count
+    pages = min(total_pages, MAX_PDF_PAGES)
+    if pages == 0:
+        return None
+    out_parts, unrendered = _collect_pdf_text(doc, pages, render_page, recognize_image)
+    return _completed_pdf_text(out_parts, total_pages, pages, unrendered)
+
+
 def ocr_pdf(data: bytes) -> str | None:
     """Rasterize each PDF page to an RGB bitmap, then OCR it. Image-only
     scans have no text layer, so this is the only way to read them."""
@@ -273,31 +371,8 @@ def ocr_pdf(data: bytes) -> str | None:
         doc = pymupdf.open(stream=data, filetype="pdf")
     except Exception:  # noqa: BLE001 - a damaged or non-PDF byte string
         return None
-
     try:
-        total_pages = doc.page_count
-        pages = min(total_pages, MAX_PDF_PAGES)
-        if pages == 0:
-            return None
-
-        out_parts: list[str] = []
-        unrendered = 0
-        for page_number in range(pages):
-            png = _render_pdf_page_png(doc, page_number)
-            if png is None:
-                # A damaged page object or a rasterizer allocation this Mac
-                # refused. Counted, not swallowed: the pages that DID render
-                # must not be handed on as the whole document.
-                unrendered += 1
-                continue
-            text = ocr_image_bytes(png)
-            if text is not None and text.strip():
-                out_parts.append(text)
-
-        out = "\n".join(out_parts)
-        if not out.strip():
-            return None
-        return out + unread_notes(total_pages, pages, unrendered)
+        return _ocr_pdf_document(doc, _render_pdf_page_png, ocr_image_bytes)
     finally:
         doc.close()
 

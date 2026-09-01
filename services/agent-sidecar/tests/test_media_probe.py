@@ -24,7 +24,9 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -120,6 +122,190 @@ def test_last_frame_also_answers_none_rather_than_raising(tmp_path: Path) -> Non
     assert probe_mod.last_frame(str(missing)) is None
 
 
+class _FakeEndFrameGenerator:
+    def __init__(self, replies: list[object | None]) -> None:
+        self.replies = replies
+        self.transform = False
+        self.before: list[object] = []
+        self.after: list[object] = []
+        self.requests: list[object] = []
+
+    def setAppliesPreferredTrackTransform_(self, enabled: bool) -> None:
+        self.transform = enabled
+
+    def setRequestedTimeToleranceBefore_(self, value: object) -> None:
+        self.before.append(value)
+
+    def setRequestedTimeToleranceAfter_(self, value: object) -> None:
+        self.after.append(value)
+
+    def copyCGImageAtTime_actualTime_error_(
+        self, value: object, _actual: object, _error: object
+    ) -> tuple[object | None, None]:
+        self.requests.append(value)
+        return self.replies.pop(0), None
+
+
+class _FakeEndFrameBitmap:
+    def __init__(self, encoded: bytes | None) -> None:
+        self.encoded = encoded
+
+    def representationUsingType_properties_(self, _kind: object, _options: object) -> bytes | None:
+        return self.encoded
+
+
+def _frame_time(value: float, timescale: int = 100) -> SimpleNamespace:
+    return SimpleNamespace(flags=1, timescale=timescale, value=value)
+
+
+def _install_fake_last_frame_stack(
+    monkeypatch: pytest.MonkeyPatch,
+    asset: object,
+    generator: _FakeEndFrameGenerator,
+    bitmap: _FakeEndFrameBitmap | None,
+) -> None:
+    monkeypatch.setattr(probe_mod, "_AVFOUNDATION_AVAILABLE", True)
+    monkeypatch.setattr(probe_mod, "objc", SimpleNamespace(autorelease_pool=nullcontext))
+    monkeypatch.setattr(
+        probe_mod,
+        "Foundation",
+        SimpleNamespace(NSURL=SimpleNamespace(fileURLWithPath_=lambda path: path)),
+    )
+    monkeypatch.setattr(
+        probe_mod,
+        "CM",
+        SimpleNamespace(
+            kCMTimeFlags_Valid=1,
+            kCMTimeFlags_PositiveInfinity=2,
+            CMTime=lambda **values: SimpleNamespace(**values),
+        ),
+    )
+    monkeypatch.setattr(
+        probe_mod,
+        "AVFoundation",
+        SimpleNamespace(
+            AVMediaTypeVideo="video",
+            AVURLAsset=SimpleNamespace(
+                URLAssetWithURL_options_=lambda _url, _options: asset
+            ),
+            AVAssetImageGenerator=SimpleNamespace(
+                alloc=lambda: SimpleNamespace(initWithAsset_=lambda _asset: generator)
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        probe_mod,
+        "AppKit",
+        SimpleNamespace(
+            NSBitmapImageFileTypePNG="PNG",
+            NSBitmapImageRep=SimpleNamespace(
+                alloc=lambda: SimpleNamespace(initWithCGImage_=lambda _image: bitmap)
+            ),
+        ),
+    )
+
+
+def _last_frame_asset(duration: object, video_tracks: list[object]) -> SimpleNamespace:
+    return SimpleNamespace(
+        duration=lambda: duration,
+        tracksWithMediaType_=lambda media_type: video_tracks if media_type == "video" else [],
+    )
+
+
+def test_last_frame_uses_the_video_track_end_with_exact_tolerance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    track = SimpleNamespace(
+        timeRange=lambda: SimpleNamespace(start=_frame_time(100), duration=_frame_time(200))
+    )
+    asset = _last_frame_asset(_frame_time(2_000), [track])
+    generator = _FakeEndFrameGenerator([object()])
+    _install_fake_last_frame_stack(monkeypatch, asset, generator, _FakeEndFrameBitmap(b"png"))
+
+    assert probe_mod.last_frame("clip.mov") == b"png"
+    assert generator.transform is True
+    assert [time.value for time in generator.requests] == [1780]
+    assert [time.value for time in generator.before] == [0]
+    assert [time.value for time in generator.after] == [0]
+
+
+def test_last_frame_falls_back_earlier_when_exact_decode_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _last_frame_asset(_frame_time(600), [])
+    generator = _FakeEndFrameGenerator([None, object()])
+    _install_fake_last_frame_stack(monkeypatch, asset, generator, _FakeEndFrameBitmap(b"png"))
+
+    assert probe_mod.last_frame("clip.mov") == b"png"
+    assert [time.value for time in generator.requests] == [3580, 3580]
+    assert [time.value for time in generator.before] == [0, 9_223_372_036_854_775_807]
+    assert [time.value for time in generator.after] == [0, 0]
+    assert generator.before[1].flags == 3
+
+
+def test_last_frame_keeps_a_zero_length_video_range_over_asset_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    track = SimpleNamespace(
+        timeRange=lambda: SimpleNamespace(start=_frame_time(0), duration=_frame_time(0))
+    )
+    asset = _last_frame_asset(_frame_time(600), [track])
+    generator = _FakeEndFrameGenerator([object()])
+    _install_fake_last_frame_stack(monkeypatch, asset, generator, _FakeEndFrameBitmap(b"png"))
+
+    assert probe_mod.last_frame("clip.mov") == b"png"
+    assert generator.requests[0].value == 0
+
+
+def test_last_frame_uses_asset_duration_for_an_unusable_track_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad_start = SimpleNamespace(flags=0, timescale=100, value=0)
+    track = SimpleNamespace(
+        timeRange=lambda: SimpleNamespace(start=bad_start, duration=_frame_time(100))
+    )
+    asset = _last_frame_asset(_frame_time(200), [track])
+    generator = _FakeEndFrameGenerator([object()])
+    _install_fake_last_frame_stack(monkeypatch, asset, generator, _FakeEndFrameBitmap(b"png"))
+
+    assert probe_mod.last_frame("clip.mov") == b"png"
+    assert generator.requests[0].value == 1180
+
+    nan_duration_asset = _last_frame_asset(_frame_time(float("nan")), [])
+    no_capture = _FakeEndFrameGenerator([])
+    _install_fake_last_frame_stack(monkeypatch, nan_duration_asset, no_capture, None)
+    assert probe_mod.last_frame("clip.mov") is None
+
+
+def test_last_frame_returns_none_for_unavailable_invalid_or_undecodable_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(probe_mod, "_AVFOUNDATION_AVAILABLE", False)
+    assert probe_mod.last_frame("clip.mov") is None
+
+    invalid_asset = _last_frame_asset(SimpleNamespace(flags=0, timescale=100, value=1), [])
+    invalid_generator = _FakeEndFrameGenerator([])
+    _install_fake_last_frame_stack(monkeypatch, invalid_asset, invalid_generator, None)
+    assert probe_mod.last_frame("clip.mov") is None
+
+    no_frame_asset = _last_frame_asset(_frame_time(100), [])
+    no_frame_generator = _FakeEndFrameGenerator([None, None])
+    _install_fake_last_frame_stack(monkeypatch, no_frame_asset, no_frame_generator, None)
+    assert probe_mod.last_frame("clip.mov") is None
+
+
+def test_last_frame_png_encoder_can_decline_a_decoded_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = _last_frame_asset(_frame_time(100), [])
+    generator = _FakeEndFrameGenerator([object()])
+    _install_fake_last_frame_stack(monkeypatch, asset, generator, None)
+    assert probe_mod.last_frame("clip.mov") is None
+
+    _install_fake_last_frame_stack(monkeypatch, asset, generator, _FakeEndFrameBitmap(None))
+    assert probe_mod._png_bytes(object()) is None
+
+
 # ------------------------------------------------- (3) no decrypted leftovers
 
 
@@ -183,6 +369,130 @@ def test_unreadable_fields_stay_unknown_rather_than_defaulting() -> None:
     assert not probe_mod.MediaMeta(has_audio=False).is_empty()
 
 
+def _fake_asset(
+    video_tracks: list[object], audio_tracks: list[object], duration: object
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        duration=lambda: duration,
+        tracksWithMediaType_=lambda media_type: (
+            video_tracks if media_type == "video" else audio_tracks
+        ),
+    )
+
+
+def _install_fake_probe_stack(
+    monkeypatch: pytest.MonkeyPatch, asset: SimpleNamespace
+) -> None:
+    """Make the public probe path deterministic without standing in for its
+    metadata rules. The real-framework tests above retain the AVFoundation
+    integration contract; these fakes let the error and malformed-container
+    cases reach the same public API on every developer machine.
+    """
+    monkeypatch.setattr(probe_mod, "_AVFOUNDATION_AVAILABLE", True)
+    monkeypatch.setattr(probe_mod, "objc", SimpleNamespace(autorelease_pool=nullcontext))
+    monkeypatch.setattr(
+        probe_mod,
+        "Foundation",
+        SimpleNamespace(NSURL=SimpleNamespace(fileURLWithPath_=lambda path: path)),
+    )
+    monkeypatch.setattr(
+        probe_mod,
+        "AVFoundation",
+        SimpleNamespace(
+            AVMediaTypeVideo="video",
+            AVMediaTypeAudio="audio",
+            AVURLAsset=SimpleNamespace(
+                URLAssetWithURL_options_=lambda _url, _options: asset
+            ),
+        ),
+    )
+    monkeypatch.setattr(probe_mod, "_display_size", lambda track: track.size)
+    monkeypatch.setattr(probe_mod, "_track_codec", lambda track: track.codec)
+
+
+def _fake_video_track(bitrate: float, size: tuple[int, int] | None = (1920, 1080)) -> object:
+    return SimpleNamespace(
+        codec="H.264",
+        size=size,
+        nominalFrameRate=lambda: 29.97,
+        estimatedDataRate=lambda: bitrate,
+    )
+
+
+def _valid_time(value: float) -> SimpleNamespace:
+    return SimpleNamespace(
+        flags=probe_mod.CM.kCMTimeFlags_Valid,
+        timescale=100,
+        value=value,
+    )
+
+
+@pytest.mark.parametrize(
+    ("bitrate", "expected_kbps"),
+    [(2500.0, 3), (float("nan"), None), (0.0, None)],
+)
+def test_probe_keeps_track_facts_when_bitrate_is_missing(
+    monkeypatch: pytest.MonkeyPatch, bitrate: float, expected_kbps: int | None
+) -> None:
+    asset = _fake_asset([_fake_video_track(bitrate)], [], _valid_time(150))
+    _install_fake_probe_stack(monkeypatch, asset)
+
+    meta = probe_mod.probe("fixture.mov")
+
+    assert meta == probe_mod.MediaMeta(
+        duration_secs=1.5,
+        width=1920,
+        height=1080,
+        video_codec="H.264",
+        frame_rate=29.97,
+        bitrate_kbps=expected_kbps,
+        has_audio=False,
+    )
+
+
+def test_probe_keeps_audio_only_assets_and_rejects_empty_assets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio = SimpleNamespace(codec="AAC")
+    _install_fake_probe_stack(monkeypatch, _fake_asset([], [audio], _valid_time(200)))
+
+    assert probe_mod.probe("audio.m4a") == probe_mod.MediaMeta(
+        duration_secs=2.0,
+        has_audio=True,
+        audio_codec="AAC",
+    )
+
+    _install_fake_probe_stack(monkeypatch, _fake_asset([], [], _valid_time(200)))
+    assert probe_mod.probe("renamed-text.mp4") is None
+
+
+@pytest.mark.parametrize(
+    "duration",
+    [
+        _valid_time(0),
+        _valid_time(float("nan")),
+        SimpleNamespace(flags=0, timescale=100, value=100),
+    ],
+)
+def test_probe_drops_unusable_duration_without_dropping_track_metadata(
+    monkeypatch: pytest.MonkeyPatch, duration: SimpleNamespace
+) -> None:
+    asset = _fake_asset([_fake_video_track(1000.0, size=None)], [], duration)
+    _install_fake_probe_stack(monkeypatch, asset)
+
+    meta = probe_mod.probe("durationless.mov")
+
+    assert meta is not None
+    assert meta.duration_secs is None
+    assert meta.width is None and meta.height is None
+    assert meta.video_codec == "H.264"
+
+
+def test_probe_is_unavailable_off_macos(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(probe_mod, "_AVFOUNDATION_AVAILABLE", False)
+    assert probe_mod.probe("fixture.mov") is None
+
+
 # --------------------------------------------------- (5) fourcc / codec_name
 
 
@@ -210,6 +520,21 @@ def test_codecs_are_named_where_we_know_them_and_verbatim_where_we_do_not() -> N
     # An unmapped code is shown as the file stated it — dropping it would
     # hide a fact the container did give us.
     assert probe_mod.codec_name("xyzw") == "xyzw"
+
+
+def test_track_codec_leaves_absent_or_unprintable_descriptions_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    no_description = SimpleNamespace(formatDescriptions=lambda: [])
+    assert probe_mod._track_codec(no_description) is None
+
+    monkeypatch.setattr(
+        probe_mod,
+        "CM",
+        SimpleNamespace(CMFormatDescriptionGetMediaSubType=lambda _description: 0),
+    )
+    non_ascii_description = SimpleNamespace(formatDescriptions=lambda: [object()])
+    assert probe_mod._track_codec(non_ascii_description) is None
 
 
 # --------------------------------------------------------- (6) is_empty()
@@ -308,6 +633,8 @@ def test_display_size_survives_a_nan_transform() -> None:
     # A normal, finite transform still works after the reordering.
     identity = Quartz.CGAffineTransformMake(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
     assert probe_mod._display_size(_FakeTrack(size, identity)) == (1920, 1080)
+    zero_size = Quartz.CGSizeMake(0.0, 1080.0)
+    assert probe_mod._display_size(_FakeTrack(zero_size, identity)) is None
 
     # A 90-degree rotation swaps the axes, same as the module docstring says.
     rotated = Quartz.CGAffineTransformMake(0.0, 1.0, -1.0, 0.0, 0.0, 0.0)

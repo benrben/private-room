@@ -38,7 +38,7 @@
  * mid-UTF-8-byte.
  */
 
-import { foldEditChar } from "./editMatchExtraction.js";
+import { foldEditChar, type FoldOut } from "./editMatchExtraction.js";
 
 /**
  * A collapsed whitespace run that spans a paragraph break (2+ newlines)
@@ -85,59 +85,81 @@ function splitsALigature(spans: readonly Span[], first: number, last: number): b
   return beginsMid || endsMid;
 }
 
+interface PendingWhitespace {
+  start: number;
+  end: number;
+  newlines: number;
+}
+
+function appendWhitespace(
+  pending: PendingWhitespace | null,
+  start: number,
+  end: number,
+  sourceChar: string,
+): PendingWhitespace {
+  const newlines = sourceChar === "\n" ? 1 : 0;
+  if (pending === null) return { start, end, newlines };
+  return { start: pending.start, end, newlines: pending.newlines + newlines };
+}
+
+function flushWhitespace(
+  pending: PendingWhitespace | null,
+  chars: string[],
+  spans: Span[],
+): null {
+  if (pending !== null) {
+    chars.push(pending.newlines >= 2 ? PARA_SENTINEL : " ");
+    spans.push([pending.start, pending.end]);
+  }
+  return null;
+}
+
+function appendFoldedChar(chars: string[], spans: Span[], value: string, start: number, end: number): void {
+  chars.push(value);
+  spans.push([start, end]);
+}
+
+function appendFoldedPair(
+  chars: string[],
+  spans: Span[],
+  first: string,
+  second: string,
+  start: number,
+  end: number,
+): void {
+  appendFoldedChar(chars, spans, first, start, end);
+  appendFoldedChar(chars, spans, second, start, end);
+}
+
 /** Ported verbatim from `edit_match::normalize_with_spans`. */
 export function normalizeWithSpans(text: string): NormText {
   const chars: string[] = [];
   const spans: Span[] = [];
   // Pending whitespace run: start, end (exclusive) and newline count.
-  let wsStart = -1;
-  let wsEnd = -1;
-  let wsNewlines = 0;
-  const flushWs = (): void => {
-    if (wsStart !== -1) {
-      chars.push(wsNewlines >= 2 ? PARA_SENTINEL : " ");
-      spans.push([wsStart, wsEnd]);
-      wsStart = -1;
-      wsEnd = -1;
-      wsNewlines = 0;
-    }
-  };
+  let whitespace: PendingWhitespace | null = null;
   let i = 0;
   for (const c of text) {
     const end = i + c.length;
     const fold = foldEditChar(c);
     switch (fold.kind) {
-      case "space": {
-        const nl = c === "\n" ? 1 : 0;
-        if (wsStart === -1) {
-          wsStart = i;
-          wsEnd = end;
-          wsNewlines = nl;
-        } else {
-          wsEnd = end;
-          wsNewlines += nl;
-        }
+      case "space":
+        whitespace = appendWhitespace(whitespace, i, end, c);
         break;
-      }
       case "drop":
         break;
       case "char":
-        flushWs();
-        chars.push(fold.c);
-        spans.push([i, end]);
+        whitespace = flushWhitespace(whitespace, chars, spans);
+        appendFoldedChar(chars, spans, fold.c, i, end);
         break;
       case "pair":
-        flushWs();
+        whitespace = flushWhitespace(whitespace, chars, spans);
         // Both halves map back to the SAME source char span.
-        chars.push(fold.a);
-        spans.push([i, end]);
-        chars.push(fold.b);
-        spans.push([i, end]);
+        appendFoldedPair(chars, spans, fold.a, fold.b, i, end);
         break;
     }
     i = end;
   }
-  flushWs();
+  flushWhitespace(whitespace, chars, spans);
   return { chars, spans };
 }
 
@@ -150,33 +172,32 @@ export function normalizeWithSpans(text: string): NormText {
  * The three are observationally identical; the Rust source keeps all three,
  * one per matcher, and so does this port.
  */
+function emitPendingSpace(out: string[], pending: boolean): void {
+  if (pending) out.push(" ");
+}
+
+function appendNeedleFold(out: string[], pending: boolean, fold: FoldOut): boolean {
+  switch (fold.kind) {
+    case "space":
+      return out.length > 0;
+    case "drop":
+      return pending;
+    case "char":
+      emitPendingSpace(out, pending);
+      out.push(fold.c);
+      return false;
+    case "pair":
+      emitPendingSpace(out, pending);
+      out.push(fold.a, fold.b);
+      return false;
+  }
+}
+
 export function normalizeNeedle(s: string): string[] {
   const out: string[] = [];
   let pendingSpace = false;
   for (const c of s) {
-    const fold = foldEditChar(c);
-    switch (fold.kind) {
-      case "space":
-        pendingSpace = out.length > 0;
-        break;
-      case "drop":
-        break;
-      case "char":
-        if (pendingSpace) {
-          out.push(" ");
-          pendingSpace = false;
-        }
-        out.push(fold.c);
-        break;
-      case "pair":
-        if (pendingSpace) {
-          out.push(" ");
-          pendingSpace = false;
-        }
-        out.push(fold.a);
-        out.push(fold.b);
-        break;
-    }
+    pendingSpace = appendNeedleFold(out, pendingSpace, foldEditChar(c));
   }
   return out;
 }
@@ -204,6 +225,41 @@ function sliceEquals(hay: readonly string[], at: number, needle: readonly string
   return true;
 }
 
+interface FuzzyMatchScan {
+  first: number;
+  count: number;
+}
+
+function matchesNeedleAt(hay: NormText, needle: readonly string[], at: number): boolean {
+  return sliceEquals(hay.chars, at, needle) && !splitsALigature(hay.spans, at, at + needle.length - 1);
+}
+
+function scanMatches(hay: NormText, needle: readonly string[]): FuzzyMatchScan {
+  let first = -1;
+  let count = 0;
+  let at = 0;
+  while (at + needle.length <= hay.chars.length) {
+    if (matchesNeedleAt(hay, needle, at)) {
+      count += 1;
+      if (first === -1) first = at;
+      at += needle.length;
+    } else {
+      at += 1;
+    }
+  }
+  return { first, count };
+}
+
+function fuzzyResult(hay: NormText, needle: readonly string[], scan: FuzzyMatchScan): FuzzyFind {
+  if (scan.count === 0) return NOT_FOUND;
+  if (scan.count !== 1 || scan.first === -1) return { kind: "ambiguous", count: scan.count };
+  return {
+    kind: "unique",
+    start: hay.spans[scan.first]![0],
+    end: hay.spans[scan.first + needle.length - 1]![1],
+  };
+}
+
 /**
  * Scan `content` for `oldText` tolerant of the fold table, requiring a UNIQUE
  * hit. Counts NON-OVERLAPPING matches (the same advance discipline as the
@@ -213,34 +269,8 @@ function sliceEquals(hay: readonly string[], at: number, needle: readonly string
  */
 export function fuzzyFind(content: string, oldText: string): FuzzyFind {
   const needle = normalizeNeedle(oldText);
-  if (needle.length === 0) {
-    return NOT_FOUND;
-  }
+  if (needle.length === 0) return NOT_FOUND;
   const hay = normalizeWithSpans(content);
-  const h = hay.chars;
-  const n = needle.length;
-  if (h.length < n) {
-    return NOT_FOUND;
-  }
-  let first = -1;
-  let count = 0;
-  let i = 0;
-  while (i + n <= h.length) {
-    if (sliceEquals(h, i, needle) && !splitsALigature(hay.spans, i, i + n - 1)) {
-      count += 1;
-      if (first === -1) {
-        first = i;
-      }
-      i += n; // non-overlapping
-    } else {
-      i += 1;
-    }
-  }
-  if (count === 1 && first !== -1) {
-    return { kind: "unique", start: hay.spans[first]![0], end: hay.spans[first + n - 1]![1] };
-  }
-  if (count === 0) {
-    return NOT_FOUND;
-  }
-  return { kind: "ambiguous", count };
+  if (hay.chars.length < needle.length) return NOT_FOUND;
+  return fuzzyResult(hay, needle, scanMatches(hay, needle));
 }

@@ -41,6 +41,35 @@ function fact(label: string, value: string | null): MediaFact {
     : { label, value, known: true };
 }
 
+function durationValue(meta: MediaMeta | null, playerDurationSecs: number | null): string | null {
+  const duration = meta?.durationSecs ?? playerDurationSecs;
+  return duration == null ? null : formatDuration(duration);
+}
+
+function sizeValue(meta: MediaMeta | null): string | null {
+  if (meta?.width == null || meta.height == null) return null;
+  return `${meta.width} × ${meta.height}`;
+}
+
+function audioValue(meta: MediaMeta | null): string | null {
+  if (meta?.hasAudio === false) return "none";
+  return meta?.hasAudio === true ? meta.audioCodec ?? "yes" : null;
+}
+
+function standardVideoFacts(meta: MediaMeta | null, playerDurationSecs: number | null): MediaFact[] {
+  return [
+    fact("Length", durationValue(meta, playerDurationSecs)),
+    fact("Size", sizeValue(meta)),
+    fact("Video", meta?.videoCodec ?? null),
+    fact("Frame rate", meta?.frameRate != null ? formatFps(meta.frameRate) : null),
+    fact("Audio", audioValue(meta)),
+  ];
+}
+
+function bitrateFact(meta: MediaMeta | null): MediaFact | null {
+  return meta?.bitrateKbps != null ? fact("Bitrate", `${meta.bitrateKbps} kbps`) : null;
+}
+
 /**
  * The technical facts to show for a video.
  *
@@ -53,31 +82,23 @@ export function videoFacts(
   meta: MediaMeta | null,
   playerDurationSecs: number | null,
 ): MediaFact[] {
-  const duration = meta?.durationSecs ?? playerDurationSecs;
-  const size =
-    meta?.width != null && meta.height != null
-      ? `${meta.width} × ${meta.height}`
-      : null;
-  // `hasAudio === false` is a FINDING — "this video is silent" — and must not
-  // be flattened into the same "unknown" that `null` means.
-  let audio: string | null = null;
-  if (meta?.hasAudio === false) audio = "none";
-  else if (meta?.hasAudio === true) audio = meta.audioCodec ?? "yes";
-
-  const facts: MediaFact[] = [
-    fact("Length", duration != null ? formatDuration(duration) : null),
-    fact("Size", size),
-    fact("Video", meta?.videoCodec ?? null),
-    fact("Frame rate", meta?.frameRate != null ? formatFps(meta.frameRate) : null),
-    fact("Audio", audio),
-  ];
+  const facts = standardVideoFacts(meta, playerDurationSecs);
   // Bitrate is not one of the five things a person opens a video to check, so
   // it appears only when the file actually stated it — a sixth "unknown" would
   // cost more attention than the field is worth.
-  if (meta?.bitrateKbps != null) {
-    facts.push(fact("Bitrate", `${meta.bitrateKbps} kbps`));
-  }
-  return facts;
+  const bitrate = bitrateFact(meta);
+  return bitrate === null ? facts : [...facts, bitrate];
+}
+
+function usableSpan(start: number | null, end: number | null): number | null {
+  if (start == null || end == null) return null;
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  const seconds = end - start;
+  return seconds >= 0.1 ? seconds : null;
+}
+
+function spanLength(seconds: number): string {
+  return Number.isInteger(seconds) ? `${seconds}s` : `${seconds.toFixed(1)}s`;
 }
 
 /** How a trim span reads in the button: "0:07 → 0:19 (12s)". Returns null when
@@ -86,13 +107,10 @@ export function describeSpan(
   start: number | null,
   end: number | null,
 ): string | null {
-  if (start == null || end == null) return null;
-  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
-  if (end - start < 0.1) return null;
-  const secs = end - start;
+  const seconds = usableSpan(start, end);
+  if (seconds === null || start === null || end === null) return null;
   // Not rounded to whole seconds: this label says what the button is about to
   // cut, and "12s" for an 11.7s span is a small lie in the one place the user
   // is checking the numbers.
-  const length = Number.isInteger(secs) ? `${secs}s` : `${secs.toFixed(1)}s`;
-  return `${formatDuration(start)} → ${formatDuration(end)} (${length})`;
+  return `${formatDuration(start)} → ${formatDuration(end)} (${spanLength(seconds)})`;
 }

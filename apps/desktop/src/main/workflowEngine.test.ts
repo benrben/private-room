@@ -68,6 +68,7 @@ import {
   PER_FILE_CHARS,
   resolveFiles,
   ROOM_GONE,
+  runWorkflowNode,
   saveFileNode,
   sidecarJsonCancellableRun,
   storeWfArtifact,
@@ -484,6 +485,13 @@ describe("wfGenerate", () => {
 });
 
 describe("wfNodeValue / wfNode", () => {
+  it("maps a workflow-node sidecar error through the shared model sentinel", async () => {
+    await expect(wfNodeValue(
+      async () => ({ kind: "error", error: { code: "MODEL_MISSING", error: "gone", status: 404 } }),
+      "vote", "missing-model", "job", 0, "cpu", {}, new CancelFlag(),
+    )).rejects.toThrow("MODEL_MISSING:missing-model");
+  });
+
   it("the sidecar's own stopped answer maps to the same STOPPED sentinel", async () => {
     await expect(
       wfNodeValue(valueWfNodePost({ stopped: true }), "vote", "m", "job", 0, "cpu", {}, new CancelFlag())
@@ -583,6 +591,24 @@ describe("sidecarJsonCancellableRun", () => {
       // torn down explicitly or `close()` waits for it.
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("stays stopped when best-effort cancel delivery cannot reach the sidecar", async () => {
+    const cancel = new CancelFlag();
+    vi.mocked(ensureUp)
+      .mockResolvedValueOnce("http://offline.test")
+      .mockRejectedValueOnce(new Error("fabricated sidecar outage"));
+    vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+    })));
+    try {
+      const pending = sidecarJsonCancellableRun("/wf_node", {}, cancel, "job-offline:0", 2_000);
+      setTimeout(() => cancel.store(true), 10);
+      await expect(pending).resolves.toEqual({ kind: "stopped" });
+      expect(ensureUp).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.unstubAllGlobals();
     }
   });
 });
@@ -774,6 +800,12 @@ describe("countNewFiles", () => {
     expect(countNewFiles(rooms, roomPath, "9999-01-01")).toBe(0);
     rooms.swapTo(null);
     expect(countNewFiles(rooms, roomPath, "1970-01-01")).toBe(0);
+  });
+
+  it("degrades to zero when the pinned room connection cannot be queried", () => {
+    const { rooms, db, path: roomPath } = freshRoom();
+    db.close();
+    expect(countNewFiles(rooms, roomPath, null)).toBe(0);
   });
 });
 
@@ -1565,6 +1597,52 @@ describe("executeWorkflowStep — script_run (through the REAL scriptRun.ts runn
     expect(loadWfArtifact(db, "job1", 0)?.result).toBe("ran");
   });
 
+  it("preserves an execution failure when the approved script bytes still match", async () => {
+    const { rooms, db, path: roomPath } = freshRoom();
+    const bytes = Buffer.from("print(1)");
+    const file = insertFile(db, "s.py", "text/x-python", bytes, "print(1)", "upload");
+    const deps = baseDeps(rooms, { scriptExecute: async () => { throw new Error("fabricated runner failure"); } });
+    const step = makeStep(0, { id: "sc", label: "", kind: "script_run", file: file.id, mode: "import" });
+    const plan = makePlan({ script_consents: new Map([[file.id, scriptFingerprint(bytes)]]) });
+
+    const { result } = await runStep(deps, "job1", roomPath, plan, step);
+
+    expect(errorOf(result)).toBe("fabricated runner failure");
+  });
+
+  it("reports ROOM_GONE when the room closes before a script node resolves its file", async () => {
+    const { rooms, db, path: roomPath } = freshRoom();
+    const bytes = Buffer.from("print(1)");
+    const file = insertFile(db, "s.py", "text/x-python", bytes, "print(1)", "upload");
+    const step = makeStep(0, { id: "sc", label: "", kind: "script_run", file: file.id, mode: "import" });
+    rooms.swapTo(null);
+    const { result } = await runStep(baseDeps(rooms), "job1", roomPath, makePlan(), step);
+    expect(errorOf(result)).toBe(ROOM_GONE);
+  });
+
+  it("reports ROOM_GONE when the room closes at the script resolver boundary", async () => {
+    const { rooms, db, path: roomPath } = freshRoom();
+    const open = rooms.current();
+    const bytes = Buffer.from("print(1)");
+    const file = insertFile(db, "late-close.py", "text/x-python", bytes, "print(1)", "upload");
+    let reads = 0;
+    const closesAtResolver: RoomSource = {
+      current: () => (++reads < 4 ? open : null),
+    };
+    const step = makeStep(0, {
+      id: "sc-late-close",
+      label: "",
+      kind: "script_run",
+      file: file.id,
+      mode: "import",
+    });
+
+    const { result } = await runStep(baseDeps(closesAtResolver), "job-late-close", roomPath, makePlan(), step);
+
+    expect(errorOf(result)).toBe(ROOM_GONE);
+    expect(reads).toBeGreaterThanOrEqual(4);
+  });
+
   it("an unapproved script PARKS (NEEDS_APPROVAL), which is not the same as a failure", async () => {
     const { rooms, db, path: roomPath } = freshRoom();
     const bytes = Buffer.from("print(1)");
@@ -1661,6 +1739,15 @@ describe("executeWorkflowStep — the one funnel that owns the diagram", () => {
     expect(seen).toEqual([]);
   });
 
+  it("the direct executor keeps its exhaustive-node refusal", async () => {
+    const { rooms, path: roomPath } = freshRoom();
+    const step = makeStep(0, { id: "valid-step", label: "", kind: "transform", op: "upper", find: null, value: null });
+    const unknown = { id: "unknown", label: "", kind: "not_a_workflow_node" } as unknown as WorkflowNode;
+    await expect(
+      runWorkflowNode(baseDeps(rooms), "job1", roomPath, makePlan(), step, new CancelFlag(), ref(), unknown)
+    ).rejects.toThrow("internal: unhandled node kind");
+  });
+
   it("a NEEDS_APPROVAL park is STRIPPED for the diagram but KEPT in the returned error", async () => {
     const { rooms, path: roomPath } = freshRoom();
     const { emit, seen } = events();
@@ -1703,6 +1790,19 @@ describe("executeWorkflowStep — the one funnel that owns the diagram", () => {
     const { result } = await runStep(baseDeps(rooms, { emit }), "job1", roomPath, makePlan(), step);
     expect(errorOf(result)).toBe(ROOM_GONE);
     expect(seen.map((e) => e.status)).toEqual(["running", "error"]);
+  });
+
+  it("a room that closes after node work cannot checkpoint an artifact", async () => {
+    const { rooms, path: roomPath } = freshRoom();
+    const deps = baseDeps(rooms, {
+      agentRun: async () => {
+        rooms.swapTo(null);
+        return "finished too late";
+      },
+    });
+    const step = makeStep(0, { id: "a", label: "", kind: "agent_run", question: "q" });
+    const { result } = await runStep(deps, "job1", roomPath, makePlan(), step);
+    expect(result).toEqual({ ok: false, error: ROOM_GONE });
   });
 });
 

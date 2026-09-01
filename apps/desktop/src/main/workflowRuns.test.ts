@@ -489,6 +489,16 @@ describe("planToWire / wireToPlan", () => {
     (badLane["steps"] as Array<Record<string, unknown>>)[0]!["lane"] = "gpu";
     expect(() => wireToPlan(badLane)).toThrow(WORKFLOW_PLAN_UNREADABLE);
   });
+
+  it("refuses malformed optional plan fields and a non-array step list", () => {
+    const badOptional = planToWire(samplePlan()) as Record<string, unknown>;
+    badOptional["input_file_id"] = 42;
+    expect(() => wireToPlan(badOptional)).toThrow(WORKFLOW_PLAN_UNREADABLE);
+
+    const badSteps = planToWire(samplePlan()) as Record<string, unknown>;
+    badSteps["steps"] = {};
+    expect(() => wireToPlan(badSteps)).toThrow(WORKFLOW_PLAN_UNREADABLE);
+  });
 });
 
 // ============================================================================
@@ -2214,3 +2224,393 @@ describe("adversarial: two triggers fired without awaiting between them", () => 
     await waitUntil(() => settled(db, manual));
   });
 });
+
+describe("workflow run fallback paths", () => {
+  it("rejects every newly-split malformed stored-step shape with the workflow-plan sentence", () => {
+    const { db } = freshRoom();
+    const { plan } = planFor(db, upperTransformDef());
+    const wire = planToWire(plan) as Record<string, unknown>;
+
+    const unreadable = (mutate: (value: Record<string, unknown>) => void): void => {
+      const value = JSON.parse(JSON.stringify(wire)) as Record<string, unknown>;
+      mutate(value);
+      expect(() => wireToPlan(value)).toThrow(WORKFLOW_PLAN_UNREADABLE);
+    };
+
+    unreadable((value) => {
+      value.steps = [null];
+    });
+    unreadable((value) => {
+      delete (value.steps as Array<Record<string, unknown>>)[0]!.depends_on;
+    });
+    unreadable((value) => {
+      (value.steps as Array<Record<string, unknown>>)[0]!.id = "not-a-number";
+    });
+    unreadable((value) => {
+      (value.steps as Array<Record<string, unknown>>)[0]!.kind = null;
+    });
+    const nullConsents = JSON.parse(JSON.stringify(wire)) as Record<string, unknown>;
+    nullConsents.script_consents = null;
+    expect(wireToPlan(nullConsents).script_consents).toEqual(new Map());
+  });
+
+  it("keeps the recovery helpers best-effort when their database read or cleanup fails", () => {
+    const throwingDb = {
+      prepare: () => {
+        throw new Error("database closed");
+      },
+    } as unknown as Database.Database;
+    expect(previousRunAt(throwingDb, "wf")).toBeNull();
+    expect(hasInflightRun(throwingDb, "wf")).toBe(false);
+    expect(() => retireParkedJobs(throwingDb, "wf")).not.toThrow();
+
+    const runRow = ["run", "wf", "job", "manual", "running", null, null, "now", null];
+    const jobRow = ["job", "workflow", "title", "{}", "{}", 0, 1, "paused", null, null, null, "now", "now"];
+    const missingJobDb = fakeWorkflowDb(runRow, null, false);
+    expect(hasInflightRun(missingJobDb, "wf")).toBe(false);
+    expect(() => retireParkedJobs(missingJobDb, "wf")).not.toThrow();
+
+    const deleteFailureDb = fakeWorkflowDb(runRow, jobRow, true);
+    expect(() => retireParkedJobs(deleteFailureDb, "wf")).not.toThrow();
+
+    const nullJobDb = fakeWorkflowDb(["run", "wf", null, "manual", "running", null, null, "now", null], null, false);
+    expect(() => retireParkedJobs(nullJobDb, "wf")).not.toThrow();
+  });
+
+  it("treats a non-object checkpoint as an empty done set when a stored workflow row resumes", async () => {
+    const { db, path: roomPath } = freshRoom();
+    const { plan } = planFor(db, upperTransformDef());
+    const jobId = createJob(db, "workflow", "Workflow — W", planToWire(plan), plan.steps.length);
+    createWorkflowRun(db, plan.workflow_id, jobId, "manual", null);
+    const rooms = new OneRoom({ db, path: roomPath });
+    const { sink } = fakeSink();
+    const starter = workflowRowStarter({ cacheDir: tempDir("wf-null-state-") });
+    const started = await starter(
+      { state: createJobQueueState(), rooms, sink, cancelState: createCancelState(), starters: new Map() },
+      { ...getJob(db, jobId), state: null },
+      roomPath,
+      new CancelFlag()
+    );
+    expect(started).toEqual({ kind: "runner" });
+    await waitUntil(() => settled(db, jobId));
+  });
+
+  it("keeps runner lifecycle events flowing when status writes, checkpoints, or parked reasons cannot persist", async () => {
+    const { db, path: roomPath } = freshRoom();
+    const empty = planFor(db, upperTransformDef()).plan;
+    const { deps: statusDeps } = makeRunnerDeps(db, roomPath);
+    const statusFailureDb = {
+      prepare: () => {
+        throw new Error("status write refused");
+      },
+    } as unknown as Database.Database;
+    await spawnWorkflowJob(
+      { ...statusDeps, rooms: new OneRoom({ db: statusFailureDb, path: roomPath }) },
+      "missing-job",
+      roomPath,
+      { ...empty, steps: [] },
+      new Set(),
+      new CancelFlag()
+    );
+
+    let roomGoneAfterArtifact = false;
+    const checkpointDb = proxyDatabase(db, (sql, statement) => {
+      if (!sql.includes("INSERT OR REPLACE INTO job_artifacts")) {
+        return statement;
+      }
+      return proxyStatement(statement, (...args: unknown[]) => {
+        const result = statement.run(...args);
+        roomGoneAfterArtifact = true;
+        return result;
+      });
+    });
+    const checkpointPlan = planFor(db, upperTransformDef());
+    const { deps: checkpointDeps } = makeRunnerDeps(db, roomPath);
+    const disappearingRooms: RoomSource = {
+      current: () => (roomGoneAfterArtifact ? null : { db: checkpointDb, path: roomPath }),
+    };
+    await spawnWorkflowJob(
+      { ...checkpointDeps, rooms: disappearingRooms },
+      checkpointPlan.jobId,
+      roomPath,
+      checkpointPlan.plan,
+      new Set(),
+      new CancelFlag()
+    );
+
+    // A checkpoint may also fail while the room remains open (for example, a
+    // transient encrypted-DB write failure). The runner must still finish and
+    // release its queue slot; checkpoints are deliberately best-effort.
+    const checkpointWriteFailureDb = proxyDatabase(db, (sql, statement) =>
+      sql.includes("UPDATE jobs SET cursor")
+        ? proxyStatement(statement, () => {
+            throw new Error("checkpoint write refused");
+          })
+        : statement
+    );
+    const checkpointWriteFailurePlan = planFor(db, upperTransformDef());
+    const { deps: checkpointWriteFailureDeps, settledJobs } = makeRunnerDeps(db, roomPath);
+    await spawnWorkflowJob(
+      {
+        ...checkpointWriteFailureDeps,
+        rooms: new OneRoom({ db: checkpointWriteFailureDb, path: roomPath }),
+      },
+      checkpointWriteFailurePlan.jobId,
+      roomPath,
+      checkpointWriteFailurePlan.plan,
+      new Set(),
+      new CancelFlag()
+    );
+    expect(settledJobs).toEqual([checkpointWriteFailurePlan.jobId]);
+    expect(getJob(db, checkpointWriteFailurePlan.jobId).status).toBe("done");
+
+    const script = insertFile(db, "pause.py", "text/x-python", Buffer.from("print('hi')\n"), "print('hi')\n", "upload");
+    const parkedPlan = planFor(db, scriptDef(script.id));
+    const parkedDb = proxyDatabase(db, (sql, statement) =>
+      sql.includes("UPDATE jobs SET parked_reason")
+        ? proxyStatement(statement, () => {
+            throw new Error("parked reason write refused");
+          })
+        : statement
+    );
+    const { deps: parkedDeps } = makeRunnerDeps(db, roomPath);
+    await spawnWorkflowJob(
+      { ...parkedDeps, rooms: new OneRoom({ db: parkedDb, path: roomPath }) },
+      parkedPlan.jobId,
+      roomPath,
+      parkedPlan.plan,
+      new Set(),
+      new CancelFlag()
+    );
+  });
+
+  it("preserves no-room and unreadable-definition errors through every public run entrypoint", async () => {
+    const base = baseRunDeps();
+    base.rooms.swapTo(null);
+    await expect(runWorkflowCommand(base.deps, "wf", null)).rejects.toThrow("No room is open.");
+    await expect(agentRunWorkflow(base.deps, { name_or_id: "wf" })).rejects.toThrow("No room is open.");
+    await expect(agentTestWorkflow(base.deps, { name_or_id: "wf" })).rejects.toThrow("No room is open.");
+
+    const readable = baseRunDeps();
+    const bad = createWorkflow(readable.db, "Broken", "", "", { nope: true }, "user", { scope: "general" });
+    await expect(runWorkflowCommand(readable.deps, bad, null)).rejects.toThrow(DEFINITION_UNREADABLE);
+
+    const changing = baseRunDeps();
+    const id = createWorkflow(changing.db, "Changes room", "", "", upperTransformDef(), "user", { scope: "general" });
+    await expect(
+      startWorkflowRun(
+        {
+          ...changing.deps,
+          listModels: async () => {
+            changing.rooms.swapTo(null);
+            return [];
+          },
+        },
+        id,
+        "manual",
+        null,
+        new Set()
+      )
+    ).rejects.toThrow("No room is open.");
+  });
+
+  it("keeps non-script files and extracted input files on their established manual-run paths", async () => {
+    const { deps, db } = baseRunDeps();
+    const text = insertFile(db, "plain.txt", "text/plain", Buffer.from("hello"), "hello", "upload");
+    const script = createWorkflow(db, "Plain script", "", "", scriptDef(text.id), "user", { scope: "general" });
+    await expect(runWorkflowCommand(deps, script, null)).resolves.toBeTruthy();
+
+    const missing = createWorkflow(db, "Missing script", "", "", scriptDef("missing-file"), "user", { scope: "general" });
+    await expect(runWorkflowCommand(deps, missing, null)).resolves.toBeTruthy();
+
+    const transform = createWorkflow(db, "Uses selected file", "", "", upperTransformDef(), "user", { scope: "general" });
+    await expect(runWorkflowCommand(deps, transform, text.id)).resolves.toBeTruthy();
+  });
+
+  it("uses the default test sleeper while waiting for a real workflow run", async () => {
+    const { deps, db } = baseRunDeps({
+      fetchPage: async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+        return { title: "T", text: "B", finalUrl: "https://example.test/page", status: 200 };
+      },
+    });
+    const id = createWorkflow(db, "Fetcher", "", "", fetchChainDef(), "user", { scope: "general" });
+    const text = await agentTestWorkflow({ ...deps, testTimeoutMs: 800 }, { name_or_id: id });
+    expect(text).toContain("SUCCESS — every step ran.");
+  });
+
+  it("reports a missing named test input and an agent test refused by the queue cap", async () => {
+    const input = baseRunDeps();
+    const bound = createWorkflow(input.db, "Bound", "", "", runInputDef(), "user", FILE_BINDING);
+    await expect(agentTestWorkflow(input.deps, { name_or_id: bound, file: "not-in-this-room" })).rejects.toThrow(
+      /No source file matching/
+    );
+
+    const full = baseRunDeps();
+    for (let i = 0; i < 10; i++) {
+      createJob(full.db, "other", `queued ${i}`, {}, 1);
+    }
+    const id = createWorkflow(full.db, "Full queue", "", "", upperTransformDef(), "user", { scope: "general" });
+    await expect(agentTestWorkflow(full.deps, { name_or_id: id })).rejects.toThrow("Couldn't start a test run");
+  });
+
+  it("reports a paused test without inventing a reason after cancellation", async () => {
+    const g = gate();
+    const base = baseRunDeps({
+      fetchPage: async () => {
+        await g.wait;
+        return { title: "T", text: "B", finalUrl: "https://example.test/page", status: 200 };
+      },
+    });
+    const id = createWorkflow(base.db, "Fetcher", "", "", fetchChainDef(), "user", { scope: "general" });
+    const deps: AgentTestWorkflowDeps = {
+      ...base.deps,
+      testTimeoutMs: 0,
+      sleepMs: async (ms: number) => {
+        if (ms === 1500) {
+          g.open();
+          const jobId = listWorkflowRuns(base.db, id)[0]?.jobId as string;
+          await waitUntil(() => settled(base.db, jobId));
+        }
+      },
+    };
+    const text = await agentTestWorkflow(deps, { name_or_id: id });
+    expect(text).toContain("PAUSED — it was stopped before finishing. Nothing failed.");
+  });
+
+  it("uses an unreadable artifact fallback and a truthful no-room partial report", async () => {
+    const base = baseRunDeps({
+      fetchPage: async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        return { title: "T", text: "B", finalUrl: "https://example.test/page", status: 200 };
+      },
+    });
+    const id = createWorkflow(base.db, "Fetcher", "", "", fetchChainDef(), "user", { scope: "general" });
+    let replaced = false;
+    const malformedDeps: AgentTestWorkflowDeps = {
+      ...base.deps,
+      testTimeoutMs: 500,
+      sleepMs: async () => {
+        const jobId = listWorkflowRuns(base.db, id)[0]?.jobId;
+        if (jobId !== undefined) {
+          await waitUntil(() => settled(base.db, jobId));
+          if (!replaced) {
+            putJobArtifact(base.db, jobId, 0, "not JSON");
+            replaced = true;
+          }
+        }
+      },
+    };
+    const malformed = await agentTestWorkflow(malformedDeps, { name_or_id: id });
+    expect(malformed).toContain("(no output)");
+
+    const roomless = baseRunDeps({
+      fetchPage: async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        return { title: "T", text: "B", finalUrl: "https://example.test/page", status: 200 };
+      },
+    });
+    const roomlessId = createWorkflow(roomless.db, "Roomless", "", "", fetchChainDef(), "user", { scope: "general" });
+    const roomlessDeps: AgentTestWorkflowDeps = {
+      ...roomless.deps,
+      testTimeoutMs: 0,
+      sleepMs: async () => {
+        const jobId = listWorkflowRuns(roomless.db, roomlessId)[0]?.jobId as string;
+        await waitUntil(() => settled(roomless.db, jobId));
+        roomless.rooms.swapTo(null);
+      },
+    };
+    const partial = await agentTestWorkflow(roomlessDeps, { name_or_id: roomlessId });
+    expect(partial).toContain("still running after");
+    expect(partial).toContain("(did not run)");
+  });
+
+  it("degrades a swapped broken room to an honest timeout without reading its job or artifacts", async () => {
+    const g = gate();
+    const base = baseRunDeps({
+      fetchPage: async () => {
+        await g.wait;
+        return { title: "T", text: "B", finalUrl: "https://example.test/page", status: 200 };
+      },
+    });
+    const id = createWorkflow(base.db, "Broken room", "", "", fetchChainDef(), "user", { scope: "general" });
+    const brokenDb = {
+      prepare: () => {
+        throw new Error("room connection closed");
+      },
+    } as unknown as Database.Database;
+    const deps: AgentTestWorkflowDeps = {
+      ...base.deps,
+      testTimeoutMs: 10,
+      sleepMs: async (ms: number) => {
+        if (ms === 400) {
+          base.rooms.swapTo({ db: brokenDb, path: base.roomPath });
+        }
+        if (ms === 1500) {
+          g.open();
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 3));
+      },
+    };
+    const text = await agentTestWorkflow(deps, { name_or_id: id });
+    expect(text).toContain("still running after");
+    expect(text).toContain("(did not run)");
+  });
+});
+
+function fakeWorkflowDb(
+  workflowRunRow: readonly unknown[],
+  jobRow: readonly unknown[] | null,
+  failJobDelete: boolean
+): Database.Database {
+  const statement = {
+    raw: () => statement,
+    all: () => [workflowRunRow],
+    get: () => {
+      if (jobRow === null) {
+        throw new Error("missing job");
+      }
+      return jobRow;
+    },
+    run: () => {
+      if (failJobDelete) {
+        throw new Error("database closed during delete");
+      }
+      return { changes: 0 };
+    },
+  };
+  return { prepare: () => statement } as unknown as Database.Database;
+}
+
+interface PreparedStatementLike {
+  run(...values: unknown[]): unknown;
+}
+
+function proxyStatement(
+  statement: PreparedStatementLike,
+  run: (...values: unknown[]) => unknown
+): PreparedStatementLike {
+  return new Proxy(statement, {
+    get(target, property, receiver) {
+      if (property === "run") {
+        return run;
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function proxyDatabase(
+  db: Database.Database,
+  intercept: (sql: string, statement: PreparedStatementLike) => PreparedStatementLike
+): Database.Database {
+  return new Proxy(db, {
+    get(target, property, receiver) {
+      if (property !== "prepare") {
+        return Reflect.get(target, property, receiver);
+      }
+      return (sql: string): PreparedStatementLike => intercept(sql, target.prepare(sql) as unknown as PreparedStatementLike);
+    },
+  }) as Database.Database;
+}

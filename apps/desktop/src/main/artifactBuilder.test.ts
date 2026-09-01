@@ -32,9 +32,10 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { CancelFlag, Node } from "./cancel.js";
@@ -44,6 +45,8 @@ import { fileProvenance } from "./db-host/artifacts.js";
 import { getFileExtractedText, insertFile, listFiles } from "./db-host/files.js";
 import { listFileVersions } from "./db-host/fileVersionsList.js";
 import { restoreVersionInto } from "./safetyTools.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 
 let tmpDir: string | null = null;
 let open: Database.Database | null = null;
@@ -62,6 +65,42 @@ function freshRoom(): Database.Database {
   const roomPath = path.join(tmpDir, `pr-test-${randomUUID()}.roomai`);
   open = createRoom(roomPath, "correct horse battery staple", "Test Room");
   return open;
+}
+
+function freshWorkspace(): { db: Database.Database; root: string; workspace: WorkspaceService } {
+  tmpDir = mkdtempSync(path.join(os.tmpdir(), "artifact-builder-workspace-"));
+  const root = path.join(tmpDir, "Room");
+  const created = createWorkspaceRoom(root, "correct horse battery staple", "Test Room");
+  open = created.db;
+  return { db: created.db, root, workspace: new WorkspaceService(created.db, root) };
+}
+
+function stagedCount(db: Database.Database): number {
+  return (db.prepare("SELECT count(*) AS count FROM staged_artifacts").get() as { count: number }).count;
+}
+
+function databaseWithFailingStagedDiscard(db: Database.Database): Database.Database {
+  return new Proxy(db, {
+    get(target, property, receiver) {
+      if (property === "prepare") {
+        return (sql: string) => {
+          const statement = target.prepare(sql);
+          if (sql !== "DELETE FROM staged_artifacts WHERE id = ?") return statement;
+          return new Proxy(statement, {
+            get(stagedStatement, stagedProperty, stagedReceiver) {
+              if (stagedProperty === "run") {
+                return () => { throw new Error("staging cleanup unavailable"); };
+              }
+              const value = Reflect.get(stagedStatement, stagedProperty, stagedReceiver);
+              return typeof value === "function" ? value.bind(stagedStatement) : value;
+            },
+          });
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
 
 describe("Artifact.commit", () => {
@@ -305,5 +344,99 @@ describe("Artifact.commit", () => {
       fileProvenance(db, mine.id),
       "no run wrote what is on screen now, so nothing is credited"
     ).toBeNull();
+  });
+
+  it("cleans up staging when the legacy commit route refuses a workspace database", () => {
+    const { db } = freshWorkspace();
+
+    expect(() => Artifact.new("Plan.md", "text/markdown", "body").commit(db)).toThrow(
+      "Workspace artifacts must be committed through commitToWorkspace.",
+    );
+    expect(stagedCount(db)).toBe(0);
+  });
+
+  it("reports a cancelled write even when best-effort staging cleanup fails", () => {
+    const db = freshRoom();
+    const stop = new CancelFlag();
+    stop.store(true);
+
+    expect(() => Artifact.new("Stopped.md", "text/markdown", "body")
+      .cancelWith(stop)
+      .commit(databaseWithFailingStagedDiscard(db))).toThrow(/nothing was written/);
+    expect(stagedCount(db)).toBe(1);
+  });
+});
+
+describe("Artifact.commitToWorkspace", () => {
+  it("keeps cancellation between staging and the workspace write", async () => {
+    const { db, workspace } = freshWorkspace();
+    const stop = new CancelFlag();
+    stop.store(true);
+
+    await expect(
+      Artifact.new("Stopped.md", "text/markdown", "body").cancelWith(stop).commitToWorkspace(workspace),
+    ).rejects.toThrow(/nothing was written/);
+    expect(stagedCount(db)).toBe(0);
+    expect(listFiles(db)).toEqual([]);
+  });
+
+  it("creates then versions a generated workspace file with history before the replacement", async () => {
+    const { db, root, workspace } = freshWorkspace();
+    const first = await Artifact.new("Brief.md", "text/markdown", "first")
+      .by("Documents agent")
+      .indexedAs("first indexed")
+      .commitToWorkspace(workspace);
+    expect(first.versioned).toBe(false);
+    expect(readFileSync(path.join(root, "Brief.md"), "utf8")).toBe("first");
+    expect(getFileExtractedText(db, first.meta.id)).toBe("first indexed");
+
+    const second = await Artifact.new("Brief.md", "text/markdown", "second")
+      .by("Documents agent")
+      .indexedAs("second indexed")
+      .commitToWorkspace(workspace);
+    expect(second).toMatchObject({ versioned: true, meta: { id: first.meta.id } });
+    expect(readFileSync(path.join(root, "Brief.md"), "utf8")).toBe("second");
+    expect(getFileExtractedText(db, first.meta.id)).toBe("second indexed");
+    const versions = listFileVersions(db, first.meta.id);
+    expect(versions).toHaveLength(1);
+    expect((await workspace.versionSnapshot(versions[0]!.id)).bytes.toString("utf8")).toBe("first");
+    expect(stagedCount(db)).toBe(0);
+  });
+
+  it("heals a legacy live blob before versioning its stable generated-file id", async () => {
+    const { db, root, workspace } = freshWorkspace();
+    const id = randomUUID();
+    db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, extracted_text, storage_kind)
+       VALUES (?, ?, ?, ?, 'generated', ?, ?, 'blob')`,
+    ).run(id, "Recovered.md", "text/markdown", 3, Buffer.from("old"), "old");
+
+    const written = await Artifact.new("Recovered.md", "text/markdown", "new")
+      .indexedAs("new indexed")
+      .commitToWorkspace(workspace);
+
+    expect(written).toMatchObject({ versioned: true, meta: { id } });
+    expect(readFileSync(path.join(root, "Recovered.md"), "utf8")).toBe("new");
+    expect(db.prepare("SELECT storage_kind, original_bytes FROM files WHERE id = ?").get(id)).toEqual({
+      storage_kind: "workspace",
+      original_bytes: null,
+    });
+    expect(getFileExtractedText(db, id)).toBe("new indexed");
+    expect(stagedCount(db)).toBe(0);
+  });
+
+  it("discards staging when a new workspace file cannot be created", async () => {
+    const { db } = freshWorkspace();
+    const failingWorkspace = {
+      db,
+      createFile: async (_name: string, _content: Readable, _source: string) => {
+        throw new Error("disk unavailable");
+      },
+    } as unknown as WorkspaceService;
+
+    await expect(
+      Artifact.new("Failed.md", "text/markdown", "body").commitToWorkspace(failingWorkspace),
+    ).rejects.toThrow("disk unavailable");
+    expect(stagedCount(db)).toBe(0);
   });
 });

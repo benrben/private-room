@@ -272,6 +272,161 @@ def _detect_language(ctx: object, threads: int) -> tuple[str, float] | None:
         return None
 
 
+@dataclass(frozen=True)
+class _DecodeSettings:
+    forced_language: str | None
+    use_beam: bool
+    want_detection: bool
+
+
+@dataclass
+class _TokenStats:
+    pieces: list[tuple[bytes, int, int]] = field(default_factory=list)
+    probability_total: float = 0.0
+    logprob_total: float = 0.0
+    scored_count: int = 0
+
+
+def _decode_settings(mode: LangMode) -> _DecodeSettings:
+    return _DecodeSettings(
+        forced_language=mode.lang if isinstance(mode, (Forced, Watch)) else None,
+        use_beam=isinstance(mode, (Sniff, Watch)),
+        want_detection=isinstance(mode, (Sniff, Watch)),
+    )
+
+
+def _decode_params(settings: _DecodeSettings, threads: int) -> object:
+    strategy = _BEAM_SEARCH if settings.use_beam else _GREEDY
+    params = _pw.whisper_full_default_params(strategy)
+    params.language = settings.forced_language if settings.forced_language is not None else "auto"
+    params.n_threads = threads
+    params.print_special = False
+    params.print_progress = False
+    params.print_realtime = False
+    params.print_timestamps = False
+    params.token_timestamps = True
+    params.suppress_blank = True
+    params.suppress_nst = True
+    params.no_context = True
+    if settings.use_beam:
+        params.beam_search = {"beam_size": 5, "patience": -1.0}
+    else:
+        params.greedy = {"best_of": 5}
+    return params
+
+
+def _run_decode(ctx: object, params: object, pcm: np.ndarray) -> None:
+    if _pw.whisper_full(ctx, params, pcm, pcm.size) != 0:
+        raise RuntimeError("transcription failed")
+
+
+def _decoded_language(ctx: object) -> str | None:
+    return _pw.whisper_lang_str(_pw.whisper_full_lang_id(ctx))
+
+
+def _special_token(raw: bytes) -> bool:
+    return raw.startswith(b"[_") or raw.startswith(b"<|")
+
+
+def _token_stats(ctx: object, segment_index: int, offset_cs: int) -> _TokenStats:
+    stats = _TokenStats()
+    n_tokens = _pw.whisper_full_n_tokens(ctx, segment_index)
+    for token_index in range(n_tokens):
+        token_id = _pw.whisper_full_get_token_id(ctx, segment_index, token_index)
+        raw = _pw.whisper_token_to_bytes(ctx, token_id)
+        if _special_token(raw):
+            continue
+        data = _pw.whisper_full_get_token_data(ctx, segment_index, token_index)
+        stats.probability_total += data.p
+        stats.logprob_total += data.plog
+        stats.scored_count += 1
+        t0 = offset_cs + max(data.t0, 0)
+        t1 = offset_cs + max(data.t1, max(data.t0, 0))
+        stats.pieces.append((raw, t0, t1))
+    return stats
+
+
+def _mean_probability(stats: _TokenStats) -> float:
+    if stats.scored_count == 0:
+        return 0.0
+    return stats.probability_total / stats.scored_count
+
+
+def _should_drop_stock_hallucination(text: str, mean_probability: float) -> bool:
+    return is_stock_hallucination(text) and mean_probability < STOCK_MAX_CONFIDENCE
+
+
+def _should_drop_silence(ctx: object, segment_index: int, stats: _TokenStats) -> bool:
+    if stats.scored_count == 0:
+        return False
+    avg_logprob = stats.logprob_total / stats.scored_count
+    no_speech = _segment_no_speech_prob(ctx, segment_index)
+    return no_speech is not None and no_speech > 0.6 and avg_logprob < -1.0
+
+
+def _segment_output(
+    ctx: object,
+    segment_index: int,
+    offset_cs: int,
+    text: str,
+    words: list[tuple[str, int, int]],
+    language: str | None,
+    mean_probability: float,
+) -> SegOut:
+    return SegOut(
+        t0=offset_cs + max(_pw.whisper_full_get_segment_t0(ctx, segment_index), 0),
+        t1=offset_cs + max(_pw.whisper_full_get_segment_t1(ctx, segment_index), 0),
+        text=text,
+        words=words,
+        lang=language,
+        mean_p=mean_probability,
+    )
+
+
+def _decoded_segments(ctx: object, offset_cs: int, language: str | None) -> list[SegOut]:
+    out: list[SegOut] = []
+    for segment_index in range(_pw.whisper_full_n_segments(ctx)):
+        raw_text = _pw.whisper_full_get_segment_text(ctx, segment_index)
+        text = raw_text.decode("utf-8", errors="replace").strip()
+        if is_junk_segment(text):
+            continue
+        stats = _token_stats(ctx, segment_index, offset_cs)
+        mean_probability = _mean_probability(stats)
+        words = merge_token_words(stats.pieces)
+        if _should_drop_stock_hallucination(text, mean_probability):
+            continue
+        if _should_drop_silence(ctx, segment_index, stats):
+            continue
+        out.append(
+            _segment_output(
+                ctx, segment_index, offset_cs, text, words, language, mean_probability
+            )
+        )
+    return out
+
+
+def _detected_language(ctx: object, threads: int, want_detection: bool) -> tuple[str, float] | None:
+    return _detect_language(ctx, threads) if want_detection else None
+
+
+def _phrase_from_entry(
+    entry: object, pcm: np.ndarray, offset_cs: int, threads: int, settings: _DecodeSettings
+) -> PhraseOut:
+    decode_acquired = False
+    try:
+        entry.decode_lock.acquire()
+        decode_acquired = True
+        ctx = entry.model._ctx  # noqa: SLF001 - see module docstring
+        _run_decode(ctx, _decode_params(settings, threads), pcm)
+        language = _decoded_language(ctx)
+        segments = _decoded_segments(ctx, offset_cs, language)
+        detected = _detected_language(ctx, threads, settings.want_detection)
+        return PhraseOut(segs=segments, detected=detected)
+    finally:
+        if decode_acquired:
+            entry.decode_lock.release()
+
+
 def transcribe_segments(
     model_path: str, pcm: np.ndarray, offset_cs: int, mode: LangMode
 ) -> PhraseOut:
@@ -287,10 +442,7 @@ def transcribe_segments(
 
     pcm32 = np.asarray(pcm, dtype=np.float32)
     threads = _n_threads()
-
-    forced = mode.lang if isinstance(mode, (Forced, Watch)) else None
-    use_beam = isinstance(mode, (Sniff, Watch))
-    want_detect = isinstance(mode, (Sniff, Watch))
+    settings = _decode_settings(mode)
 
     # The lock ends inside `_checkout` — see `engine.py`'s own `_lock` doc
     # comment: a live phrase must not park behind a whole-file import's cache
@@ -298,135 +450,7 @@ def transcribe_segments(
     # uses (see the module docstring's DECISION note) — never a second,
     # separate warm model.
     entry = _checkout(model_path)
-    decode_acquired = False
     try:
-        entry.decode_lock.acquire()
-        decode_acquired = True
-        ctx = entry.model._ctx  # noqa: SLF001 - see module docstring
-
-        # Finals (Sniff/Watch) decode with beam search — the reference
-        # quality setting (openai/faster-whisper default beam 5), barely
-        # slower on Metal. Partials (Auto/Forced) stay greedy: they are
-        # repainted every ~1.5s, so latency wins; best_of=5 still lets
-        # whisper.cpp's temperature fallback sample candidates when a hard
-        # phrase makes the greedy pick fail.
-        strategy = _BEAM_SEARCH if use_beam else _GREEDY
-        # A FRESH params struct, never `entry.model._params` — see the
-        # module docstring's DECISION note for why that isolation matters.
-        params = _pw.whisper_full_default_params(strategy)
-        params.language = forced if forced is not None else "auto"
-        params.n_threads = threads
-        params.print_special = False
-        params.print_progress = False
-        params.print_realtime = False
-        params.print_timestamps = False
-        params.token_timestamps = True
-        params.suppress_blank = True
-        # Never emit music/sound-effect token spans (♪, bracketed noise) as
-        # words.
-        params.suppress_nst = True
-        # Each phrase stands alone; carrying context across them makes the
-        # model repeat the previous phrase over silence.
-        params.no_context = True
-        if use_beam:
-            params.beam_search = {"beam_size": 5, "patience": -1.0}
-        else:
-            params.greedy = {"best_of": 5}
-
-        if _pw.whisper_full(ctx, params, pcm32, pcm32.size) != 0:
-            raise RuntimeError("transcription failed")
-
-        # full_lang_id is the language the decode ran in — the forced one
-        # when one was forced — which is exactly what each segment must
-        # persist. Read from the real post-decode state, never assumed: a
-        # decode forced to a language that does not match the audio still
-        # reads back as the FORCED language here (verified against the real
-        # model — see `test_forced_language_readback_is_read_not_assumed`),
-        # independent of what `_detect_language` (below) says the audio
-        # actually sounds like.
-        lang_id = _pw.whisper_full_lang_id(ctx)
-        lang = _pw.whisper_lang_str(lang_id)
-
-        n_segments = _pw.whisper_full_n_segments(ctx)
-        out: list[SegOut] = []
-        for i in range(n_segments):
-            raw_text = _pw.whisper_full_get_segment_text(ctx, i)
-            text = raw_text.decode("utf-8", errors="replace").strip()
-            if is_junk_segment(text):
-                continue
-
-            # RAW bytes per token, never per-token strings: BPE splits
-            # multi-byte characters across tokens, and lossy-decoding each
-            # half yields "�" (see hallucination.py's `merge_token_words`
-            # doc and engine.py's DIVERGENCE 1 note for the same fact hit
-            # twice already in this codebase). This also needs `plog` per
-            # token (engine.py's `_segment_mean_p` never computes that — see
-            # this module's own docstring for why that helper is not reused
-            # here).
-            pieces: list[tuple[bytes, int, int]] = []
-            p_sum = 0.0
-            plog_sum = 0.0
-            n_scored = 0
-            n_tokens = _pw.whisper_full_n_tokens(ctx, i)
-            for j in range(n_tokens):
-                token_id = _pw.whisper_full_get_token_id(ctx, i, j)
-                raw = _pw.whisper_token_to_bytes(ctx, token_id)
-                # Specials like "[_BEG_]" / "<|endoftext|>" carry no words.
-                if raw.startswith(b"[_") or raw.startswith(b"<|"):
-                    continue
-                data = _pw.whisper_full_get_token_data(ctx, i, j)
-                p_sum += data.p
-                plog_sum += data.plog
-                n_scored += 1
-                t0 = offset_cs + max(data.t0, 0)
-                t1 = offset_cs + max(data.t1, max(data.t0, 0))
-                pieces.append((raw, t0, t1))
-
-            words = merge_token_words(pieces)
-            mean_p = p_sum / n_scored if n_scored > 0 else 0.0
-
-            # A stock hallucination the model itself wasn't sure about is
-            # noise dressed as text. A REAL "thank you" decodes confidently
-            # and stays — this pair of conditions is what the old
-            # unconditional confidence floor got wrong in both directions.
-            if is_stock_hallucination(text) and mean_p < STOCK_MAX_CONFIDENCE:
-                continue
-
-            # The REFERENCE silence rule (openai / faster-whisper /
-            # whisper.cpp all agree): text is dropped only when the model
-            # says "probably no speech here" AND the decode is
-            # low-confidence — both together. Low confidence alone is NOT a
-            # reason to delete: hard audio — accented, far-mic, compressed —
-            # decodes correct words at low probability, and deleting them
-            # punches holes in real speech. The old mean-p floors (0.30
-            # short / 0.18 long) did exactly that on real-world meetings and
-            # are gone on purpose. See the module docstring's DEVIATION note:
-            # `_segment_no_speech_prob` can only ever return `None` in this
-            # build, so this branch never actually fires in production — the
-            # conservative side of that gap.
-            if n_scored > 0:
-                avg_logprob = plog_sum / n_scored
-                no_speech = _segment_no_speech_prob(ctx, i)
-                if no_speech is not None and no_speech > 0.6 and avg_logprob < -1.0:
-                    continue
-
-            seg_t0 = offset_cs + max(_pw.whisper_full_get_segment_t0(ctx, i), 0)
-            seg_t1 = offset_cs + max(_pw.whisper_full_get_segment_t1(ctx, i), 0)
-            out.append(
-                SegOut(t0=seg_t0, t1=seg_t1, text=text, words=words, lang=lang, mean_p=mean_p)
-            )
-
-        # The ctx still holds this phrase's mel from `whisper_full()` above
-        # (whisper.cpp computes+stores mel as the first step of
-        # `whisper_full`, regardless of forced/auto language), so detection
-        # only costs one extra encoder pass, not a fresh mel/decode.
-        # Best-effort: a detect failure just reports nothing, which the
-        # sticky policy treats as no vote — never an exception escaping this
-        # function.
-        detected = _detect_language(ctx, threads) if want_detect else None
-
-        return PhraseOut(segs=out, detected=detected)
+        return _phrase_from_entry(entry, pcm32, offset_cs, threads, settings)
     finally:
-        if decode_acquired:
-            entry.decode_lock.release()
         _checkin(entry)

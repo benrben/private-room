@@ -185,6 +185,28 @@ export function clipSelection(
   };
 }
 
+function isNothingSelected(error: unknown): boolean {
+  return error instanceof Error && error.message === NOTHING_SELECTED;
+}
+
+function selectionFromCapture(value: Record<string, unknown>): BrowserPageSelection {
+  const { text, clipped } = clipSelection(
+    typeof value.text === "string" ? value.text : "",
+    value.truncated === true,
+  );
+  // The page script measures the WHOLE selection; both caps below it are ours
+  // or its own. Carried through so a caller showing a clipped passage can say
+  // how much it is leaving out rather than implying it has all of it.
+  const total = typeof value.total === "number" ? value.total : Array.from(text).length;
+  return {
+    text,
+    url: typeof value.url === "string" ? value.url : "",
+    title: typeof value.title === "string" ? value.title : "",
+    truncated: clipped,
+    total,
+  };
+}
+
 /**
  * The user's current selection, as text. READ-ONLY: nothing is written, and
  * nothing is journalled.
@@ -207,26 +229,12 @@ export async function browserPageSelection(
   try {
     v = (await browser.call("capture", { what: "selection" })) as Record<string, unknown>;
   } catch (e) {
-    if (e instanceof Error && e.message === NOTHING_SELECTED) {
+    if (isNothingSelected(e)) {
       return emptySelection();
     }
     throw e;
   }
-  const { text, clipped } = clipSelection(
-    typeof v.text === "string" ? v.text : "",
-    v.truncated === true,
-  );
-  // The page script measures the WHOLE selection; both caps below it are ours
-  // or its own. Carried through so a caller showing a clipped passage can say
-  // how much it is leaving out rather than implying it has all of it.
-  const total = typeof v.total === "number" ? v.total : Array.from(text).length;
-  return {
-    text,
-    url: typeof v.url === "string" ? v.url : "",
-    title: typeof v.title === "string" ? v.title : "",
-    truncated: clipped,
-    total,
-  };
+  return selectionFromCapture(v);
 }
 
 /** The one thing this module needs from the app's own window: the ability to

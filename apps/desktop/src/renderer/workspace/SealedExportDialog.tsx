@@ -6,13 +6,37 @@ import { sealedExportPasswordProblem } from "../rooms/passwordChange";
 import { useFocusTrap } from "../settings/useFocusTrap";
 
 type PasswordMode = "room" | "alternate";
+type Toast = (kind: "success" | "error", message: string) => void;
+
+async function saveSealedBackup(password: string | null) {
+  const destination = await api.chooseSavePath({
+    title: "Save sealed Arcelle backup",
+    defaultPath: "Room Backup.arcelle",
+    filters: [{ name: "Arcelle sealed backup", extensions: ["arcelle"] }],
+  });
+  if (!destination) return null;
+  return api.createSealedPackage(destination, password);
+}
+
+function sealedExportSuccess(fileCount: number): string {
+  return `Sealed ${fileCount} file${fileCount === 1 ? "" : "s"} into the backup.`;
+}
+
+function backupPassword(mode: PasswordMode, password: string): string | null {
+  return mode === "alternate" ? password : null;
+}
+
+function alternatePasswordProblem(mode: PasswordMode, password: string, repeat: string): string | null {
+  if (mode !== "alternate") return null;
+  return sealedExportPasswordProblem(password, repeat, MIN_PASSWORD);
+}
 
 export default function SealedExportDialog({
   onClose,
   pushToast,
 }: {
   onClose: () => void;
-  pushToast: (kind: "success" | "error", message: string) => void;
+  pushToast: Toast;
 }) {
   const [mode, setMode] = useState<PasswordMode>("room");
   const [password, setPassword] = useState("");
@@ -26,10 +50,7 @@ export default function SealedExportDialog({
 
   const create = async () => {
     if (busy) return;
-    const alternate = mode === "alternate";
-    const problem = alternate
-      ? sealedExportPasswordProblem(password, repeat, MIN_PASSWORD)
-      : null;
+    const problem = alternatePasswordProblem(mode, password, repeat);
     if (problem) {
       setError(problem);
       return;
@@ -37,23 +58,12 @@ export default function SealedExportDialog({
     setBusy(true);
     setError("");
     try {
-      const destination = await api.chooseSavePath({
-        title: "Save sealed Arcelle backup",
-        defaultPath: "Room Backup.arcelle",
-        filters: [{ name: "Arcelle sealed backup", extensions: ["arcelle"] }],
-      });
-      if (!destination) {
+      const info = await saveSealedBackup(backupPassword(mode, password));
+      if (!info) {
         setBusy(false);
         return;
       }
-      const info = await api.createSealedPackage(
-        destination,
-        alternate ? password : null,
-      );
-      pushToast(
-        "success",
-        `Sealed ${info.fileCount} file${info.fileCount === 1 ? "" : "s"} into the backup.`,
-      );
+      pushToast("success", sealedExportSuccess(info.fileCount));
       onClose();
     } catch (reason) {
       const message = String(reason);

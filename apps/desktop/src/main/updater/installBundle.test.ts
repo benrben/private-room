@@ -178,6 +178,19 @@ describe("installExtractedBundle — ordering", () => {
     expect(state.calls.some((c) => c === "rm:/Applications/Arcelle.app")).toBe(false);
   });
 
+  it("reports a non-errno failure while moving the current app without inventing escalation", async () => {
+    const { deps } = fakeDeps({ existing: ["/Applications/Arcelle.app"] });
+    deps.fs.rename = async () => {
+      throw "fabricated non-errno move failure";
+    };
+
+    const err = await rejectsWith<InstallError>(
+      installExtractedBundle(deps, "/tmp/extracted", "/Applications/Arcelle.app"),
+    );
+    expect(err).toMatchObject({ code: "install_failed", privilegedMoveScript: undefined });
+    expect(err.message).toContain("could not move the current app aside");
+  });
+
   it("puts the old app BACK when the second rename fails", async () => {
     // This is why a delete-then-move ordering is wrong: a failure there leaves
     // the user with no app at all.
@@ -459,6 +472,33 @@ describe("extractTarGz — guards", () => {
     const err = await rejectsWith<InstallError>(extractTarGz(deps, "/tmp/x.tar.gz"));
     expect(err.code).toBe("extract_failed");
     expect(state.calls.some((c) => c.startsWith("rm:/tmp/arcelle-update-"))).toBe(true);
+  });
+
+  it("keeps the extraction error when best-effort cleanup also fails", async () => {
+    const { deps } = fakeDeps();
+    deps.proc.run = async () => {
+      throw new Error("fabricated tar failure");
+    };
+    deps.fs.rm = async () => {
+      throw new Error("fabricated cleanup failure");
+    };
+
+    const err = await rejectsWith<InstallError>(extractTarGz(deps, "/tmp/x.tar.gz"));
+    expect(err.code).toBe("extract_failed");
+    expect(err.message).toContain("fabricated tar failure");
+  });
+});
+
+describe("default process runner", () => {
+  it("includes stderr and the exit code for a real failing child process", async () => {
+    const deps = defaultInstallDeps();
+    await expect(deps.proc.run("/bin/sh", ["-c", "printf fabricated-error >&2; exit 7"]))
+      .rejects.toThrow("/bin/sh exited 7: fabricated-error");
+  });
+
+  it("detaches a harmless real child without waiting for it", () => {
+    const deps = defaultInstallDeps();
+    expect(() => deps.proc.spawnDetached("/usr/bin/true", [])).not.toThrow();
   });
 });
 

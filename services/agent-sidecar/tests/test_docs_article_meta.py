@@ -20,7 +20,16 @@ Rust, since the Rust source delegates this logic to the crate entirely.
 
 from __future__ import annotations
 
-from arcelle_sidecar.docs.article_meta import PageMeta, extract_page_meta
+from typing import cast
+
+from bs4 import Tag
+
+from arcelle_sidecar.docs.article_meta import (
+    PageMeta,
+    _first_article_like,
+    _parsed_json_ld,
+    extract_page_meta,
+)
 
 # A page shaped like the ones this feature exists for: real article body,
 # wrapped in the site's furniture, with its metadata declared in `<meta>`
@@ -137,12 +146,63 @@ def test_json_ld_graph_picks_the_article_shaped_node() -> None:
     assert meta.published == "2026-01-02"
 
 
+def test_json_ld_node_selection_falls_back_from_article_shape_to_type_then_object() -> None:
+    typed = {"@type": "WebPage"}
+    plain: dict[str, object] = {}
+
+    assert _first_article_like([42, plain, typed]) is typed
+    assert _first_article_like([42, plain]) is plain
+    assert _first_article_like([42]) is None
+
+
 def test_malformed_json_ld_is_treated_as_absent_not_raised() -> None:
     html = """<html><head><title>Still Works</title>
         <script type="application/ld+json">{ not valid json </script>
         </head><body></body></html>"""
     meta = extract_page_meta(html, None)
     assert meta.title == "Still Works"
+
+
+def test_json_ld_skips_blank_and_malformed_scripts_for_a_later_declaration() -> None:
+    html = """<html><head>
+        <script type="application/ld+json">  </script>
+        <script type="application/ld+json">{ bad json }</script>
+        <script type="application/ld+json">
+        {"headline": "Later declaration", "author": {"name": "Ada Lovelace"}}
+        </script>
+        </head><body></body></html>"""
+    meta = extract_page_meta(html, None)
+    assert meta.title == "Later declaration"
+    assert meta.byline == "Ada Lovelace"
+
+
+def test_json_ld_parser_uses_tag_text_when_no_single_string_is_available() -> None:
+    class FragmentedJsonLdTag:
+        string = None
+
+        def get_text(self) -> str:
+            return '{"headline": "Fallback text"}'
+
+    assert _parsed_json_ld(cast(Tag, FragmentedJsonLdTag())) == {"headline": "Fallback text"}
+
+
+def test_json_ld_bare_list_uses_article_and_ignores_unsupported_value() -> None:
+    html = """<html><head><script type="application/ld+json">
+        [{"@type": "WebSite", "name": "Not this"}, {"headline": "Listed article"}]
+        </script></head><body></body></html>"""
+    assert extract_page_meta(html, None).title == "Listed article"
+
+    unsupported = """<html><head><title>Fallback title</title>
+        <script type="application/ld+json">42</script>
+        </head><body></body></html>"""
+    assert extract_page_meta(unsupported, None).title == "Fallback title"
+
+
+def test_json_ld_author_list_keeps_only_declared_nonblank_names() -> None:
+    html = """<html><head><script type="application/ld+json">
+        {"author": [{"name": " Ada "}, "Grace", {"name": "  "}, {}, 42]}
+        </script></head><body></body></html>"""
+    assert extract_page_meta(html, None).byline == "Ada, Grace"
 
 
 def test_og_title_beats_twitter_title_beats_title_tag() -> None:
@@ -199,3 +259,7 @@ def test_og_description_used_only_when_description_meta_is_absent() -> None:
 def test_source_url_none_and_blank_both_read_as_absent() -> None:
     assert extract_page_meta("<html></html>", None).source_url is None
     assert extract_page_meta("<html></html>", "   ").source_url is None
+
+
+def test_fragment_without_an_html_element_has_no_declared_language() -> None:
+    assert extract_page_meta("<title>Loose title</title>", None).lang is None

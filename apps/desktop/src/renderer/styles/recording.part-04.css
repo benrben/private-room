@@ -1,0 +1,474 @@
+
+
+/* Replacing a transcript deserves a plain-words confirm, inline. */
+.rec-retrans-confirm {
+  flex-wrap: wrap;
+  max-width: 58ch;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+
+/* ==========================================================================
+   5. NARROW PANE
+   The centre column is resized by the rail and the AI pane, so these are
+   container queries against .rec-view and not media queries against the
+   window.
+   ========================================================================== */
+
+@container rec-view (max-width: 720px) {
+  /* Clips move under the reading rather than squeezing it to nothing. */
+  .rec-body {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+  .rec-panel,
+  .rec-clips {
+    flex: none;
+    overflow-y: visible;
+  }
+  .rec-clips {
+    /* The rule turns with the layout: a horizontal stroke above the list. */
+    background-size: 100% 1px;
+    background-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--line-soft) 3%,
+      var(--line-soft) 96%,
+      transparent 100%
+    );
+  }
+}
+
+@container rec-view (max-width: 560px) {
+  .rec-transport {
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: center;
+    row-gap: var(--sp-2);
+  }
+  .rec-transport-end {
+    justify-content: center;
+  }
+  .rec-drawer-hint {
+    display: none;
+  }
+  .rec-tabs {
+    gap: var(--sp-3);
+  }
+  /* One variable, so the stamp gutter, the speaker's hanging indent and the
+     phrase column all narrow together — they are one edge, and the layout
+     that narrows two of the three is the one that looks broken. */
+  .rec-turn {
+    --rec-gutter: 54px;
+    --rec-gap: var(--sp-2);
+  }
+  .rec-read-note {
+    padding-inline-start: 70px;
+  }
+}
+
+/* ==========================================================================
+   6. THE CAPTURE DOCK
+   The one unmistakable "the microphone is doing something" pill, fixed above
+   the composer. It genuinely floats, which is why it is one of the few things
+   in this system allowed an opaque fill (paper.css §9).
+   ========================================================================== */
+
+.capture-dock {
+  position: fixed;
+  left: 50%;
+  bottom: 26px;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 9px 16px;
+  border-radius: 999px 999px 999px 999px / 22px 20px 22px 20px;
+  font-size: var(--fs-meta);
+  color: var(--text);
+  background: var(--raised);
+  border: 1.5px solid var(--rule-strong);
+  /* Theme-aware: the old near-black shadow was drawn on ivory paper too. */
+  box-shadow:
+    0 12px 30px var(--shadow),
+    0 2px 6px var(--shadow-lift);
+}
+
+.capture-dock.recording {
+  border-color: var(--sem-urgent);
+}
+
+.capture-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--text);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.capture-label.rec {
+  color: var(--sem-urgent);
+  font-weight: 600;
+}
+
+/* Streaming dictation's rolling partial (journal/file/memory mics — the
+   composer paints its own). One line, tail kept: the newest words matter. */
+.capture-partial {
+  max-width: 340px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  direction: inherit;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+}
+
+/* Destructive-outline, per the system: a red edge and red ink on the dock's
+   own ground, never a saturated red fill. On a wash it would measure 4.3:1;
+   on the dock's opaque paper it is 4.5:1 dark and 5.5:1 light. */
+.capture-stop {
+  min-height: 26px;
+  padding: 4px 14px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  color: var(--sem-urgent);
+  background: none;
+  border: 1.5px solid var(--sem-urgent);
+  border-radius: 999px 999px 999px 999px / 16px 14px 16px 14px;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-pen);
+}
+.capture-stop:hover {
+  background-color: color-mix(in srgb, var(--sem-urgent-fill) 20%, transparent);
+}
+.capture-stop:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---- top-bar chip ----
+   Sits in the top bar while a capture runs anywhere in the room. The dot and
+   the edge carry the recording red; the WORDS are --text, because red ink on
+   a red wash misses 4.5:1 in light mode at this size. */
+.rec-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 24px;
+  padding: 4px 12px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  color: var(--text);
+  border: 1px solid var(--sem-urgent);
+  background-color: color-mix(in srgb, var(--sem-urgent-fill) 13%, transparent);
+  border-radius: 999px 999px 999px 999px / 16px 14px 16px 14px;
+  cursor: pointer;
+  /* "Recording paused" is two words in a top bar whose container is
+     `min-width: 0`, so it will happily be squeezed. This chip states a live
+     capture — it is allowed to push its neighbours, not to break in half.
+     (It used to come from a second .rec-indicator rule in shell.css, which
+     also overrode the colour above with red-on-red; that rule is gone.) */
+  white-space: nowrap;
+}
+/* Same reason as the record button: the hovered-button ghost from base.css
+   would swap the recording wash for the pen's pink. */
+.rec-indicator:hover {
+  background-color: color-mix(in srgb, var(--sem-urgent-fill) 24%, transparent);
+  border-color: var(--sem-urgent);
+}
+.rec-indicator:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.rec-indicator.paused {
+  border-color: var(--rule-strong);
+  background-color: transparent;
+}
+.rec-indicator.paused:hover {
+  background-color: var(--hover);
+  border-color: var(--sketch);
+}
+
+/* ==========================================================================
+   7. FEEDBACK MODAL (ADD-28)
+   ========================================================================== */
+
+.feedback-modal {
+  max-width: 560px;
+}
+
+.feedback-raw {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+
+.feedback-raw textarea {
+  flex: 1;
+}
+
+.feedback-body {
+  width: 100%;
+  margin-top: var(--sp-2);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+}
+
+.feedback-diag {
+  margin-top: var(--sp-2);
+  display: flex;
+}
+
+/* The error messages offered for attachment. Scrolls rather than growing: the
+   sheet has to stay usable with ten of them, and the user is meant to READ
+   these before ticking the box. */
+.feedback-errors {
+  margin: var(--sp-1) 0 0;
+  padding: 6px 8px 6px 22px;
+  max-height: 120px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.feedback-errors li {
+  margin: 2px 0;
+}
+
+/* ==========================================================================
+   7b. THE RECORDINGS LANDING PAGE (.rec-home)
+   The shelf you arrive at, not an empty state. Everything here is an ordinary
+   notebook composition — editorial title, hand-circled count, the two capture
+   actions drawn with the SAME concentric record ring the transport uses, then
+   a ruled list of what the room holds. It replaced a 40px centred microphone
+   that said the same thing whether the room held nothing or held forty tapes.
+   ========================================================================== */
+
+.rec-home {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-6) var(--sp-6) var(--sp-8);
+}
+
+.rec-home-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-6);
+}
+.rec-home-title {
+  margin: 0;
+  font-size: var(--fs-page);
+  font-family: var(--display);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text-strong);
+}
+.rec-home-count {
+  align-self: center;
+}
+/* The subtitle takes the whole second line: .nb-subtitle draws its marker
+   swipe with an ::after that runs past both ends of the text, and sharing a
+   baseline row with a 44px title would put that swipe through the title's
+   descenders. */
+.rec-home-sub {
+  flex-basis: 100%;
+  margin: 2px 0 0;
+}
+
+/* ----- the way in -----
+   ONE now, not two side by side: the overview used to repeat the contextual
+   sidebar's capture buttons, and the sidebar is where they live. What is left
+   is the empty state's single call to action, so the grid that laid the pair
+   out (`.rec-home-start`) went with them rather than sitting here styling
+   nothing. A real target with its own explanation, because the difference
+   between the captures is the thing a reader has to know before choosing. */
+.rec-home-action {
+  align-items: flex-start;
+  gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-4) var(--sp-4) var(--sp-4);
+  text-align: left;
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-radius: var(--radius-lg);
+  transition: border-color var(--dur-fast) var(--ease-pen),
+    transform var(--dur-fast) var(--ease-pen);
+}
+.rec-home-action:hover:not(:disabled) {
+  border-color: var(--sketch);
+}
+.rec-home-action:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.rec-home-action-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+/* The one line that tells the two captures apart. Body size and the interface
+   face: this is an instruction, and §4/§25 keep instructions out of the hand. */
+.rec-home-action-copy {
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  color: var(--ink-2);
+  white-space: normal;
+}
+/* `.rec-record-ring.is-quiet` — the voice note's quieter ring — lived here to
+   tell the two capture buttons apart. Only one of them is on this page now, so
+   there is nothing left for it to contrast with, and five rules that style no
+   element are five rules the next reader has to disprove. */
+
+/* ----- the shelf ----- */
+.rec-home-shelf-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-3);
+}
+.rec-home-rule {
+  flex: 1;
+  min-width: 0;
+}
+.rec-home-empty {
+  max-width: 40ch;
+  margin: var(--sp-4) 0 0;
+}
+
+.rec-home-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.rec-home-card {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  width: 100%;
+  padding: var(--sp-4);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.rec-home-card.is-current {
+  border-color: var(--accent);
+}
+.rec-home-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* A tape reel, at list weight: the same imperfect concentric circle as the
+   record control, in pencil rather than in red. Red on this page belongs to
+   the one capture that is actually running. */
+.rec-home-card-mark {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 1.5px solid var(--rule-strong);
+  border-radius: 52% 48% 51% 49% / 49% 52% 48% 51%;
+  color: var(--ink-2);
+}
+.rec-home-card-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 54% 46% 52% 48% / 48% 54% 46% 52%;
+  background: var(--rule-strong);
+}
+.rec-home-card-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.rec-home-card-title {
+  font-size: var(--fs-card);
+  font-weight: 600;
+  color: var(--text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rec-home-card-meta {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+.rec-home-when {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--ink-muted);
+}
+.rec-home-state {
+  flex: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rec-home-action {
+    transition: none;
+  }
+}
+
+/* ==========================================================================
+   8. REDUCED MOTION
+   Every animation above becomes an instant state. Nothing animates INTO its
+   resting appearance, so switching them off lands on the finished frame.
+   The recording indicator loses its pulse and keeps its colour, its word and
+   its running timer — none of which were the animation's job anyway.
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  .rec-dot.pulsing,
+  .rec-seg.ghost::after {
+    animation: none;
+  }
+  .rec-record,
+  .rec-tbtn,
+  .rec-tab,
+  .rec-clip,
+  .rec-meter b,
+  .rec-drawer-caret,
+  .capture-stop {
+    transition: none;
+  }
+  .rec-record:active,
+  .rec-tbtn:active {
+    transform: none;
+  }
+}
+
+/* Remove control on a found item — quiet until the row is hovered, because
+   the list is for reading and only sometimes for editing. */
+.rec-found-x {
+  flex: none;
+  border: 0;
+  background: none;
+  padding: 0 2px;
+  cursor: pointer;
+  color: var(--ink-soft);
+  opacity: 0;
+  font-size: 1.1em;
+  line-height: 1;
+}
+.rec-found:hover .rec-found-x,
+.rec-found-x:focus-visible {
+  opacity: 1;
+}
+.rec-found-x:hover {
+  color: var(--ink);
+}
+/* "Mark this moment" sits in the live transport, beside the REC chip. */
+.rec-mark-now {
+  margin-inline-start: 8px;
+}

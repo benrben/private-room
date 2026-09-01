@@ -141,6 +141,10 @@ def seg(speaker: str, source: str, voice: VoicePrint | None) -> RecSegment:
 # =============================================================================
 
 
+def test_relabel_leaves_too_little_phrase_evidence_unchanged() -> None:
+    assert label.relabel([], 0, label.Naming.plain({}, set())) is False
+
+
 def test_swapped_labels_swap_their_names() -> None:
     """The name map is rebuilt, not edited in place, so two voices trading
     numbers trade their names too instead of one overwriting the other."""
@@ -263,6 +267,94 @@ def test_split_by_voice_backfills_leading_silence_to_the_first_known_voice(
     assert [w.w for w in segments[1].words] == [f"w{k}" for k in range(6, 10)]
     assert segments[0].speaker != segments[1].speaker, "the pieces share one label"
     assert sum(len(s.words) for s in segments) == 10, "words lost or duplicated by the cut"
+
+
+def test_split_by_voice_keeps_unsplittable_rows_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One-window, window-less, and word-less rows do not create a split.
+
+    This drives the same public pass through both lane planning paths.  In
+    particular, only the system row with words supplies a usable voice
+    group; every other row must remain the original object when no split or
+    name move is needed.
+    """
+    voice = VoicePrint(vec=np.array([1.0, 0.0], dtype=np.float32), voiced_frames=50)
+    legacy = RecSegment(
+        id="legacy",
+        source="sys",
+        speaker="Speaker 4",
+        t0=0,
+        t1=50,
+        text="legacy",
+        words=[],
+        lang=None,
+        voice=voice,
+    )
+    one_mic_window = RecSegment(
+        id="mic-one-window",
+        source="mic",
+        speaker="You",
+        t0=100,
+        t1=150,
+        text="mic",
+        words=[RecWord(w="mic", t0=100, t1=150)],
+        lang=None,
+        voice=voice,
+    )
+    one_voice = RecSegment(
+        id="sys-one-voice",
+        source="sys",
+        speaker="Speaker 1",
+        t0=200,
+        t1=300,
+        text="keep original text",
+        words=[RecWord(w="same", t0=200, t1=250)],
+        lang=None,
+        voice=voice,
+    )
+    wordless = RecSegment(
+        id="sys-wordless",
+        source="sys",
+        speaker="Speaker 2",
+        t0=400,
+        t1=500,
+        text="no words",
+        words=[],
+        lang=None,
+        voice=voice,
+    )
+    segments = [legacy, one_mic_window, one_voice, wordless]
+    windows = {
+        "legacy": [],
+        "mic-one-window": [(100, 150, voice)],
+        "sys-one-voice": [(200, 250, voice), (250, 300, voice)],
+        "sys-wordless": [(400, 450, voice), (450, 500, voice)],
+    }
+    seen: list[str] = []
+
+    def wins_for(segment: RecSegment) -> list[tuple[int, int, VoicePrint]]:
+        seen.append(segment.id)
+        return windows[segment.id]
+
+    def one_cluster(
+        prints: list[VoicePrint], spans: list[tuple[int, int]], cap: int, min_voice_frames: int
+    ) -> list[int | None]:
+        assert len(prints) == len(spans) == 4
+        assert cap == 3
+        assert min_voice_frames > 0
+        return [0] * len(prints)
+
+    monkeypatch.setattr(label, "cluster_gated", one_cluster)
+
+    assert not label.split_by_voice(segments, 3, label.Naming.plain({}, set()), wins_for)
+    assert seen == ["legacy", "mic-one-window", "sys-one-voice", "sys-wordless"]
+    assert segments == [legacy, one_mic_window, one_voice, wordless]
+    assert label._nearest_window_id([], [], 0) is None
+    assert label._backfill_unknown_labels([None]) == [None]
+    assert label._voice_cuts([]) == []
+    assert label._piece_text(one_voice, [], False) == "keep original text"
+    assert label._piece_voice(one_voice, [], 200, 300) is voice
 
 
 def test_a_freed_label_reused_by_a_different_voice_does_not_inherit_a_stale_guess() -> None:

@@ -1,0 +1,359 @@
+
+.wf-branch-row select:first-of-type {
+  flex: 0 0 6.5rem;
+}
+.wf-branch-row button {
+  flex: 0 0 auto;
+}
+/* Fan-in checkbox rows: a checkbox and its word on one line, not stacked the
+   way the sheet's other labels are. Qualified by the sheet rather than shouted:
+   `.node-param-sheet label` (0,1,1) is what stacks these into a column, and
+   naming the ancestor makes this (0,2,0), which beats it on specificity. An
+   !important here would have been the first one on this surface, and it would
+   also have been unbeatable by the next person who needed a variant. */
+.node-param-sheet .wf-input-row {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--sp-1);
+  font-weight: 400;
+}
+.wf-input-row input {
+  width: auto;
+}
+
+/* ==========================================================================
+   9. RUN HISTORY — a ruled timeline
+   One dashed pencil thread down the gutter (.nb-connect, which spans the
+   container's own box and so needs nothing measured), a drawn node per run,
+   ruled rows, and mono timestamps that line up column-wise.
+   Also rendered on the Scripts page — no .wf-page ancestor here.
+   ========================================================================== */
+
+/* Rendered before the timeline exists, so it carries no thread and no gutter. */
+.run-history-empty {
+  margin-top: var(--sp-3);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+
+.run-history {
+  margin-top: var(--sp-3);
+  /* The gutter the thread and its nodes live in. The numbers are the same
+     ones Room Home's timeline uses: thread at 8px, a 9px node centred on it. */
+  padding-left: 26px;
+  --nb-connect-at: 8px;
+}
+.run-row {
+  position: relative;
+}
+/* Rows carry the separator on TOP and the first row goes without, so a list
+   never opens with a rule hanging off nothing. Drawn as a background gradient
+   rather than a border so it fades at both ends the way a pencil does. */
+.run-row + .run-row {
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+.run-row-head {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  width: 100%;
+  min-height: 36px;
+  padding: var(--sp-2);
+  /* A real <button> for disclosure semantics — strip the default chrome. */
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  font: inherit;
+  font-size: var(--fs-meta);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-pen);
+}
+/* Two classes deep so it beats base.css's own `button:hover`, which would
+   otherwise wash every row in the accent ghost. A history row is a list row,
+   and list rows warm to the neutral paper hover, not to the pen. */
+.run-history .run-row-head:hover {
+  background-color: var(--hover);
+}
+.run-row-head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* The node on the thread. Filled in the sheet's colour so the dash passes
+   behind it rather than through it; the ring is --rule-strong, the 3:1
+   stroke, because on a timeline the node is what says "an entry is here". */
+.run-row-head::before {
+  content: "";
+  position: absolute;
+  left: -22px;
+  top: calc(50% - 5px);
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid var(--rule-strong);
+  border-radius: 50%;
+  background: var(--page);
+  pointer-events: none;
+}
+.run-row-head:hover::before {
+  border-color: var(--accent);
+}
+.run-row-trigger {
+  flex: none;
+  padding: 1px 8px;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  border-radius: 999px 999px 999px 999px / 12px 10px 12px 10px;
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+/* A timestamp is technical data: mono, tabular, exact. */
+.run-row-when {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+.run-row-err {
+  min-width: 0;
+  max-width: 44ch;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--sem-urgent);
+}
+.run-row-caret {
+  flex: none;
+  color: var(--faint);
+}
+
+.run-step {
+  padding: var(--sp-2) var(--sp-3);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  border-top: 1px solid var(--line-soft);
+}
+/* Both forms: a caption nested inside a step body, and a step row that IS the
+   caption (`class="run-step caption"`) — a descendant selector alone silently
+   misses the second one. */
+.run-step .caption,
+.run-step.caption {
+  color: var(--muted);
+}
+.run-step-head {
+  display: flex;
+  gap: var(--sp-1) var(--sp-2);
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: var(--sp-1);
+}
+.run-step-head strong {
+  color: var(--text-strong);
+}
+.run-step-kind {
+  font-size: var(--fs-micro);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.run-step-spacer {
+  flex: 1;
+}
+/* Two classes deep on purpose: base.css's `button.subtle` sets the padding at
+   the same weight a single class would, and a copy button that lands at 22px
+   is under the 24px floor for anything clickable. */
+.run-step-head .run-step-copy {
+  min-height: 24px;
+  padding: 2px var(--sp-2);
+  font-size: var(--fs-micro);
+}
+.run-step-body {
+  max-height: 260px;
+  overflow: auto;
+  border-radius: var(--radius-sm);
+}
+/* A step's stored output is FILE CONTENT: it wraps, it is never clipped, and
+   nothing here touches direction or unicode-bidi, so Hebrew, CJK and mixed
+   runs render exactly as the bidi algorithm decides. */
+.run-step pre {
+  margin: var(--sp-1) 0 0;
+  padding: var(--sp-2);
+  max-height: 180px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+  background: color-mix(in srgb, var(--raised) 70%, transparent);
+  border-radius: var(--radius-sm);
+}
+
+/* A script node's step result, rendered as exit code + stdout/stderr rather
+   than the raw ScriptRunReport JSON. */
+.script-report {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin-top: var(--sp-1);
+}
+.script-stream > strong {
+  display: block;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.script-stream.err > strong {
+  color: var(--sem-urgent);
+}
+
+/* ==========================================================================
+   10. THE SCHEDULE POPOVER
+   It floats, so it is opaque — a popover has to occlude what is under it.
+   Rendered by the Scripts page too.
+   ========================================================================== */
+
+.wf-popover {
+  position: absolute;
+  z-index: 40;
+  min-width: 262px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  color: var(--text);
+  background: var(--raised);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  box-shadow:
+    0 12px 30px var(--shadow),
+    0 2px 6px var(--shadow-lift);
+}
+.wf-popover label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+}
+.wf-popover input,
+.wf-popover select {
+  font-weight: 400;
+}
+/* Instructions, so: sans, and not shrunk below the metadata floor. */
+.wf-popover .caption {
+  font-weight: 400;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+/* A switch and its word on one line. This is a <label>, and `.wf-popover label`
+   above stacks labels into a column — so the rule is qualified by the popover
+   it only ever renders inside (SchedulePopover), making it (0,2,0) against that
+   rule's (0,1,1). Specificity, not !important: the same fix, and it leaves the
+   declaration overridable. */
+.wf-popover .wf-toggle-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  font-size: var(--fs-meta);
+}
+/* The schedule read back as the calendar note the library card will show —
+   what you are about to save, in the words you will next see it in. A pencil
+   outline rather than a marker wash: this is an echo of the fields above it,
+   not a status, and every hue in this palette already means something. */
+.wf-sched-note {
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+/* A problem with what has been typed. role="alert" carries it to assistive
+   technology; the urgent ink and the sentence carry it on screen. Written at
+   two classes deep because .wf-popover .caption above would otherwise win the
+   colour back. */
+.wf-popover .wf-schedule-problem {
+  color: var(--sem-urgent);
+}
+
+/* ==========================================================================
+   11. EMPTY STATE
+   ========================================================================== */
+
+.wf-empty {
+  max-width: 60ch;
+  margin: 0 0 var(--sp-6);
+  text-align: left;
+}
+.wf-empty h3 {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-section);
+  font-family: var(--display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+  color: var(--text-strong);
+}
+/* Never set instructions small: this is the paragraph that explains what a
+   workflow IS to someone who has never made one. */
+.wf-empty-sub {
+  margin: 0;
+  max-width: 60ch;
+  font-size: var(--fs-lead);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+
+/* ==========================================================================
+   12. QUICK ACTIONS (the top-bar shortcut menu)
+   .qa-pill's chrome belongs to shell.css, which loads after this file and
+   defines the whole control; only the menu's own scroll cap lives here.
+   ========================================================================== */
+
+.qa-menu {
+  max-height: 320px;
+  overflow-y: auto;
+}
+.qa-menu .pop-menu-item {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+}
+
+/* ==========================================================================
+   13. REDUCED MOTION
+   Every hover treatment still happens — it just stops travelling. The .nb-*
+   primitives this surface borrows are already covered by paper.css's own
+   block; these are the rules that belong to this file.
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  .wf-card,
+  .wf-card-emoji,
+  .wf-card-cta,
+  .pipeline-node,
+  .run-row-head {
+    transition: none;
+  }
+  .wf-card:hover,
+  .wf-card:active {
+    transform: none;
+  }
+}

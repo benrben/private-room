@@ -38,11 +38,11 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, renameSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { CancelFlag } from "./cancel.js";
 import { TurnId } from "./turn.js";
@@ -64,7 +64,9 @@ import {
   COMMAND_STREAM_IDLE_CLI_SECS,
   COMMAND_STREAM_IDLE_SECS,
   extractMdTable,
+  generateStream,
   LAYOUT_GRAPH_NOT_IMPLEMENTED,
+  layoutGraphNotImplemented,
   mediaKind,
   mergeMinutes,
   mergeSketch,
@@ -84,7 +86,26 @@ import {
 } from "./chatCommandsGenerate.js";
 import { htmlDocument } from "./docsHtml.js";
 import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { createRoomFile } from "./workspace/roomContent.js";
 import { WorkspaceService } from "./workspace/workspaceService.js";
+import type { ProviderDeps } from "./providers.js";
+
+vi.mock("./sidecar.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./sidecar.js")>();
+  return { ...actual, ensureUp: vi.fn(actual.ensureUp) };
+});
+
+vi.mock("./web.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./web.js")>();
+  return {
+    ...actual,
+    fetchReadable: vi.fn(actual.fetchReadable),
+    searchWeb: vi.fn(actual.searchWeb),
+  };
+});
+
+import { ensureUp } from "./sidecar.js";
+import { fetchReadable, searchWeb } from "./web.js";
 
 // ============================================================================
 // fixtures
@@ -92,8 +113,13 @@ import { WorkspaceService } from "./workspace/workspaceService.js";
 
 let tmpDir: string | null = null;
 let openDb: Database.Database | null = null;
+const originalFetch = globalThis.fetch;
 
 afterEach(() => {
+  globalThis.fetch = originalFetch;
+  vi.mocked(ensureUp).mockReset();
+  vi.mocked(fetchReadable).mockReset();
+  vi.mocked(searchWeb).mockReset();
   openDb?.close();
   openDb = null;
   if (tmpDir) {
@@ -139,6 +165,191 @@ function makeCtx(db: Database.Database, overrides: Partial<CmdCtx> = {}): CmdCtx
   };
 }
 
+function ndjsonResponse(lines: string[]): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const line of lines) controller.enqueue(Buffer.from(line));
+      controller.close();
+    },
+  });
+  return new Response(stream, { status: 200 });
+}
+
+function respondWith(response: Response): void {
+  vi.mocked(ensureUp).mockResolvedValue("http://sidecar.test");
+  globalThis.fetch = vi.fn(async () => response) as unknown as typeof fetch;
+}
+
+// ============================================================================
+// generate_stream — streaming wire, cancellation, policy/provider and errors
+// ============================================================================
+
+describe("generateStream", () => {
+  it("streams split NDJSON deltas while preserving attachments, tools, and an explicit privacy policy", async () => {
+    vi.mocked(ensureUp).mockResolvedValue("http://sidecar.test");
+    let url = "";
+    let sent: Record<string, unknown> = {};
+    globalThis.fetch = vi.fn(async (input: unknown, init?: RequestInit) => {
+      url = String(input);
+      sent = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return ndjsonResponse([
+        "not json\n123\n{\"t\":\"delta\",\"v\":\"\"}\n{\"t\":\"delta\",\"v\":4}\n{\"t\":4}\n{\"t\":\"other\"}\n{\"t\":\"delta\",\"v\":\"Hel",
+        "lo\"}\n{\"t\":\"delta\",\"v\":\"!\"}\n{\"t\":\"done\"}\n",
+      ]);
+    }) as unknown as typeof fetch;
+    const deltas: string[] = [];
+
+    const result = await generateStream(
+      "/generate_stream",
+      {
+        model: "qwen3.5:4b",
+        messages: [{ role: "user", content: "Summarize the attachment" }],
+        attachments: [{ fileId: "brief" }],
+        tools: [{ name: "room_search" }],
+        privacy: null,
+      },
+      new CancelFlag(),
+      new AbortController(),
+      (delta) => deltas.push(delta),
+    );
+
+    expect(result).toBe("Hello!");
+    expect(deltas).toEqual(["Hello", "!"]);
+    expect(url).toBe("http://sidecar.test/generate_stream");
+    expect(sent).toMatchObject({
+      attachments: [{ fileId: "brief" }],
+      tools: [{ name: "room_search" }],
+      privacy: null,
+    });
+  });
+
+  it("returns the accumulated text when the sidecar ends without a done event", async () => {
+    respondWith(ndjsonResponse(['{"t":"delta","v":"partial"}\n']));
+    const deltas: string[] = [];
+
+    await expect(
+      generateStream("/generate_stream", {}, new CancelFlag(), new AbortController(), (delta) => deltas.push(delta)),
+    ).resolves.toBe("partial");
+    expect(deltas).toEqual(["partial"]);
+  });
+
+  it("surfaces an in-stream sidecar error with its code and message", async () => {
+    respondWith(ndjsonResponse(['{"t":"error","code":"MODEL_BUSY","error":"try later"}\n']));
+
+    await expect(
+      generateStream("/generate_stream", { model: "qwen3.5:4b" }, new CancelFlag(), new AbortController(), () => {}),
+    ).rejects.toThrow(/try later/);
+  });
+
+  it("classifies HTTP errors, malformed error bodies, and a missing response body", async () => {
+    respondWith(new Response(JSON.stringify({ code: "INVALID_REQUEST", error: "bad prompt" }), { status: 422 }));
+    await expect(
+      generateStream("/generate_stream", {}, new CancelFlag(), new AbortController(), () => {}),
+    ).rejects.toThrow(/bad prompt/);
+
+    respondWith(new Response("not json", { status: 500 }));
+    await expect(
+      generateStream("/generate_stream", {}, new CancelFlag(), new AbortController(), () => {}),
+    ).rejects.toThrow(/unknown error/);
+
+    respondWith(new Response(null, { status: 200 }));
+    await expect(
+      generateStream("/generate_stream", {}, new CancelFlag(), new AbortController(), () => {}),
+    ).rejects.toThrow(/returned no body/);
+  });
+
+  it("reports a reader failure and tolerates a reader that was already released", async () => {
+    vi.mocked(ensureUp).mockResolvedValue("http://sidecar.test");
+    const reader = {
+      read: async (): Promise<{ done: boolean }> => Promise.reject(new Error("socket reset")),
+      cancel: async (): Promise<void> => Promise.reject(new Error("already released")),
+    };
+    globalThis.fetch = vi.fn(async () => ({ ok: true, body: { getReader: () => reader } }) as unknown as Response) as unknown as typeof fetch;
+
+    await expect(
+      generateStream("/generate_stream", {}, new CancelFlag(), new AbortController(), () => {}),
+    ).rejects.toThrow(/Local AI stream failed: socket reset/);
+  });
+
+  it("uses a provider setup failure as an engine refusal before it starts the sidecar", async () => {
+    const providerDeps: ProviderDeps = {
+      readKey: () => {
+        throw new Error("missing provider key");
+      },
+      storeKey: () => {},
+      deleteKey: () => {},
+      fetchJson: async () => ({ ok: false, status: 401, json: async () => ({}) }),
+    };
+
+    await expect(
+      generateStream(
+        "/generate_stream",
+        { model: "openrouter::example/model" },
+        new CancelFlag(),
+        new AbortController(),
+        () => {},
+        providerDeps,
+      ),
+    ).rejects.toThrow(/no OpenRouter API key is saved/);
+    expect(ensureUp).not.toHaveBeenCalled();
+  });
+
+  it("reports sidecar startup and both transport failure classes", async () => {
+    vi.mocked(ensureUp).mockRejectedValue(new Error("sidecar not installed"));
+    await expect(
+      generateStream("/generate_stream", {}, new CancelFlag(), new AbortController(), () => {}),
+    ).rejects.toThrow(/sidecar not installed/);
+
+    vi.mocked(ensureUp).mockResolvedValue("http://sidecar.test");
+    globalThis.fetch = vi.fn(async () => {
+      const refused = Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+      throw refused;
+    }) as unknown as typeof fetch;
+    await expect(
+      generateStream("/generate_stream", {}, new CancelFlag(), new AbortController(), () => {}),
+    ).rejects.toThrow("OLLAMA_DOWN");
+
+    globalThis.fetch = vi.fn(async () => Promise.reject("transport lost")) as unknown as typeof fetch;
+    await expect(
+      generateStream("/generate_stream", {}, new CancelFlag(), new AbortController(), () => {}),
+    ).rejects.toThrow(/transport lost/);
+  });
+
+  it("keeps polling an uncancelled request until an external abort closes it", async () => {
+    vi.mocked(ensureUp).mockResolvedValue("http://sidecar.test");
+    globalThis.fetch = vi.fn(
+      (_input: unknown, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    ) as unknown as typeof fetch;
+    const controller = new AbortController();
+    const stop = setTimeout(() => controller.abort(), 125);
+
+    await expect(
+      generateStream("/generate_stream", {}, new CancelFlag(), controller, () => {}),
+    ).resolves.toBe("");
+    clearTimeout(stop);
+  });
+
+  it("polls Stop during a pending request and returns empty once it aborts the connection", async () => {
+    vi.mocked(ensureUp).mockResolvedValue("http://sidecar.test");
+    globalThis.fetch = vi.fn(
+      (_input: unknown, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    ) as unknown as typeof fetch;
+    const cancel = new CancelFlag();
+    const stop = setTimeout(() => cancel.store(true), 0);
+
+    await expect(
+      generateStream("/generate_stream", {}, cancel, new AbortController(), () => {}),
+    ).resolves.toBe("");
+    clearTimeout(stop);
+  });
+});
+
 // ============================================================================
 // watch_stream (chat_commands.rs::stream_watchdog_tests)
 // ============================================================================
@@ -174,6 +385,23 @@ describe("watchStream", () => {
     await expect(
       watchStream(never(), () => {}, cancel, { current: Date.now() - 10_000 }, { current: "" }, 0, 1_500)
     ).rejects.toThrow(/stopped responding/);
+  });
+
+  it("propagates a stream failure instead of disguising it as an idle timeout", async () => {
+    const cancel = new CancelFlag();
+    await expect(
+      watchStream(Promise.reject(new Error("model exploded")), () => {}, cancel, { current: Date.now() }, { current: "" }, 300, 0),
+    ).rejects.toThrow("model exploded");
+  });
+
+  it("waits through Stop grace before an independently stalled stream is hung up", async () => {
+    const cancel = new CancelFlag();
+    cancel.store(true);
+    let aborted = false;
+    await expect(
+      watchStream(never(), () => { aborted = true; }, cancel, { current: Date.now() - 10_000 }, { current: "" }, 0, 1_000),
+    ).rejects.toThrow(/stopped responding/);
+    expect(aborted).toBe(true);
   });
 });
 
@@ -298,6 +526,40 @@ describe("mergeSketch", () => {
     expect(nodes).toHaveLength(1);
     expect(nodes[0]?.label).toBe("Real");
   });
+
+  it("ignores malformed model fields while preserving fallback labels, kinds, and valid edge order", () => {
+    const merged = mergeSketch([
+      null,
+      { title: 3, explanation: 4, nodes: "not an array", edges: "not an array" },
+      {
+        title: "  Model flow  ",
+        nodes: [
+          4,
+          { id: "   " },
+          { id: "fallback" },
+          { id: "kind", label: " Kind ", note: " ", kind: "start" },
+        ],
+        edges: [
+          4,
+          {},
+          { from: 3, to: "kind" },
+          { from: "fallback", to: 4 },
+          { from: "fallback", to: "kind", label: "  " },
+          { from: "fallback", to: "kind", label: "duplicate" },
+        ],
+      },
+    ]);
+
+    expect(merged).toMatchObject({
+      title: "Model flow",
+      explanation: "",
+      nodes: [
+        { id: "fallback", label: "fallback" },
+        { id: "kind", label: "Kind", kind: "start" },
+      ],
+      edges: [{ from: "fallback", to: "kind" }],
+    });
+  });
 });
 
 // ============================================================================
@@ -367,6 +629,31 @@ describe("mergeMinutes", () => {
     expect(m.actions).toHaveLength(2);
     expect(mergeMinutes([]).timeline).toHaveLength(0);
   });
+
+  it("drops malformed, empty and duplicate structured fields without changing valid item order", () => {
+    const merged = mergeMinutes([
+      null,
+      { title: 3, date: {}, attendees: "not an array", timeline: "not an array", decisions: {}, actions: {} },
+      {
+        title: "  Retrospective  ",
+        date: " 2026-08-01 ",
+        attendees: [4, " ", "Ana", " ana "],
+        decisions: [null, "", "Ship", " ship "],
+        timeline: [4, {}, { topic: " ", summary: " " }, { topic: "Plan", summary: "" }, { topic: "", summary: "Result" }, { topic: " plan ", summary: " " }],
+        actions: [4, {}, { owner: "", task: "" }, { owner: " Ana ", task: "Send notes" }, { owner: "ana", task: " send notes " }],
+      },
+    ]);
+
+    expect(merged).toMatchObject({
+      title: "Retrospective",
+      date: "2026-08-01",
+      attendees: ["Ana"],
+      decisions: ["Ship"],
+      timeline: [{ topic: "Plan", summary: "" }, { topic: "", summary: "Result" }],
+      actions: [{ owner: " Ana ", task: "Send notes" }],
+    });
+    expect(renderMinutesHtml(merged, "Retrospective")).toContain("Result");
+  });
 });
 
 describe("renderMinutesHtml", () => {
@@ -400,6 +687,26 @@ describe("renderMinutesHtml", () => {
     expect(doc).toContain("--accent");
     expect(doc).toContain('class="doc"');
     expect(doc).toContain("doc-foot");
+  });
+
+  it("renders a minimal document when every optional section is empty or malformed", () => {
+    const body = renderMinutesHtml(
+      {
+        title: "",
+        date: " ",
+        attendees: [" "],
+        timeline: [null as unknown as Record<string, unknown>],
+        decisions: [" "],
+        actions: [],
+      },
+      "Minimal",
+    );
+
+    expect(body).toContain("Meeting minutes");
+    expect(body).not.toContain('class="chips"');
+    expect(body).not.toContain("<h2>Timeline</h2>");
+    expect(body).not.toContain("<h2>Decisions</h2>");
+    expect(body).not.toContain("<h2>Action items</h2>");
   });
 });
 
@@ -449,6 +756,28 @@ describe("cmdSummarize", () => {
     expect(result.content).toContain("This room is about planning.");
     expect(result.content).toContain("Summarize room");
     expect(result.sources).toEqual([]);
+  });
+
+  it("uses an existing per-file summary in the room inventory", async () => {
+    const db = freshRoom();
+    const id = addFile(db, "plan.md", "hello");
+    db.prepare("UPDATE files SET ai_summary = ? WHERE id = ?").run("  A saved planning summary.  ", id);
+    let prompt = "";
+    const ctx = makeCtx(db, {
+      generateStream: async (_path, body) => {
+        prompt = JSON.stringify(body);
+        return "Room overview";
+      },
+    });
+    await expect(cmdSummarize(ctx)).resolves.toMatchObject({ content: expect.stringContaining("Room overview") });
+    expect(prompt).toContain("A saved planning summary.");
+  });
+
+  it("refuses a file when the digest boundary returns no readable content", async () => {
+    const db = freshRoom();
+    const id = addFile(db, "plan.md", "source text ".repeat(2_000));
+    const ctx = makeCtx(db, { refs: [id], generate: async () => "   " });
+    await expect(cmdSummarize(ctx)).rejects.toThrow('Couldn\'t read "plan.md"');
   });
 });
 
@@ -550,6 +879,14 @@ describe("cmdCompare", () => {
     expect(result.content).toContain("The ship dates differ.");
     expect(result.content).toContain("No supported overview was found.");
   });
+
+  it("rejects malformed structured comparison output with the grounding error", async () => {
+    const db = freshRoom();
+    const a = addFile(db, "a.md", "Alpha evidence");
+    const b = addFile(db, "b.md", "Beta evidence");
+    const ctx = makeCtx(db, { refs: [a, b], chatStructured: async () => "not-json" });
+    await expect(cmdCompare(ctx)).rejects.toThrow("comparison was not grounded in readable source evidence");
+  });
 });
 
 describe("cmdTranscribe", () => {
@@ -638,9 +975,48 @@ describe("cmdTranscribe", () => {
     const ctx = makeCtx(db, { refs: [id], transcribeAudio: async () => "   " });
     await expect(cmdTranscribe(ctx)).rejects.toThrow(/Couldn't get any speech/);
   });
+
+  it("refuses a media row whose stored bytes have vanished", async () => {
+    const db = freshRoom();
+    const id = addFile(db, "call.m4a", null, "audio/mp4");
+    db.prepare("UPDATE files SET original_bytes = NULL WHERE id = ?").run(id);
+    const ctx = makeCtx(db, { refs: [id], transcribeAudio: async () => "must not run" });
+    await expect(cmdTranscribe(ctx)).rejects.toThrow("This recording has no stored audio.");
+  });
+
+  it("returns the transcript even when best-effort cache persistence fails", async () => {
+    const db = freshRoom();
+    const id = addFile(db, "call.m4a", null, "audio/mp4");
+    const ctx = makeCtx(db, {
+      refs: [id],
+      transcribeAudio: async () => {
+        db.close();
+        openDb = null;
+        return "Words that still reached the user";
+      },
+    });
+    await expect(cmdTranscribe(ctx)).resolves.toMatchObject({
+      content: expect.stringContaining("Words that still reached the user"),
+    });
+  });
 });
 
 describe("cmdMinutes", () => {
+  it("renders the whole-source coverage note when the meeting needs multiple windows", async () => {
+    const db = freshRoom();
+    const ctx = makeCtx(db, {
+      history: "Ana: ship Friday. ".repeat(2_000),
+      chatStructured: async () => JSON.stringify({
+        title: "Long meeting",
+        timeline: [{ topic: "Decision", summary: "Ship Friday" }],
+      }),
+    });
+
+    const result = await cmdMinutes(ctx);
+
+    expect(result.content).toMatch(/a 1-point timeline, read in [2-9]\d* passes over the whole source/);
+  });
+
   it("asks for a source when none is given", async () => {
     const ctx = makeCtx(freshRoom());
     await expect(cmdMinutes(ctx)).rejects.toThrow("Give me something to turn into minutes");
@@ -683,9 +1059,33 @@ describe("cmdMinutes", () => {
     expect(html).toContain("Ship Friday");
     expect(events.some(([e]) => e === "agent-open-file")).toBe(true);
   });
+
+  it("saves minutes through a workspace room", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "chat-minutes-workspace-"));
+    const root = path.join(tmpDir, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Test Room");
+    openDb = db;
+    const workspace = new WorkspaceService(db, root);
+    const ctx = makeCtx(db, {
+      rooms: { current: () => ({ db, path: root, workspace }) },
+      history: "Ana: ship Friday. Ben: agreed.",
+      chatStructured: async () => JSON.stringify({
+        title: "Workspace meeting",
+        timeline: [{ topic: "Decision", summary: "Ship Friday" }],
+      }),
+    });
+    const result = await cmdMinutes(ctx);
+    expect(result.content).toContain("Workspace meeting.html");
+    const saved = fileByExactName(db, "Workspace meeting.html")!;
+    await expect(workspace.readBuffer(saved.id)).resolves.toEqual(expect.any(Buffer));
+  });
 });
 
 describe("cmdSketch", () => {
+  it("makes the default missing-layout boundary explicit", () => {
+    expect(() => layoutGraphNotImplemented([], [])).toThrow(LAYOUT_GRAPH_NOT_IMPLEMENTED);
+  });
+
   it("asks for something to draw when nothing is given", async () => {
     const ctx = makeCtx(freshRoom());
     await expect(cmdSketch(ctx)).rejects.toThrow("Give me something to draw");
@@ -755,6 +1155,22 @@ describe("cmdToSheet", () => {
     expect(getFileExtractedText(db, saved!.id)).toBe("Name,Age\nAnn,30\nBob,25\n");
     expect(events.some(([e]) => e === "agent-open-file")).toBe(true);
   });
+
+  it("saves a converted table through a workspace room and ignores emit failures", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "chat-sheet-workspace-"));
+    const root = path.join(tmpDir, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Test Room");
+    openDb = db;
+    const workspace = new WorkspaceService(db, root);
+    const ctx = makeCtx(db, {
+      rooms: { current: () => ({ db, path: root, workspace }) },
+      history: "| A | B |\n|---|---|\n| 1 | 2 |\n",
+      emit: () => { throw new Error("fabricated renderer disconnect"); },
+    });
+    await expect(cmdToSheet(ctx)).resolves.toMatchObject({ content: expect.stringContaining("table.csv") });
+    const saved = fileByExactName(db, "table.csv")!;
+    await expect(workspace.readBuffer(saved.id)).resolves.toEqual(Buffer.from("A,B\n1,2\n"));
+  });
 });
 
 describe("cmdTranslate", () => {
@@ -775,6 +1191,11 @@ describe("cmdTranslate", () => {
       "inline code were not preserved exactly",
       "a Hebrew translation must contain Hebrew script",
     ]);
+    expect(translationValidationIssues(
+      "Keep https://example.com/q twice: https://example.com/q and `same` with `same`.",
+      "Conserva https://example.com/q dos veces: https://example.com/q y `same` con `same`.",
+      "Spanish",
+    )).toEqual([]);
   });
 
   it("requires an @-pinned file", async () => {
@@ -896,6 +1317,92 @@ describe("cmdTranslate", () => {
     expect(saved).toContain("Part 1 is missing");
     expect(saved).toContain("תרגום תקין בעברית");
   });
+
+  it("keeps a completed first chunk and publishes the partial artifact after Stop", async () => {
+    const db = freshRoom();
+    const id = addFile(db, "long.txt", "Alpha ".repeat(600));
+    const cancel = new CancelFlag();
+    const events: Array<[string, unknown]> = [];
+    const steps: Array<[string, unknown]> = [];
+    const ctx = makeCtx(db, {
+      refs: [id],
+      args: "to Spanish",
+      cancel,
+      send: (event: string, payload: unknown) => steps.push([event, payload]),
+      emit: (event: string, payload: unknown) => events.push([event, payload]),
+      generate: async () => {
+        cancel.store(true);
+        return "Parte traducida";
+      },
+    });
+
+    const result = await cmdTranslate(ctx);
+    const saved = getFileExtractedText(db, fileByExactName(db, "long (Spanish).md")!.id) ?? "";
+
+    expect(result.content).toBe("Partially translated **long.txt** into Spanish → **long (Spanish).md**.");
+    expect(saved).toContain("Parte traducida\n");
+    expect(saved).toContain('Part 2 is missing from "long.txt" because the run was stopped.');
+    expect(steps.map(([event]) => event)).toEqual(["ask-step"]);
+    expect(events.map(([event]) => event)).toEqual(["room-files-changed", "agent-open-file"]);
+  });
+
+  it("stops retrying after consecutive translation failures while retaining earlier chunks", async () => {
+    const db = freshRoom();
+    const id = addFile(db, "very-long.txt", "Alpha ".repeat(2_200));
+    let calls = 0;
+    const ctx = makeCtx(db, {
+      refs: [id],
+      args: "to Spanish",
+      generate: async () => {
+        calls += 1;
+        if (calls === 1) return "Primer fragmento";
+        throw new Error(`engine failure ${calls}`);
+      },
+    });
+
+    const result = await cmdTranslate(ctx);
+    const saved = getFileExtractedText(db, fileByExactName(db, "very-long (Spanish).md")!.id) ?? "";
+
+    expect(calls).toBe(CHUNK_GIVE_UP_AFTER + 1);
+    expect(result.content).toContain("Partially translated");
+    expect(saved).toContain("Partial translation — translated 1 of 5 parts.");
+    expect(saved).toContain("Parts 2, 3, 4, 5 are missing");
+  });
+
+  it("commits a complete translation through the workspace writer and announces it", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "chat-command-translate-workspace-"));
+    const root = path.join(tmpDir, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Test Room");
+    openDb = db;
+    const workspace = new WorkspaceService(db, root);
+    const source = await createRoomFile(
+      { db, path: root },
+      "notes.md",
+      "text/markdown",
+      Buffer.from("Hello"),
+      "Hello",
+      "upload",
+    );
+    const events: Array<[string, unknown]> = [];
+    const steps: Array<[string, unknown]> = [];
+    const ctx = makeCtx(db, {
+      rooms: { current: () => ({ db, path: root, workspace }) },
+      refs: [source.id],
+      args: "to Spanish",
+      send: (event: string, payload: unknown) => steps.push([event, payload]),
+      emit: (event: string, payload: unknown) => events.push([event, payload]),
+      generate: async () => "Hola",
+    });
+
+    await expect(cmdTranslate(ctx)).resolves.toMatchObject({
+      content: "Translated **notes.md** into Spanish → **notes (Spanish).md**.",
+    });
+    const written = fileByExactName(db, "notes (Spanish).md");
+    expect(written).not.toBeNull();
+    await expect(workspace.readBuffer(written!.id)).resolves.toEqual(Buffer.from("Hola\n"));
+    expect(steps.map(([event]) => event)).toEqual(["ask-step"]);
+    expect(events.map(([event]) => event)).toEqual(["room-files-changed", "agent-open-file"]);
+  });
 });
 
 describe("cmdResearch", () => {
@@ -910,6 +1417,118 @@ describe("cmdResearch", () => {
     const ctx = makeCtx(db, { args: "who won the game" });
     const result = await cmdResearch(ctx);
     expect(result.content).toContain("Web access is off in this room.");
+    expect(result.sources).toEqual([]);
+  });
+
+  it("distinguishes an unavailable search from a search with no results", async () => {
+    const db = freshRoom();
+    setSetting(db, "web_provider", "duckduckgo");
+    vi.mocked(searchWeb).mockResolvedValue({
+      hits: [],
+      merged: 0,
+      tookMs: 0,
+      cached: false,
+      failed: ["DuckDuckGo"],
+    });
+
+    const result = await cmdResearch(makeCtx(db, { args: "history of tea" }));
+    expect(result.content).toContain("did not run");
+    expect(result.content).toContain("DuckDuckGo");
+  });
+
+  it("saves each distinct readable page before answering from those saved sources", async () => {
+    const db = freshRoom();
+    setSetting(db, "web_provider", "duckduckgo");
+    vi.mocked(searchWeb).mockResolvedValue({
+      hits: [
+        { title: "Source one", url: "https://example.test/one", engines: ["test"], score: 1 },
+        { title: "Unavailable", url: "https://example.test/bad", engines: ["test"], score: 1 },
+        { title: "Empty", url: "https://example.test/empty", engines: ["test"], score: 1 },
+        { title: "Repeated", url: "https://example.test/one", engines: ["test"], score: 1 },
+      ],
+      merged: 4,
+      tookMs: 0,
+      cached: false,
+      failed: [],
+    });
+    vi.mocked(fetchReadable).mockImplementation(async (url) => {
+      if (url.endsWith("bad")) throw new Error("unavailable");
+      if (url.endsWith("empty")) return { title: "Empty", text: "   " };
+      return { title: "Read title", text: "Source evidence" };
+    });
+    const ctx = makeCtx(db, {
+      args: "what happened",
+      generate: async () => "Short digest",
+      generateStream: async () => "The sources say what happened.",
+    });
+
+    const result = await cmdResearch(ctx);
+    expect(result.content).toBe("The sources say what happened.");
+    expect(result.sources).toEqual(["Read title.md"]);
+    expect(fileByExactName(db, "Read title.md")).not.toBeNull();
+    expect(fetchReadable).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps saved sources when the answer stream fails", async () => {
+    const db = freshRoom();
+    setSetting(db, "web_provider", "duckduckgo");
+    vi.mocked(searchWeb).mockResolvedValue({
+      hits: [{ title: "Source", url: "https://example.test/source", engines: ["test"], score: 1 }],
+      merged: 1,
+      tookMs: 0,
+      cached: false,
+      failed: [],
+    });
+    vi.mocked(fetchReadable).mockResolvedValue({ title: "", text: "Source evidence" });
+    const result = await cmdResearch(makeCtx(db, {
+      args: "what happened",
+      generate: async () => "Short digest",
+      generateStream: async () => Promise.reject(new Error("model unavailable")),
+    }));
+
+    expect(result.content).toContain("Saved 1 source(s) into the room:");
+    expect(result.sources).toEqual(["Source.md"]);
+  });
+
+  it("falls back to the saved-source list when the answer stream is blank", async () => {
+    const db = freshRoom();
+    setSetting(db, "web_provider", "duckduckgo");
+    vi.mocked(searchWeb).mockResolvedValue({
+      hits: [{ title: "Source", url: "https://example.test/source", engines: ["test"], score: 1 }],
+      merged: 1, tookMs: 0, cached: false, failed: [],
+    });
+    vi.mocked(fetchReadable).mockResolvedValue({ title: "Source", text: "Evidence" });
+    const ctx = makeCtx(db, {
+      args: "what happened",
+      generate: async () => "Digest",
+      generateStream: async () => "   ",
+      emit: () => { throw new Error("fabricated renderer disconnect"); },
+    });
+    const result = await cmdResearch(ctx);
+    expect(result.content).toContain("Saved 1 source(s) into the room:");
+    expect(result.content).toContain("- Source.md");
+  });
+
+  it("reports readable hits as unsavable when the room write fails", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "chat-research-workspace-"));
+    const root = path.join(tmpDir, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Test Room");
+    openDb = db;
+    const workspace = new WorkspaceService(db, root);
+    setSetting(db, "web_provider", "duckduckgo");
+    vi.mocked(searchWeb).mockResolvedValue({
+      hits: [{ title: "Source", url: "https://example.test/source", engines: ["test"], score: 1 }],
+      merged: 1, tookMs: 0, cached: false, failed: [],
+    });
+    vi.mocked(fetchReadable).mockImplementation(async () => {
+      renameSync(root, `${root}-gone`);
+      return { title: "Source", text: "Evidence" };
+    });
+    const result = await cmdResearch(makeCtx(db, {
+      args: "what happened",
+      rooms: { current: () => ({ db, path: root, workspace }) },
+    }));
+    expect(result.content).toContain("couldn't save any readable copies");
     expect(result.sources).toEqual([]);
   });
 });

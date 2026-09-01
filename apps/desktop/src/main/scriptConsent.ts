@@ -1,100 +1,21 @@
-/**
- * Wave 5 (Idea 13) — the SCRIPT surface's consent layer: the SEC-1 approval
- * store, the auto-workflow bookkeeping, script scheduling, and the pure
- * run-output shaping the agent seam hands back to the model.
+/** Script approvals, scheduling, and workflow bookkeeping.
  *
- * Ported from `src-tauri/src/commands/scripts.rs` (876 lines, read in full,
- * including its `#[cfg(test)] mod tests`), plus the two helpers scripts.rs
- * only CALLS: `stamp_script_consents` (`jobs/workflow.rs`, still stubbed) and
- * `resolve_script_file`/`script_fingerprint` (`jobs/script_run.rs`, now landed
- * as `scriptRun.ts` — this file imports and re-exports both rather than
- * keeping its own copy; see the import block below).
- *
- * ============================================================================
- * THE SEC-1 DOCTRINE, AND THE ONE PROPERTY THIS FILE EXISTS TO GUARANTEE
- * ============================================================================
- * Copied verbatim from `mcp_cmds.rs` — the way this migration already ported
- * it in `mcpConfig.ts`: THE ROOM'S AUTHOR IS THE ATTACKER. A `.roomai` is
- * attacker-authored content, so "the user let this code run on this Mac" is:
- *
- *   - PER-MAC. {@link scriptApprovalsFile} is a direct sibling of
- *     `mcpConfig.ts`'s `mcpApprovalsFile` — `script_approvals.json` in the
- *     app's own data folder, NEVER inside a room. A booby-trapped room opened
- *     on a fresh Mac can therefore not ship its own "already approved" stamp.
- *
- *   - CONTENT-ADDRESSED. The key is {@link scriptFingerprint} — SHA-256 of the
- *     script's raw BYTES — not its file id and not its name. ANY edit, down to
- *     a single byte, produces a different hash, so the old approval silently
- *     stops matching and the next run re-prompts. That is the whole gate: it
- *     costs nothing and it cannot be forgotten, because every consumer here
- *     ({@link stampScriptConsents}, {@link setScriptSchedule}) hashes the
- *     file's CURRENT bytes at decision time rather than trusting a hash handed
- *     to it. `scriptConsent.test.ts` proves that end to end — edit a real row
- *     in a real room, then watch the old grant stop covering it.
- *
- * ============================================================================
- * WHAT IS REAL HERE (no unported dependency)
- * ============================================================================
- *   - The approval store: {@link scriptApprovalsFile} /
- *     {@link readScriptApprovals} / {@link addScriptApproval}.
- *   - {@link scriptFingerprint} and {@link resolveScriptFile} — imported and
- *     re-exported from `scriptRun.ts`, not redefined here (see below).
- *   - {@link wfIsForScript} / {@link ensureScriptWorkflow} — the auto-workflow
- *     find-or-create. These LOOK `WorkflowDef`-shaped but are not: a
- *     `db::Workflow`'s `definition` is a `serde_json::Value` (this port's
- *     `Workflow.definition: unknown`), and the Rust source reads it as plain
- *     JSON here (`.get("nodes")`/`.as_array()`) and writes it with a bare
- *     `serde_json::json!` — never the typed struct. So they need only
- *     `db-host/workflows.ts`, already ported.
- *   - {@link stampScriptConsents} — the consent decision itself, ported whole
- *     (node walk, resolve, hash, filter) for the same reason: the Rust
- *     original's only `WorkflowDef` dependency is the shape of the node list,
- *     which is plain JSON on both sides of the wire.
- *   - {@link setScriptSchedule} — checked line by line against
- *     `set_script_schedule`: it touches the fingerprint, the approvals file,
- *     `ensure_script_workflow`, `db::upsert_schedule` and `next_run_from_now`
- *     (`db-host/workflows.ts`, `jobScheduler.ts`) — never `ScriptManifest` or
- *     `WorkflowDef`.
- *   - {@link interpreterLine} / {@link parseScriptDecision} — the pure
- *     fragments of the manual-run consent card.
- *   - {@link createPendingScriptApprovals} / {@link resolveScriptRun} — the
- *     pending-request registry behind the `script-approve-request` card
- *     (Rust's `AppState.script_pending` + the `resolve_script_run` command),
- *     as a plain map so it is testable without a renderer.
- *   - {@link printedOutput} / {@link scriptOutput} / {@link clampScriptOutput}
- *     — what a finished run hands the model.
- *
- * NOT ported, mirroring `mcpConfig.ts`'s own precedent for the analogous piece
- * (`mcp_call_approved`, "the caller's", because it needs a live renderer round
- * trip): `script_run_approved`'s `window.emit` + oneshot wait. Its pure
- * decision half is {@link parseScriptDecision}; its registry half is
- * {@link resolveScriptRun}; only the emit-and-await plumbing between them
- * belongs to a later integration batch.
- *
- * ============================================================================
- * WHAT IS STILL STUBBED — ONE unported dependency
- * ============================================================================
- * `jobs/workflow.rs` (5855 lines) — `WorkflowDef`/`NodeKind`, the definition
- * compiler, `start_workflow_run`. `jobs/script_run.rs` has since landed as
- * `scriptRun.ts` (`ScriptManifest`/`ScriptLang`/`Shortcut`/`Runner`,
- * `script_lang_of`, `parse_script_manifest`, `resolve_interpreter`,
- * `referenced_room_files`, the sandboxed executor) and is no longer stubbed
- * here — {@link scriptFingerprint}/{@link resolveScriptFile} are imported
- * from it directly.
- *
- * The `jobs/workflow.rs` stub below follows this codebase's established shape
- * (`autoIndex.ts`'s `START_REC_READ_NOT_IMPLEMENTED`, `jobScheduler.ts`'s
- * `startWorkflowRunNotImplemented`): an exported message constant naming the
- * real blocker, and a function that fails loudly rather than fabricating a
- * result.
+ * Room authors are untrusted: approvals are per-Mac and keyed by the current
+ * script bytes, so a room cannot ship a grant and every edit requires review.
+ * Output rendering is separated into `scriptOutput.ts`; the remaining explicit
+ * NOT_IMPLEMENTED adapters fail loudly where workflow execution is not ported.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type Database from "better-sqlite3-multiple-ciphers";
-import { findFileLike, getFileBytes, getFileBytesNamed, listFiles } from "./db-host/files.js";
+import {
+  findFileLike,
+  getFileBytes,
+  getFileBytesNamed,
+  listFiles,
+} from "./db-host/files.js";
 import type { RoomHandle } from "./jobs.js";
-import { getJobArtifact } from "./db-host/jobs.js";
 import {
   createWorkflow,
   getSchedule,
@@ -102,7 +23,6 @@ import {
   listWorkflows,
   setWorkflowStatus,
   upsertSchedule,
-  type Schedule,
   type Workflow,
   type WorkflowRun,
 } from "./db-host/workflows.js";
@@ -115,10 +35,16 @@ import {
   scriptLangOf,
   type ResolvedScriptFile,
 } from "./scriptRun.js";
-import { clampBytes } from "./textClamp.js";
 import { readRoomFile } from "./workspace/roomContent.js";
+import type {
+  FailureHistory,
+  ScriptCandidate,
+  ScriptInfo,
+} from "./scriptConsentTypes.js";
 
 export { resolveScriptFile, scriptFingerprint, type ResolvedScriptFile };
+export { clampScriptOutput, printedOutput, scriptOutput } from "./scriptOutput.js";
+export type { ScriptInfo } from "./scriptConsentTypes.js";
 
 export async function resolveScriptFileInRoom(
   room: RoomHandle,
@@ -351,23 +277,12 @@ export function stampScriptConsents(
   approved: ReadonlySet<string>
 ): Map<string, string> {
   const out = new Map<string, string>();
-  const nodes =
-    isPlainObject(definition) && Array.isArray(definition["nodes"]) ? definition["nodes"] : [];
-  for (const node of nodes) {
-    if (!isPlainObject(node) || node["kind"] !== "script_run") continue;
-    const file = node["file"];
-    if (typeof file !== "string") continue;
-    let resolved: ResolvedScriptFile;
+  for (const file of scriptNodeFiles(definition)) {
     try {
-      resolved = resolveScriptFile(db, file);
+      stampResolvedConsent(out, resolveScriptFile(db, file), approved);
     } catch {
       // An unresolvable script is left to the executor to surface honestly —
       // no consent for a file we cannot even read. (Rust: `if let Ok(…)`.)
-      continue;
-    }
-    const sha = scriptFingerprint(resolved.bytes);
-    if (approved.has(sha)) {
-      out.set(resolved.id, sha);
     }
   }
   return out;
@@ -380,20 +295,34 @@ export async function stampScriptConsentsInRoom(
 ): Promise<Map<string, string>> {
   if (room.workspace === undefined) return stampScriptConsents(room.db, definition, approved);
   const out = new Map<string, string>();
-  const nodes = isPlainObject(definition) && Array.isArray(definition["nodes"])
-    ? definition["nodes"]
-    : [];
-  for (const node of nodes) {
-    if (!isPlainObject(node) || node["kind"] !== "script_run" || typeof node["file"] !== "string") continue;
+  for (const file of scriptNodeFiles(definition)) {
     try {
-      const resolved = await resolveScriptFileInRoom(room, node["file"]);
-      const sha = scriptFingerprint(resolved.bytes);
-      if (approved.has(sha)) out.set(resolved.id, sha);
+      stampResolvedConsent(out, await resolveScriptFileInRoom(room, file), approved);
     } catch {
       // The executor reports missing or unreadable scripts.
     }
   }
   return out;
+}
+
+function scriptNodeFiles(definition: unknown): string[] {
+  if (!isPlainObject(definition) || !Array.isArray(definition["nodes"])) return [];
+  return definition["nodes"].flatMap(scriptNodeFile);
+}
+
+function scriptNodeFile(node: unknown): string[] {
+  if (!isPlainObject(node) || node["kind"] !== "script_run") return [];
+  const file = node["file"];
+  return typeof file === "string" ? [file] : [];
+}
+
+function stampResolvedConsent(
+  consents: Map<string, string>,
+  resolved: ResolvedScriptFile,
+  approved: ReadonlySet<string>,
+): void {
+  const fingerprint = scriptFingerprint(resolved.bytes);
+  if (approved.has(fingerprint)) consents.set(resolved.id, fingerprint);
 }
 
 // ============================================================================
@@ -420,25 +349,7 @@ export function setScriptSchedule(
   enabled: boolean
 ): void {
   const [name, bytes] = getFileBytesNamed(db, fileId);
-  const sha = scriptFingerprint(bytes ?? Buffer.alloc(0));
-  if (kind !== "" && !readScriptApprovals(userDataDir).includes(sha)) {
-    throw new Error(
-      "Approve this script (run it once and choose “Always allow”) before scheduling it."
-    );
-  }
-  const wfId = ensureScriptWorkflow(db, fileId, name);
-  if (kind === "") {
-    upsertSchedule(db, wfId, "", "", true, true, null);
-    return;
-  }
-  // catch-up ON for daily/weekly (a missed nightly run should catch up);
-  // interval runs are frequent enough that a single catch-up adds noise.
-  const catchUp = kind === "daily" || kind === "weekly";
-  const next = enabled ? nextRunFromNow(kind, param) : null;
-  if (enabled && next === null) {
-    throw new Error("That schedule is invalid — check the time or interval.");
-  }
-  upsertSchedule(db, wfId, kind, param, enabled, catchUp, next);
+  scheduleCurrentScript(db, userDataDir, fileId, name, bytes, kind, param, enabled);
 }
 
 export async function setScriptScheduleInRoom(
@@ -454,175 +365,54 @@ export async function setScriptScheduleInRoom(
     return;
   }
   const resolved = await resolveScriptFileInRoom(room, fileId);
-  const sha = scriptFingerprint(resolved.bytes);
-  if (kind !== "" && !readScriptApprovals(userDataDir).includes(sha)) {
-    throw new Error("Approve this script (run it once and choose “Always allow”) before scheduling it.");
-  }
-  const wfId = ensureScriptWorkflow(room.db, fileId, resolved.name);
+  scheduleCurrentScript(room.db, userDataDir, fileId, resolved.name, resolved.bytes, kind, param, enabled);
+}
+
+function scheduleCurrentScript(
+  db: Database.Database,
+  userDataDir: string,
+  fileId: string,
+  name: string,
+  bytes: Uint8Array | null,
+  kind: string,
+  param: string,
+  enabled: boolean,
+): void {
+  requireScheduleApproval(userDataDir, kind, bytes ?? Buffer.alloc(0));
+  const workflowId = ensureScriptWorkflow(db, fileId, name);
+  updateScriptSchedule(db, workflowId, kind, param, enabled);
+}
+
+function requireScheduleApproval(userDataDir: string, kind: string, bytes: Uint8Array): void {
+  if (kind === "") return;
+  const approved = readScriptApprovals(userDataDir).includes(scriptFingerprint(bytes));
+  if (approved) return;
+  throw new Error("Approve this script (run it once and choose “Always allow”) before scheduling it.");
+}
+
+function updateScriptSchedule(
+  db: Database.Database,
+  workflowId: string,
+  kind: string,
+  param: string,
+  enabled: boolean,
+): void {
   if (kind === "") {
-    upsertSchedule(room.db, wfId, "", "", true, true, null);
+    upsertSchedule(db, workflowId, "", "", true, true, null);
     return;
   }
-  const catchUp = kind === "daily" || kind === "weekly";
-  const next = enabled ? nextRunFromNow(kind, param) : null;
-  if (enabled && next === null) throw new Error("That schedule is invalid — check the time or interval.");
-  upsertSchedule(room.db, wfId, kind, param, enabled, catchUp, next);
+  upsertSchedule(db, workflowId, kind, param, enabled, scheduleCatchesUp(kind), scheduleNextRun(kind, param, enabled));
 }
 
-// ============================================================================
-// Agent seam: what a finished run hands the model. Ported from
-// `printed_output` / `script_output` / `clamp_script_output`.
-// ============================================================================
-
-/**
- * What one stored step artifact means by "output". An import-mode `script_run`
- * records the whole run REPORT as its result, so the printed text is the
- * report's `stdoutTail`; a transform-mode step's result already IS the stdout.
- *
- * The stdout is not the WHOLE answer, though: an import-mode script's point is
- * the files it wrote. Quoting the raw report JSON at the model was wrong, but
- * so was dropping it — a script that writes chart.png and prints nothing came
- * back as "it finished successfully and printed nothing", so the assistant
- * could neither name what it produced nor relay why an output was skipped. The
- * printed text leads; the record's short, human parts follow it.
- */
-export function printedOutput(rawArtifact: string): string {
-  let result = "";
-  try {
-    const v: unknown = JSON.parse(rawArtifact);
-    if (isPlainObject(v) && typeof v["result"] === "string") {
-      result = v["result"];
-    }
-  } catch {
-    // Not JSON at all — `result` stays "" (Rust: `.ok()` → `unwrap_or_default`).
-  }
-
-  let report: Record<string, unknown> | null = null;
-  try {
-    const parsed: unknown = JSON.parse(result);
-    if (isPlainObject(parsed) && typeof parsed["stdoutTail"] === "string") {
-      report = parsed;
-    }
-  } catch {
-    // Not a run record — a transform step's result already IS the stdout.
-  }
-  if (report === null) {
-    return result;
-  }
-
-  const parts: string[] = [];
-  const tail = (report["stdoutTail"] as string).trim();
-  if (tail !== "") {
-    parts.push(tail);
-  }
-
-  const imported = Array.isArray(report["imported"]) ? report["imported"] : [];
-  const created = imported
-    .map((f) => (isPlainObject(f) && typeof f["name"] === "string" ? f["name"] : null))
-    .filter((n): n is string => n !== null);
-  if (created.length > 0) {
-    parts.push(`Created: ${created.join(", ")}`);
-  }
-
-  // Why a declared output did NOT arrive (not written, over the size cap, the
-  // new-file import cap) — the user needs to hear these.
-  const skipped = Array.isArray(report["skipped"]) ? report["skipped"] : [];
-  for (const note of skipped) {
-    if (typeof note === "string") {
-      parts.push(`Note: ${note}`);
-    }
-  }
-
-  // Rust: `as_i64().unwrap_or(0) != 0` — a missing or non-numeric exit code
-  // reads as 0, and a clean exit is not worth a line.
-  const exitCode = typeof report["exitCode"] === "number" ? report["exitCode"] : 0;
-  if (exitCode !== 0) {
-    parts.push(`Exit code: ${exitCode}`);
-  }
-
-  return parts.join("\n");
+function scheduleCatchesUp(kind: string): boolean {
+  return kind === "daily" || kind === "weekly";
 }
 
-/**
- * Everything the script PRINTED, read back from the run's stored artifacts. A
- * script auto-workflow is one `script_run` node, so step 0 holds it; the loop
- * keeps working if that ever grows a second step, and stops at the first step
- * with no artifact (Rust's `let Ok(Some(raw)) = … else { break }`).
- */
-export function scriptOutput(db: Database.Database, jobId: string): string {
-  const parts: string[] = [];
-  for (let step = 0; step < 4; step++) {
-    const raw = getJobArtifact(db, jobId, step);
-    if (raw === null) break;
-    const text = printedOutput(raw).trim();
-    if (text !== "") {
-      parts.push(text);
-    }
-  }
-  return parts.join("\n");
-}
-
-/**
- * The model reads this; a runaway `print` loop must not eat the turn.
- *
- * The cap is 4000 BYTES, not characters: Rust compares `String::len()`, and
- * cuts at the last char boundary at or before it. {@link clampBytes} is that
- * same cut (`floorBoundary` walks back off a UTF-8 continuation byte exactly
- * as `char_indices().take_while(…).last()` lands on the last char start), so
- * it is reused rather than re-implemented. The marker is appended AFTER the
- * cut, unbudgeted — matching Rust's `truncate(cut); push_str(marker)`, and
- * deliberately NOT `clampBytesMarked`, which reserves the marker's bytes
- * inside the cap and would cut the body a little earlier than Rust does.
- */
-export function clampScriptOutput(name: string, out: string): string {
-  const MAX = 4000;
-  if (out.trim() === "") {
-    return `Ran ${name}. It finished successfully and printed nothing.`;
-  }
-  let body = out;
-  if (Buffer.byteLength(body, "utf8") > MAX) {
-    body = `${clampBytes(body, MAX)}\n… (output truncated)`;
-  }
-  return (
-    `Ran ${name}. It finished successfully. Its output — quote these values ` +
-    `exactly, they are the answer:\n${body}`
-  );
-}
-
-// ============================================================================
-// NOT_IMPLEMENTED stubs — each names the real blocker. See this file's header.
-// ============================================================================
-
-/** One script row for the Scripts page — mirrors the Rust `ScriptInfo` struct
- * (`#[serde(rename_all = "camelCase")]`). scripts.rs, not script_run.rs, owns
- * this type, so it is ported here; only {@link listScripts}'s IMPLEMENTATION
- * is blocked.
- *
- * `changedSinceApproval` is true when the script has been run (so an
- * auto-workflow exists) but its CURRENT content is not remembered on this Mac.
- * An "Allow once" run and an edit after "Always allow" both land here and this
- * flag cannot tell them apart — it drives the "Needs review" ribbon, which is
- * honest for both, so that ribbon's tooltip must NOT claim the script changed. */
-export interface ScriptInfo {
-  fileId: string;
-  name: string;
-  /** "py" | "js" */
-  lang: string;
-  deps: string[];
-  inputs: string[];
-  outputs: string[];
-  /** "global" | "file" | "none" */
-  shortcut: string;
-  /** True when this exact content is approved on this Mac. */
-  approved: boolean;
-  changedSinceApproval: boolean;
-  workflowId: string | null;
-  schedule: Schedule | null;
-  lastRun: WorkflowRun | null;
-  /** How many of the most-recent runs failed with the SAME error text,
-   * newest-first (0 = the latest run did not fail). */
-  consecutiveFailures: number;
-  lastError: string | null;
+function scheduleNextRun(kind: string, param: string, enabled: boolean): string | null {
+  if (!enabled) return null;
+  const next = nextRunFromNow(kind, param);
+  if (next !== null) return next;
+  throw new Error("That schedule is invalid — check the time or interval.");
 }
 
 function readableRoomFiles(db: Database.Database, declared: readonly string[], text: string): string[] {
@@ -634,51 +424,70 @@ function readableRoomFiles(db: Database.Database, declared: readonly string[], t
   return out;
 }
 
+function scriptCandidates(db: Database.Database): ScriptCandidate[] {
+  const candidates: ScriptCandidate[] = [];
+  for (const file of listFiles(db)) {
+    const lang = scriptLangOf(file.name);
+    if (lang !== null) candidates.push({ file, lang });
+  }
+  return candidates;
+}
+
+function failureHistory(runs: readonly WorkflowRun[]): FailureHistory {
+  const first = runs[0];
+  if (first?.status !== "error") return { consecutiveFailures: 0, lastError: null };
+  const lastError = first.error ?? "";
+  return { consecutiveFailures: matchingFailures(runs, lastError), lastError };
+}
+
+function matchingFailures(runs: readonly WorkflowRun[], error: string): number {
+  let count = 0;
+  for (const run of runs) {
+    if (run.status !== "error") break;
+    if ((run.error ?? "") !== error) break;
+    count += 1;
+  }
+  return count;
+}
+
+function scriptInfo(
+  db: Database.Database,
+  approved: ReadonlySet<string>,
+  workflows: readonly Workflow[],
+  candidate: ScriptCandidate,
+  bytes: Buffer,
+): ScriptInfo {
+  const text = bytes.toString("utf8");
+  const manifest = parseScriptManifest(candidate.file.name, text);
+  const workflow = workflows.find((item) => wfIsForScript(item, candidate.file.id));
+  const runs = workflow === undefined ? [] : listWorkflowRuns(db, workflow.id);
+  const failures = failureHistory(runs);
+  const isApproved = approved.has(scriptFingerprint(bytes));
+  return {
+    fileId: candidate.file.id,
+    name: candidate.file.name,
+    lang: candidate.lang,
+    deps: manifest.deps,
+    inputs: readableRoomFiles(db, manifest.inputs, text),
+    outputs: manifest.outputs,
+    shortcut: manifest.shortcut,
+    approved: isApproved,
+    changedSinceApproval: !isApproved && workflow !== undefined,
+    workflowId: workflow?.id ?? null,
+    schedule: workflow === undefined ? null : getSchedule(db, workflow.id),
+    lastRun: runs[0] ?? null,
+    consecutiveFailures: failures.consecutiveFailures,
+    lastError: failures.lastError,
+  };
+}
+
 export function listScripts(db: Database.Database, userDataDir: string): ScriptInfo[] {
   const approved = new Set(readScriptApprovals(userDataDir));
   const workflows = listWorkflows(db);
-  const out: ScriptInfo[] = [];
-  for (const file of listFiles(db)) {
-    const lang = scriptLangOf(file.name);
-    if (lang === null) continue;
-    const bytes = getFileBytes(db, file.id) ?? Buffer.alloc(0);
-    const text = bytes.toString("utf8");
-    const manifest = parseScriptManifest(file.name, text);
-    const isApproved = approved.has(scriptFingerprint(bytes));
-    const workflow = workflows.find((candidate) => wfIsForScript(candidate, file.id));
-    const runs = workflow ? listWorkflowRuns(db, workflow.id) : [];
-    let consecutiveFailures = 0;
-    let lastError: string | null = null;
-    for (const run of runs) {
-      if (run.status !== "error") break;
-      const error = run.error ?? "";
-      if (lastError === null) {
-        lastError = error;
-        consecutiveFailures = 1;
-      } else if (lastError === error) {
-        consecutiveFailures += 1;
-      } else {
-        break;
-      }
-    }
-    out.push({
-      fileId: file.id,
-      name: file.name,
-      lang,
-      deps: manifest.deps,
-      inputs: readableRoomFiles(db, manifest.inputs, text),
-      outputs: manifest.outputs,
-      shortcut: manifest.shortcut,
-      approved: isApproved,
-      changedSinceApproval: !isApproved && workflow !== undefined,
-      workflowId: workflow?.id ?? null,
-      schedule: workflow ? getSchedule(db, workflow.id) : null,
-      lastRun: runs[0] ?? null,
-      consecutiveFailures,
-      lastError,
-    });
-  }
-  return out;
+  return scriptCandidates(db).map((candidate) => {
+    const bytes = getFileBytes(db, candidate.file.id) ?? Buffer.alloc(0);
+    return scriptInfo(db, approved, workflows, candidate, bytes);
+  });
 }
 
 export async function listScriptsInRoom(
@@ -689,43 +498,9 @@ export async function listScriptsInRoom(
   const approved = new Set(readScriptApprovals(userDataDir));
   const workflows = listWorkflows(room.db);
   const out: ScriptInfo[] = [];
-  for (const file of listFiles(room.db)) {
-    const lang = scriptLangOf(file.name);
-    if (lang === null) continue;
-    const resolved = await resolveScriptFileInRoom(room, file.id);
-    const text = resolved.bytes.toString("utf8");
-    const manifest = parseScriptManifest(file.name, text);
-    const isApproved = approved.has(scriptFingerprint(resolved.bytes));
-    const workflow = workflows.find((candidate) => wfIsForScript(candidate, file.id));
-    const runs = workflow ? listWorkflowRuns(room.db, workflow.id) : [];
-    let consecutiveFailures = 0;
-    let lastError: string | null = null;
-    for (const run of runs) {
-      if (run.status !== "error") break;
-      const error = run.error ?? "";
-      if (lastError === null) {
-        lastError = error;
-        consecutiveFailures = 1;
-      } else if (lastError === error) {
-        consecutiveFailures += 1;
-      } else break;
-    }
-    out.push({
-      fileId: file.id,
-      name: file.name,
-      lang,
-      deps: manifest.deps,
-      inputs: readableRoomFiles(room.db, manifest.inputs, text),
-      outputs: manifest.outputs,
-      shortcut: manifest.shortcut,
-      approved: isApproved,
-      changedSinceApproval: !isApproved && workflow !== undefined,
-      workflowId: workflow?.id ?? null,
-      schedule: workflow ? getSchedule(room.db, workflow.id) : null,
-      lastRun: runs[0] ?? null,
-      consecutiveFailures,
-      lastError,
-    });
+  for (const candidate of scriptCandidates(room.db)) {
+    const resolved = await resolveScriptFileInRoom(room, candidate.file.id);
+    out.push(scriptInfo(room.db, approved, workflows, candidate, resolved.bytes));
   }
   return out;
 }

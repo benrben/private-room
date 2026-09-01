@@ -12,25 +12,51 @@ function stringValue(value: unknown, label: string, allowEmpty = false): string 
   return value;
 }
 
-function startRequest(args: unknown): HarnessStartRequest {
-  const row = (typeof args === "object" && args !== null ? args : {}) as Record<string, unknown>;
-  const providers: HarnessProvider[] = ["codex", "claude", "ollama-local", "ollama-cloud", "openrouter"];
-  if (!providers.includes(row.provider as HarnessProvider)) {
+const HARNESS_PROVIDERS = new Set<HarnessProvider>([
+  "codex", "claude", "ollama-local", "ollama-cloud", "openrouter",
+]);
+const PRIVACY_MODES = new Set<PrivacyMode>(["local", "cloud-direct", "cloud-redacted"]);
+
+function requestRow(args: unknown): Record<string, unknown> {
+  return typeof args === "object" && args !== null ? args as Record<string, unknown> : {};
+}
+
+function harnessProvider(value: unknown): HarnessProvider {
+  if (!HARNESS_PROVIDERS.has(value as HarnessProvider)) {
     throw new Error("provider must be codex, claude, ollama-local, ollama-cloud, or openrouter.");
   }
-  if (row.privacyMode !== "local" && row.privacyMode !== "cloud-direct" && row.privacyMode !== "cloud-redacted") {
-    throw new Error("privacyMode is invalid.");
-  }
-  if (typeof row.writeEnabled !== "boolean") throw new Error("writeEnabled must be a boolean.");
-  return {
-    provider: row.provider as HarnessProvider,
+  return value as HarnessProvider;
+}
+
+function privacyMode(value: unknown): PrivacyMode {
+  if (!PRIVACY_MODES.has(value as PrivacyMode)) throw new Error("privacyMode is invalid.");
+  return value as PrivacyMode;
+}
+
+function writeEnabled(value: unknown): boolean {
+  if (typeof value !== "boolean") throw new Error("writeEnabled must be a boolean.");
+  return value;
+}
+
+function optionalStartString(row: Record<string, unknown>, key: string, allowEmpty = false): string | undefined {
+  const value = row[key];
+  return value === undefined ? undefined : stringValue(value, key, allowEmpty);
+}
+
+function startRequest(args: unknown): HarnessStartRequest {
+  const row = requestRow(args);
+  const request: HarnessStartRequest = {
+    provider: harnessProvider(row.provider),
     model: stringValue(row.model, "model"),
-    privacyMode: row.privacyMode satisfies PrivacyMode,
-    writeEnabled: row.writeEnabled,
+    privacyMode: privacyMode(row.privacyMode),
+    writeEnabled: writeEnabled(row.writeEnabled),
     text: stringValue(row.text, "text"),
-    ...(row.threadId === undefined ? {} : { threadId: stringValue(row.threadId, "threadId") }),
-    ...(row.systemPrompt === undefined ? {} : { systemPrompt: stringValue(row.systemPrompt, "systemPrompt", true) }),
   };
+  const threadId = optionalStartString(row, "threadId");
+  if (threadId !== undefined) request.threadId = threadId;
+  const systemPrompt = optionalStartString(row, "systemPrompt", true);
+  if (systemPrompt !== undefined) request.systemPrompt = systemPrompt;
+  return request;
 }
 
 export function registerHarnessSurfaceIpc(

@@ -1,0 +1,451 @@
+
+
+/* ==========================================================================
+   9. MARKETPLACE — CARDS
+   ========================================================================== */
+
+.mkt-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--sp-3);
+}
+
+.mkt-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+  text-align: left;
+  color: var(--text);
+  font: inherit;
+  font-family: var(--sans);
+  background: transparent;
+}
+/* base.css washes any hovered button in the accent ghost. A card is a frame
+   on the sheet, not a filled control: the pen pressing harder (.nb-card's own
+   border change) plus the 2px lift is the whole hover, and a pink wash under
+   a card would read as selection. */
+.mkt-card:hover {
+  background-color: transparent;
+}
+.mkt-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.mkt-card-head {
+  display: flex;
+  gap: var(--sp-3);
+  align-items: center;
+}
+
+/* The monogram tile. The hue is IDENTITY, not status — the same job the
+   token-budget categories and the seven search engines do — so it comes from
+   a .nb-mark-* class the component picks deterministically from the
+   publisher's name, and never from an arbitrary hsl(). The initials are drawn
+   in --ink on a wash of that hue, which is .nb-cat's recipe (~10:1 in every
+   hue) rather than white-on-mid-tone, which failed contrast in light mode. */
+.mkt-mono {
+  width: 34px;
+  height: 34px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  color: var(--ink);
+  font-weight: 700;
+  font-size: var(--fs-meta);
+  letter-spacing: -0.02em;
+  background-image: linear-gradient(
+    145deg,
+    color-mix(in srgb, var(--mk, var(--mk-blue)) 34%, transparent) 0%,
+    color-mix(in srgb, var(--mk, var(--mk-blue)) 22%, transparent) 100%
+  );
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--mk-ink, var(--blue)) 55%, transparent);
+  border-radius: var(--radius-sm);
+}
+.mkt-mono.lg {
+  width: 42px;
+  height: 42px;
+  font-size: var(--fs-card);
+}
+/* A real logo (a backend-inlined data URI) fills the same tile — with no
+   marker class of its own, so it drops the wash and the coloured ring and
+   takes a plain pencil edge instead. Colouring a publisher's own logo would
+   be this stylesheet inventing a claim about it. */
+img.mkt-mono {
+  object-fit: cover;
+  overflow: hidden;
+  background-image: none;
+  background-color: var(--hover);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+
+.mkt-id {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.mkt-name {
+  display: block;
+  color: var(--text-strong);
+  font-size: var(--fs-body);
+  font-weight: 600;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+/* The registry's own check, kept beside the name in the DRAWER — the card
+   carries the word in a badge instead. */
+.mkt-verified {
+  display: inline-flex;
+  color: var(--sem-linked);
+  vertical-align: -2px;
+}
+.mkt-verified svg {
+  width: 14px;
+  height: 14px;
+}
+.mkt-pub {
+  display: block;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  overflow-wrap: anywhere;
+}
+
+/* Two lines of the registry's own description. It is third-party text shown
+   verbatim: clamped in the visual only, never rewritten, and the drawer
+   shows it in full. */
+.mkt-desc {
+  display: -webkit-box;
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.mkt-badges {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  margin-top: auto;
+  padding-top: var(--sp-1);
+}
+
+/* ==========================================================================
+   10. THE INSTALL DRAWER
+   A floating surface, so — and only so — it is opaque: it has to occlude the
+   page behind it. Everything else on these two surfaces stays a frame on the
+   sheet.
+   ========================================================================== */
+
+.mkt-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  justify-content: flex-end;
+  /* A literal rgba, not a token: a scrim must DARKEN what is behind it in
+     both themes, and every theme-aware surface token inverts between them.
+     Matches the app's other backdrops (misc.css .approve-backdrop). */
+  background: rgba(0, 0, 0, 0.42);
+}
+.mkt-drawer {
+  width: min(460px, 96vw);
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--raised);
+  color: var(--text);
+  border-left: 1.5px solid var(--sketch);
+  box-shadow: -24px 0 60px -30px var(--shadow);
+  animation: mkt-slide var(--dur-slow) var(--ease-pen);
+}
+@keyframes mkt-slide {
+  from {
+    transform: translateX(100%);
+  }
+}
+
+.mkt-dr-head {
+  display: flex;
+  gap: var(--sp-3);
+  align-items: flex-start;
+  padding: var(--sp-4) var(--sp-4) var(--sp-3);
+  border-bottom: 1px solid var(--line-soft);
+}
+.mkt-dr-id {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.mkt-dr-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-strong);
+  font-size: var(--fs-card);
+  font-weight: 650;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+.mkt-dr-badges {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: var(--sp-1);
+}
+.mkt-dr-x {
+  width: 29px;
+  height: 29px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+}
+.mkt-dr-x:hover {
+  color: var(--text-strong);
+  background-color: var(--hover);
+}
+.mkt-dr-x svg {
+  width: 15px;
+  height: 15px;
+}
+
+.mkt-dr-body {
+  flex: 1;
+  overflow: auto;
+  padding: var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+/* The registry's own words, shown in full and unstyled beyond the type. */
+.mkt-dr-desc {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  overflow-wrap: anywhere;
+}
+/* Inside the drawer the notes are siblings in a column, so they carry their
+   own top margin rather than the attached-note stem. */
+.mkt-dr-body .mkt-note,
+.mkt-dr-foot .mkt-note {
+  margin-top: 0;
+}
+
+.mkt-label {
+  margin-bottom: var(--sp-2);
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+/* The endpoint or the command line. This is the single most important thing
+   in the drawer — it is what the user is agreeing to run or talk to — so it
+   is exact, selectable, monospaced and scrolls rather than wraps mid-token. */
+.mkt-code {
+  padding: 9px 11px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--raised) 70%, transparent);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  line-height: 1.5;
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.mkt-fields {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+.mkt-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.mkt-field span {
+  color: var(--muted);
+  font-size: var(--fs-meta);
+}
+/* A key is data the user pastes, so it is set in the mono face — but it is
+   also masked, so the face only shows in the placeholder. */
+.mkt-field input {
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  padding: 7px 10px;
+}
+
+.mkt-repo {
+  align-self: flex-start;
+  color: var(--accent);
+  font-size: var(--fs-meta);
+  text-decoration: none;
+  border-radius: var(--radius-sm);
+}
+.mkt-repo:hover {
+  text-decoration: underline;
+}
+.mkt-repo:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.mkt-dr-foot {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+  border-top: 1px solid var(--line-soft);
+}
+.mkt-install {
+  width: 100%;
+  justify-content: center;
+}
+/* The remote install gets the "quick pen redraw" — a second stroke in the
+   caution ink around the button — so the one action that opens a network
+   connection is marked without the button leaving the system's filled-ink
+   primary. The label already differs ("Yes, connect now" vs "Yes, start it
+   now") and the note above it says what happens; this is the third carrier,
+   not the only one. */
+.mkt-install.remote::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border: 1px solid var(--sem-pending);
+  border-radius: inherit;
+  pointer-events: none;
+}
+.mkt-install:disabled {
+  opacity: 0.7;
+  cursor: default;
+}
+.mkt-dr-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  text-align: center;
+}
+
+/* Remote sign-in: the button plus, while waiting, a hint and an escape hatch
+   so a stuck browser round-trip never traps the user on the spinner. */
+.mkt-oauth {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.mkt-oauth-wait {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+}
+.mkt-oauth-hint {
+  flex: 1;
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+.mkt-oauth-cancel {
+  flex: none;
+  align-self: center;
+}
+.mkt-oauth-manual {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+/* Local-vs-cloud, shown when a connector offers both transports. Two real
+   buttons in a group; the chosen one is CIRCLED (a second offset stroke),
+   not merely tinted, so the choice survives greyscale. */
+.mkt-transport {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-2);
+}
+.mkt-tp-opt {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  text-align: left;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+}
+.mkt-tp-opt svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+.mkt-tp-opt span {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  line-height: 1.25;
+}
+.mkt-tp-opt b {
+  color: var(--text);
+  font-size: var(--fs-meta);
+}
+.mkt-tp-opt small {
+  font-size: var(--fs-micro);
+}
+.mkt-tp-opt.on {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-ghost);
+}
+.mkt-tp-opt.on::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+/* ==========================================================================
+   11. MOTION
+   Every animation above has its escape here. Nothing animates INTO its
+   resting state from a value the element does not otherwise have, so
+   switching them off lands on the finished frame.
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  .mkt-drawer {
+    animation: none;
+  }
+  .mkt-switch,
+  .mkt-sw,
+  .mkt-sw::after,
+  .conn-remove,
+  .mkt-card {
+    transition: none;
+  }
+  /* paper.css switches .nb-chip-btn's press off, but the filter chip is
+     pressed through its label — a different selector, so it needs its own. */
+  .mkt-filter:active .mkt-filter-face {
+    transform: none;
+  }
+}

@@ -168,6 +168,115 @@ export async function retranscribeFileRouted(
   }
 }
 
+type OpenRoom = NonNullable<RoomManagerState["room"]>;
+type MediaKind = NonNullable<ReturnType<typeof mediaKind>>;
+
+type RetranscriptionPreflight =
+  | { kind: "model-missing"; name: string }
+  | {
+    bytes: Buffer | null | undefined;
+    extension: string;
+    kind: "ready";
+    mediaKind: MediaKind;
+    modelPath: string;
+    name: string;
+    open: OpenRoom;
+  };
+
+function openRoom(state: RoomManagerState): OpenRoom {
+  if (!state.room) throw new Error("No room is open.");
+  return state.room;
+}
+
+function retranscriptionPreflight(
+  state: RoomManagerState,
+  userDataDir: string,
+  resourcesPath: string | null,
+  fileId: string,
+): RetranscriptionPreflight {
+  const open = openRoom(state);
+  const [name, mime0, bytes] = getFileFull(open.conn, fileId);
+  const mime = mime0 ?? "application/octet-stream";
+  const extension = path.extname(name).slice(1).toLowerCase();
+  const kind = mediaKind(mime, extension);
+  if (kind === null) throw new Error("This file isn't audio or video, so there's nothing to transcribe.");
+  if (!bytes && open.workspace === undefined) throw new Error("This recording has no stored audio bytes.");
+  const modelPath = sttEffectiveModel(userDataDir, resourcesPath);
+  if (!modelPath) return { kind: "model-missing", name };
+  return { bytes, extension, kind: "ready", mediaKind: kind, modelPath, name, open };
+}
+
+async function stageRetranscriptionInput(
+  open: OpenRoom,
+  fileId: string,
+  bytes: Buffer | null | undefined,
+  staged: string,
+): Promise<void> {
+  if (open.workspace === undefined) {
+    await fs.promises.writeFile(staged, bytes!, { mode: 0o600 });
+    return;
+  }
+  await pipeline(
+    open.workspace.readStream(fileId),
+    fs.createWriteStream(staged, { flags: "wx", mode: 0o600 }),
+  );
+}
+
+function transcriptFromOutcome(
+  outcome: Awaited<ReturnType<typeof sidecarJsonCancellable>>,
+): string {
+  if (outcome.kind === "stopped") throw new Error("Stopped.");
+  if (outcome.kind === "error") throw new Error(outcome.error.error);
+  const text = object(outcome.value).text;
+  if (typeof text !== "string") throw new Error("The speech engine returned no transcript.");
+  return text;
+}
+
+async function requestTranscript(
+  staged: string,
+  modelPath: string,
+  kind: MediaKind,
+): Promise<string> {
+  const outcome = await sidecarJsonCancellable(
+    "/stt/transcribe_file",
+    { path: staged, model_path: modelPath, kind },
+    new CancelFlag(),
+    10 * 60 * 60 * 1000,
+  );
+  return transcriptFromOutcome(outcome);
+}
+
+function currentRoom(state: RoomManagerState, open: OpenRoom): OpenRoom {
+  if (!state.room || state.room.path !== open.path) {
+    throw new Error("The room was closed while transcription was running.");
+  }
+  return state.room;
+}
+
+function commitTranscript(
+  state: RoomManagerState,
+  open: OpenRoom,
+  fileId: string,
+  name: string,
+  text: string,
+  emit: EventSender,
+  onIndexed?: (roomPath: string) => void,
+): void {
+  setFileExtractedText(currentRoom(state, open).conn, fileId, text);
+  emit("file-updated", fileId);
+  emit("room-files-changed", {});
+  onIndexed?.(open.path);
+  emit("stt-progress", [name, text.trim() === "" ? "none" : "done"]);
+}
+
+function failureMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function removeTempDirectory(tempDir: string): Promise<void> {
+  await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+}
+
 /**
  * The TEXT-ONLY lane: one `POST /stt/transcribe_file`, one flat string, into
  * `files.extracted_text`. No speakers, no `recordings` row.
@@ -196,54 +305,24 @@ export async function retranscribeFile(
   fileId: string,
   onIndexed?: (roomPath: string) => void,
 ): Promise<void> {
-    const open = state.room;
-    if (!open) throw new Error("No room is open.");
-    const [name, mime0, bytes] = getFileFull(open.conn, fileId);
-    const mime = mime0 ?? "application/octet-stream";
-    const extension = path.extname(name).slice(1).toLowerCase();
-    const kind = mediaKind(mime, extension);
-    if (kind === null) throw new Error("This file isn't audio or video, so there's nothing to transcribe.");
-    if (!bytes && open.workspace === undefined) throw new Error("This recording has no stored audio bytes.");
-    const modelPath = sttEffectiveModel(userDataDir, resourcesPath);
-    if (!modelPath) {
-      emit("stt-progress", [name, "model-missing"]);
-      return;
-    }
-    const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "arcelle-stt-"));
-    const staged = path.join(tempDir, `source.${extension || "bin"}`);
-    try {
-      if (open.workspace === undefined) {
-        await fs.promises.writeFile(staged, bytes!, { mode: 0o600 });
-      } else {
-        await pipeline(
-          open.workspace.readStream(fileId),
-          fs.createWriteStream(staged, { flags: "wx", mode: 0o600 }),
-        );
-      }
-      emit("stt-progress", [name, "started"]);
-      const outcome = await sidecarJsonCancellable(
-        "/stt/transcribe_file",
-        { path: staged, model_path: modelPath, kind },
-        new CancelFlag(),
-        10 * 60 * 60 * 1000,
-      );
-      if (outcome.kind === "stopped") throw new Error("Stopped.");
-      if (outcome.kind === "error") throw new Error(outcome.error.error);
-      const text = object(outcome.value).text;
-      if (typeof text !== "string") throw new Error("The speech engine returned no transcript.");
-      if (!state.room || state.room.path !== open.path) throw new Error("The room was closed while transcription was running.");
-      setFileExtractedText(state.room.conn, fileId, text);
-      emit("file-updated", fileId);
-      emit("room-files-changed", {});
-      onIndexed?.(open.path);
-      emit("stt-progress", [name, text.trim() === "" ? "none" : "done"]);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      emit("stt-progress", [name, `failed: ${message}`]);
-      throw error;
-    } finally {
-      await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
-    }
+  const preflight = retranscriptionPreflight(state, userDataDir, resourcesPath, fileId);
+  if (preflight.kind === "model-missing") {
+    emit("stt-progress", [preflight.name, "model-missing"]);
+    return;
+  }
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "arcelle-stt-"));
+  const staged = path.join(tempDir, `source.${preflight.extension || "bin"}`);
+  try {
+    await stageRetranscriptionInput(preflight.open, fileId, preflight.bytes, staged);
+    emit("stt-progress", [preflight.name, "started"]);
+    const text = await requestTranscript(staged, preflight.modelPath, preflight.mediaKind);
+    commitTranscript(state, preflight.open, fileId, preflight.name, text, emit, onIndexed);
+  } catch (error) {
+    emit("stt-progress", [preflight.name, `failed: ${failureMessage(error)}`]);
+    throw error;
+  } finally {
+    await removeTempDirectory(tempDir);
+  }
 }
 
 /** Transcribe in-memory media for chat's #transcribe command without first

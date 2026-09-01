@@ -343,12 +343,24 @@ def _guess_choice(sample: bytes) -> _EncodingChoice:
     explicit superset/variant alias map, then the windows-1252 default. See
     the module docstring's "detect" section.
     """
+    normalized = _normalized_detection_codec(sample)
+    return _choice_for_normalized_detection(normalized)
+
+
+def _normalized_detection_codec(sample: bytes) -> str | None:
+    """Return the detector's Python-normalized codec name, if usable."""
     best = _cn_from_bytes(sample).best()
     if best is None or not best.encoding:
-        return _DEFAULT_CHOICE
+        return None
     try:
-        normalized = codecs.lookup(best.encoding).name
+        return codecs.lookup(best.encoding).name
     except LookupError:
+        return None
+
+
+def _choice_for_normalized_detection(normalized: str | None) -> _EncodingChoice:
+    """Resolve a normalized detector name through direct and alias matches."""
+    if normalized is None:
         return _DEFAULT_CHOICE
     matched = _BY_NORMALIZED_CODEC.get(normalized)
     if matched is not None:

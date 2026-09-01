@@ -21,27 +21,51 @@ function fail(error: unknown): ToolOutcome {
 
 function formatSnapshot(raw: unknown): string {
   const value = object(raw);
-  const elements = Array.isArray(value.elements) ? value.elements.map(object) : [];
-  const lines = elements.map((item) => {
-    const ref = String(item.ref ?? item.mark ?? "?");
-    const role = String(item.role ?? "control");
-    const label = String(item.label ?? item.name ?? "");
-    const region = typeof item.region === "string" && item.region ? ` — ${item.region}` : "";
-    const state = typeof item.state === "string" && item.state ? ` (${item.state})` : "";
-    return `[${ref}] ${role} "${label}"${region}${state}`;
-  });
+  const lines = snapshotElements(value).map(formatSnapshotElement);
   if (lines.length === 0) return "No interactive controls are visible on this page.";
-  const title = typeof value.title === "string" && value.title ? `${value.title}\n` : "";
-  return `${title}${lines.join("\n")}`;
+  return `${snapshotTitle(value)}${lines.join("\n")}`;
+}
+
+function snapshotElements(value: Record<string, unknown>): Record<string, unknown>[] {
+  return Array.isArray(value.elements) ? value.elements.map(object) : [];
+}
+
+function formatSnapshotElement(item: Record<string, unknown>): string {
+  return `[${snapshotField(item.ref, item.mark, "?")}] ${snapshotField(item.role, undefined, "control")} "${snapshotField(item.label, item.name, "")}"${snapshotDetail(item.region, " — ", "")}${snapshotDetail(item.state, " (", ")")}`;
+}
+
+function snapshotField(primary: unknown, secondary: unknown, fallback: string): string {
+  return String(primary ?? secondary ?? fallback);
+}
+
+function snapshotDetail(value: unknown, prefix: string, suffix: string): string {
+  return typeof value === "string" && value !== "" ? `${prefix}${value}${suffix}` : "";
+}
+
+function snapshotTitle(value: Record<string, unknown>): string {
+  return snapshotDetail(value.title, "", "\n");
 }
 
 function formatRead(raw: unknown): string {
   const value = object(raw);
-  const title = typeof value.title === "string" && value.title ? `${value.title}\n` : "";
-  const url = typeof value.url === "string" && value.url ? `Source: ${value.url}\n\n` : "";
-  const text = typeof value.text === "string" ? value.text : "";
-  const next = typeof value.nextOffset === "number" ? `\n\nContinue with offset ${value.nextOffset}.` : "";
-  return `${title}${url}${text}${next}`.trim() || "This page has no readable text.";
+  const formatted = `${readTitle(value)}${readUrl(value)}${readText(value)}${readContinuation(value)}`.trim();
+  return formatted === "" ? "This page has no readable text." : formatted;
+}
+
+function readTitle(value: Record<string, unknown>): string {
+  return snapshotDetail(value.title, "", "\n");
+}
+
+function readUrl(value: Record<string, unknown>): string {
+  return snapshotDetail(value.url, "Source: ", "\n\n");
+}
+
+function readText(value: Record<string, unknown>): string {
+  return typeof value.text === "string" ? value.text : "";
+}
+
+function readContinuation(value: Record<string, unknown>): string {
+  return typeof value.nextOffset === "number" ? `\n\nContinue with offset ${value.nextOffset}.` : "";
 }
 
 function typedActions(args: Record<string, unknown>): Array<{ field: string; text: string }> {
@@ -74,81 +98,218 @@ export function createBrowserAgentTool(deps: BrowserAgentRuntimeDeps) {
     emitFilesChanged: () => deps.emit("room-files-changed", {}),
   });
 
-  return async (name: string, args: Record<string, unknown>, effects: ToolEffects): Promise<ToolOutcome | null> => {
-    if (!name.startsWith("browse_")) return null;
-    try {
-      if (!deps.state.room) throw new Error("No room is open.");
-      if (deps.browser.takeover) throw new Error("The user is controlling the browser right now. Wait until they hand it back.");
-      if (name !== "browse_open" && deps.browser.isOpen()) await deps.browser.waitReady();
-      switch (name) {
-        case "browse_open": {
-          const address = classify(String(args.url ?? ""));
-          if (address === null) throw new Error("Say what to open, or what to search for.");
-          if (address.kind === "search") {
-            const masked = maskOutboundWeb(address.query);
-            const query = masked?.masked ?? address.query;
-            const result = await runSearch({
-              db: deps.state.room.conn,
-              searchForBrowser,
-              hasModelConfigured: (db) => modelSetting(db) !== null,
-              journal: (kind, url, detail) => deps.browser.journal(kind, url, detail),
-            }, query);
-            deps.emit("browser-searched", result);
-            return ok(`${formatHitsForAgent(result)}${masked ? webMaskNote(masked.hidden) : ""}`);
-          }
-          const hidden = outboundUrlHides(address.url);
-          if (hidden !== null) return ok(`Not opened: this address carries ${hidden} protected name(s), and Cloud privacy is on.`);
-          const url = await browserNavigate(commandDeps(), address.url);
-          await deps.browser.waitReady(OPEN_BUDGET_MS);
-          deps.browser.journal("open", url, "Opened by the agent");
-          deps.emit("browser-navigated", url);
-          const settled = object(await deps.browser.callAsync("settle", { budget_ms: 8_000 }, 12_000));
-          return ok(formatSnapshot(settled.snapshot ?? settled));
-        }
-        case "browse_read": {
-          const page = await deps.browser.call("read", { mode: String(args.mode ?? "main"), offset: Number(args.offset ?? 0) });
-          return ok(formatRead(page));
-        }
-        case "browse_find": {
-          const text = String(args.text ?? "");
-          const found = object(await deps.browser.call("find", { text }));
-          const matches = Array.isArray(found.matches) ? found.matches : [];
-          return ok(matches.length === 0 ? `Nothing on this page matches "${text}".` : `${matches.length} match(es) for "${text}":\n${formatSnapshot({ elements: matches })}`);
-        }
-        case "browse_snapshot": return ok(formatSnapshot(await deps.browser.call("snapshot", {})));
-        case "browse_do": {
-          const actions = Array.isArray(args.actions) ? args.actions : [];
-          if (actions.length === 0) throw new Error("browse_do needs at least one action.");
-          const info = object(await deps.browser.call("info", {}));
-          for (const typed of typedActions(args)) {
-            const answer = object(await requestAgentUi(deps.agentUi, deps.emit, "browse_consent", {
-              url: String(info.url ?? ""), field: typed.field, text: typed.text, entities: [],
-            }));
-            if (answer.approved !== true) throw new Error("The user declined, so nothing was typed.");
-          }
-          const result = object(await deps.browser.callAsync("act", { actions }, 60_000));
-          const results = Array.isArray(result.results) ? result.results.map(object) : [];
-          const did = results.filter((row) => row.ok === true).map((row) => String(row.did ?? "Done"));
-          const summary = did.length ? `Browser: ${did.join("; ")}` : String(result.error ?? "Nothing was done — the first action failed.");
-          deps.browser.journal("act", String(info.url ?? ""), summary);
-          return result.ok === false ? fail(summary) : ok(`${summary}\n${formatSnapshot(result.snapshot)}`);
-        }
-        case "browse_look": {
-          await deps.browser.callAsync("annotate", { on: true }, 10_000);
-          try {
-            const png = await deps.browser.captureActivePage();
-            effects.pendingImages.push(png.toString("base64"));
-            return ok("Captured a picture of the current page with its interactive controls numbered.");
-          } finally {
-            await deps.browser.callAsync("annotate", { on: false }, 10_000).catch(() => undefined);
-          }
-        }
-        case "browse_save": return ok(await browserSavePage(commandDeps(), String(args.what ?? "page")));
-        default: return null;
-      }
-    } catch (error) {
-      deps.browser.journal("error", "", `${name} failed: ${error instanceof Error ? error.message : String(error)}`);
-      return fail(error);
-    }
-  };
+  return (name: string, args: Record<string, unknown>, effects: ToolEffects): Promise<ToolOutcome | null> =>
+    callBrowserAgentTool(deps, commandDeps, name, args, effects);
 }
+
+type BrowserCommandDeps = () => BrowseCommandsDeps;
+
+interface BrowserToolContext {
+  deps: BrowserAgentRuntimeDeps;
+  commandDeps: BrowserCommandDeps;
+  room: NonNullable<RoomManagerState["room"]>;
+}
+
+type BrowserToolHandler = (context: BrowserToolContext, args: Record<string, unknown>, effects: ToolEffects) => Promise<ToolOutcome>;
+
+async function callBrowserAgentTool(
+  deps: BrowserAgentRuntimeDeps,
+  commandDeps: BrowserCommandDeps,
+  name: string,
+  args: Record<string, unknown>,
+  effects: ToolEffects,
+): Promise<ToolOutcome | null> {
+  if (!name.startsWith("browse_")) {
+    return null;
+  }
+  try {
+    const context = await prepareBrowserTool(deps, commandDeps, name);
+    return await dispatchBrowserTool(name, context, args, effects);
+  } catch (error) {
+    deps.browser.journal("error", "", `${name} failed: ${errorMessage(error)}`);
+    return fail(error);
+  }
+}
+
+async function prepareBrowserTool(
+  deps: BrowserAgentRuntimeDeps,
+  commandDeps: BrowserCommandDeps,
+  name: string,
+): Promise<BrowserToolContext> {
+  const room = requireBrowserRoom(deps.state);
+  if (deps.browser.takeover) {
+    throw new Error("The user is controlling the browser right now. Wait until they hand it back.");
+  }
+  if (name !== "browse_open" && deps.browser.isOpen()) {
+    await deps.browser.waitReady();
+  }
+  return { deps, commandDeps, room };
+}
+
+function requireBrowserRoom(state: RoomManagerState): NonNullable<RoomManagerState["room"]> {
+  if (state.room === null) {
+    throw new Error("No room is open.");
+  }
+  return state.room;
+}
+
+function dispatchBrowserTool(
+  name: string,
+  context: BrowserToolContext,
+  args: Record<string, unknown>,
+  effects: ToolEffects,
+): Promise<ToolOutcome | null> {
+  const handler = BROWSER_TOOL_HANDLERS[name];
+  return handler === undefined ? Promise.resolve(null) : handler(context, args, effects);
+}
+
+async function browseOpen(
+  context: BrowserToolContext,
+  args: Record<string, unknown>,
+  _effects: ToolEffects,
+): Promise<ToolOutcome> {
+  const address = classify(String(args.url ?? ""));
+  if (address === null) {
+    throw new Error("Say what to open, or what to search for.");
+  }
+  return address.kind === "search" ? browseSearch(context, address.query) : browseUrl(context, address.url);
+}
+
+async function browseSearch(context: BrowserToolContext, query: string): Promise<ToolOutcome> {
+  const masked = maskOutboundWeb(query);
+  const result = await runSearch({
+    db: context.room.conn,
+    searchForBrowser,
+    hasModelConfigured: (db) => modelSetting(db) !== null,
+    journal: (kind, url, detail) => context.deps.browser.journal(kind, url, detail),
+  }, masked?.masked ?? query);
+  context.deps.emit("browser-searched", result);
+  return ok(`${formatHitsForAgent(result)}${masked ? webMaskNote(masked.hidden) : ""}`);
+}
+
+async function browseUrl(context: BrowserToolContext, address: string): Promise<ToolOutcome> {
+  const hidden = outboundUrlHides(address);
+  if (hidden !== null) {
+    return ok(`Not opened: this address carries ${hidden} protected name(s), and Cloud privacy is on.`);
+  }
+  const url = await browserNavigate(context.commandDeps(), address);
+  await context.deps.browser.waitReady(OPEN_BUDGET_MS);
+  context.deps.browser.journal("open", url, "Opened by the agent");
+  context.deps.emit("browser-navigated", url);
+  const settled = object(await context.deps.browser.callAsync("settle", { budget_ms: 8_000 }, 12_000));
+  return ok(formatSnapshot(settled.snapshot ?? settled));
+}
+
+async function browseRead(
+  context: BrowserToolContext,
+  args: Record<string, unknown>,
+  _effects: ToolEffects,
+): Promise<ToolOutcome> {
+  const page = await context.deps.browser.call("read", { mode: String(args.mode ?? "main"), offset: Number(args.offset ?? 0) });
+  return ok(formatRead(page));
+}
+
+async function browseFind(
+  context: BrowserToolContext,
+  args: Record<string, unknown>,
+  _effects: ToolEffects,
+): Promise<ToolOutcome> {
+  const text = String(args.text ?? "");
+  const found = object(await context.deps.browser.call("find", { text }));
+  const matches = Array.isArray(found.matches) ? found.matches : [];
+  return ok(findSummary(text, matches));
+}
+
+function findSummary(text: string, matches: unknown[]): string {
+  if (matches.length === 0) {
+    return `Nothing on this page matches "${text}".`;
+  }
+  return `${matches.length} match(es) for "${text}":\n${formatSnapshot({ elements: matches })}`;
+}
+
+async function browseSnapshot(
+  context: BrowserToolContext,
+  _args: Record<string, unknown>,
+  _effects: ToolEffects,
+): Promise<ToolOutcome> {
+  return ok(formatSnapshot(await context.deps.browser.call("snapshot", {})));
+}
+
+async function browseDo(
+  context: BrowserToolContext,
+  args: Record<string, unknown>,
+  _effects: ToolEffects,
+): Promise<ToolOutcome> {
+  const actions = Array.isArray(args.actions) ? args.actions : [];
+  if (actions.length === 0) {
+    throw new Error("browse_do needs at least one action.");
+  }
+  const info = object(await context.deps.browser.call("info", {}));
+  await confirmTypedActions(context, args, info);
+  const result = object(await context.deps.browser.callAsync("act", { actions }, 60_000));
+  return browserActionOutcome(context, info, result);
+}
+
+async function confirmTypedActions(
+  context: BrowserToolContext,
+  args: Record<string, unknown>,
+  info: Record<string, unknown>,
+): Promise<void> {
+  for (const typed of typedActions(args)) {
+    const answer = object(await requestAgentUi(context.deps.agentUi, context.deps.emit, "browse_consent", {
+      url: String(info.url ?? ""), field: typed.field, text: typed.text, entities: [],
+    }));
+    if (answer.approved !== true) {
+      throw new Error("The user declined, so nothing was typed.");
+    }
+  }
+}
+
+function browserActionOutcome(
+  context: BrowserToolContext,
+  info: Record<string, unknown>,
+  result: Record<string, unknown>,
+): ToolOutcome {
+  const results = Array.isArray(result.results) ? result.results.map(object) : [];
+  const did = results.filter((row) => row.ok === true).map((row) => String(row.did ?? "Done"));
+  const summary = did.length > 0 ? `Browser: ${did.join("; ")}` : String(result.error ?? "Nothing was done — the first action failed.");
+  context.deps.browser.journal("act", String(info.url ?? ""), summary);
+  return result.ok === false ? fail(summary) : ok(`${summary}\n${formatSnapshot(result.snapshot)}`);
+}
+
+async function browseLook(
+  context: BrowserToolContext,
+  _args: Record<string, unknown>,
+  effects: ToolEffects,
+): Promise<ToolOutcome> {
+  await context.deps.browser.callAsync("annotate", { on: true }, 10_000);
+  try {
+    const png = await context.deps.browser.captureActivePage();
+    effects.pendingImages.push(png.toString("base64"));
+    return ok("Captured a picture of the current page with its interactive controls numbered.");
+  } finally {
+    await context.deps.browser.callAsync("annotate", { on: false }, 10_000).catch(() => undefined);
+  }
+}
+
+async function browseSave(
+  context: BrowserToolContext,
+  args: Record<string, unknown>,
+  _effects: ToolEffects,
+): Promise<ToolOutcome> {
+  return ok(await browserSavePage(context.commandDeps(), String(args.what ?? "page")));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+const BROWSER_TOOL_HANDLERS: Readonly<Record<string, BrowserToolHandler>> = {
+  browse_open: browseOpen,
+  browse_read: browseRead,
+  browse_find: browseFind,
+  browse_snapshot: browseSnapshot,
+  browse_do: browseDo,
+  browse_look: browseLook,
+  browse_save: browseSave,
+};

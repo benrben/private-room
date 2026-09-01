@@ -65,7 +65,10 @@ import {
   placementNote,
 } from "./db-host/files.js";
 import { retrieveContextExcluding } from "./db-host/retrieval.js";
+import { isA1Range, parseA1 } from "./fileToolsA1.js";
 import { clampBytes, clampWords, excerpt, normalizeForMatch, tailBytes } from "./textClamp.js";
+
+export { isA1Range, parseA1 } from "./fileToolsA1.js";
 
 // ------------------------------------------------------------------- shell
 
@@ -173,65 +176,6 @@ export function execSearchRoom(db: Database.Database, args: Record<string, unkno
 
 // ----------------------------------------------------------- A1 cell parsing
 
-/** A spreadsheet's own ceilings: columns run A..XFD (three letters, 16 384)
- * and rows stop at 1 048 576. Enforced BEFORE the column accumulator runs — a
- * long run of letters used to multiply its way past `usize`, producing a
- * meaningless index that then took the app down when the grid was resized to
- * reach it. From `commands/spreadsheet.rs`. */
-const MAX_A1_COL_LETTERS = 3;
-const MAX_A1_ROW = 1_048_576;
-
-/** Rust's `c.is_ascii_alphabetic()`, applied to an already-uppercased cell. */
-const ASCII_UPPER = /[A-Z]/;
-/** Rust's `digits.chars().all(|c| c.is_ascii_digit())`. JS `$` matches only at
- * end of input (no Python-style trailing-newline leniency), so this is a total
- * check. */
-const ASCII_DIGITS_ONLY = /^[0-9]+$/;
-
-/** "B7" → zero-based (row, col). `null` when it isn't A1 notation. Ported
- * verbatim from `commands/spreadsheet.rs`'s `parse_a1`. */
-export function parseA1(cellRaw: string): [number, number] | null {
-  const cell = cellRaw.trim().toUpperCase();
-  let i = 0;
-  while (i < cell.length && ASCII_UPPER.test(cell[i] as string)) {
-    i += 1;
-  }
-  const letters = cell.slice(0, i);
-  const digits = cell.slice(i);
-  if (letters === "" || digits === "" || !ASCII_DIGITS_ONLY.test(digits)) {
-    return null;
-  }
-  if (letters.length > MAX_A1_COL_LETTERS) {
-    return null;
-  }
-  let col = 0;
-  for (const c of letters) {
-    col = col * 26 + (c.charCodeAt(0) - "A".charCodeAt(0) + 1);
-  }
-  col -= 1;
-  // Rust's `digits.parse::<usize>()` already refuses a number too large for
-  // `usize`; the row ceiling refuses one that merely LOOKS valid but would
-  // grow the grid until the app runs out of memory. `Number(digits)` cannot
-  // fail on an all-digit string, so the ceiling is the whole check here.
-  const row = Number(digits);
-  if (!Number.isFinite(row) || row === 0 || row > MAX_A1_ROW) {
-    return null;
-  }
-  return [row - 1, col];
-}
-
-/** A lone cell, or a `first:second` range whose two ends both parse as A1
- * cells. Mirrors Rust's `splitn(2, ':')` — only the FIRST colon splits, so
- * "A1:B2:C3" tries "B2:C3" as the second half and fails it. Ported verbatim
- * from `commands/spreadsheet.rs`'s `is_a1_range`. */
-export function isA1Range(range: string): boolean {
-  const idx = range.indexOf(":");
-  if (idx === -1) {
-    return parseA1(range) !== null;
-  }
-  return parseA1(range.slice(0, idx)) !== null && parseA1(range.slice(idx + 1)) !== null;
-}
-
 // ------------------------------------------------------ closest-snippet match
 
 /** Rust's `char::is_alphanumeric()` — the Alphabetic property plus general
@@ -265,6 +209,24 @@ interface WordSpan {
   key: string;
 }
 
+function appendWord(chars: string[], start: number | null, end: number, words: WordSpan[]): void {
+  if (start === null) {
+    return;
+  }
+  const key = norm(chars.slice(start, end).join(""));
+  if (key !== "") {
+    words.push({ start, end, key });
+  }
+}
+
+function nextWordStart(chars: string[], index: number, start: number | null, words: WordSpan[]): number | null {
+  if (WHITESPACE.test(chars[index] as string)) {
+    appendWord(chars, start, index, words);
+    return null;
+  }
+  return start ?? index;
+}
+
 /** Each whitespace-delimited word of `text` as a (start, end, key) span, where
  * key is the {@link norm}-alized form; words that normalize to empty (pure
  * punctuation) are dropped. Ported from `agent.rs`'s private
@@ -274,25 +236,66 @@ function wordsWithSpans(text: string): { chars: string[]; words: WordSpan[] } {
   const words: WordSpan[] = [];
   let start: number | null = null;
   for (let i = 0; i < chars.length; i++) {
-    if (WHITESPACE.test(chars[i] as string)) {
-      if (start !== null) {
-        const key = norm(chars.slice(start, i).join(""));
-        if (key !== "") {
-          words.push({ start, end: i, key });
-        }
-        start = null;
-      }
-    } else if (start === null) {
-      start = i;
-    }
+    start = nextWordStart(chars, i, start, words);
   }
-  if (start !== null) {
-    const key = norm(chars.slice(start).join(""));
-    if (key !== "") {
-      words.push({ start, end: chars.length, key });
-    }
-  }
+  appendWord(chars, start, chars.length, words);
   return { chars, words };
+}
+
+interface SnippetWindow {
+  score: number;
+  si: number;
+  ei: number;
+}
+
+function normalizedWords(quote: string): string[] {
+  return quote
+    .split(WHITESPACE_RUN)
+    .filter((word) => word !== "")
+    .map(norm)
+    .filter((word) => word !== "");
+}
+
+function snippetWindowWidths(wordCount: number): number[] {
+  return [Math.max(wordCount - 2, 2), wordCount, wordCount + 2];
+}
+
+function windowScore(words: WordSpan[], start: number, width: number, quoteWords: Set<string>): number {
+  let score = 0;
+  for (let index = start; index < start + width; index++) {
+    if (quoteWords.has((words[index] as WordSpan).key)) {
+      score += 1;
+    }
+  }
+  return score;
+}
+
+function isBetterWindow(best: SnippetWindow | null, candidate: SnippetWindow): boolean {
+  return best === null || candidate.score > best.score;
+}
+
+function bestSnippetWindow(
+  words: WordSpan[],
+  quoteWords: Set<string>,
+  widths: number[]
+): SnippetWindow | null {
+  let best: SnippetWindow | null = null;
+  for (const width of widths) {
+    if (width > words.length) {
+      continue;
+    }
+    for (let start = 0; start <= words.length - width; start++) {
+      const candidate = { score: windowScore(words, start, width, quoteWords), si: start, ei: start + width };
+      if (isBetterWindow(best, candidate)) {
+        best = candidate;
+      }
+    }
+  }
+  return best;
+}
+
+function isSolidSnippetMatch(best: SnippetWindow | null, quoteWordCount: number): best is SnippetWindow {
+  return best !== null && best.score * 2 > quoteWordCount;
 }
 
 /**
@@ -305,11 +308,7 @@ function wordsWithSpans(text: string): { chars: string[]; words: WordSpan[] } {
  * from `agent.rs`'s `closest_snippet`.
  */
 export function closestSnippet(extracted: string, quote: string): string | null {
-  const qWords = quote
-    .split(WHITESPACE_RUN)
-    .filter((w) => w !== "")
-    .map(norm)
-    .filter((w) => w !== "");
+  const qWords = normalizedWords(quote);
   if (qWords.length < 3) {
     return null; // too short to approximate safely
   }
@@ -319,24 +318,8 @@ export function closestSnippet(extracted: string, quote: string): string | null 
   }
   const qSet = new Set(qWords);
   const win = qWords.length;
-  let best: { score: number; si: number; ei: number } | null = null;
-  for (const w of [Math.max(win - 2, 2), win, win + 2]) {
-    if (w > h.length) {
-      continue;
-    }
-    for (let i = 0; i <= h.length - w; i++) {
-      let score = 0;
-      for (let k = i; k < i + w; k++) {
-        if (qSet.has((h[k] as WordSpan).key)) {
-          score += 1;
-        }
-      }
-      if (best === null || score > best.score) {
-        best = { score, si: i, ei: i + w };
-      }
-    }
-  }
-  if (best === null || best.score * 2 <= win) {
+  const best = bestSnippetWindow(h, qSet, snippetWindowWidths(win));
+  if (!isSolidSnippetMatch(best, win)) {
     return null; // need a strict majority of the quote's words present
   }
   return chars.slice((h[best.si] as WordSpan).start, (h[best.ei - 1] as WordSpan).end).join("");
@@ -356,6 +339,61 @@ function quoteIsGrounded(extracted: string, quote: string): boolean {
 
 // ------------------------------------------------------------------ open_file
 
+function validCell(value: string | null): string | null {
+  return value !== null && parseA1(value) !== null ? value : null;
+}
+
+function requestedFind(value: string | null): string | null {
+  return value !== null && value.trim() !== "" ? value : null;
+}
+
+interface GroundedFind {
+  find: string | null;
+  approx: boolean;
+}
+
+function groundedFind(text: string | null, requested: string | null): GroundedFind {
+  if (requested === null || text === null || quoteIsGrounded(text, requested)) {
+    return { find: requested, approx: false };
+  }
+  return { find: closestSnippet(text, requested), approx: true };
+}
+
+function openTarget(page: number | null, cell: string | null, find: string | null): string {
+  if (page !== null) {
+    return ` at page ${page}`;
+  }
+  if (cell !== null) {
+    return ` at cell ${cell}`;
+  }
+  return find !== null ? ` at "${find}"` : "";
+}
+
+function openNote(approx: boolean, find: string | null): string {
+  if (!approx) {
+    return "";
+  }
+  if (find !== null) {
+    return (
+      "\n(The exact text you asked for isn't in the file — jumped to the closest " +
+      "real passage instead. Quote text verbatim from search_room next time.)"
+    );
+  }
+  return (
+    "\n(That text isn't in this file — opened it from the start. Use search_room " +
+    "first and copy the passage exactly.)"
+  );
+}
+
+function fileSnippet(text: string | null): string {
+  if (text === null) {
+    return "";
+  }
+  const head = clampBytes(text, 1200);
+  const tail = tailBytes(text, 600);
+  return tail === "" ? `\nIt begins:\n${head}` : `\nIt begins:\n${head}\n…\nIt ends:\n${tail}`;
+}
+
 /** Ported from `exec_tool`'s `"open_file"` arm. `emit` is
  * `window.emit("agent-open-file", …)`, threaded through exactly like
  * `execTool.ts`'s own `deps.emit` for the memory arms — optional, and
@@ -368,9 +406,9 @@ export function execOpenFile(
   const name = asString(args.name).toLowerCase();
   const page = asOptionalUint(args.page);
   const cellArg = asOptionalString(args.cell);
-  const cell = cellArg !== null && parseA1(cellArg) !== null ? cellArg : null;
+  const cell = validCell(cellArg);
   const findArg = asOptionalString(args.find);
-  const requested = findArg !== null && findArg.trim() !== "" ? findArg : null;
+  const requested = requestedFind(findArg);
 
   let id: string;
   let realName: string;
@@ -387,46 +425,16 @@ export function execOpenFile(
   // silently stays on page 1. Verify the passage, or swap in the closest real
   // one. With no extracted text there is nothing to verify against, so the
   // request is passed through unjudged, exactly as Rust's `(f, _)` arm does.
-  let find = requested;
-  let approx = false;
-  if (requested !== null && text !== null && !quoteIsGrounded(text, requested)) {
-    find = closestSnippet(text, requested); // null when nothing is close
-    approx = true;
-  }
+  const { find, approx } = groundedFind(text, requested);
 
   emitSafely(emit, "agent-open-file", { id, page, cell, find });
-
-  let target = "";
-  if (page !== null) {
-    target = ` at page ${page}`;
-  } else if (cell !== null) {
-    target = ` at cell ${cell}`;
-  } else if (find !== null) {
-    target = ` at "${find}"`;
-  }
-
-  let note = "";
-  if (approx && find !== null) {
-    note =
-      "\n(The exact text you asked for isn't in the file — jumped to the closest " +
-      "real passage instead. Quote text verbatim from search_room next time.)";
-  } else if (approx) {
-    note =
-      "\n(That text isn't in this file — opened it from the start. Use search_room " +
-      "first and copy the passage exactly.)";
-  }
 
   // Head AND tail. The head alone made "did my append land?" unanswerable with
   // this tool — the only verb an agent has for reading back a file it just
   // wrote (self-test 2026-08-01, wave 3). Char-safe both ends.
-  let snippet = "";
-  if (text !== null) {
-    const head = clampBytes(text, 1200);
-    const tail = tailBytes(text, 600);
-    snippet = tail === "" ? `\nIt begins:\n${head}` : `\nIt begins:\n${head}\n…\nIt ends:\n${tail}`;
-  }
-
-  return ok(`Opened "${realName}" in the viewer${target}.${note}${snippet}`);
+  return ok(
+    `Opened "${realName}" in the viewer${openTarget(page, cell, find)}.${openNote(approx, find)}${fileSnippet(text)}`
+  );
 }
 
 // -------------------------------------------------------------- annotate_file
@@ -444,6 +452,71 @@ export function execOpenFile(
  * `agent.rs::build_annotation` function directly — one function, two Rust
  * callers, and now two TS callers of one export rather than a second copy.
  */
+type AnnotationResult =
+  | { ok: true; payload: Record<string, unknown>; described: string }
+  | { ok: false; error: string };
+
+interface ResolvedAnnotationQuote {
+  quote: string;
+  approx: boolean;
+}
+
+function rangeAnnotation(
+  id: string,
+  realName: string,
+  range: string,
+  sheet: string | null,
+  note: string | null
+): AnnotationResult {
+  if (!isA1Range(range)) {
+    return {
+      ok: false,
+      error: `"${range}" is not a cell range — use A1 notation like B7 or B2:D5.`,
+    };
+  }
+  return {
+    ok: true,
+    payload: { fileId: id, name: realName, sheet, range, note },
+    described: `cells ${range}`,
+  };
+}
+
+function resolveAnnotationQuote(extracted: string | null, quote: string): ResolvedAnnotationQuote | null {
+  const text = extracted ?? "";
+  if (quoteIsGrounded(text, quote)) {
+    return { quote, approx: false };
+  }
+  const snippet = closestSnippet(text, quote);
+  if (snippet === null) {
+    return null;
+  }
+  return { quote: snippet, approx: true };
+}
+
+function quoteAnnotation(
+  id: string,
+  realName: string,
+  extracted: string | null,
+  quote: string,
+  page: number | null,
+  note: string | null
+): AnnotationResult {
+  const resolved = resolveAnnotationQuote(extracted, quote);
+  if (resolved === null) {
+    return {
+      ok: false,
+      error:
+        `Could not find that text in "${realName}". Copy a short snippet exactly as ` +
+        "it appears in the file (use search_room or open_file to see its text first).",
+    };
+  }
+  return {
+    ok: true,
+    payload: { fileId: id, name: realName, quote: resolved.quote, page, note, approx: resolved.approx },
+    described: resolved.approx ? `"${resolved.quote}" (closest match)` : `"${resolved.quote}"`,
+  };
+}
+
 export function buildAnnotation(
   id: string,
   realName: string,
@@ -453,47 +526,15 @@ export function buildAnnotation(
   page: number | null,
   sheet: string | null,
   note: string | null
-): { ok: true; payload: Record<string, unknown>; described: string } | { ok: false; error: string } {
+): AnnotationResult {
   const quote = quoteRaw.trim();
   if (range !== "") {
-    if (!isA1Range(range)) {
-      return {
-        ok: false,
-        error: `"${range}" is not a cell range — use A1 notation like B7 or B2:D5.`,
-      };
-    }
-    return {
-      ok: true,
-      payload: { fileId: id, name: realName, sheet, range, note },
-      described: `cells ${range}`,
-    };
+    return rangeAnnotation(id, realName, range, sheet, note);
   }
   if (quote !== "") {
     // ADD-22: on a miss, don't hard-fail — anchor on the closest real passage
     // so a paraphrased/near quote still highlights (marked approximate).
-    let finalQuote: string;
-    let approx: boolean;
-    if (quoteIsGrounded(extracted ?? "", quote)) {
-      finalQuote = quote;
-      approx = false;
-    } else {
-      const snip = closestSnippet(extracted ?? "", quote);
-      if (snip === null) {
-        return {
-          ok: false,
-          error:
-            `Could not find that text in "${realName}". Copy a short snippet exactly as ` +
-            "it appears in the file (use search_room or open_file to see its text first).",
-        };
-      }
-      finalQuote = snip;
-      approx = true;
-    }
-    return {
-      ok: true,
-      payload: { fileId: id, name: realName, quote: finalQuote, page, note, approx },
-      described: approx ? `"${finalQuote}" (closest match)` : `"${finalQuote}"`,
-    };
+    return quoteAnnotation(id, realName, extracted, quote, page, note);
   }
   return { ok: false, error: "Provide either exact text to highlight, or a cell range for spreadsheets." };
 }

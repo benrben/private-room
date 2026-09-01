@@ -356,6 +356,20 @@ def test_parse_string_list_matches_rust() -> None:
     assert len(chat_docs.parse_string_list(big)) == 20
 
 
+def test_parse_string_list_keeps_json_filtering_and_normalization() -> None:
+    raw = 'intro ["  Apple  ", 7, "apple", "", "Microsoft"] trailing'
+    assert chat_docs.parse_string_list(raw) == ["Apple", "Microsoft"]
+
+
+def test_parse_string_list_fallback_handles_missing_or_invalid_arrays() -> None:
+    long_item = "x" * 80
+    fallback = f"\n1. Apple\n- apple\n{long_item}\n2. Microsoft\n"
+    assert chat_docs.parse_string_list(fallback) == ["Apple", "Microsoft"]
+    assert chat_docs.parse_string_list('["Apple"') == ['["Apple"']
+    # Faithful Rust quirk: an empty JSON array uses the line fallback.
+    assert chat_docs.parse_string_list("[]") == ["[]"]
+
+
 def test_value_str_matches_rust() -> None:
     parsed = {"a": "  x  ", "n": 3, "empty": "   "}
     assert chat_docs.value_str(parsed, "a") == "x"
@@ -394,6 +408,17 @@ def test_a_long_sheet_is_windowed_with_overlap_not_clamped() -> None:
     assert "Person 119" in windows[-1]
 
 
+@pytest.mark.asyncio
+async def test_an_empty_character_sheet_never_calls_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def should_not_run(*_: Any, **__: Any) -> str:
+        raise AssertionError("empty sheets have no windows to read")
+
+    monkeypatch.setattr(chat_docs, "_structured", should_not_run)
+    assert await chat_docs.extract_cast("m", "http://h:1", "   ") == []
+
+
 def test_the_same_person_in_two_windows_is_one_person() -> None:
     """The overlap means a person can come back twice. Two heroes with the same
     name, each knowing half of themselves, is the failure to avoid."""
@@ -417,6 +442,22 @@ def test_a_later_thinner_window_never_erases_a_fuller_one() -> None:
         ]
     )
     assert merged[0]["description"] == "Tall, grey wool coat, cropped hair."
+
+
+def test_duplicate_cast_details_only_add_new_text() -> None:
+    merged = chat_docs.merge_cast(
+        [
+            {"name": " Mira ", "description": "Tall.", "story": "Sailor."},
+            {"name": "mira", "description": "tall.", "story": " Lost her ship. "},
+        ]
+    )
+    assert merged == [
+        {
+            "name": "Mira",
+            "description": "Tall.",
+            "story": "Sailor. Lost her ship.",
+        }
+    ]
 
 
 def test_a_nameless_row_is_dropped_and_the_ceiling_holds() -> None:
@@ -455,6 +496,46 @@ async def test_reading_a_character_sheet_returns_the_people(
     sent = fake_client.calls["chat"]["messages"][0]["content"]
     assert "Never invent a character" in sent
     assert "what they LOOK like" in sent
+
+
+@pytest.mark.asyncio
+async def test_a_nonfatal_window_failure_keeps_people_from_later_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replies: list[object] = [
+        llm.LlmError("ENGINE_ERROR", "one window was unreadable"),
+        '{"cast":[7,{"name":"Mira","description":"Tall.","story":"Sailor."}]}',
+    ]
+
+    async def read_window(*_: Any, **__: Any) -> str:
+        reply = replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return str(reply)
+
+    monkeypatch.setattr(chat_docs, "cast_windows", lambda _: ["first", "second"])
+    monkeypatch.setattr(chat_docs, "_structured", read_window)
+
+    assert await chat_docs.extract_cast("m", "http://h:1", "document") == [
+        {"name": "Mira", "description": "Tall.", "story": "Sailor."}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_valid_json_without_a_cast_list_is_an_unreadable_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replies = ["[]", '{"cast":"Mira"}']
+
+    async def read_window(*_: Any, **__: Any) -> str:
+        return replies.pop(0)
+
+    monkeypatch.setattr(chat_docs, "cast_windows", lambda _: ["first", "second"])
+    monkeypatch.setattr(chat_docs, "_structured", read_window)
+
+    with pytest.raises(llm.LlmError, match="could not read this file") as error:
+        await chat_docs.extract_cast("m", "http://h:1", "document")
+    assert error.value.code == "ENGINE_ERROR"
 
 
 @pytest.mark.asyncio

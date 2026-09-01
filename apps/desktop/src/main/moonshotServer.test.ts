@@ -55,7 +55,7 @@ import {
   type RoomServerSlot,
   type SetRoomServerDeps,
 } from "./moonshotServer.js";
-import type { ToolDispatcher, ToolScope } from "./mcpBridge.js";
+import { McpBridge, type ToolDispatcher, type ToolScope } from "./mcpBridge.js";
 
 // --------------------------------------------------------------- fixtures
 
@@ -114,6 +114,30 @@ function fakeBridge(scope: ToolScope, overrides: Partial<RunningBridge> = {}): R
     stopAndWait: vi.fn(async () => {}),
     ...overrides,
   };
+}
+
+function settingsOnlyDb(initial: Record<string, string> = {}): {
+  db: Database.Database;
+  settings: Map<string, string>;
+} {
+  const settings = new Map(Object.entries(initial));
+  const db = {
+    prepare(sql: string) {
+      const statement = {
+        raw: () => statement,
+        get: (key: string) => {
+          const value = settings.get(key);
+          return value === undefined ? undefined : [value];
+        },
+        run: (key: string, value: string) => {
+          if (sql.includes("INSERT INTO settings")) settings.set(key, value);
+          return { changes: 1 };
+        },
+      };
+      return statement;
+    },
+  } as unknown as Database.Database;
+  return { db, settings };
 }
 
 // ============================================================================
@@ -363,6 +387,32 @@ describe("createRoomBridge", () => {
     }
   });
 
+  it("uses a supplied token in the advertised config instead of minting another", async () => {
+    const bridge = await createRoomBridge({
+      scope: { kind: "LocalEngine" },
+      dispatcher,
+      token: "caller-selected-token",
+    });
+    try {
+      expect(bridge.token).toBe("caller-selected-token");
+      expect(bridge.mcpConfigJson()).toContain("Bearer caller-selected-token");
+    } finally {
+      bridge.stop();
+      await bridge.stopAndWait();
+    }
+  });
+
+  it("refuses a bridge whose listen step reports no bound address", async () => {
+    const listen = vi.spyOn(McpBridge.prototype, "listen").mockResolvedValue(undefined);
+    try {
+      await expect(createRoomBridge({ scope: { kind: "LocalEngine" }, dispatcher })).rejects.toThrow(
+        "mcp bridge bind failed: no address"
+      );
+    } finally {
+      listen.mockRestore();
+    }
+  });
+
   it("retries a taken fixed port then falls back to an ephemeral one, stable:false", async () => {
     const occupied = http.createServer();
     await new Promise<void>((resolve) => occupied.listen(0, "127.0.0.1", resolve));
@@ -390,6 +440,184 @@ function roomSourceFrom(room: { path: string; name: string; db: Database.Databas
 }
 
 describe("setRoomServer", () => {
+  it("keeps an already-running full bridge without restarting it", async () => {
+    const { db } = settingsOnlyDb();
+    const room = { path: "/memory-full.roomai", name: "Memory Full", db };
+    const already = fakeBridge({ kind: "ExternalAgent" });
+    const slot: RoomServerSlot = { bridge: already };
+    const deps: SetRoomServerDeps = {
+      startBridge: vi.fn(async () => fakeBridge({ kind: "ExternalAgent" })),
+      writeDiscovery: vi.fn(),
+      removeDiscovery: vi.fn(),
+    };
+
+    await setRoomServer(
+      db,
+      room.path,
+      room.name,
+      { enabled: true, allowCloud: false, scope: "full" },
+      slot,
+      roomSourceFrom(room),
+      deps,
+    );
+
+    expect(deps.startBridge).not.toHaveBeenCalled();
+    expect(already.stopAndWait).not.toHaveBeenCalled();
+    expect(slot.bridge).toBe(already);
+  });
+
+  it("starts a files bridge once and reuses that exact bridge for the same request", async () => {
+    const { db } = settingsOnlyDb();
+    const room = { path: "/memory-files.roomai", name: "Memory Files", db };
+    const started = fakeBridge({ kind: "CloudAdvisor", includeMcp: false });
+    const slot: RoomServerSlot = { bridge: null };
+    const deps: SetRoomServerDeps = {
+      startBridge: vi.fn(async () => started),
+      writeDiscovery: vi.fn(),
+      removeDiscovery: vi.fn(),
+    };
+
+    await setRoomServer(
+      db,
+      room.path,
+      room.name,
+      { enabled: true, allowCloud: false, scope: "files" },
+      slot,
+      roomSourceFrom(room),
+      deps
+    );
+    await setRoomServer(
+      db,
+      room.path,
+      room.name,
+      { enabled: true, allowCloud: false, scope: "files" },
+      slot,
+      roomSourceFrom(room),
+      deps
+    );
+
+    expect(deps.startBridge).toHaveBeenCalledOnce();
+    expect(slot.bridge).toBe(started);
+    expect(deps.removeDiscovery).toHaveBeenCalledOnce();
+  });
+
+  it("restarts a mismatched bridge and keeps serving if writing discovery fails", async () => {
+    const { db } = settingsOnlyDb();
+    const room = { path: "/memory-full.roomai", name: "Memory Full", db };
+    const old = fakeBridge({ kind: "CloudAdvisor", includeMcp: false });
+    const fresh = fakeBridge({ kind: "ExternalAgent" }, { port: 21212, token: "fresh-token" });
+    const slot: RoomServerSlot = { bridge: old };
+    const deps: SetRoomServerDeps = {
+      startBridge: vi.fn(async () => fresh),
+      writeDiscovery: vi.fn(() => {
+        throw new Error("discovery directory is unavailable");
+      }),
+      removeDiscovery: vi.fn(),
+    };
+
+    const status = await setRoomServer(
+      db,
+      room.path,
+      room.name,
+      { enabled: true, allowCloud: false, scope: "full" },
+      slot,
+      roomSourceFrom(room),
+      deps
+    );
+
+    expect(old.stopAndWait).toHaveBeenCalledOnce();
+    expect(deps.writeDiscovery).toHaveBeenCalledWith(21212, "fresh-token", "full", "Memory Full");
+    expect(slot.bridge).toBe(fresh);
+    expect(status.running).toBe(true);
+  });
+
+  it("stops a freshly started bridge without discovery when its room closes during the await", async () => {
+    const { db } = settingsOnlyDb();
+    const room = { path: "/closed-during-start.roomai", name: "Closing Room", db };
+    const started = fakeBridge({ kind: "ExternalAgent" });
+    const slot: RoomServerSlot = { bridge: null };
+    const deps: SetRoomServerDeps = {
+      startBridge: vi.fn(async () => started),
+      writeDiscovery: vi.fn(),
+      removeDiscovery: vi.fn(),
+    };
+
+    const status = await setRoomServer(
+      db,
+      room.path,
+      room.name,
+      { enabled: true, allowCloud: false, scope: "full" },
+      slot,
+      { currentRoom: () => null },
+      deps
+    );
+
+    expect(started.stop).toHaveBeenCalledOnce();
+    expect(slot.bridge).toBeNull();
+    expect(deps.writeDiscovery).not.toHaveBeenCalled();
+    expect(deps.removeDiscovery).not.toHaveBeenCalled();
+    expect(status.running).toBe(false);
+  });
+
+  it("turns a memory-backed bridge off without invoking a starter", async () => {
+    const { db } = settingsOnlyDb();
+    const room = { path: "/memory-off.roomai", name: "Memory Off", db };
+    const running = fakeBridge({ kind: "ExternalAgent" });
+    const slot: RoomServerSlot = { bridge: running };
+    const deps: SetRoomServerDeps = {
+      startBridge: vi.fn(),
+      writeDiscovery: vi.fn(),
+      removeDiscovery: vi.fn(),
+    };
+
+    await setRoomServer(
+      db,
+      room.path,
+      room.name,
+      { enabled: false, allowCloud: false, scope: "full" },
+      slot,
+      roomSourceFrom(room),
+      deps
+    );
+
+    expect(running.stop).toHaveBeenCalledOnce();
+    expect(deps.startBridge).not.toHaveBeenCalled();
+    expect(deps.removeDiscovery).toHaveBeenCalledOnce();
+    expect(slot.bridge).toBeNull();
+  });
+
+  it("persists the requested tier before a replacement bridge fails to start", async () => {
+    const { db, settings } = settingsOnlyDb();
+    const old = fakeBridge({ kind: "CloudAdvisor", includeMcp: false });
+    const slot: RoomServerSlot = { bridge: old };
+    const room = { path: "/memory.roomai", name: "Memory Room", db };
+    const deps: SetRoomServerDeps = {
+      startBridge: vi.fn(async () => Promise.reject(new Error("starter failed"))),
+      writeDiscovery: vi.fn(),
+      removeDiscovery: vi.fn(),
+    };
+
+    await expect(
+      setRoomServer(
+        db,
+        room.path,
+        room.name,
+        { enabled: true, allowCloud: false, scope: "full" },
+        slot,
+        roomSourceFrom(room),
+        deps
+      )
+    ).rejects.toThrow("starter failed");
+
+    expect(settings.get("room_server_enabled")).toBe("1");
+    expect(settings.get("room_server_scope")).toBe("full");
+    expect(settings.get("leash_port")).toBe(String(LEASH_DEFAULT_PORT));
+    expect(old.stopAndWait).toHaveBeenCalledOnce();
+    expect(slot.bridge).toBeNull();
+    expect(deps.writeDiscovery).not.toHaveBeenCalled();
+    expect(deps.removeDiscovery).not.toHaveBeenCalled();
+  });
+
   it("enabled:true, scope:files — starts a bridge, persists settings, removes discovery", async () => {
     const room = freshRoom();
     const slot: RoomServerSlot = { bridge: null };
@@ -809,6 +1037,29 @@ describe("registerMoonshotServerIpc", () => {
       stable: false,
       allowCloud: false,
     });
+  });
+
+  it("regenerates a token for the current room through injected bridge dependencies", async () => {
+    const ipc = fakeIpcMain();
+    const room = freshRoom();
+    const old = fakeBridge({ kind: "ExternalAgent" }, { token: "old-token" });
+    const fresh = fakeBridge({ kind: "ExternalAgent" }, { token: "fresh-token" });
+    const slot: RoomServerSlot = { bridge: old };
+    const deps: SetRoomServerDeps = {
+      startBridge: vi.fn(async () => fresh),
+      writeDiscovery: vi.fn(),
+      removeDiscovery: vi.fn(),
+    };
+    setSetting(room.db, "room_server_enabled", "1");
+    setSetting(room.db, "room_server_scope", "full");
+    registerMoonshotServerIpc(ipc as never, roomSourceFrom(room), slot, deps);
+
+    await expect(ipc.handlers.get("regenerate_leash_token")!({} as never)).resolves.toEqual(
+      expect.objectContaining({ running: true }),
+    );
+    expect(old.stopAndWait).toHaveBeenCalledOnce();
+    expect(deps.startBridge).toHaveBeenCalledOnce();
+    expect(slot.bridge).toBe(fresh);
   });
 });
 

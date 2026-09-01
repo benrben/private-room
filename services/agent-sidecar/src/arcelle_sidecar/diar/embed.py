@@ -1,87 +1,37 @@
-"""Speaker-embedding voiceprints for the meeting lane.
+"""Speaker embedding, neural inference, and DSP fallback for meeting lanes.
 
-Ported from three Rust sources, in order, MERGED into this one file (the
-Electron+Python rewrite has no module system as fine-grained as Rust's, so
-where a name collided across the three files below it was disambiguated
-mechanically — see the ``FBANK_*`` prefix note below — never by changing a
-value):
-
-- ``src-tauri/src/recording/diarize/fbank.rs`` — the exact log-mel front end
-  TitaNet was trained with (the ``Fbank`` class + ``mel_slaney``/
-  ``inv_mel_slaney``/``mel_banks``).
-- ``src-tauri/src/recording/diarize/titanet.rs`` — the ONNX embedding wrapper
-  (``titanet_embed``, renamed from Rust's ``titanet::embed`` only because a
-  bare ``embed`` name is already the top-level per-phrase dispatcher below;
-  same function, same signature shape, same infallible-by-``None`` contract).
-- ``src-tauri/src/recording/diarize.rs`` — the DSP fallback voiceprint (used
-  only if the neural model is missing or fails), the print-generation gates,
-  and ``cosine``.
-
-## The two-generation contract
-
-A "voiceprint" is either a 192-dim L2-normalized TitaNet embedding (the
-*neural* generation) or a 19/21-dim hand-rolled DSP print (band-delta-of-
-log-mel-envelope, plus two pitch dims — the *DSP* generation, kept only as a
-silent fallback for when the bundled ONNX model is missing or broken). The
-two generations share no geometry: [`cosine`] refuses to compare across them
-(a hard 0.0), and each carries its own clustering calibration ([`Gates`]).
-
-## What this module deliberately does NOT port
-
-Only the embedding half of ``diarize.rs`` lives here — the per-print math
-(fbank, TitaNet, DSP fallback, gates, cosine) and the ``VoicePrint`` value
-type. The clustering/session-centering/Viterbi-continuity/cross-recording-
-recognition machinery (``cluster``, ``SpeakerBook``, ``lane_voices``,
-``identity_print``, ``KNOWN_SAME``, the online ``MIN_OPEN_FRAMES``/
-``MIN_UPDATE_FRAMES``/``MIN_CLUSTER_*`` gates) is a separate module's
-responsibility and is out of scope here.
-
-## Numeric-fidelity notes (deliberate, disclosed deviations from the Rust)
-
-- The Rust FFT is a hand-rolled radix-2 complex FFT computed internally in
-  f64 and cast to f32 only at the very end (`power_spectrum`'s `re`/`im`
-  arrays are `[f64; NFFT]`). We use ``numpy.fft.rfft`` on a float64 view of
-  the windowed frame for the same reason: it is at least as accurate as the
-  hand-rolled version (see the test file's `test_rfft_matches_direct_dft`
-  cross-check against a pure-Python direct DFT), and matches the Rust
-  computation's own internal f64 precision rather than a naive f32 FFT.
-- A few other spots (mel-band accumulation in `bin_energy`, the running sums
-  in `frame_f0` and `dsp_embed`) are computed in float64 and cast to float32
-  only where the Rust struct stores an `f32` value. This is a strictly
-  higher-precision choice than the Rust `f32` accumulation it replaces, in
-  the same spirit the porting brief invited for the FFT — not a change in
-  formula, constant, or behavior.
-- `titanet.rs` reads the embedding as `out.get(1)` (the second ONNX output,
-  positionally). This port instead asks onnxruntime for the output by name,
-  ``"embs"`` (confirmed via `session.get_outputs()` against the real bundled
-  model: outputs are `["logits", "embs"]`, so name and position agree) —
-  more robust than a hardcoded index, not a numeric change.
+The numerical pipeline remains a faithful Python port of the Rust fbank,
+TitaNet, and diarization implementations. Embedding-space value types and
+comparison rules live in :mod:`arcelle_sidecar.diar.embed_types`.
 """
 
 from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
 
 import numpy as np
 import onnxruntime as ort
 
-# =============================================================================
+from arcelle_sidecar.diar.embed_types import (
+    DSP_GATES as DSP_GATES,
+    EMB_DIM,
+    MIN_NEW_VOICE_FRAMES as MIN_NEW_VOICE_FRAMES,
+    NEURAL_GATES as NEURAL_GATES,
+    Gates as Gates,
+    VoicePrint,
+    cosine as cosine,
+    gates_for as gates_for,
+    is_neural as is_neural,
+)
+
 # ---- Fbank: the exact log-mel front end TitaNet was trained with -----------
 # Ported from fbank.rs. Change nothing here without re-validating against the
 # onnxruntime parity check the Rust comment describes (max feature diff
 # < 1e-4, embedding cosine 1.000000).
-# =============================================================================
 
-# NOTE ``WIN`` collides in name (not value: 400 here vs 512 in the DSP
-# section below) with `diarize.rs`'s own `WIN` constant. Rust keeps these
-# apart because they live in different modules (`fbank::WIN` vs
-# `diarize::WIN`); merged into one Python file, the fbank-local ones are
-# prefixed `FBANK_` to avoid silently shadowing the DSP section's `WIN`/
-# `HOP`. The DSP section keeps the bare Rust names (`WIN`, `HOP`, ...) since
-# those are the ones actually used pervasively by the rest of this file,
-# exactly mirroring `diarize.rs`.
+# Fbank constants are prefixed because its 400-sample window differs from the
+# DSP fallback's 512-sample window below.
 FBANK_SR: float = 16000.0
 FBANK_WIN: int = 400  # 25 ms
 FBANK_SHIFT: int = 160  # 10 ms
@@ -105,6 +55,29 @@ def inv_mel_slaney(m: float) -> float:
     return 1000.0 * math.exp((m - 15.0) * 0.068_751_777)
 
 
+def _mel_triangle_weight(hz: float, left: float, center: float, right: float) -> float:
+    if hz <= center:
+        weight = (hz - left) / (center - left)
+    else:
+        weight = (right - hz) / (right - center)
+    return weight * 2.0 / (right - left)  # Slaney norm
+
+
+def _sparse_mel_bank(
+    left: float, center: float, right: float, fft_bin_width: float
+) -> tuple[int, np.ndarray]:
+    bins = [
+        (i, fft_bin_width * i)
+        for i in range(FBANK_NFFT // 2 + 1)
+        if left < fft_bin_width * i < right
+    ]
+    if not bins:
+        raise ValueError("empty mel bin")
+    first = bins[0][0]
+    weights = [_mel_triangle_weight(hz, left, center, right) for _, hz in bins]
+    return first, np.asarray(weights, dtype=np.float32)
+
+
 def mel_banks() -> list[tuple[int, np.ndarray]]:
     """Sparse triangular filters: (first FFT bin, weights).
 
@@ -120,24 +93,7 @@ def mel_banks() -> list[tuple[int, np.ndarray]]:
         left = inv_mel_slaney(mlo + b * delta)
         center = inv_mel_slaney(mlo + (b + 1) * delta)
         right = inv_mel_slaney(mlo + (b + 2) * delta)
-        first: int | None = None
-        weights: list[float] = []
-        for i in range(FBANK_NFFT // 2 + 1):
-            hz = fft_bin_width * i
-            if left < hz < right:
-                if hz <= center:
-                    weight = (hz - left) / (center - left)
-                else:
-                    weight = (right - hz) / (right - center)
-                weight *= 2.0 / (right - left)  # slaney norm
-                if first is None:
-                    first = i
-                weights.append(weight)
-            elif first is not None:
-                break
-        if first is None:
-            raise ValueError("empty mel bin")
-        banks.append((first, np.asarray(weights, dtype=np.float32)))
+        banks.append(_sparse_mel_bank(left, center, right, fft_bin_width))
     return banks
 
 
@@ -211,14 +167,10 @@ class Fbank:
         return num_frames, feats.reshape(-1)
 
 
-# =============================================================================
 # ---- TitaNet-small speaker embedding (ONNX) ---------------------------------
 # Ported from titanet.rs. Everything here is infallible-by-None: a missing or
 # broken model file must never break a recording, so the caller falls back
 # to the DSP print.
-# =============================================================================
-
-EMB_DIM: int = 192
 
 # The bundled model file name, for reference only (path RESOLUTION --
 # MODEL_FILE/set_model_path/model_path() in diarize.rs lines 89-100 -- is a
@@ -372,12 +324,10 @@ def titanet_embed(model_path: str, samples: np.ndarray) -> np.ndarray | None:
     return (emb / norm).astype(np.float32)
 
 
-# =============================================================================
 # ---- The DSP fallback voiceprint --------------------------------------------
 # Ported from diarize.rs. Used only when the bundled TitaNet model is
 # missing or inference fails -- a missing model must never break a
 # recording.
-# =============================================================================
 
 SAMPLE_RATE: int = 16000
 
@@ -413,14 +363,6 @@ PITCH_WEIGHT: float = 0.6
 # Pitched frames for the pitch dims to carry full weight (~0.3 s); below
 # that they fade out linearly rather than assert a pitch from a hiss.
 MIN_PITCHED_FRAMES: int = 20
-# Voiced frames (16 ms hop) a phrase must carry before it can define a voice
-# -- about 1 s of actual speech (sub-second far-field embeddings run near
-# coin-flip error rates). A one-word reply ("Perfect.") has too little
-# evidence to trust: it joins the nearest known voice instead of inventing a
-# participant who was never in the room.
-MIN_NEW_VOICE_FRAMES: int = 62
-
-
 def hz_to_mel(hz: float) -> float:
     """HTK-style mel scale -- DIFFERENT from fbank.rs's Slaney scale above;
     this one is only for the DSP fallback's band centers, never confuse the
@@ -514,35 +456,6 @@ def pitch_dims(f0s: list[float]) -> np.ndarray:
     )
 
 
-@dataclass
-class VoicePrint:
-    """One phrase's voiceprint plus how much real speech went into it -- the
-    vector alone can't say whether it is trustworthy.
-
-    ``vec`` is L2-normalized, so cosine similarity is a plain dot product:
-    192 dims for a TitaNet print; 19 or 21 dims for the DSP prints in older
-    files (and in fallback prints when the model is unavailable) --
-    :func:`cosine` never compares across that divide. All zeros when the
-    phrase held no voiced audio at all.
-    """
-
-    vec: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
-    voiced_frames: int = 0
-
-    def is_silent(self) -> bool:
-        return self.voiced_frames == 0 or bool(np.all(self.vec == 0.0))
-
-    def defines_voice(self, min_frames: int) -> bool:
-        """Enough speech to define a voice rather than merely be labeled
-        with one, at a caller-chosen evidence scale. THE rule -- callers
-        should never measure this a different way."""
-        return self.voiced_frames >= min_frames and not self.is_silent()
-
-    def is_strong(self) -> bool:
-        """:meth:`defines_voice` at the phrase scale."""
-        return self.defines_voice(MIN_NEW_VOICE_FRAMES)
-
-
 def _frame_view(samples: np.ndarray, win: int, hop: int) -> np.ndarray:
     """(num_frames, win) view of `samples` framed at hop `hop`, only frames
     that fit entirely inside the signal (matches the `while pos + WIN <=
@@ -570,6 +483,38 @@ def count_voiced(samples: np.ndarray) -> int:
 # fixed 1.5-3 s windows, never whole variable-length phrases.
 EMB_WIN: int = SAMPLE_RATE * 2
 EMB_HOP: int = SAMPLE_RATE
+
+
+def _window_embedding(model_path: str, samples: np.ndarray) -> np.ndarray | None:
+    if len(samples) < EMB_WIN // 2:
+        return None
+    if count_voiced(samples) * HOP < len(samples) // 4:
+        return None
+    return titanet_embed(model_path, samples)
+
+
+def _long_phrase_embeddings(
+    model_path: str, samples: np.ndarray
+) -> tuple[np.ndarray, int]:
+    acc = np.zeros(EMB_DIM, dtype=np.float64)
+    count = 0
+    pos = 0
+    total = samples.shape[0]
+    while pos < total:
+        end = min(pos + EMB_WIN, total)
+        embedding = _window_embedding(model_path, samples[pos:end])
+        if embedding is not None:
+            acc += embedding.astype(np.float64)
+            count += 1
+        if end == total:
+            break
+        pos += EMB_HOP
+    return acc, count
+
+
+def _normalized_embedding_sum(acc: np.ndarray) -> np.ndarray:
+    norm = max(float(np.sqrt(np.sum(acc * acc))), 1e-9)
+    return (acc / norm).astype(np.float32)
 
 
 def dsp_embed(samples: np.ndarray) -> VoicePrint:
@@ -622,27 +567,12 @@ def neural_embed(model_path: str, samples: np.ndarray) -> np.ndarray | None:
     if total <= EMB_WIN + EMB_HOP // 2:
         return titanet_embed(model_path, samples)
 
-    acc = np.zeros(EMB_DIM, dtype=np.float64)
-    n = 0
-    pos = 0
-    while pos < total:
-        end = min(pos + EMB_WIN, total)
-        win = samples[pos:end]
-        voiced_enough = count_voiced(win) * HOP >= len(win) // 4
-        if len(win) >= EMB_WIN // 2 and voiced_enough:
-            e = titanet_embed(model_path, win)
-            if e is not None:
-                acc += e.astype(np.float64)
-                n += 1
-        if end == total:
-            break
-        pos += EMB_HOP
+    acc, n = _long_phrase_embeddings(model_path, samples)
 
     if n == 0:
         return titanet_embed(model_path, samples)
 
-    norm = max(float(np.sqrt(np.sum(acc * acc))), 1e-9)
-    return (acc / norm).astype(np.float32)
+    return _normalized_embedding_sum(acc)
 
 
 def embed_at(model_path: str, samples: np.ndarray) -> VoicePrint:
@@ -666,68 +596,3 @@ def embed(model_path: str, samples: np.ndarray) -> VoicePrint:
     singleton is host-app wiring out of this module's scope in the rewrite,
     so callers pass `model_path` directly instead)."""
     return embed_at(model_path, samples)
-
-
-# =============================================================================
-# ---- Print-generation dispatch (Gates) --------------------------------------
-# =============================================================================
-
-
-@dataclass(frozen=True)
-class Gates:
-    """The clustering constants of an embedding SPACE: where its
-    same-speaker mass sits once the session channel has been removed. Each
-    print generation carries its own set -- one code path, two
-    calibrations."""
-
-    split: float
-    center: bool
-    raw_same: float
-    online_same: float
-    online_new: float
-
-
-# The legacy DSP space (fallback when the TitaNet model is missing). Raw
-# clean-audio anchors: one voice's pairs measured 0.86-0.94, different
-# voices 0.30-0.57 -- the bar sits in the valley.
-DSP_GATES = Gates(split=0.65, center=False, raw_same=0.85, online_same=0.35, online_new=0.10)
-
-# The TitaNet space, measured in the centered space on real meeting audio
-# (AMI far-field, ground-truth speakers) and the clean/room/far-mic `say`
-# fixtures: the small-session bar sits between the worst same-text
-# cross-voice centroid (+0.33) and every regime's same-voice floor (>= +0.396).
-NEURAL_GATES = Gates(split=0.36, center=True, raw_same=0.69, online_same=0.40, online_new=0.20)
-
-
-def is_neural(v: np.ndarray | list[float]) -> bool:
-    """Which embedding space a print lives in. The generations share no
-    geometry -- a similarity across them is meaningless -- so every
-    comparison in this module is gated on this."""
-    return len(v) == EMB_DIM
-
-
-def gates_for(v: np.ndarray | list[float]) -> Gates:
-    return NEURAL_GATES if is_neural(v) else DSP_GATES
-
-
-def cosine(a: np.ndarray, b: np.ndarray) -> float:
-    """Plain dot product between same-generation prints (both unit-norm).
-    Across GENERATIONS (neural vs DSP) there is no shared geometry at all,
-    so the answer is a hard 0 -- maximally unlike, never merged. Within the
-    DSP generation, a print loaded from a file saved before the pitch dims
-    is 2 short; against one the comparison falls back to the shared
-    band-delta prefix, renormalized so an old/new pair of the same voice
-    scores like an old/old pair -- resumed recordings lose nothing but the
-    pitch help."""
-    a = np.asarray(a, dtype=np.float64)
-    b = np.asarray(b, dtype=np.float64)
-    if is_neural(a) != is_neural(b):
-        return 0.0
-    if a.shape[0] == b.shape[0]:
-        return float(np.dot(a, b))
-    n = min(a.shape[0], b.shape[0])
-    ap, bp = a[:n], b[:n]
-    dot = float(np.dot(ap, bp))
-    na = float(np.sqrt(np.sum(ap * ap)))
-    nb = float(np.sqrt(np.sum(bp * bp)))
-    return dot / max(na * nb, 1e-6)

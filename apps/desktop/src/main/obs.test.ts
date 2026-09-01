@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Val } from "./obs.js";
 import {
   ERR_KINDS,
@@ -128,6 +128,12 @@ describe("errKind", () => {
       ["the AI service refused the Stop (status 503)", "upstream_error"],
       ["Read timed out after 30s", "timeout"],
       ["no api key for this provider", "no_credential"],
+      ["permission denied", "denied"],
+      ["429 quota exceeded", "rate_limited"],
+      ["operation was cancelled", "cancelled"],
+      ["allocation failed: out of memory", "out_of_memory"],
+      ["context too large for this model", "too_large"],
+      ["malformed json schema", "malformed"],
       ["", "none"],
       ["Q3 board minutes.pdf", "other"],
     ];
@@ -436,7 +442,7 @@ describe("filterFrom", () => {
     }
 
     // Values that CANNOT speak about us: honoured would mean silence.
-    for (const bad of ["not a filter!!", "ARCELLE=debug", "somethingelse=trace", "arcelle=debag"]) {
+    for (const bad of ["", " , ", "not a filter!!", "ARCELLE=debug", "somethingelse=trace", "arcelle=debag"]) {
       const { understood, level } = filterFrom(bad);
       expect(understood, `${JSON.stringify(bad)} was taken at face value`).toBe(false);
       expect(level, `${JSON.stringify(bad)} silenced the fallback`).toBe("info");
@@ -612,5 +618,88 @@ describe("event names, field keys, and whitelists must be compile-time literals"
     const line = render("job.status", [["job", id(secretFilename)]]);
     expect(line).not.toContain("Divorce");
     expect(line).toContain(UNLOGGABLE);
+  });
+});
+
+describe("sink failure handling and startup wiring", () => {
+  it("keeps logging non-fatal when opening, writing, or closing a sink fails", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "arcelle-obs-test-"));
+    const importWithFs = async (overrides: Record<string, unknown>) => {
+      vi.resetModules();
+      vi.doMock("node:fs", async () => {
+        const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+        return { ...actual, ...overrides };
+      });
+      return import("./obs.js");
+    };
+    const clearFsMock = () => {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    };
+    try {
+      const writing = await importWithFs({
+        writeSync: () => { throw new Error("disk full"); },
+      });
+      const writeSink = new writing.Sink(path.join(dir, "write.log"), path.join(dir, "write.prev.log"));
+      expect(() => writeSink.info("safe.event", [["n", writing.count(1)]])).not.toThrow();
+      writeSink.close();
+      clearFsMock();
+
+      const rotating = await importWithFs({
+        closeSync: () => { throw new Error("close failed"); },
+      });
+      const rotationSink = new rotating.Sink(path.join(dir, "rotate.log"), path.join(dir, "rotate.prev.log"));
+      Reflect.set(rotationSink as unknown as object, "written", rotating.MAX_LOG_BYTES);
+      expect(() => rotationSink.writeRaw("x")).not.toThrow();
+      clearFsMock();
+
+      const unopened = await importWithFs({
+        openSync: () => { throw new Error("sandboxed"); },
+      });
+      const unopenedSink = new unopened.Sink(path.join(dir, "unavailable.log"), path.join(dir, "unavailable.prev.log"));
+      expect(() => unopenedSink.writeRaw("ignored")).not.toThrow();
+      clearFsMock();
+
+      const closing = await importWithFs({
+        closeSync: () => { throw new Error("close failed"); },
+      });
+      const closeSink = new closing.Sink(path.join(dir, "close.log"), path.join(dir, "close.prev.log"));
+      expect(() => closeSink.close()).not.toThrow();
+    } finally {
+      clearFsMock();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes a single startup record and reports a rejected filter in its isolated log directory", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "arcelle-obs-init-test-"));
+    const previous = process.env[LOG_ENV];
+    process.env[LOG_ENV] = "arcelle=debag";
+    vi.resetModules();
+    vi.doMock("node:os", async () => {
+      const actual = await vi.importActual<typeof import("node:os")>("node:os");
+      return { ...actual, tmpdir: () => dir };
+    });
+    try {
+      const isolated = await import("./obs.js");
+      isolated.init("qwen3.5:4b");
+      isolated.init("ignored-on-second-call");
+      const log = fs.readFileSync(path.join(dir, "arcelle-host.log"), "utf8");
+      expect(log).toContain("host.start version=qwen3.5:4b");
+      expect(log).toContain("host.log_filter_ignored");
+      expect(log.match(/host\.start/g)).toHaveLength(1);
+    } finally {
+      vi.doUnmock("node:os");
+      vi.resetModules();
+      if (previous === undefined) delete process.env[LOG_ENV];
+      else process.env[LOG_ENV] = previous;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("retains the default Val guard even if an external runtime mutates an opaque instance", () => {
+    const forged = id("opaque") as unknown as { shape: unknown; toString(): unknown };
+    Reflect.set(forged, "shape", { kind: "impossible" });
+    expect(forged.toString()).toEqual({ kind: "impossible" });
   });
 });

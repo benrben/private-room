@@ -26,6 +26,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 function domException(name: string): Error {
@@ -56,6 +57,22 @@ describe("the NOT_IMPLEMENTED seam", () => {
     await expect(defaultLoopbackTapDeps().requestDisplayMedia(SYSTEM_AUDIO_CONSTRAINTS)).rejects.toThrow(
       /session\.setDisplayMediaRequestHandler/
     );
+  });
+
+  it("adapts the browser's native audio context in the default dependency", () => {
+    class NativeAudioContextDouble {
+      state = "running";
+      sampleRate = 44_100;
+      destination = { connect: vi.fn(), disconnect: vi.fn() };
+      audioWorklet = { addModule: vi.fn(async () => undefined) };
+      resume = vi.fn(async () => undefined);
+      close = vi.fn(async () => undefined);
+    }
+    vi.stubGlobal("AudioContext", NativeAudioContextDouble);
+
+    const context = defaultLoopbackTapDeps().createAudioContext();
+    expect(context.state).toBe("running");
+    expect(context.sampleRate).toBe(44_100);
   });
 });
 

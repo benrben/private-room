@@ -124,6 +124,45 @@ def test_constants_match_rust_source() -> None:
     assert vad.VAD_TAIL == FRAME * 22 == 11264
 
 
+def test_score_buffer_has_no_model_work_for_zero_frames() -> None:
+    nv = _bare_vad()
+    assert np.array_equal(nv._score_buffer(np.zeros(0, dtype=np.float32)), np.zeros(0, dtype=np.float32))
+
+
+def test_score_buffer_uses_the_onnx_session_one_frame_at_a_time() -> None:
+    class FakeSession:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, np.ndarray]] = []
+
+        def run(self, _names, inputs):  # noqa: ANN001
+            self.calls.append(inputs)
+            return np.array([[0.25]], dtype=np.float32), inputs["state"]
+
+    nv = _bare_vad()
+    session = FakeSession()
+    nv._session = session
+    probabilities = nv._score_buffer(np.zeros(FRAME * 2, dtype=np.float32))
+    assert np.array_equal(probabilities, np.array([0.25, 0.25], dtype=np.float32))
+    assert len(session.calls) == 2
+
+
+def test_constructor_uses_a_cpu_onnx_session_for_an_existing_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = tmp_path / "model.onnx"
+    model.write_bytes(b"placeholder")
+    captured: dict[str, object] = {}
+
+    class FakeSession:
+        def __init__(self, path: str, *, providers: list[str]) -> None:
+            captured.update(path=path, providers=providers)
+
+    monkeypatch.setattr(vad.ort, "InferenceSession", FakeSession)
+    neural_vad = vad.NeuralVad(str(model))
+    assert neural_vad.model_path == str(model)
+    assert captured == {"path": str(model), "providers": ["CPUExecutionProvider"]}
+
+
 # ------------------------------------------------------- _vad_model_path()
 
 

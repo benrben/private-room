@@ -66,6 +66,7 @@ import { resolvePublicAddr } from "./browser/guard.js";
 import {
   bodyCappedTo,
   decodeBody,
+  defaultDownloadTempDir,
   dispositionFileName,
   downloadToTemp,
   extractCaptionTracks,
@@ -105,6 +106,11 @@ describe("download MIME routing", () => {
   it("routes TIFF to the image surface after the worker decoder ships", () => {
     expect(guessDownloadMime("scan.tiff")).toBe("image/tiff");
     expect(guessDownloadMime("scan.tif")).toBe("image/tiff");
+  });
+
+  it("uses the generic binary fallback for names without a usable extension", () => {
+    expect(guessDownloadMime("download")).toBe("application/octet-stream");
+    expect(guessDownloadMime("trailing.")).toBe("application/octet-stream");
   });
 });
 
@@ -178,6 +184,10 @@ describe("redirectTarget", () => {
     expect(redirectTarget(302, null, from)).toBeNull();
     expect(redirectTarget(302, "   ", from)).toBeNull();
   });
+
+  it("refuses an invalid redirect location instead of throwing from URL parsing", () => {
+    expect(redirectTarget(302, "http://[not-an-ip", from)).toBeNull();
+  });
 });
 
 describe("htmlTitle", () => {
@@ -187,6 +197,11 @@ describe("htmlTitle", () => {
 
   it("is null when there is no title tag", () => {
     expect(htmlTitle("<html><head></head></html>")).toBeNull();
+  });
+
+  it("is null for a truncated title opening or closing tag", () => {
+    expect(htmlTitle("<title")).toBeNull();
+    expect(htmlTitle("<title>unterminated")).toBeNull();
   });
 });
 
@@ -287,6 +302,13 @@ describe("extractCaptionTracks", () => {
     expect(tracks).toHaveLength(1);
     expect((tracks![0] as Record<string, unknown>).baseUrl).toBe("https://yt/a]b");
   });
+
+  it("keeps scanning through escaped quotes and brackets inside a caption value", () => {
+    const html = 'x"captionTracks":[{"baseUrl":"https://yt/a\\"quoted]b"}] rest';
+    const tracks = extractCaptionTracks(html);
+    expect(tracks).toHaveLength(1);
+    expect((tracks![0] as Record<string, unknown>).baseUrl).toBe('https://yt/a"quoted]b');
+  });
 });
 
 describe("timedtextJson3ToLines", () => {
@@ -307,6 +329,19 @@ describe("timedtextJson3ToLines", () => {
   it("uses an h:mm:ss stamp past the hour", () => {
     const json = JSON.stringify({ events: [{ tStartMs: 3_723_000, segs: [{ utf8: "late" }] }] });
     expect(timedtextJson3ToLines(json)).toBe("[1:02:03] late");
+  });
+
+  it("skips malformed and explicit-null aAppend events while retaining later valid order", () => {
+    const json = JSON.stringify({
+      events: [
+        null,
+        { tStartMs: 1, aAppend: null, segs: [{ utf8: "repeated" }] },
+        { tStartMs: 2, segs: "not an array" },
+        { tStartMs: "not a number", segs: [{ utf8: "first" }] },
+        { tStartMs: 1_000, segs: [{ utf8: 7 }, null, { utf8: "second" }] },
+      ],
+    });
+    expect(timedtextJson3ToLines(json)).toBe("[0:00] first\n[0:01] second");
   });
 });
 
@@ -369,6 +404,17 @@ describe("previewFromHtml", () => {
     const single = "<meta property='og:image' content='https://a.com/x.png'>";
     expect(previewFromHtml("https://a.com/", single).imageUrl).toBe("https://a.com/x.png");
   });
+
+  it("keeps looking past an empty metadata value and treats an invalid page base as no asset URL", () => {
+    const html = [
+      '<meta property="og:image" content="">',
+      '<meta property="twitter:image" content="/fallback.png">',
+    ].join("");
+    expect(previewFromHtml("https://example.com/p", html).imageUrl).toBe(
+      "https://example.com/fallback.png",
+    );
+    expect(previewFromHtml("not a URL", '<meta property="og:image" content="/x.png">').imageUrl).toBeNull();
+  });
 });
 
 // ================================================== bodyCappedTo, unit-level
@@ -411,7 +457,7 @@ describe("bodyCappedTo", () => {
   });
 
   it("a body under the cap is read whole", async () => {
-    const out = await bodyCappedTo(chunked([bytes(10, 7), bytes(5, 8)]), 100, false, "too large");
+    const out = await bodyCappedTo(chunked([Buffer.alloc(0), bytes(10, 7), bytes(5, 8)]), 100, false, "too large");
     expect(out.length).toBe(15);
   });
 
@@ -702,11 +748,31 @@ describe("fetchReadable", () => {
     expect(text).toContain("hi");
     expect(text).not.toContain("menu");
   });
+
+  it("keeps plain textual bodies untouched and refuses binary response bodies", async () => {
+    const base = await listenOn((req, res) => {
+      if (req.url === "/plain") {
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end("plain body");
+        return;
+      }
+      res.writeHead(200, { "content-type": "image/png" });
+      res.end(Buffer.from([1, 2, 3]));
+    });
+    await expect(fetchReadable(`${base}/plain`)).resolves.toMatchObject({ text: "plain body" });
+    await expect(fetchReadable(`${base}/image`)).rejects.toThrow(
+      "The URL is not a text page (content-type: image/png).",
+    );
+  });
 });
 
 // ============================================================== downloadToTemp
 
 describe("downloadToTemp", () => {
+  it("exposes the stable default staging directory", () => {
+    expect(defaultDownloadTempDir()).toBe(path.join(os.tmpdir(), "arcelle-downloads"));
+  });
+
   it("downloads a file, honoring the Content-Disposition filename and declared mime", async () => {
     const base = await listenOn((_req, res) => {
       res.writeHead(200, {
@@ -747,6 +813,15 @@ describe("downloadToTemp", () => {
     const dir = tempDir();
     const outcome = await downloadToTemp(`${base}/data/table.csv`, 1024, null, () => {}, dir);
     expect(outcome.kind === "done" && outcome.downloaded.fileName).toBe("table.csv");
+  });
+
+  it("uses the generic download name for a URL with no final path segment", async () => {
+    const base = await listenOn((_req, res) => {
+      res.writeHead(200, { "content-type": "application/octet-stream" });
+      res.end("bytes");
+    });
+    const outcome = await downloadToTemp(base, 1024, null, () => {}, tempDir());
+    expect(outcome.kind === "done" && outcome.downloaded.fileName).toBe("download");
   });
 
   it("rejects a declared oversize download before reading any bytes", async () => {
@@ -804,6 +879,19 @@ describe("downloadToTemp", () => {
     const progress = vi.fn();
     await expect(downloadToTemp(`${base}/f`, 10_000, { load: () => true }, progress, dir)).rejects.toThrow("Stopped.");
     expect(progress).not.toHaveBeenCalled();
+    expect(readdirSync(dir)).toHaveLength(0);
+  });
+
+  it("wraps a broken response stream and removes its partially opened staged file", async () => {
+    const base = await listenOn((_req, res) => {
+      res.writeHead(200, { "content-type": "application/octet-stream" });
+      res.write(Buffer.alloc(50, "a"));
+      setImmediate(() => res.destroy(new Error("socket broke")));
+    });
+    const dir = tempDir();
+    await expect(downloadToTemp(`${base}/f.bin`, 10_000, null, () => {}, dir)).rejects.toThrow(
+      "The download failed partway:",
+    );
     expect(readdirSync(dir)).toHaveLength(0);
   });
 });
@@ -865,6 +953,41 @@ describe("youtubeTranscript — end-to-end over a fake watch page + timedtext en
       "Local and private-network addresses cannot be fetched."
     );
   });
+
+  it("keeps the distinct no-track, malformed-track and empty-caption errors", async () => {
+    const cases: Array<[string, string]> = [
+      ["[null]", "This video has no captions/transcript to import."],
+      ["[{}]", "This video's captions could not be read."],
+    ];
+    for (const [tracks, message] of cases) {
+      const base = await listenOn((_req, res) => {
+        res.writeHead(200, { "content-type": "text/html" });
+        res.end(`"captionTracks":${tracks}`);
+      });
+      await expect(youtubeTranscript(`${base}/watch`)).rejects.toThrow(message);
+      await new Promise<void>((resolve) => server?.close(() => resolve()));
+      server = undefined;
+    }
+
+    const base = await listenOn((req, res) => {
+      if (req.url === "/watch") {
+        res.writeHead(200, { "content-type": "text/html" });
+        res.end(`"captionTracks":[{"baseUrl":"${base}/timedtext"}]`);
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ events: [] }));
+    });
+    await expect(youtubeTranscript(`${base}/watch`)).rejects.toThrow(
+      "This video's captions came back empty.",
+    );
+  });
+
+  it("rejects incomplete and malformed caption arrays instead of accepting a partial track list", () => {
+    expect(extractCaptionTracks('"captionTracks":not-an-array')).toBeNull();
+    expect(extractCaptionTracks('"captionTracks":[{"baseUrl":"https://yt/a"}')).toBeNull();
+    expect(extractCaptionTracks('"captionTracks":[not json]')).toBeNull();
+  });
 });
 
 // ========================================================= previews (BROWSE-3b)
@@ -880,6 +1003,32 @@ describe("fetchPreview / fetchImage", () => {
     const preview = await fetchPreview(`${base}/result`);
     expect(preview.title).toBe("T");
     expect(preview.imageUrl).toBe(`${base}/hero.png`);
+  });
+
+  it("fetchPreview rejects a non-HTML response after discarding its stream", async () => {
+    const base = await listenOn((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"not":"html"}');
+    });
+    await expect(fetchPreview(`${base}/result`)).rejects.toThrow(
+      "Not an HTML page (content-type: application/json).",
+    );
+  });
+
+  it("ignores malformed/empty metadata and link tags while retaining a later usable icon", () => {
+    const laterIcon = '<link rel="stylesheet" href="/styles.css"><link rel="icon" href="/icon.png">';
+    expect(previewFromHtml("https://example.com/", laterIcon).iconUrl).toBe(
+      "https://example.com/icon.png",
+    );
+    expect(previewFromHtml("https://example.com/", '<link rel="icon"><link rel="icon" href="">').iconUrl).toBe(
+      "https://example.com/favicon.ico",
+    );
+    expect(previewFromHtml("https://example.com/", '<link rel="icon" href="/unterminated"').iconUrl).toBe(
+      "https://example.com/favicon.ico",
+    );
+    expect(previewFromHtml("https://example.com/", 'property="og:image" content="/outside.png"').imageUrl).toBeNull();
+    expect(previewFromHtml("https://example.com/", '<meta property="og:image" content=/bare.png>').imageUrl).toBeNull();
+    expect(previewFromHtml("https://example.com/", '<meta property="og:image" content="unterminated>').imageUrl).toBeNull();
   });
 
   it("fetchImage refuses a non-image content type", async () => {

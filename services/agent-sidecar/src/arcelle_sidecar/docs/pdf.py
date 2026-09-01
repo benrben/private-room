@@ -148,6 +148,24 @@ def _is_ascii_alnum(c: str) -> bool:
     return c.isascii() and c.isalnum()
 
 
+def _visual_hebrew_counts(text: str) -> tuple[int, int]:
+    """Count Hebrew bases and visual-order orphan marks in a bounded sample."""
+    letters = 0
+    orphan_marks = 0
+    previous_was_space = False
+    for char in text[:400_000]:
+        if is_heb_letter(char):
+            letters += 1
+        elif is_heb_mark(char) and previous_was_space:
+            orphan_marks += 1
+        previous_was_space = char.isspace()
+    return letters, orphan_marks
+
+
+def _has_visual_hebrew_signature(letters: int, orphan_marks: int) -> bool:
+    return letters > 200 and orphan_marks > 50 and orphan_marks * 20 > letters
+
+
 def looks_visual_hebrew(text: str) -> bool:
     """Detect visual-order Hebrew from its signature artifact: clusters
     emitted as `space + mark(s) + base`, i.e. combining marks that FOLLOW a
@@ -157,16 +175,8 @@ def looks_visual_hebrew(text: str) -> bool:
     document-wide property, not something that needs a full multi-megabyte
     book read.
     """
-    letters = 0
-    orphan_marks = 0
-    prev_space = False
-    for c in text[:400_000]:
-        if is_heb_letter(c):
-            letters += 1
-        elif is_heb_mark(c) and prev_space:
-            orphan_marks += 1
-        prev_space = c.isspace()
-    return letters > 200 and orphan_marks > 50 and orphan_marks * 20 > letters
+    letters, orphan_marks = _visual_hebrew_counts(text)
+    return _has_visual_hebrew_signature(letters, orphan_marks)
 
 
 def _rust_lines(text: str) -> list[str]:
@@ -186,6 +196,97 @@ def _rust_lines(text: str) -> list[str]:
     return [p[:-1] if p.endswith("\r") else p for p in parts]
 
 
+def _unmirror_ascii_runs(chars: list[str]) -> None:
+    """Restore digit and Latin runs after the enclosing visual line flips."""
+    index = 0
+    while index < len(chars):
+        if not _is_ascii_alnum(chars[index]):
+            index += 1
+            continue
+        start = index
+        while index < len(chars) and _is_ascii_alnum(chars[index]):
+            index += 1
+        chars[start:index] = reversed(chars[start:index])
+
+
+def _is_hebrew_glyph(char: str) -> bool:
+    return is_heb_letter(char) or is_heb_mark(char)
+
+
+def _is_mark_cluster_boundary(fixed: list[str]) -> bool:
+    return not fixed or not _is_hebrew_glyph(fixed[-1])
+
+
+def _has_hebrew_base(chars: list[str], index: int) -> bool:
+    return index < len(chars) and is_heb_letter(chars[index])
+
+
+def _mark_run_end(chars: list[str], index: int) -> int:
+    while index < len(chars) and is_heb_mark(chars[index]):
+        index += 1
+    return index
+
+
+def _restore_mark_clusters(chars: list[str]) -> list[str]:
+    """Move a visual-order mark run behind the Hebrew base it modifies."""
+    fixed: list[str] = []
+    index = 0
+    while index < len(chars):
+        if _is_mark_cluster_boundary(fixed) and is_heb_mark(chars[index]):
+            start = index
+            index = _mark_run_end(chars, index)
+            if _has_hebrew_base(chars, index):
+                fixed.append(chars[index])
+                fixed.extend(chars[start:index])
+                index += 1
+            else:
+                fixed.extend(chars[start:index])
+            continue
+        fixed.append(chars[index])
+        index += 1
+    return fixed
+
+
+def _space_has_hebrew_on_both_sides(cleaned: list[str], fixed: list[str], index: int) -> bool:
+    return bool(cleaned) and _is_hebrew_glyph(cleaned[-1]) and index < len(fixed) and _is_hebrew_glyph(fixed[index])
+
+
+def _keep_space(run_length: int, cleaned: list[str], fixed: list[str], index: int) -> bool:
+    return run_length >= 2 or not _space_has_hebrew_on_both_sides(cleaned, fixed, index)
+
+
+def _space_run_end(fixed: list[str], index: int) -> int:
+    while index < len(fixed) and fixed[index] == " ":
+        index += 1
+    return index
+
+
+def _collapse_cluster_spaces(fixed: list[str]) -> list[str]:
+    """Drop a single visual cluster gap but retain real word separators."""
+    cleaned: list[str] = []
+    index = 0
+    while index < len(fixed):
+        if fixed[index] != " ":
+            cleaned.append(fixed[index])
+            index += 1
+            continue
+        start = index
+        index = _space_run_end(fixed, index)
+        if _keep_space(index - start, cleaned, fixed, index):
+            cleaned.append(" ")
+    return cleaned
+
+
+def _fix_visual_hebrew_line(line: str) -> str:
+    chars = list(reversed(line))
+    _unmirror_ascii_runs(chars)
+    return "".join(_collapse_cluster_spaces(_restore_mark_clusters(chars)))
+
+
+def _hebrew_letter_count(line: str) -> int:
+    return sum(1 for char in line if is_heb_letter(char))
+
+
 def fix_visual_hebrew(text: str) -> str:
     """Restore logical order for visual-order Hebrew text, line by line:
     reverse the line, un-mirror embedded digit/Latin runs, re-attach
@@ -199,67 +300,10 @@ def fix_visual_hebrew(text: str) -> str:
 
     out_lines: list[str] = []
     for line in _rust_lines(text):
-        heb = sum(1 for c in line if is_heb_letter(c))
-        if heb < 2:
+        if _hebrew_letter_count(line) < 2:
             out_lines.append(line)
             continue
-
-        # 1. Mirror the line back to logical order.
-        chars: list[str] = list(reversed(line))
-
-        # 2. Digit/Latin runs got mirrored too ("13" -> "31") -- flip them back.
-        j = 0
-        while j < len(chars):
-            if _is_ascii_alnum(chars[j]):
-                start = j
-                while j < len(chars) and _is_ascii_alnum(chars[j]):
-                    j += 1
-                chars[start:j] = list(reversed(chars[start:j]))
-            else:
-                j += 1
-
-        # 3. Clusters the extractor emitted as (base, mark) are now
-        #    (mark, base) -- move any mark-run that sits after a space/start
-        #    and directly before a letter back behind that letter.
-        fixed: list[str] = []
-        j = 0
-        while j < len(chars):
-            at_boundary = not fixed or not (is_heb_letter(fixed[-1]) or is_heb_mark(fixed[-1]))
-            if at_boundary and is_heb_mark(chars[j]):
-                start = j
-                while j < len(chars) and is_heb_mark(chars[j]):
-                    j += 1
-                if j < len(chars) and is_heb_letter(chars[j]):
-                    fixed.append(chars[j])
-                    fixed.extend(chars[start:j])
-                    j += 1
-                else:
-                    fixed.extend(chars[start:j])
-            else:
-                fixed.append(chars[j])
-                j += 1
-
-        # 4. Spaces: a single space was a glyph-cluster gap INSIDE a word --
-        #    drop it when it sits between Hebrew text on both sides; runs of
-        #    2+ spaces were the real word separators.
-        cleaned: list[str] = []
-        j = 0
-        while j < len(fixed):
-            if fixed[j] == " ":
-                start = j
-                while j < len(fixed) and fixed[j] == " ":
-                    j += 1
-                run = j - start
-                prev_heb = bool(cleaned) and (is_heb_letter(cleaned[-1]) or is_heb_mark(cleaned[-1]))
-                next_heb = j < len(fixed) and (is_heb_letter(fixed[j]) or is_heb_mark(fixed[j]))
-                if run >= 2 or not (prev_heb and next_heb):
-                    cleaned.append(" ")
-                # else: intra-word cluster gap -- dropped.
-            else:
-                cleaned.append(fixed[j])
-                j += 1
-
-        out_lines.append("".join(cleaned))
+        out_lines.append(_fix_visual_hebrew_line(line))
 
     return "\n".join(out_lines)
 
@@ -324,38 +368,44 @@ class PdfTextFault(Enum):
     NOT_LANGUAGE = "not_language"
 
 
+def _replacement_ratio(text: str) -> float:
+    return sum(1 for char in text if char == "�") / len(text)
+
+
+def _is_readable_pdf_char(char: str) -> bool:
+    return char.isalnum() or char.isspace() or char in _ASCII_PUNCTUATION or char in _HEB_OTHER_ALPHABETIC
+
+
+def _readable_ratio(text: str) -> float:
+    return sum(1 for char in text if _is_readable_pdf_char(char)) / len(text)
+
+
+def _space_ratio(text: str) -> float:
+    return sum(1 for char in text if char.isspace()) / len(text)
+
+
+def _sample_fault(sample: str) -> PdfTextFault | None:
+    if _replacement_ratio(sample) > MAX_REPLACEMENT_RATIO:
+        return PdfTextFault.UNDECODABLE
+    if _readable_ratio(sample) < MIN_READABLE_RATIO:
+        return PdfTextFault.NOT_LANGUAGE
+    if _space_ratio(sample) < MIN_SPACE_RATIO:
+        return PdfTextFault.NO_WORD_BREAKS
+    return None
+
+
 def fault_in(text: str) -> PdfTextFault | None:
     """Judge extracted PDF text. `None` means "good enough to index"."""
     trimmed = text.strip()
     if not trimmed:
         return PdfTextFault.EMPTY
-
     # Sample the head rather than walk a 900-page book: the failure modes
     # are properties of the document's fonts and layout, not of one page.
     sample = trimmed[:20_000]
     if len(sample) < MIN_SAMPLE:
         return None
-    total = len(sample)
-
-    replacement = sum(1 for c in sample if c == "�")
-    if replacement / total > MAX_REPLACEMENT_RATIO:
-        return PdfTextFault.UNDECODABLE
-
-    readable = sum(
-        1
-        for c in sample
-        if c.isalnum() or c.isspace() or c in _ASCII_PUNCTUATION or c in _HEB_OTHER_ALPHABETIC
-    )
-    if readable / total < MIN_READABLE_RATIO:
-        return PdfTextFault.NOT_LANGUAGE
-
-    # Word breaks: any whitespace counts, since a reader that emits one
-    # glyph per line still separates its words.
-    spaces = sum(1 for c in sample if c.isspace())
-    if spaces / total < MIN_SPACE_RATIO:
-        return PdfTextFault.NO_WORD_BREAKS
-
-    return None
+    # Any whitespace counts as a word break: one glyph per line still separates words.
+    return _sample_fault(sample)
 
 
 def should_reread_with_ocr(text: str) -> bool:
@@ -363,6 +413,17 @@ def should_reread_with_ocr(text: str) -> bool:
     rendered pages. Named for the decision it drives.
     """
     return fault_in(text) is not None
+
+
+def _choose_two_readings(extracted: str, ocr: str) -> str:
+    """Prefer a sound reading, then the longer of two faulty readings."""
+    if fault_in(extracted) is None:
+        return extracted
+    if fault_in(ocr) is None:
+        return ocr
+    # Both are poor: keep whichever has more readable content, so a
+    # partial reading still beats nothing.
+    return ocr if len(ocr.strip()) > len(extracted.strip()) else extracted
 
 
 def choose(extracted: str | None, ocr: str | None) -> str | None:
@@ -374,21 +435,11 @@ def choose(extracted: str | None, ocr: str | None) -> str | None:
     only if it is not faulty itself -- a scan of a blank page must not
     replace real text with nothing.
     """
-    if extracted is not None and ocr is not None:
-        if fault_in(extracted) is None:
-            return extracted
-        if fault_in(ocr) is None:
-            return ocr
-        # Both are poor: keep whichever has more readable content, so a
-        # partial reading still beats nothing.
-        if len(ocr.strip()) > len(extracted.strip()):
-            return ocr
-        return extracted
-    if extracted is not None:
-        return extracted
-    if ocr is not None:
+    if extracted is None:
         return ocr
-    return None
+    if ocr is None:
+        return extracted
+    return _choose_two_readings(extracted, ocr)
 
 
 __all__ = [

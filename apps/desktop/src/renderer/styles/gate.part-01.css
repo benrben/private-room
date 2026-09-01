@@ -1,0 +1,493 @@
+/* ---------- gate: the cover page of the notebook ----------
+
+   The gate is the first thing anyone sees and the screen with the least
+   competing content, so it is the one place in the app that can spend real
+   space. The composition runs across the bare sheet instead of being posted
+   inside a 380px utility card: the mark and the wordmark are set at title
+   size, the two ways into a room are large drawn actions, and the rooms you
+   were last in are a ruled list down the facing column.
+
+   TWO LAYOUTS, ONE CONTAINER. App.tsx owns the gate markup — it renders the
+   mark, the wordmark and then whichever screen is current, all as siblings
+   inside `.gate-card`. There is no modifier class to hang a layout on and
+   that file is not ours to change, so the layout is chosen from what the
+   current screen actually rendered:
+
+     .gate-card                            the default: one narrow column,
+                                           which is what create and unlock
+                                           want — the frame goes on the form
+                                           itself, not on the page
+     .gate-card:has(> .gate-assurances)    the start screen — a two-column
+                                           cover: masthead left, actions and
+                                           the recent list right
+
+   The narrow column is the DEFAULT rather than the override so an engine
+   without :has() degrades to a stacked, working screen instead of to a
+   two-column grid with one column empty. (:has() has shipped in WebKit since
+   15.4, and misc-moonshot-cards.css already depends on it for the recovery
+   sheet's print rules — this is belt and braces, not a real doubt.)
+
+   NOTHING HERE IS OPAQUE. `.gate-card` used to be a filled panel with a drop
+   shadow sitting on the paper. In this system a pane earns its identity from
+   a drawn border, so the composition sits directly on the dotted sheet and
+   the only opaque surface on the whole screen is the recovery-code dialog,
+   which has to occlude the code shown behind it.
+
+   THREE CLASSES HERE ARE NOT GATE-ONLY, and are styled here on purpose so
+   there is one look wherever they appear:
+
+     .gate-error   the app's error banner — Settings, connectors, viewers and
+                   the marketplace all render it, most of them WITHOUT the `!`
+                   badge, so nothing may depend on the badge existing.
+     .pw-*         the password-strength block, reused by Settings → Lock &
+                   password for Change password and for a duplicate's
+                   password.
+     .recovery-*   lives in misc-moonshot-cards.css (shared with Settings);
+                   only the dialog's own backdrop is ours.
+
+   Contrast note that shapes several rules below: every colour on the recent
+   rows was measured against the page AND against the hover wash. A heavier
+   hover than --accent-ghost drops the mono path and the marker words under
+   4.5:1 in light mode, which is why the hover here is a marker edge plus the
+   lightest wash in the palette rather than a filled row. */
+
+/* ==========================================================================
+   1. THE PAGE
+   ========================================================================== */
+
+/* The sheet itself; html paints the dotted grid, so this stays transparent.
+   Centred with `margin:auto` on the child rather than with `align-items:
+   center` here, because a centred flex item that outgrows a scroll container
+   has its top edge cut off and cannot be scrolled back to. */
+.gate {
+  height: 100%;
+  display: flex;
+  overflow-y: auto;
+  padding: var(--sp-8) var(--sp-6);
+  background: transparent;
+}
+
+.gate-card {
+  width: min(100%, 27rem);
+  margin: auto;
+  text-align: center;
+  position: relative;
+}
+
+/* A sealed manifest is still part of the unlock gate, but its paths need a
+   reading-width sheet rather than the password form's narrow column. */
+.gate-card:has(> .sealed-inspection) {
+  width: min(100%, 46rem);
+}
+.sealed-inspection {
+  text-align: left;
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius-lg);
+  padding: var(--sp-5);
+  background: var(--raised);
+}
+.sealed-inspection-title {
+  margin: 0 0 var(--sp-4);
+  font-family: var(--mono);
+  font-size: var(--fs-card);
+  overflow-wrap: anywhere;
+}
+.sealed-inspection-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-2) var(--sp-5);
+  margin: 0 0 var(--sp-4);
+}
+.sealed-inspection-meta > div {
+  min-width: 0;
+}
+.sealed-inspection-meta dt {
+  color: var(--muted);
+  font-size: var(--fs-meta);
+}
+.sealed-inspection-meta dd {
+  margin: 2px 0 0;
+  color: var(--text-strong);
+  overflow-wrap: anywhere;
+}
+.sealed-inspection-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin: var(--sp-4) 0 var(--sp-2);
+}
+.sealed-file-list {
+  max-height: min(42vh, 24rem);
+  overflow: auto;
+  list-style: none;
+  margin: 0 0 var(--sp-4);
+  padding: 0;
+  border-block: 1px solid var(--line);
+}
+.sealed-file-list li + li {
+  border-top: 1px solid var(--line-soft);
+}
+.sealed-file-list label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2);
+  cursor: pointer;
+}
+.sealed-file-path {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  overflow-wrap: anywhere;
+}
+.sealed-file-size {
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  white-space: nowrap;
+}
+.sealed-inspection-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+@media (max-width: 620px) {
+  .sealed-inspection-meta,
+  .sealed-inspection-actions {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ----- the start screen: a two-column cover -----
+   Column one is the masthead and the promise; column two is what you came to
+   do. Auto-placement does the work: every child defaults into column one and
+   stacks down it, and only the two right-hand blocks are placed by hand. */
+.gate-card:has(> .gate-assurances) {
+  width: min(100%, 50rem);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+  column-gap: var(--sp-8);
+  row-gap: var(--sp-4);
+  align-items: start;
+  text-align: left;
+}
+/* Spacing between the blocks is the grid's job here, so their own margins go:
+   a row-gap plus a leftover margin-bottom is a rhythm nobody can predict. */
+.gate-card:has(> .gate-assurances) > * {
+  grid-column: 1;
+  margin: 0;
+}
+.gate-card:has(> .gate-assurances) > .gate-actions {
+  grid-column: 2;
+  grid-row: 1 / span 3;
+}
+.gate-card:has(> .gate-assurances) > .recent {
+  grid-column: 2;
+  grid-row: 4;
+}
+
+/* Below the width the two columns need (50rem of composition plus the page's
+   own padding) the cover stacks into DOM order — masthead, promise, actions,
+   list. The grid placements above go inert under `display: flex`, so there is
+   nothing to unset. */
+@media (max-width: 54rem) {
+  .gate-card:has(> .gate-assurances) {
+    width: min(100%, 34rem);
+    display: flex;
+    flex-direction: column;
+    /* `align-items: start` is right for grid tracks and wrong for a column
+       flex: it stops being "top of the row" and becomes "shrink to content
+       width", which let the recent list size itself to its longest path and
+       burst straight out of the column. */
+    align-items: stretch;
+    gap: var(--sp-4);
+  }
+}
+
+/* ==========================================================================
+   2. THE MASTHEAD
+   ========================================================================== */
+
+.gate-logo {
+  display: flex;
+  justify-content: center;
+  line-height: 0;
+}
+
+/* The mark carries this screen. At 56px it read as an app-bar icon that had
+   wandered onto a title page. Sized in CSS rather than through the component's
+   `size` prop because App.tsx renders the shared <Logomark/> and that file is
+   not ours — the mark draws from a viewBox, so scaling it here is lossless. */
+.gate-logo svg {
+  width: 64px;
+  height: 64px;
+}
+.gate-card:has(> .gate-assurances) .gate-logo {
+  justify-content: flex-start;
+}
+.gate-card:has(> .gate-assurances) .gate-logo svg {
+  width: 108px;
+  height: 108px;
+}
+
+.gate-card h1 {
+  margin: var(--sp-3) 0 var(--sp-2);
+  font-size: var(--fs-section);
+  font-family: var(--display);
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  line-height: 1.1;
+  color: var(--text-strong);
+}
+.gate-card:has(> .gate-assurances) h1 {
+  font-size: var(--fs-page);
+}
+/* A short pencil stroke ruled under the wordmark, the way a title is
+   underscored on a cover page. Decorative, inert, and drawn only where there
+   is room for it. */
+.gate-card:has(> .gate-assurances) h1::after {
+  content: "";
+  display: block;
+  width: 152px;
+  max-width: 100%;
+  height: 1px;
+  margin-top: var(--sp-3);
+  background: linear-gradient(
+    90deg,
+    var(--sketch) 0%,
+    var(--rule) 58%,
+    transparent 100%
+  );
+  pointer-events: none;
+}
+
+/* The promise under the mark, and the "Unlock <file>" lead on the unlock
+   screen. Instruction and intro copy is never set small. */
+.gate-sub {
+  margin: 0 0 var(--sp-4);
+  font-size: var(--fs-lead);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+.gate-sub strong {
+  color: var(--text-strong);
+  font-weight: 700;
+}
+/* The room's own file name. It is a file name and this screen is entirely
+   about which file you are opening, so it is set in the mono face — never in
+   the hand, which is reserved for annotations. */
+.gate-sub .gate-file {
+  /* IBM Plex Mono runs wide, so it is stepped down to sit on the same optical
+     size as the sans around it, and given a hair of side padding — a mono run
+     butted straight against a proportional one reads as a missing space. */
+  font-family: var(--mono);
+  font-size: 0.9em;
+  font-weight: 600;
+  padding: 0 1px;
+}
+
+/* ----- the three reassurances -----
+   The green check is "verified" in the marker map and the glyph carries the
+   meaning, so the colour is never doing the work on its own. */
+.gate-assurances {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+}
+.gate-assurances li {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-meta);
+  color: var(--muted);
+}
+.gate-assurances .nb-ico {
+  --nb-ico-size: 15px;
+  color: var(--sem-done);
+}
+
+/* ==========================================================================
+   3. THE TWO WAYS IN
+   ========================================================================== */
+
+.gate-actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin-top: var(--sp-2);
+}
+
+/* ----- the large drawn actions -----
+   Outlined rather than filled: on a bare sheet an ink slab reads as a control
+   that was pasted on, and these two are the whole point of the screen. The
+   lead action is separated from the second by pen weight, an accent swash and
+   the hand arrow — not by a fill, which would make it the only solid object
+   on the page.
+
+   The swash is the button's own background-image growing from zero width, so
+   the label can never end up underneath it. base.css gives every button an
+   `--accent-ghost` background-color on hover; that is cleared here, or it
+   would sit under the swash and mute it. */
+.gate-action {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  min-height: 58px;
+  padding: var(--sp-3) var(--sp-4);
+  font-size: var(--fs-card);
+  font-weight: 600;
+  text-align: left;
+  color: var(--text-strong);
+  background-color: transparent;
+  background-image: linear-gradient(
+    98deg,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 30%, transparent) 0%,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 18%, transparent) 62%,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 26%, transparent) 100%
+  );
+  background-repeat: no-repeat;
+  background-position: left center;
+  background-size: 0% 100%;
+  border: var(--stroke-w) solid var(--rule-strong);
+  border-radius: var(--radius-lg);
+  transition:
+    background-size var(--dur) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen),
+    transform var(--dur-fast) var(--ease-pen);
+}
+.gate-action:hover:not(:disabled) {
+  background-color: transparent;
+  background-size: 100% 100%;
+  border-color: var(--sketch);
+}
+.gate-action:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.gate-action svg {
+  flex: none;
+  color: var(--ink-2);
+}
+/* The lead action is already drawn at full pen weight at rest. */
+.gate-action-lead {
+  border-color: var(--sketch);
+}
+.gate-action-lead svg {
+  color: var(--accent);
+}
+/* .nb-btn-go supplies the drawn arrow; it only needs pushing to the far edge. */
+.gate-action.nb-btn-go::after {
+  margin-left: auto;
+  color: var(--ink-2);
+}
+
+/* The demo is a third, quieter door — a text button, not a third slab.
+   Written as a descendant so it beats base.css's `button.subtle` padding,
+   which would leave the target under the 24px floor. */
+.gate-actions .gate-demo {
+  align-self: flex-start;
+  min-height: 24px;
+  margin-top: calc(var(--sp-1) * -1);
+  padding: var(--sp-1) var(--sp-2);
+  font-size: var(--fs-meta);
+}
+
+/* ==========================================================================
+   4. RECENT ROOMS — the ruled list
+   ========================================================================== */
+
+.recent {
+  margin-top: var(--sp-4);
+  text-align: left;
+}
+
+/* "Recent" is a short label in the margin of a list, which is one of the few
+   places the hand belongs. The type and the marker swipe come from
+   .nb-subtitle; only the spacing is local. */
+.recent-label {
+  display: inline-block;
+  margin-bottom: var(--sp-3);
+}
+
+.recent-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.recent-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  border-radius: var(--radius);
+  transition:
+    background-color var(--dur-fast) var(--ease-pen),
+    box-shadow var(--dur-fast) var(--ease-pen);
+}
+/* The ruled line between entries: a pencil stroke that fades at both ends,
+   drawn as a background IMAGE so hover and selection keep the background
+   COLOR to themselves. The first row goes without, so the list never opens
+   with a rule hanging off nothing. */
+.recent-row + .recent-row {
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+/* Hover is the pen leaning on the row: a marker edge down the left and the
+   lightest wash in the palette. Anything heavier and the mono path, the
+   handwritten date and the marker words all drop under 4.5:1 in light mode. */
+.recent-row:hover {
+  background-color: var(--accent-ghost);
+  box-shadow: inset 3px 0 0 var(--accent-fill);
+}
+/* A room whose file is no longer where we left it keeps its caution edge even
+   under the cursor — hence the placement AFTER the hover rule. It is still a
+   row you click: the open path is what knows how to go and find the file
+   again. It used to be dimmed to 55% opacity, which put the name at ~2:1 in
+   light mode; the marker edge and the sentence in the row say the same thing
+   without making it unreadable. */
+.recent-row.missing {
+  box-shadow: inset 3px 0 0 var(--sem-pending-fill);
+}
+
+.recent-open {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: var(--sp-3);
+  background: none;
+  border: none;
+  border-radius: inherit;
+  text-align: left;
+}
+/* The row carries the hover, so the button inside it must not draw a second
+   one on top. */
+.recent-row .recent-open:hover {
+  background: none;
+  border-color: transparent;
+}
+
+.recent-name {
+  max-width: 100%;
+  font-size: var(--fs-card);
+  font-weight: 600;
+  color: var(--text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

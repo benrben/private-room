@@ -65,7 +65,12 @@ const FAKE_TOOLS: ToolSpec[] = [
   },
 ];
 
-const dispatcher: ToolDispatcher = {
+/**
+ * Fixed wire-compat dispatcher. Exported so its protocol outcomes can be
+ * exercised with a fabricated bridge transport; the standalone runner below
+ * remains the only code that listens on a port.
+ */
+export const fakeWireDispatcher: ToolDispatcher = {
   listTools: () => FAKE_TOOLS,
   callTool: async (_scope, name, args) => {
     if (name === "echo") {
@@ -84,7 +89,7 @@ const alwaysCancelled: CancelFlagLike = { load: () => true };
 const bridge = new McpBridge({
   token,
   scope,
-  dispatcher,
+  dispatcher: fakeWireDispatcher,
   cancelFlag: cancelled ? alwaysCancelled : undefined,
   serverVersion: "0.0.0-wire-compat",
 });

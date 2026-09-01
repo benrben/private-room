@@ -1,9 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { type RefObject, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import TextView from "../workspace/TextView";
 import QuickLookView from "./QuickLookView";
 import { applyQuoteHighlight, clearQuoteHighlight } from "./highlight";
 import "./officedoc.css";
+
+type OfficeDocState = "loading" | "ready" | "none" | "error";
+type OfficeDocMode = "page" | "text";
 
 /**
  * A legacy `.doc` or `.rtf`, rendered with its real formatting.
@@ -34,12 +37,12 @@ export default function OfficeDocView({
   quote?: string;
 }) {
   const [url, setUrl] = useState("");
-  const [state, setState] = useState<"loading" | "ready" | "none" | "error">("loading");
+  const [state, setState] = useState<OfficeDocState>("loading");
   const [message, setMessage] = useState("");
   // The formatted document renders in an opaque frame, so a selection made in
   // it never reaches the app. This second reading is the same one the page and
   // book readers offer, and the only way this document's words can be quoted.
-  const [mode, setMode] = useState<"page" | "text">(quote ? "text" : "page");
+  const [mode, setMode] = useState<OfficeDocMode>(initialMode(quote));
   const textRef = useRef<HTMLPreElement>(null);
 
   // A citation lands on the Text side because it can land nowhere else: the
@@ -86,76 +89,163 @@ export default function OfficeDocView({
     };
   }, [fileId]);
 
+  return (
+    <OfficeDocumentContent
+      fileId={fileId}
+      text={text}
+      quote={quote}
+      url={url}
+      state={state}
+      message={message}
+      mode={mode}
+      onModeChange={setMode}
+      textRef={textRef}
+    />
+  );
+}
+
+function OfficeDocumentContent({
+  fileId,
+  text,
+  quote,
+  url,
+  state,
+  message,
+  mode,
+  onModeChange,
+  textRef,
+}: {
+  fileId: string;
+  text: string | null;
+  quote?: string;
+  url: string;
+  state: OfficeDocState;
+  message: string;
+  mode: OfficeDocMode;
+  onModeChange: (mode: OfficeDocMode) => void;
+  textRef: RefObject<HTMLPreElement | null>;
+}) {
   if (state === "ready" && url) {
     return (
-      <div className="odoc-view">
-        <div className="odoc-bar rdr-bar">
-          <span className="rdr-modes" role="group" aria-label="How to read this document">
-            <button
-              type="button"
-              className="rdr-mode"
-              aria-pressed={mode === "page"}
-              title="The document with its real formatting"
-              onClick={() => setMode("page")}
-            >
-              Page
-            </button>
-            <button
-              type="button"
-              className="rdr-mode"
-              aria-pressed={mode === "text"}
-              title="The document's words — selectable, and quotable in chat"
-              onClick={() => setMode("text")}
-            >
-              Text
-            </button>
-          </span>
-        </div>
-        {/* Hidden rather than unmounted: remounting reloads the staged
-            document and throws away the reader's scroll position. */}
-        <iframe
-          key={url}
-          className="odoc-frame"
-          hidden={mode !== "page"}
-          // No allow-scripts: a document is prose. The sandbox's CSP already
-          // forbids script; withholding the permission too means the frame is
-          // opaque even if that CSP ever changed.
-          sandbox=""
-          src={url}
-          title="Document"
-        />
-        {mode === "text" && (
-          <div className="odoc-text">
-            {text?.trim() ? (
-              <pre className="html-doc" dir="auto" ref={textRef}>
-                {text}
-              </pre>
-            ) : (
-              <div className="empty-hint">
-                No text could be read out of this document.
-              </div>
-            )}
-          </div>
-        )}
-      </div>
+      <FormattedOfficeDocument
+        url={url}
+        text={text}
+        mode={mode}
+        onModeChange={onModeChange}
+        textRef={textRef}
+      />
     );
   }
-  if (state === "loading") {
-    return <div className="empty-hint">Opening document…</div>;
-  }
+  if (state === "loading") return <div className="empty-hint">Opening document…</div>;
   // macOS couldn't import it: fall back to the text we did read, with the
   // Quick Look page under it — strictly more than this format used to get.
   return (
     <QuickLookView fileId={fileId}>
-      {state === "error" && (
-        <div className="viewer-status">
-          This document's formatting could not be read ({message}) — its text is
-          below.
-        </div>
-      )}
-      {text ? <TextView text={text} quote={quote} /> : null}
+      <FormattingError state={state} message={message} />
+      <ExtractedText text={text} quote={quote} />
     </QuickLookView>
   );
+}
+
+function FormattedOfficeDocument({
+  url,
+  text,
+  mode,
+  onModeChange,
+  textRef,
+}: {
+  url: string;
+  text: string | null;
+  mode: OfficeDocMode;
+  onModeChange: (mode: OfficeDocMode) => void;
+  textRef: RefObject<HTMLPreElement | null>;
+}) {
+  return (
+    <div className="odoc-view">
+      <OfficeDocumentModeBar mode={mode} onModeChange={onModeChange} />
+      {/* Hidden rather than unmounted: remounting reloads the staged
+          document and throws away the reader's scroll position. */}
+      <iframe
+        key={url}
+        className="odoc-frame"
+        hidden={mode !== "page"}
+        // No allow-scripts: a document is prose. The sandbox's CSP already
+        // forbids script; withholding the permission too means the frame is
+        // opaque even if that CSP ever changed.
+        sandbox=""
+        src={url}
+        title="Document"
+      />
+      <OfficeDocumentText mode={mode} text={text} textRef={textRef} />
+    </div>
+  );
+}
+
+function OfficeDocumentModeBar({
+  mode,
+  onModeChange,
+}: {
+  mode: OfficeDocMode;
+  onModeChange: (mode: OfficeDocMode) => void;
+}) {
+  return (
+    <div className="odoc-bar rdr-bar">
+      <span className="rdr-modes" role="group" aria-label="How to read this document">
+        <button
+          type="button"
+          className="rdr-mode"
+          aria-pressed={mode === "page"}
+          title="The document with its real formatting"
+          onClick={() => onModeChange("page")}
+        >
+          Page
+        </button>
+        <button
+          type="button"
+          className="rdr-mode"
+          aria-pressed={mode === "text"}
+          title="The document's words — selectable, and quotable in chat"
+          onClick={() => onModeChange("text")}
+        >
+          Text
+        </button>
+      </span>
+    </div>
+  );
+}
+
+function OfficeDocumentText({
+  mode,
+  text,
+  textRef,
+}: {
+  mode: OfficeDocMode;
+  text: string | null;
+  textRef: RefObject<HTMLPreElement | null>;
+}) {
+  if (mode !== "text") return null;
+  if (!text?.trim()) {
+    return <div className="odoc-text"><div className="empty-hint">No text could be read out of this document.</div></div>;
+  }
+  return <div className="odoc-text"><pre className="html-doc" dir="auto" ref={textRef}>{text}</pre></div>;
+}
+
+function FormattingError({ state, message }: { state: OfficeDocState; message: string }) {
+  if (state !== "error") return null;
+  return (
+    <div className="viewer-status">
+      This document's formatting could not be read ({message}) — its text is below.
+    </div>
+  );
+}
+
+function ExtractedText({ text, quote }: { text: string | null; quote?: string }) {
+  if (!text) return null;
+  return <TextView text={text} quote={quote} />;
+}
+
+function initialMode(quote: string | undefined): OfficeDocMode {
+  return quote ? "text" : "page";
 }
 
 /* The document's page, written into the frame's own markup.

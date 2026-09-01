@@ -131,6 +131,26 @@ def test_a_tool_result_cannot_forge_a_user_turn() -> None:
     assert "User: what does that page say?" in prompt
 
 
+def test_flatten_agent_replays_assistant_tool_calls() -> None:
+    prompt = external_llm.flatten_agent_messages(
+        [
+            {"role": "system", "content": "Stay concise."},
+            {
+                "role": "assistant",
+                "content": "I will look it up.",
+                "tool_calls": [
+                    {"function": {"name": "search_room", "arguments": {"q": "lease"}}},
+                    "not a call",
+                ],
+            },
+        ]
+    )
+
+    assert "Instructions:\nStay concise." in prompt
+    assert "Assistant: I will look it up." in prompt
+    assert 'Assistant called: search_room({"q":"lease"})' in prompt
+
+
 def test_flatten_folds_schema_into_a_json_only_instruction() -> None:
     schema = {"type": "object", "properties": {"markdown": {"type": "string"}}}
     prompt = flatten_messages([{"role": "user", "content": "go"}], schema)
@@ -332,6 +352,31 @@ async def test_generate_external_raises_sentinel_on_failure(monkeypatch) -> None
         )
     assert exc.value.code == "ENGINE_ERROR"
     assert "quota exhausted" in exc.value.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (FileNotFoundError("zsh"), "Could not start claude-cli: zsh"),
+        (RuntimeError("socket closed"), "claude-cli failed: socket closed"),
+    ],
+)
+async def test_generate_external_preserves_cli_start_failure_contract(
+    monkeypatch, failure: Exception, expected: str
+) -> None:
+    """Transport startup failures keep the established public sentinel wording."""
+
+    async def fake_exec(*argv, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    with pytest.raises(llm.LlmError) as exc:
+        await external_llm.generate_external(
+            "claude-cli", [{"role": "user", "content": "hi"}]
+        )
+    assert exc.value.code == "ENGINE_ERROR"
+    assert exc.value.message == expected
 
 
 # `zsh -ilc` runs the user's interactive startup files, so anything they echo
@@ -635,6 +680,49 @@ def test_agent_cmdline_asks_for_the_machine_readable_envelope() -> None:
     )
 
 
+def test_agent_cmdline_keeps_claude_scoped_tool_and_prompt_flags() -> None:
+    command = external_llm.build_agent_cmdline(
+        "claude-cli",
+        "opus",
+        "high",
+        system_path="/tmp/arcelle-system.md",
+        mcp_path="/tmp/arcelle-mcp.json",
+        allowed=["read_text"],
+        hub_allowed=["ask_jobs_agent"],
+        stream_json_input=True,
+    )
+
+    assert command == (
+        "claude -p --output-format stream-json --verbose "
+        "--include-partial-messages --input-format stream-json "
+        "--mcp-config '/tmp/arcelle-mcp.json' --strict-mcp-config --allowedTools "
+        "'mcp__room__read_text' 'mcp__hub__ask_jobs_agent' "
+        "--system-prompt-file '/tmp/arcelle-system.md' --model 'opus' --effort 'high'"
+    )
+
+
+def test_agent_cmdline_keeps_claude_toolless_with_an_empty_allowlist() -> None:
+    command = external_llm.build_agent_cmdline(
+        "claude-cli", None, None, mcp_path="/tmp/arcelle-mcp.json"
+    )
+
+    assert "--mcp-config" not in command
+    assert "--allowedTools 'mcp__none__*'" in command
+
+
+def test_agent_cmdline_attaches_staged_codex_images() -> None:
+    command = external_llm.build_agent_cmdline(
+        "codex-cli", None, None, image_paths=["/tmp/a.png", "/tmp/b.png"]
+    )
+
+    assert command.endswith("-i '/tmp/a.png' -i '/tmp/b.png' -")
+
+
+def test_agent_cmdline_rejects_an_unknown_engine() -> None:
+    with pytest.raises(ValueError, match="Unknown external engine"):
+        external_llm.build_agent_cmdline("unknown-cli", None, None)
+
+
 def test_antigravity_stream_reads_answer_and_usage() -> None:
     stream = "\n".join(
         [
@@ -644,6 +732,116 @@ def test_antigravity_stream_reads_answer_and_usage() -> None:
         ]
     )
     assert external_llm.parse_antigravity_json_stream(stream) == ("hello world", 42, None)
+
+
+def test_codex_stream_reads_final_message_usage_and_raw_fallback() -> None:
+    """Codex ignores non-public JSON and retains raw output only without events."""
+    stream = "\n".join(
+        [
+            "shell banner",
+            "[]",
+            json.dumps({"type": "item.started"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "command_execution", "text": "private"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "first"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "last"},
+                }
+            ),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 17}}),
+        ]
+    )
+
+    assert external_llm.parse_codex_json_stream(stream) == ("last", 17, None)
+    assert external_llm.parse_codex_json_stream("  plain adapter output  ") == (
+        "plain adapter output",
+        None,
+        None,
+    )
+
+
+def test_codex_stream_ignores_drifted_messages_and_usage() -> None:
+    stream = "\n".join(
+        [
+            json.dumps({"type": "item.completed", "item": []}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": 7},
+                }
+            ),
+            json.dumps({"type": "turn.completed", "usage": []}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": "7"}}),
+        ]
+    )
+
+    assert external_llm.parse_codex_json_stream(stream) == ("", None, None)
+
+
+def test_antigravity_stream_preserves_fallback_and_ignores_schema_drift() -> None:
+    """Only public text and integer usage from valid result shapes affect output."""
+    assert external_llm.parse_antigravity_json_stream("  raw adapter output  ") == (
+        "raw adapter output",
+        None,
+        None,
+    )
+
+    stream = "\n".join(
+        [
+            "not JSON",
+            "[]",
+            json.dumps({"event": "init"}),
+            json.dumps({"event": "step_update", "step_update": []}),
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {"step_type": "thought", "text_delta": "private"},
+                }
+            ),
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {"step_type": "agent_response", "text_delta": 3},
+                }
+            ),
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {"step_type": "agent_response", "text_delta": "draft"},
+                }
+            ),
+            json.dumps({"event": "result", "result": []}),
+            json.dumps({"event": "result", "result": {"response": 3, "usage": []}}),
+            json.dumps(
+                {
+                    "event": "result",
+                    "result": {
+                        "response": "terminal",
+                        "usage": {"input_tokens": "not a count"},
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "event": "result",
+                    "result": {"response": "", "usage": {"input_tokens": 0}},
+                }
+            ),
+        ]
+    )
+
+    assert external_llm.parse_antigravity_json_stream(stream) == ("", 0, None)
 
 
 def test_the_streamed_envelope_parses_exactly_like_the_plain_one() -> None:
@@ -674,6 +872,48 @@ def test_the_streamed_envelope_parses_exactly_like_the_plain_one() -> None:
         102,
         1_000_000,
     )
+
+
+def test_claude_result_parser_preserves_raw_fallbacks_and_chooses_the_busiest_model() -> None:
+    """Malformed optional records do not displace Claude's terminal reply."""
+    raw = "  plain fallback  "
+    assert external_llm.parse_claude_json_result(raw) == ("plain fallback", None, None)
+
+    drifted = json.dumps(
+        {
+            "type": "result",
+            "result": ["not text"],
+            "usage": [],
+            "modelUsage": [],
+        }
+    )
+    assert external_llm.parse_claude_json_result(drifted) == (drifted, None, None)
+
+    envelope = json.dumps(
+        {
+            "type": "result",
+            "result": "terminal",
+            "usage": {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": None,
+                "cache_read_input_tokens": 4,
+            },
+            "modelUsage": {
+                "not-an-object": [],
+                "missing-window": {"inputTokens": 999},
+                "smaller": {"inputTokens": 2, "contextWindow": 8_000},
+                "busiest": {
+                    "inputTokens": 3,
+                    "outputTokens": 4,
+                    "cacheCreationInputTokens": None,
+                    "cacheReadInputTokens": 5,
+                    "contextWindow": 200_000,
+                },
+                "later-but-smaller": {"inputTokens": 1, "contextWindow": 1_000},
+            },
+        }
+    )
+    assert external_llm.parse_claude_json_result(envelope) == ("terminal", 7, 200_000)
 
 
 def test_a_streamed_failure_still_reports_the_real_reason() -> None:
@@ -728,6 +968,50 @@ def test_codex_agent_cmdline_mounts_only_the_ephemeral_loopback_tool_server() ->
     assert "--disable shell_tool" in cmd
 
 
+def test_codex_agent_cmdline_canonicalizes_the_loopback_hostname() -> None:
+    cmd = external_llm.build_agent_cmdline(
+        "codex-cli",
+        None,
+        None,
+        codex_mcp_url="http://localhost:43123/mcp",
+    )
+    assert 'url="http://127.0.0.1:43123/mcp"' in cmd
+
+
+def test_codex_messages_render_system_calls_and_tool_results_consistently() -> None:
+    aliases = {"ask_jobs_agent": "consult_jobs", "read_text": "room_read"}
+    messages = [
+        {
+            "role": "system",
+            "content": "Ask ask_jobs_agent; agents and specialists run tools.",
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                None,
+                {"function": []},
+                {"function": {"name": "ask_jobs_agent", "arguments": {}}},
+                {"function": {"name": "unknown", "arguments": {}}},
+            ],
+        },
+        {"role": "tool", "tool_name": "read_text", "content": "result"},
+    ]
+
+    rendered = external_llm._codex_messages(messages, aliases)
+
+    assert "consult_jobs" in rendered[0]["content"]
+    assert "specialists" not in rendered[0]["content"].lower()
+    assert rendered[1]["tool_calls"] == [
+        None,
+        {"function": []},
+        {"function": {"name": "consult_jobs", "arguments": {}}},
+        {"function": {"name": "unknown", "arguments": {}}},
+    ]
+    assert rendered[2]["tool_name"] == "room_read"
+    assert messages[1]["tool_calls"][2]["function"]["name"] == "ask_jobs_agent"
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -735,6 +1019,8 @@ def test_codex_agent_cmdline_mounts_only_the_ephemeral_loopback_tool_server() ->
         "http://example.com:43123/mcp",
         "http://127.0.0.1:43123/other",
         "http://127.0.0.1/mcp",
+        "http://127.0.0.1:43123/mcp?unexpected=query",
+        "http://user:password@127.0.0.1:43123/mcp",
     ],
 )
 def test_codex_agent_cmdline_rejects_any_non_arcelle_mcp_endpoint(url: str) -> None:
@@ -760,6 +1046,26 @@ def test_catalog_renders_every_served_tool_by_name() -> None:
     assert "create_file" in rendered
     assert "Create a file in the room" in rendered
     assert '"properties"' in rendered
+
+
+def test_catalog_omits_unnamed_tools_and_keeps_its_compact_wire_format() -> None:
+    rendered = external_llm.render_catalog(
+        [
+            {"function": {"description": "missing name", "parameters": {"x": 1}}},
+            {
+                "function": {
+                    "name": "take_notes",
+                    "description": "  Save\n  the  selected text.  ",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            },
+        ]
+    )
+
+    assert rendered == (
+        "- take_notes: Save the selected text.\n"
+        '  arguments: {"type":"object","properties":{}}'
+    )
 
 
 def test_protocol_rides_the_system_prompt_and_only_when_tools_are_offered() -> None:
@@ -833,6 +1139,29 @@ def test_parse_tool_calls_survives_fences_and_drifted_shapes() -> None:
     )[0].arguments == {"id": "7"}
 
 
+def test_parse_tool_calls_skips_malformed_entries_and_normalizes_arguments() -> None:
+    calls = external_llm.parse_tool_calls(
+        json.dumps(
+            {
+                "tool_calls": [
+                    None,
+                    {"arguments": {}},
+                    {"name": "ignored_list", "arguments": []},
+                    {"name": "broken_json", "arguments": "{"},
+                    {"id": 7, "name": "kept", "arguments": {"count": 1}},
+                ]
+            }
+        )
+    )
+
+    assert [(call.name, call.arguments, call.id) for call in calls] == [
+        ("ignored_list", {}, "call_2"),
+        ("broken_json", {}, "call_3"),
+        ("kept", {"count": 1}, "7"),
+    ]
+    assert calls[2].raw["function"] == {"name": "kept", "arguments": {"count": 1}}
+
+
 def test_parse_tool_calls_treats_prose_as_an_answer() -> None:
     assert external_llm.parse_tool_calls("Here is the summary you asked for.") == []
     # Prose that merely CONTAINS braces is still prose, not a call.
@@ -851,6 +1180,7 @@ def test_a_json_answer_carrying_a_name_key_is_not_a_tool_call() -> None:
     assert external_llm.parse_tool_calls(record) == []
     config = '{"name": "my-server", "port": 8080}'
     assert external_llm.parse_tool_calls(config) == []
+    assert external_llm.parse_tool_calls('{"name": 4, "arguments": {}}') == []
 
     # A real bare call — it carries `arguments` AND names an offered tool.
     real = '{"name": "open_file", "arguments": {"id": "7"}}'
@@ -922,6 +1252,26 @@ async def test_stream_delivers_a_plain_answer_as_one_delta(monkeypatch) -> None:
     assert calls == []
     assert content == "Three files are in the room."
     assert deltas == [content]
+
+
+@pytest.mark.asyncio
+async def test_system_only_history_has_no_pending_frame_obligation(monkeypatch) -> None:
+    """A transcript without a user turn is ordinary text, not a missing frame."""
+    model = _model()
+
+    async def fake_run(*_args, **_kwargs):
+        return json.dumps({"type": "result", "result": "Ready."})
+
+    async def on_delta(_delta: str) -> None:
+        return None
+
+    monkeypatch.setattr(model, "_run", fake_run)
+    content, calls, _usage = await model.stream(
+        [{"role": "system", "content": "Stay concise."}], [], on_delta
+    )
+
+    assert content == "Ready."
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -1308,6 +1658,21 @@ def test_message_images_validates_and_caps() -> None:
     assert external_llm.message_images(m) == [_PNG] * 3
 
 
+def test_staged_images_are_private_bytes_and_cleanup_is_atomic(monkeypatch) -> None:
+    """A malformed later image removes earlier staged pixels before return."""
+    cleaned: list[str] = []
+    unlink_all = external_llm._unlink_all
+
+    def recording_cleanup(paths: list[str]) -> None:
+        cleaned.extend(paths)
+        unlink_all(paths)
+
+    monkeypatch.setattr(external_llm, "_unlink_all", recording_cleanup)
+    assert external_llm._stage_image_files([_PNG, "not base64!!"]) == []
+    assert len(cleaned) == 1
+    assert not os.path.exists(cleaned[0])
+
+
 def test_collect_images_walks_user_turns_in_order() -> None:
     msgs = [
         {"role": "system", "content": "s"},
@@ -1401,6 +1766,29 @@ async def test_generate_external_claude_ships_images_as_stream_json_blocks(
 
 
 @pytest.mark.asyncio
+async def test_generate_external_attaches_top_level_images_to_the_last_user_turn(
+    monkeypatch,
+) -> None:
+    """The one-shot image argument reaches Claude's real image channel."""
+    seen: dict = {}
+
+    async def fake_exec(*argv, **kwargs):
+        proc = _FakeProc(_envelope("Red"))
+        seen["proc"] = proc
+        return proc
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    out = await external_llm.generate_external(
+        "claude-cli",
+        [{"role": "user", "content": "what color?"}],
+        images=[_PNG],
+    )
+    assert out == "Red"
+    blocks = json.loads(seen["proc"].stdin_payload.decode())["message"]["content"]
+    assert blocks[1]["source"]["data"] == _PNG
+
+
+@pytest.mark.asyncio
 async def test_generate_external_codex_stages_files_and_cleans_them_up(
     monkeypatch,
 ) -> None:
@@ -1430,6 +1818,29 @@ async def test_generate_external_codex_stages_files_and_cleans_them_up(
     assert existed_during_run
     # …and be gone the moment the call is over: they are room content.
     assert not os.path.exists(path)
+
+
+@pytest.mark.asyncio
+async def test_generate_external_codex_refuses_to_dispatch_partial_image_staging(
+    monkeypatch,
+) -> None:
+    """A one-shot request never says Codex saw pixels that could not be staged."""
+    spawned = False
+
+    monkeypatch.setattr(external_llm, "_stage_image_files", lambda _images: [])
+
+    async def fake_exec(*argv, **kwargs):
+        nonlocal spawned
+        spawned = True
+        return _FakeProc(b"")
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    with pytest.raises(llm.LlmError, match="could not be staged"):
+        await external_llm.generate_external(
+            "codex-cli",
+            [{"role": "user", "content": "what color?", "images": [_PNG]}],
+        )
+    assert spawned is False
 
 
 @pytest.mark.asyncio
@@ -1608,6 +2019,48 @@ async def test_stream_forwards_codex_messages_as_they_complete(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_agent_spawn_rejects_a_doctored_model_before_starting(monkeypatch) -> None:
+    spawned = False
+
+    async def fake_exec(*_args, **_kwargs):
+        nonlocal spawned
+        spawned = True
+        return _FakeProc(b"")
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", fake_exec)
+    with pytest.raises(llm.LlmError, match="Unsafe model name"):
+        await _model("claude-cli::opus'; touch /tmp/pwned; '").stream(
+            [{"role": "user", "content": "hi"}], [], lambda _delta: None
+        )
+    assert spawned is False
+
+
+@pytest.mark.asyncio
+async def test_agent_spawn_reports_start_wedge_and_exit_failures(monkeypatch) -> None:
+    async def unavailable(*_args, **_kwargs):
+        raise RuntimeError("socket closed")
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", unavailable)
+    with pytest.raises(llm.LlmError, match="Could not start claude-cli: socket closed"):
+        await _model().stream([{"role": "user", "content": "hi"}], [], lambda _d: None)
+
+    async def exits_nonzero(*_args, **_kwargs):
+        return _FakeProc(b"", b"child failed", returncode=1)
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", exits_nonzero)
+    with pytest.raises(llm.LlmError, match="claude-cli failed: child failed"):
+        await _model().stream([{"role": "user", "content": "hi"}], [], lambda _d: None)
+
+    async def wedges(*_args, **_kwargs):
+        return _HangingProc()
+
+    monkeypatch.setattr(external_llm.asyncio, "create_subprocess_exec", wedges)
+    monkeypatch.setattr(external_llm, "EXTERNAL_IDLE_SECS", 0.05)
+    with pytest.raises(llm.LlmError, match="produced no output for 0.05s"):
+        await _model().stream([{"role": "user", "content": "hi"}], [], lambda _d: None)
+
+
+@pytest.mark.asyncio
 async def test_stream_forwards_antigravity_text_deltas_live(monkeypatch) -> None:
     lines = [
         json.dumps({"event": "step_update", "step_update": {"step_type": "agent_response", "text_delta": "All "}}),
@@ -1631,6 +2084,115 @@ async def test_stream_forwards_antigravity_text_deltas_live(monkeypatch) -> None
     assert calls == []
     assert deltas == ["All ", "good."]
     assert content == "All good."
+
+
+@pytest.mark.asyncio
+async def test_delta_tap_ignores_non_answer_stream_events() -> None:
+    """Shell noise and non-answer envelopes never become transcript text."""
+    events = {
+        "claude-cli": [
+            {"type": "result"},
+            {"type": "stream_event", "event": []},
+            {"type": "stream_event", "event": {"type": "message_delta"}},
+            {
+                "type": "stream_event",
+                "event": {"type": "content_block_delta", "delta": []},
+            },
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "thinking_delta"},
+                },
+            },
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": 5},
+                },
+            },
+        ],
+        "codex-cli": [
+            {"type": "item.started"},
+            {"type": "item.completed", "item": []},
+            {
+                "type": "item.completed",
+                "item": {"type": "command_execution", "text": "private"},
+            },
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": 5},
+            },
+        ],
+        "antigravity-cli": [
+            {"event": "result"},
+            {"event": "step_update", "step_update": []},
+            {
+                "event": "step_update",
+                "step_update": {"step_type": "thought", "text_delta": "private"},
+            },
+            {
+                "event": "step_update",
+                "step_update": {"step_type": "agent_response", "text_delta": 5},
+            },
+        ],
+        "unknown-cli": [{"type": "item.completed"}],
+    }
+
+    for engine, engine_events in events.items():
+        deltas: list[str] = []
+
+        async def sink(text: str) -> None:
+            deltas.append(text)
+
+        tap = external_llm._DeltaTap(engine, sink)
+        payload = b"shell banner\n" + _fence()
+        payload += b"not json\n{bad json}\n[]\n"
+        payload += b"".join(
+            json.dumps(event).encode() + b"\n" for event in engine_events
+        )
+        await tap.feed(payload)
+        assert deltas == []
+
+
+@pytest.mark.asyncio
+async def test_delta_tap_waits_for_text_and_reconciles_the_terminal_reply() -> None:
+    """Whitespace waits for its first character; terminal text supplies every gap."""
+    deltas: list[str] = []
+
+    async def sink(text: str) -> None:
+        deltas.append(text)
+
+    tap = external_llm._DeltaTap("claude-cli", sink)
+    await tap._delta("")
+    await tap._delta(" ")
+
+    assert deltas == []
+    tap._msg_raw = " "
+    assert tap._message_starts_with_json() is False
+    assert tap.tail_for("") == ""
+    assert tap.tail_for("terminal") == "terminal"
+
+    tap._msg_sent = "live"
+    assert tap.tail_for("live tail") == " tail"
+    assert tap.tail_for("liv") == ""
+    assert tap.tail_for("different") == "different"
+
+    class Restorer:
+        def feed(self, text: str) -> str:
+            return text
+
+        def flush(self) -> str:
+            return "restored tail"
+
+    restored: list[str] = []
+
+    async def restored_sink(text: str) -> None:
+        restored.append(text)
+
+    await external_llm._DeltaTap("claude-cli", restored_sink, Restorer()).flush()
+    assert restored == ["restored tail"]
 
 
 @pytest.mark.asyncio
@@ -1700,6 +2262,32 @@ async def test_frame_handoff_without_pixels_never_starts_external_engine(monkeyp
             [{"role": "user", "content": external_llm.IMAGE_HANDOFF}],
             [],
             lambda _d: None,
+        )
+    assert spawned is False
+
+
+@pytest.mark.asyncio
+async def test_frame_handoff_stops_before_an_engine_without_vision_runs(monkeypatch) -> None:
+    model = _model("antigravity-cli")
+    spawned = False
+
+    async def fake_run(*_args, **_kwargs):
+        nonlocal spawned
+        spawned = True
+        return "should not run"
+
+    monkeypatch.setattr(model, "_run", fake_run)
+    with pytest.raises(llm.LlmError, match="has no image input channel"):
+        await model.stream(
+            [
+                {
+                    "role": "user",
+                    "content": external_llm.IMAGE_HANDOFF,
+                    "images": [_PNG],
+                }
+            ],
+            [],
+            lambda _delta: None,
         )
     assert spawned is False
 
@@ -2013,6 +2601,46 @@ async def test_stream_restores_placeholders_split_across_live_deltas(
     assert "".join(deltas) == "Ben Reich is here."
     # No fragment of the placeholder ever reached the user.
     assert all("[Per" not in d for d in deltas)
+
+
+@pytest.mark.asyncio
+async def test_stream_restores_privacy_placeholders_in_tool_calls(monkeypatch) -> None:
+    """Tool arguments and the raw replay envelope cross the privacy door together."""
+    from arcelle_sidecar import privacy
+
+    model = _model()
+    model.privacy = privacy.policy_from_payload(
+        {
+            "active": True,
+            "rules": [{"real": "Ben Reich", "placeholder": "[Person A]"}],
+            "concepts": [],
+        }
+    )
+
+    async def fake_run(*_args, **_kwargs):
+        return json.dumps(
+            {
+                "type": "result",
+                "result": json.dumps(
+                    {
+                        "tool_calls": [
+                            {
+                                "name": "create_file",
+                                "arguments": {"name": "[Person A].md"},
+                            }
+                        ]
+                    }
+                ),
+            }
+        )
+
+    monkeypatch.setattr(model, "_run", fake_run)
+    _content, calls, _usage = await model.stream(
+        [{"role": "user", "content": "save Ben Reich"}], TOOLS, lambda _delta: None
+    )
+
+    assert calls[0].arguments == {"name": "Ben Reich.md"}
+    assert calls[0].raw["function"]["arguments"] == {"name": "Ben Reich.md"}
 
 
 @pytest.mark.asyncio

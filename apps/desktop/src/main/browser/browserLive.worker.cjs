@@ -11,19 +11,23 @@
 // real session genuinely stops a request Chromium's network stack would
 // otherwise have completed, and whether a real preload reaches a real page.
 
-const { app, session, net, BaseWindow, WebContentsView } = require("electron");
-const http = require("http");
-
-// Args are always [scenario, pageJsPath, ...scenario extras].
-const PAGE_JS = process.argv[3];
-const EXTRA = process.argv[4];
+let app;
+let session;
+let net;
+let BaseWindow;
+let WebContentsView;
+let http;
+let workerProcess;
+let workerSetTimeout;
+let PAGE_SCRIPTS;
+let EXTRA;
 
 function respond(obj) {
-  process.stdout.write("RESULT:" + JSON.stringify(obj) + "\n");
+  workerProcess.stdout.write("RESULT:" + JSON.stringify(obj) + "\n");
 }
 
 function wait(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => workerSetTimeout(resolve, ms));
 }
 
 function netRequest(ses, url) {
@@ -46,7 +50,7 @@ function netRequest(ses, url) {
     } catch (e) {
       done({ ok: false, error: String(e && e.message) });
     }
-    setTimeout(() => done({ ok: false, error: "timed out" }), 8000);
+    workerSetTimeout(() => done({ ok: false, error: "timed out" }), 8000);
   });
 }
 
@@ -91,10 +95,7 @@ function makeView(ses, extraPrefs) {
   });
 }
 
-async function run() {
-  const scenario = process.argv[2];
-
-  if (scenario === "ephemeral") {
+async function runEphemeralScenario() {
     const ephemeral = session.fromPartition("arcelle-live-" + Date.now());
     const persistent = session.fromPartition("persist:arcelle-live-" + Date.now());
     respond({
@@ -114,9 +115,9 @@ async function run() {
         session.fromPartition("arcelle-live-a") === session.fromPartition("arcelle-live-a"),
     });
     return;
-  }
+}
 
-  if (scenario === "webrequest-block") {
+async function runWebRequestBlockScenario() {
     const port = Number(EXTRA);
     const url = "http://127.0.0.1:" + port + "/";
     const blocking = session.fromPartition("arcelle-live-block-" + Date.now());
@@ -135,9 +136,9 @@ async function run() {
       allowed: await netRequest(plain, url),
     });
     return;
-  }
+}
 
-  if (scenario === "views") {
+async function runViewsScenario() {
     const win = new BaseWindow({ show: false, width: 200, height: 200 });
     const views = [];
     for (let i = 0; i < 3; i++) {
@@ -152,9 +153,9 @@ async function run() {
       allUnique: new Set(views.map((v) => v.id)).size === views.length,
     });
     return;
-  }
+}
 
-  if (scenario === "preload") {
+async function runPreloadScenario() {
     const site = await startSite();
     const win = new BaseWindow({ show: false, width: 400, height: 400 });
     const out = {};
@@ -162,7 +163,9 @@ async function run() {
     // (1) The real arrangement: preload registered on the session, sandboxed,
     // context-isolated, and loaded into every frame.
     const ses = session.fromPartition("arcelle-live-preload-" + Date.now());
-    ses.registerPreloadScript({ filePath: PAGE_JS, type: "frame" });
+    for (const filePath of PAGE_SCRIPTS) {
+      ses.registerPreloadScript({ filePath, type: "frame" });
+    }
     const view = makeView(ses, { nodeIntegrationInSubFrames: true });
     win.contentView.addChildView(view);
     view.setBounds({ x: 0, y: 0, width: 400, height: 400 });
@@ -204,7 +207,9 @@ async function run() {
     // (2) The same thing WITHOUT nodeIntegrationInSubFrames, to show the flag
     // is load-bearing rather than decorative.
     const ses2 = session.fromPartition("arcelle-live-preload-nosub-" + Date.now());
-    ses2.registerPreloadScript({ filePath: PAGE_JS, type: "frame" });
+    for (const filePath of PAGE_SCRIPTS) {
+      ses2.registerPreloadScript({ filePath, type: "frame" });
+    }
     const view2 = makeView(ses2, {});
     win.contentView.addChildView(view2);
     view2.setBounds({ x: 0, y: 0, width: 400, height: 400 });
@@ -224,9 +229,9 @@ async function run() {
     site.server.close();
     respond(out);
     return;
-  }
+}
 
-  if (scenario === "navigation-events") {
+async function runNavigationEventsScenario() {
     const site = await startSite();
     const win = new BaseWindow({ show: false, width: 300, height: 300 });
     const out = {};
@@ -287,18 +292,52 @@ async function run() {
     site.server.close();
     respond(out);
     return;
-  }
+}
 
+async function run() {
+  const scenario = workerProcess.argv[2];
+  if (scenario === "ephemeral") return runEphemeralScenario();
+  if (scenario === "webrequest-block") return runWebRequestBlockScenario();
+  if (scenario === "views") return runViewsScenario();
+  if (scenario === "preload") return runPreloadScenario();
+  if (scenario === "navigation-events") return runNavigationEventsScenario();
   respond({ error: "unknown scenario: " + scenario });
 }
 
-app
-  .whenReady()
-  .then(run)
-  .then(
-    () => app.exit(0),
-    (e) => {
-      respond({ error: "worker threw: " + String(e && e.stack ? e.stack : e) });
-      app.exit(1);
-    },
-  );
+function start() {
+  return app
+    .whenReady()
+    .then(run)
+    .then(
+      () => app.exit(0),
+      (e) => {
+        respond({ error: "worker threw: " + String(e && e.stack ? e.stack : e) });
+        app.exit(1);
+      },
+    );
+}
+
+function createWorker(deps) {
+  ({ app, session, net, BaseWindow, WebContentsView } = deps.electron);
+  http = deps.http;
+  workerProcess = deps.process || process;
+  workerSetTimeout = deps.setTimeout || setTimeout;
+  try {
+    const parsed = JSON.parse(workerProcess.argv[3]);
+    PAGE_SCRIPTS = Array.isArray(parsed) ? parsed : [workerProcess.argv[3]];
+  } catch (_error) {
+    PAGE_SCRIPTS = [workerProcess.argv[3]];
+  }
+  EXTRA = workerProcess.argv[4];
+  return { run, start };
+}
+
+function isWorkerEntrypoint(runtimeProcess = process) {
+  return require.main === module || runtimeProcess.argv[1] === __filename;
+}
+
+if (isWorkerEntrypoint()) {
+  createWorker({ electron: require("electron"), http: require("http"), process, setTimeout }).start();
+}
+
+module.exports = { createWorker, isWorkerEntrypoint };

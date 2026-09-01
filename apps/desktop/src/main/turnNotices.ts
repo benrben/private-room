@@ -52,6 +52,20 @@ export const STOPPED_NO_ANSWER_WITH_JOB =
   "Background work in this room is still running: check the Jobs list before asking " +
   "again, so you don't start the same job twice.)*";
 
+/** Indexed by stopped/wrote/jobLive bits. The repeated after-write entries
+ * preserve the original priority: a committed write matters more than the
+ * job state. */
+const EMPTY_REPLY_NOTICES = [
+  LOST_REPLY_CLEAN,
+  LOST_REPLY_WITH_JOB,
+  LOST_REPLY_AFTER_WRITE,
+  LOST_REPLY_AFTER_WRITE,
+  STOPPED_NO_ANSWER_CLEAN,
+  STOPPED_NO_ANSWER_WITH_JOB,
+  STOPPED_NO_ANSWER_AFTER_WRITE,
+  STOPPED_NO_ANSWER_AFTER_WRITE,
+] as const;
+
 /**
  * Which of the app's own notices stands in for an EMPTY reply. Ported
  * verbatim from `empty_reply_notice`. `stopped` splits the table in two: an
@@ -60,22 +74,8 @@ export const STOPPED_NO_ANSWER_WITH_JOB =
  * describe an app failure that did not happen.
  */
 export function emptyReplyNotice(stopped: boolean, wrote: boolean, jobLive: boolean): string {
-  if (stopped && wrote) {
-    return STOPPED_NO_ANSWER_AFTER_WRITE;
-  }
-  if (stopped && !wrote && jobLive) {
-    return STOPPED_NO_ANSWER_WITH_JOB;
-  }
-  if (stopped && !wrote && !jobLive) {
-    return STOPPED_NO_ANSWER_CLEAN;
-  }
-  if (!stopped && wrote) {
-    return LOST_REPLY_AFTER_WRITE;
-  }
-  if (!stopped && !wrote && jobLive) {
-    return LOST_REPLY_WITH_JOB;
-  }
-  return LOST_REPLY_CLEAN;
+  const index = Number(stopped) * 4 + Number(wrote) * 2 + Number(jobLive);
+  return EMPTY_REPLY_NOTICES[index]!;
 }
 
 /**
@@ -200,6 +200,12 @@ function hasClaim(lower: string, claims: readonly string[]): boolean {
  * the fenced-code-block skip and the same-line negation guard.
  */
 export function claimsUnbackedAction(text: string, wrote: boolean, highlighted: boolean): boolean {
+  const prose = unfencedNoticeProse(text);
+  const lower = prose.toLowerCase();
+  return missingWriteClaim(lower, wrote) || missingHighlightClaim(lower, highlighted);
+}
+
+function unfencedNoticeProse(text: string): string {
   // Drop fenced blocks (diffs, code, viewer markup) before scanning prose.
   let prose = "";
   let inFence = false;
@@ -213,6 +219,13 @@ export function claimsUnbackedAction(text: string, wrote: boolean, highlighted: 
       prose += "\n";
     }
   }
-  const lower = prose.toLowerCase();
-  return (!wrote && hasClaim(lower, WRITE_CLAIMS)) || (!highlighted && hasClaim(lower, HL_CLAIMS));
+  return prose;
+}
+
+function missingWriteClaim(lower: string, wrote: boolean): boolean {
+  return !wrote && hasClaim(lower, WRITE_CLAIMS);
+}
+
+function missingHighlightClaim(lower: string, highlighted: boolean): boolean {
+  return !highlighted && hasClaim(lower, HL_CLAIMS);
 }

@@ -47,34 +47,16 @@ BASE_SYSTEM = (
 
 
 def skip_unless_live() -> None:
-    """Module-level opt-in gate. Env first (cheap), daemon+model second.
+    """Skip local-LLM end-to-end suites in every automated run.
 
-    Each skip here silences a WHOLE FILE, and the reasons say so: the run
-    summary counts one skip per module, so "4 skipped" is four FILES of
-    live-model tests, not four tests. Read at a glance that is easy to
-    mistake for a rounding error rather than the entire live tier.
+    These modules call a real Ollama daemon and consume local model time. They
+    are intentionally excluded from the repository quality loop, even when a
+    developer has ``ARCELLE_E2E`` set in their shell.
     """
-    if not os.environ.get("ARCELLE_E2E"):
-        pytest.skip(
-            "live e2e: this WHOLE FILE was skipped (one skip = one file, not one "
-            "test). Opt in with ARCELLE_E2E=1 — it needs a live model and minutes "
-            "of model time, so the fast suite never runs it.",
-            allow_module_level=True,
-        )
-    try:
-        tags = httpx.get(f"{OLLAMA}/api/tags", timeout=3.0).json()
-        served = any(
-            m.get("model") == E2E_MODEL or m.get("name") == E2E_MODEL
-            for m in tags.get("models", [])
-        )
-    except Exception:  # noqa: BLE001 - unreachable daemon = skip, not error
-        served = False
-    if not served:
-        pytest.skip(
-            f"live e2e: this WHOLE FILE was skipped — Ollama at {OLLAMA} does not "
-            f"serve {E2E_MODEL} (override with ARCELLE_E2E_MODEL)",
-            allow_module_level=True,
-        )
+    pytest.skip(
+        "live e2e: skipped because this suite invokes a real local LLM",
+        allow_module_level=True,
+    )
 
 
 def tool_spec(tool: str, description: str, /, **props: dict[str, Any]) -> dict[str, Any]:

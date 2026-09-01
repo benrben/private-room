@@ -1,0 +1,498 @@
+/* ==========================================================================
+   RECORDINGS
+   The recording file view (ADD-27) — transport, waveform, tabbed reading,
+   clips, and the export drawer — plus the capture dock, the top-bar chip and
+   the feedback modal extras (ADD-28), which share this file's vocabulary.
+
+   THE SHAPE OF THE PAGE. A recording is audio first: the page opens with one
+   transport cluster and the wave at full size, and only then the reading. The
+   old layout inverted that — a seven-control header, a bare <audio controls>,
+   a 52px wave, and a second seven-control toolbar pinned under every reading
+   of the transcript. Translation, re-transcription and the three exports are
+   things you do to a recording once, so they now live in a drawer that is
+   closed by default and reports anything still running on its own summary
+   line, where closing it cannot hide progress.
+
+   RED IS RESERVED. Recording and urgent, product-wide, nothing else. In this
+   file that is: the record/stop ring and its dot, the REC chip, the pulsing
+   capture dot, the mic-muted slash (a silenced input DURING a capture is
+   exactly the urgent case), the failed-source banner, the destructive
+   confirms, and the "Cut" tape on a removed span. Level meters, the active
+   phrase and every selection wear the pen or the yellow marker instead.
+
+   COLOUR NEVER CARRIES A STATE ALONE. Every state here rides with a word
+   ("Recording", "Paused", "Transcript ready", "Cut") or a shape (the strike
+   through a deleted word, the ring around the record button, the underline
+   under the live tab).
+
+   Everything composes from the .nb-* primitives in paper.css and reads its
+   colour from tokens.css — nothing below names a colour, so light mode falls
+   out of the same rules rather than out of an override block at the end.
+   ========================================================================== */
+
+.rec-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  /* The layout has to answer "how wide is this PANE", not "how wide is the
+     window": the rail and the AI pane both resize the centre column, so a
+     media query would answer the wrong question. Named so it cannot be
+     answered by some other unnamed container up the tree. Longhands, the way
+     workspace.css declares its own container — one spelling across the app. */
+  container-type: inline-size;
+  container-name: rec-view;
+}
+
+/* ==========================================================================
+   1. THE STAGE — transport, options, waveform, facts
+   ========================================================================== */
+
+/* Deliberately WITHOUT a bottom rule of its own. The waveform draws one under
+   itself and the tab bar draws one under the tabs; a third stroke here would
+   put three horizontal marks within about ninety pixels. Spacing does the
+   grouping instead, which is what the system asks for. */
+.rec-stage {
+  flex: none;
+}
+
+.rec-transport {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4) var(--sp-2);
+}
+.rec-transport-side {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+.rec-transport-end {
+  justify-content: flex-end;
+}
+.rec-transport-main {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
+/* ----- the record / stop control -----
+   The brief's imperfect concentric circles. Three rings, each on its own
+   asymmetric radius and each a step fainter, so it reads as a hand going
+   round the same circle three times rather than as a drawn target. Fixed
+   values, never generated: a button that re-wobbles on every render is a
+   button the eye stops trusting.
+
+   The button itself is transparent and borderless — the RING is the control's
+   boundary, and it is drawn in full-strength --sem-urgent (4.8:1 dark,
+   4.8:1 light against the sheet), comfortably past the 3:1 WCAG 1.4.11 asks
+   of a component edge. The two outer rings are decoration and say so by being
+   pseudo-elements with pointer-events: none. */
+.rec-record {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 11px 16px 11px 12px;
+  background: none;
+  border: 0;
+  border-radius: var(--radius);
+  color: var(--text);
+  cursor: pointer;
+  transition: transform var(--dur-fast) var(--ease-pen);
+}
+/* base.css paints an accent ghost behind any hovered button. This control is
+   drawn in red and the pen's pink behind it would turn both to mud, so it
+   keeps its own ground and lets the rings be the only feedback. */
+.rec-record:hover {
+  background-color: transparent;
+}
+.rec-record:active {
+  transform: translateY(1px);
+}
+.rec-record:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.rec-record-ring {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 38px;
+  height: 38px;
+  color: var(--sem-urgent);
+  border: 1.5px solid var(--sem-urgent);
+  border-radius: 52% 48% 51% 49% / 49% 52% 48% 51%;
+}
+.rec-record-ring::before,
+.rec-record-ring::after {
+  content: "";
+  position: absolute;
+  border: 1px solid;
+  pointer-events: none;
+}
+.rec-record-ring::before {
+  inset: -5px;
+  border-color: color-mix(in srgb, var(--sem-urgent) 46%, transparent);
+  border-radius: 49% 51% 48% 52% / 52% 48% 51% 49%;
+}
+.rec-record-ring::after {
+  inset: -10px;
+  border-color: color-mix(in srgb, var(--sem-urgent) 20%, transparent);
+  border-radius: 51% 49% 52% 48% / 48% 51% 49% 52%;
+}
+/* While a capture is running the control becomes Stop, and its outer rings
+   sit a step stronger — the same "pen pressed harder" idea the cards use for
+   hover, saying the ring is live rather than waiting. Declared BEFORE the
+   hover rules, which match at the same specificity: hover has to be able to
+   win over the resting state, including this one. */
+.rec-record.is-stopping .rec-record-ring::before {
+  border-color: color-mix(in srgb, var(--sem-urgent) 62%, transparent);
+}
+.rec-record.is-stopping .rec-record-ring::after {
+  border-color: color-mix(in srgb, var(--sem-urgent) 30%, transparent);
+}
+/* The pen presses harder on hover: the rings gain strength, nothing moves. */
+.rec-record:hover .rec-record-ring::before {
+  border-color: color-mix(in srgb, var(--sem-urgent) 78%, transparent);
+}
+.rec-record:hover .rec-record-ring::after {
+  border-color: color-mix(in srgb, var(--sem-urgent) 42%, transparent);
+}
+.rec-record-dot {
+  width: 13px;
+  height: 13px;
+  border-radius: 54% 46% 52% 48% / 48% 54% 46% 52%;
+  background: var(--sem-urgent);
+}
+.rec-record-word {
+  font-size: var(--fs-body);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* ----- secondary transport (play / pause / resume) -----
+   Round, pen-weight, 32px so it clears the 24px minimum target with its
+   border included. */
+.rec-tbtn {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  color: var(--text);
+  background: none;
+  border: 1px solid var(--rule-strong);
+  border-radius: 52% 48% 51% 49% / 49% 52% 48% 51%;
+  cursor: pointer;
+  transition:
+    border-color var(--dur-fast) var(--ease-pen),
+    transform var(--dur-fast) var(--ease-pen);
+}
+.rec-tbtn:hover {
+  border-color: var(--sketch);
+}
+.rec-tbtn:active {
+  transform: translateY(1px);
+}
+.rec-tbtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ----- volume and speed -----
+   These were the reason a second, native <audio controls> was kept on the
+   page (QA 2026-08-15). They are controls of this transport now: two real
+   form elements, each with its own accessible name, each keyboard-operable
+   without a line of key handling. Quiet by design — the record button and the
+   seek bar are what the eye should land on. */
+.rec-dial {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-meta);
+  color: var(--muted);
+}
+.rec-dial i {
+  font-style: normal;
+}
+.rec-vol {
+  width: 74px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.rec-speed {
+  min-height: 24px;
+  padding: 2px 6px;
+  font: inherit;
+  color: var(--text);
+  background: none;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.rec-speed:hover {
+  border-color: var(--sketch);
+}
+.rec-vol:focus-visible,
+.rec-speed:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ----- the seek bar -----
+   Full width under the three transport columns, because seeking is the widest
+   act on this page and a 200px native slider tucked into a player was the
+   whole of it before. The marks are drawn ON the track: a transport that owns
+   the timeline has to say what is worth seeking to. They are decoration of a
+   control the Highlights and Chapters tabs already list in full, so they are
+   aria-hidden and take no pointer. */
+.rec-scrub {
+  grid-column: 1 / -1;
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding-top: 2px;
+}
+.rec-seek {
+  width: 100%;
+  min-width: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.rec-seek:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.rec-seekmarks {
+  position: absolute;
+  /* Inset by half a thumb at each end, so a mark sits over the position the
+     thumb can actually reach rather than over the track's raw edge. */
+  inset-inline: 8px;
+  top: 50%;
+  height: 15px;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+.rec-seekmark {
+  position: absolute;
+  top: 0;
+  width: 2px;
+  height: 100%;
+  margin-inline-start: -1px;
+  border-radius: 1px;
+}
+/* The same two inks these things wear everywhere else on the page: the marker
+   yellow for a highlight, the pen for a chapter's edge. */
+.rec-seekmark.is-highlight {
+  background-color: var(--sem-pending);
+}
+.rec-seekmark.is-chapter {
+  background-color: var(--sketch);
+}
+
+/* ----- live state chips ----- */
+.rec-live-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  /* The one place in the app red is the TEXT colour, because this sentence
+     is the recording indicator. 5.8:1 dark, 4.8:1 light on the sheet. */
+  color: var(--sem-urgent);
+}
+.rec-live-chip.paused {
+  color: var(--muted);
+  font-weight: 500;
+}
+/* The stop→saved drain: no longer an alarm (the audio is durable), so it
+   drops the recording red for calm text, with the reassurance line beside
+   it in muted type. */
+.rec-live-chip.saving {
+  color: var(--text);
+  font-weight: 500;
+  flex-wrap: wrap;
+}
+.rec-save-note {
+  flex: 1 1 100%;
+  font-weight: 400;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+}
+
+/* Playback position / length. Mono and tabular, so a counting value does not
+   make the row jitter as the digits change. */
+.rec-clock {
+  font-size: var(--fs-meta);
+  color: var(--muted);
+}
+.rec-clock i {
+  font-style: normal;
+  color: var(--faint);
+  padding: 0 2px;
+}
+
+.rec-dot {
+  width: 9px;
+  height: 9px;
+  /* Drawn, not stamped: a hand-inked dot is not a perfect circle. */
+  border-radius: 54% 46% 52% 48% / 48% 54% 46% 52%;
+  background: var(--sem-urgent);
+  display: inline-block;
+  flex: none;
+}
+
+/* The one continuous animation in the product, and it is the message: a
+   capture is running. Opacity ONLY — a transform would re-rasterise the dot
+   on every frame, and this can run for a three-hour meeting. Slow enough
+   (2.2s) to read as breathing rather than as a blinking alarm, and switched
+   off entirely under prefers-reduced-motion, where the running timer beside
+   it already says the same thing. */
+.rec-dot.pulsing {
+  animation: rec-pulse 2.2s ease-in-out infinite;
+}
+
+@keyframes rec-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.42;
+  }
+}
+
+/* Mute the mic lane while the Mac's audio keeps recording (live only). */
+.rec-mute {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: none;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 2px 7px;
+  background: none;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1.3;
+}
+.rec-mute:hover {
+  border-color: var(--sketch);
+}
+.rec-mute:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.rec-mute.muted {
+  border-color: var(--sem-urgent);
+}
+/* A struck-through microphone. Red because this mark only ever appears
+   DURING a capture, and an input silenced mid-recording is exactly the
+   urgent state the palette reserves the colour for. The slash is a shape,
+   so the state survives colour being ignored. */
+.rec-mute.muted::after {
+  content: "";
+  position: absolute;
+  left: 16%;
+  right: 16%;
+  top: 50%;
+  border-top: 2px solid var(--sem-urgent);
+  transform: rotate(-45deg);
+  pointer-events: none;
+}
+
+/* ----- level meters -----
+   The pen, not the recording red: a level is activity, not a status. Drawn
+   with paper.css's bar recipe — a marker wash inside a pencil track, with the
+   accent ink stroke paying the 3:1 a meaningful non-text mark owes. */
+.rec-meters {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.rec-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: 132px;
+}
+.rec-meter i {
+  font-style: normal;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  width: 26px;
+  flex: none;
+}
+.rec-meter-track {
+  display: block;
+  flex: 1;
+  height: 6px;
+  border-radius: 3px 2px 4px 2px / 2px 4px 2px 3px;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rule) 70%, transparent);
+  overflow: hidden;
+}
+/* No minimum width. The bar used to be floored at 2px, which drew a sliver of
+   signal for a lane that was reporting exactly none — including a muted mic,
+   where the honest picture is an empty track. */
+.rec-meter b {
+  display: block;
+  height: 100%;
+  background-color: color-mix(in srgb, var(--accent-fill) 62%, transparent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+  transition: width 0.15s linear;
+}
+
+/* ----- session options ----- */
+.rec-options {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-4);
+  padding: 0 var(--sp-4) var(--sp-3);
+}
+
+.rec-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-meta);
+  color: var(--muted);
+  user-select: none;
+}
+.rec-opt-note {
+  color: var(--faint);
+}
+.rec-opt input[type="number"] {
+  width: 44px;
+}
+.rec-opt input[list] {
+  width: 128px;
+}
+
+/* ----- the preflight -----
+   The capture choices, shown only while a finished recording is being
+   continued (QA 2026-08-15: they used to sit on the review screen for ever).
+   A framed aside rather than a floating panel: it belongs to the button above
+   it, and it must not cover the transcript it is being read next to. */
+.rec-preflight {
+  margin: 0 var(--sp-4) var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background-color: var(--hover);
+}
+.rec-preflight-lead {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-meta);
+  color: var(--text);
+}
+.rec-preflight .rec-options {
+  padding: 0 0 var(--sp-2);
+}

@@ -65,82 +65,92 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  */
 export function slimSchema(v: unknown): void {
   if (Array.isArray(v)) {
-    for (const child of v) {
-      slimSchema(child);
-    }
+    slimSchemaArray(v);
     return;
   }
   if (!isPlainObject(v)) {
     return;
   }
-  const map = v;
+  slimSchemaObject(v);
+}
+
+function slimSchemaArray(values: unknown[]): void {
+  for (const child of values) slimSchema(child);
+}
+
+function slimSchemaObject(map: Record<string, unknown>): void {
+  removeSchemaNoise(map);
+  const priorTotal = takePriorEnumTotal(map);
+  clampSchemaDescription(map);
+  appendEnumTruncationNote(map, enumTotalAfterSlimming(map, priorTotal));
+  slimSchemaChildren(map);
+}
+
+function removeSchemaNoise(map: Record<string, unknown>): void {
   for (const k of ["$schema", "title", "examples", "example", "$id", "$comment"]) {
     delete map[k];
   }
-  // Keep `additionalProperties: false` (load-bearing), drop the rest.
-  if (map.additionalProperties !== false) {
-    delete map.additionalProperties;
-  }
+  if (map.additionalProperties !== false) delete map.additionalProperties;
   for (const k of Object.keys(map)) {
-    if (k.startsWith("x-")) {
-      delete map[k];
-    }
+    if (k.startsWith("x-")) delete map[k];
   }
+}
 
-  // Peel off a note THIS function appended on an earlier pass before touching
-  // the description, remembering the real total — see the Rust source's own
-  // comment: without this, re-slimming clamps the note off the end while the
-  // already-capped enum produces no replacement, silently losing the warning.
-  let priorTotal: number | undefined;
-  if (typeof map.description === "string" && map.description.endsWith(ENUM_NOTE_TAIL)) {
-    const i = map.description.lastIndexOf(ENUM_NOTE_HEAD);
-    if (i !== -1) {
-      const tail = map.description.slice(i);
-      const afterOf = tail.split(" of ")[1];
-      const numStr = afterOf?.split(" ")[0];
-      const parsed = numStr !== undefined ? Number.parseInt(numStr, 10) : NaN;
-      priorTotal = Number.isFinite(parsed) ? parsed : undefined;
-      map.description = map.description.slice(0, i);
-    }
-  }
+function takePriorEnumTotal(map: Record<string, unknown>): number | undefined {
+  const description = map.description;
+  if (typeof description !== "string" || !description.endsWith(ENUM_NOTE_TAIL)) return undefined;
+  const noteStart = description.lastIndexOf(ENUM_NOTE_HEAD);
+  if (noteStart === -1) return undefined;
+  map.description = description.slice(0, noteStart);
+  return recordedEnumTotal(description.slice(noteStart));
+}
 
+function recordedEnumTotal(note: string): number | undefined {
+  const afterOf = note.split(" of ")[1];
+  const numStr = afterOf?.split(" ")[0];
+  if (numStr === undefined) return undefined;
+  const parsed = Number.parseInt(numStr, 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function clampSchemaDescription(map: Record<string, unknown>): void {
+  if (typeof map.description === "string") map.description = clampMarked(map.description, SCHEMA_DESC_MAX);
+}
+
+function enumTotalAfterSlimming(map: Record<string, unknown>, priorTotal: number | undefined): number | undefined {
+  if (!Array.isArray(map.enum) || map.enum.length <= SCHEMA_ENUM_MAX) return priorTotal;
+  const total = map.enum.length;
+  map.enum = map.enum.slice(0, SCHEMA_ENUM_MAX);
+  return total;
+}
+
+function appendEnumTruncationNote(map: Record<string, unknown>, total: number | undefined): void {
+  if (total === undefined) return;
+  const note = `${ENUM_NOTE_HEAD}${SCHEMA_ENUM_MAX} of ${total} allowed values — ask the user if you need one ${ENUM_NOTE_TAIL}`;
   if (typeof map.description === "string") {
-    map.description = clampMarked(map.description, SCHEMA_DESC_MAX);
+    map.description += note;
+    return;
   }
+  map.description = note.trimStart();
+}
 
-  // Announce a truncated enum in the description, so a model that needs a
-  // missing value can ask instead of assuming the list it can see is the
-  // whole list.
-  let truncatedTotal: number | undefined;
-  if (Array.isArray(map.enum) && map.enum.length > SCHEMA_ENUM_MAX) {
-    truncatedTotal = map.enum.length;
-    map.enum = map.enum.slice(0, SCHEMA_ENUM_MAX);
-  } else {
-    truncatedTotal = priorTotal;
-  }
-  if (truncatedTotal !== undefined) {
-    const note = `${ENUM_NOTE_HEAD}${SCHEMA_ENUM_MAX} of ${truncatedTotal} allowed values — ask the user if you need one ${ENUM_NOTE_TAIL}`;
-    if (typeof map.description === "string") {
-      map.description += note;
-    } else {
-      map.description = note.trimStart();
-    }
-  }
-
+function slimSchemaChildren(map: Record<string, unknown>): void {
   for (const [k, child] of Object.entries(map)) {
-    // A "map of subschemas" keyword's KEYS are names the connector chose, not
-    // JSON-Schema keywords: descend one level further so the stripping above
-    // never runs against them.
-    if (SCHEMA_MAP_KEYWORDS.includes(k)) {
-      if (isPlainObject(child)) {
-        for (const sub of Object.values(child)) {
-          slimSchema(sub);
-        }
-      }
-      continue;
-    }
-    slimSchema(child);
+    slimSchemaChild(k, child);
   }
+}
+
+function slimSchemaChild(key: string, child: unknown): void {
+  if (!SCHEMA_MAP_KEYWORDS.includes(key)) {
+    slimSchema(child);
+    return;
+  }
+  slimSchemaMapValues(child);
+}
+
+function slimSchemaMapValues(value: unknown): void {
+  if (!isPlainObject(value)) return;
+  for (const child of Object.values(value)) slimSchema(child);
 }
 
 // ------------------------------------------------------------- param schemas
@@ -212,46 +222,57 @@ const EMPTY_STRING_IS_MEANINGFUL: ReadonlySet<string> = new Set(["move_file:fold
  * behaves.
  */
 export function missingRequiredArg(tool: string, args: Record<string, unknown>): string | null {
-  const supplied: Record<string, unknown> = isPlainObject(args) ? args : {};
+  const supplied = suppliedArguments(args);
   const schema = builtinParamSchemas().get(tool);
-  if (schema === undefined) {
-    return null;
-  }
+  if (schema === undefined) return null;
   const required = schema.required;
-  if (!Array.isArray(required)) {
-    return null;
-  }
+  if (!Array.isArray(required)) return null;
   const props = isPlainObject(schema.properties) ? schema.properties : undefined;
+  return firstMissingRequiredArg(tool, supplied, required, props);
+}
+
+function suppliedArguments(args: Record<string, unknown>): Record<string, unknown> {
+  return isPlainObject(args) ? args : {};
+}
+
+function firstMissingRequiredArg(
+  tool: string,
+  supplied: Record<string, unknown>,
+  required: unknown[],
+  props: Record<string, unknown> | undefined,
+): string | null {
   for (const entry of required) {
-    if (typeof entry !== "string") {
-      return null;
-    }
+    if (typeof entry !== "string") return null;
     const key = entry;
-    const emptyOk = EMPTY_STRING_IS_MEANINGFUL.has(`${tool}:${key}`);
     const value = Object.prototype.hasOwnProperty.call(supplied, key) ? supplied[key] : undefined;
-    let present: boolean;
-    if (value === undefined || value === null) {
-      present = false;
-    } else if (typeof value === "string") {
-      present = emptyOk || value.trim().length > 0;
-    } else if (Array.isArray(value)) {
-      present = value.length > 0;
-    } else if (isPlainObject(value)) {
-      present = Object.keys(value).length > 0;
-    } else {
-      // Numbers and booleans are meaningful at any value, including 0/false.
-      present = true;
-    }
-    if (present) {
-      continue;
-    }
-    const hint =
-      props !== undefined &&
-      isPlainObject(props[key]) &&
-      typeof (props[key] as Record<string, unknown>).description === "string"
-        ? ` — ${(props[key] as Record<string, unknown>).description as string}`
-        : "";
-    return `${key} is required${hint}. Nothing was done — call ${tool} again with ${key} set.`;
+    if (requiredValueIsPresent(tool, key, value)) continue;
+    return missingArgumentMessage(tool, key, props);
   }
   return null;
+}
+
+function requiredValueIsPresent(tool: string, key: string, value: unknown): boolean {
+  if (missingValue(value)) return false;
+  if (typeof value === "string") return requiredStringIsPresent(tool, key, value);
+  if (Array.isArray(value)) return value.length > 0;
+  if (isPlainObject(value)) return Object.keys(value).length > 0;
+  return true;
+}
+
+function missingValue(value: unknown): boolean {
+  return value === undefined || value === null;
+}
+
+function requiredStringIsPresent(tool: string, key: string, value: string): boolean {
+  return EMPTY_STRING_IS_MEANINGFUL.has(`${tool}:${key}`) || value.trim().length > 0;
+}
+
+function missingArgumentMessage(tool: string, key: string, props: Record<string, unknown> | undefined): string {
+  return `${key} is required${argumentHint(props, key)}. Nothing was done — call ${tool} again with ${key} set.`;
+}
+
+function argumentHint(props: Record<string, unknown> | undefined, key: string): string {
+  const prop = props?.[key];
+  if (!isPlainObject(prop) || typeof prop.description !== "string") return "";
+  return ` — ${prop.description}`;
 }

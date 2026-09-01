@@ -10,6 +10,132 @@ import { WSState } from "./state";
  * whole report intact on every path that does work. */
 const MAX_ISSUE_URL = 6000;
 
+interface FeedbackDraftFields {
+  raw: string;
+  title: string;
+  body: string;
+  drafting: boolean;
+  setRaw(value: string): void;
+  setTitle(value: string): void;
+  setBody(value: string): void;
+  draftWithAi(): void;
+}
+
+function diagnosticLine(diag: AppDiag | null): string {
+  return diag === null ? "" : `Arcelle ${diag.version} · ${diag.os} (${diag.arch})`;
+}
+
+function errorBlock(includeErrors: boolean, recentErrors: readonly { at: string; text: string }[]): string {
+  if (!includeErrors || recentErrors.length === 0) return "";
+  const entries = recentErrors.map((error) => `- \`${error.at}\` ${error.text}`).join("\n");
+  return `\n\n### Error messages shown as pop-ups this session\n\n${entries}`;
+}
+
+function issueBody(body: string, includeDiag: boolean, diagLine: string, errors: string): string {
+  const draft = body.trim();
+  if (!includeDiag || !diagLine) return draft + errors;
+  return `${draft}\n\n---\n${diagLine}${errors}`;
+}
+
+function readyToOpen(title: string, body: string): boolean {
+  return title.trim().length > 0 && body.trim().length > 0;
+}
+
+function FeedbackDraftInput(fields: FeedbackDraftFields) {
+  return (
+    <div className="feedback-raw">
+      <textarea
+        className="studio-prompt-input"
+        placeholder="What happened, in your own words — any language…"
+        rows={3}
+        dir="auto"
+        value={fields.raw}
+        disabled={fields.drafting}
+        // No `autoFocus`: React applies it during commit, BEFORE the trap's
+        // effect reads `document.activeElement`, so the trap remembered this
+        // textarea as the trigger and had nothing to hand focus back to on close.
+        onChange={(event) => fields.setRaw(event.target.value)}
+      />
+      <button
+        className="subtle btn-ic"
+        disabled={fields.drafting || !fields.raw.trim()}
+        title="The local model turns your words into a clear issue title and body — nothing leaves this Mac"
+        onClick={fields.draftWithAi}
+      >
+        {fields.drafting ? "Drafting…" : (<><SparklesIcon size={14} /> Draft it for me</>)}
+      </button>
+    </div>
+  );
+}
+
+function FeedbackIssueFields(fields: FeedbackDraftFields) {
+  return (
+    <>
+      <input
+        className="studio-prompt-question"
+        placeholder="Issue title"
+        dir="auto"
+        value={fields.title}
+        disabled={fields.drafting}
+        onChange={(event) => fields.setTitle(event.target.value)}
+      />
+      <textarea
+        className="studio-prompt-input feedback-body"
+        placeholder={"Issue body (Markdown)\n\n## What happened\n…"}
+        rows={7}
+        dir="auto"
+        value={fields.body}
+        disabled={fields.drafting}
+        onChange={(event) => fields.setBody(event.target.value)}
+      />
+    </>
+  );
+}
+
+function DiagnosticOption({
+  checked,
+  diagLine,
+  onChange,
+}: {
+  checked: boolean;
+  diagLine: string;
+  onChange(value: boolean): void;
+}) {
+  return (
+    <label className="rec-opt feedback-diag">
+      <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
+      Append version info{diagLine ? ` — ${diagLine}` : ""}
+    </label>
+  );
+}
+
+function ErrorLogOption({
+  errors,
+  includeErrors,
+  onChange,
+}: {
+  errors: readonly { at: string; text: string }[];
+  includeErrors: boolean;
+  onChange(value: boolean): void;
+}) {
+  if (errors.length === 0) return null;
+  const plural = errors.length === 1 ? "" : "s";
+  return (
+    <>
+      <label className="rec-opt feedback-diag">
+        <input type="checkbox" checked={includeErrors} onChange={(event) => onChange(event.target.checked)} />
+        Append the {errors.length} error message{plural} shown as pop-ups this session
+      </label>
+      <p className="studio-prompt-hint">
+        Read them first — an error can name one of your files, and this report goes to a public issue tracker.
+      </p>
+      <ul className="feedback-errors" data-testid="feedback-errors">
+        {errors.map((error) => <li key={error.at + error.text} dir="auto">{error.text}</li>)}
+      </ul>
+    </>
+  );
+}
+
 /** ADD-28: feedback → GitHub issue.
  *
  * Write it yourself, or let the LOCAL model shape your words into a title +
@@ -45,20 +171,9 @@ export default function FeedbackModal({ s }: { s: WSState }) {
     void api.appDiag().then(setDiag).catch(() => {});
   }, []);
 
-  const diagLine = diag
-    ? `Arcelle ${diag.version} · ${diag.os} (${diag.arch})`
-    : "";
-  const errorBlock =
-    includeErrors && recentErrors.length > 0
-      ? `\n\n### Error messages shown as pop-ups this session\n\n${recentErrors
-          .map((e) => `- \`${e.at}\` ${e.text}`)
-          .join("\n")}`
-      : "";
-  const finalBody =
-    (includeDiag && diagLine
-      ? `${body.trim()}\n\n---\n${diagLine}`
-      : body.trim()) + errorBlock;
-  const ready = title.trim().length > 0 && body.trim().length > 0;
+  const diagLine = diagnosticLine(diag);
+  const finalBody = issueBody(body, includeDiag, diagLine, errorBlock(includeErrors, recentErrors));
+  const ready = readyToOpen(title, body);
 
   function close() {
     if (!drafting) s.setShowFeedback(false);
@@ -163,85 +278,28 @@ export default function FeedbackModal({ s }: { s: WSState }) {
           opened in <strong>your</strong> browser. The app itself sends nothing.
         </p>
 
-        <div className="feedback-raw">
-          <textarea
-            className="studio-prompt-input"
-            placeholder="What happened, in your own words — any language…"
-            rows={3}
-            dir="auto"
-            value={raw}
-            disabled={drafting}
-            // No `autoFocus`: React applies it during commit, BEFORE the trap's
-            // effect reads `document.activeElement`, so the trap remembered
-            // this textarea as the trigger and had nothing to hand focus back
-            // to on close. The trap focuses the first control — this one.
-            onChange={(e) => setRaw(e.target.value)}
-          />
-          <button
-            className="subtle btn-ic"
-            disabled={drafting || !raw.trim()}
-            title="The local model turns your words into a clear issue title and body — nothing leaves this Mac"
-            onClick={() => void draftWithAi()}
-          >
-            {drafting ? "Drafting…" : (<><SparklesIcon size={14} /> Draft it for me</>)}
-          </button>
-        </div>
-
-        <input
-          className="studio-prompt-question"
-          placeholder="Issue title"
-          dir="auto"
-          value={title}
-          disabled={drafting}
-          onChange={(e) => setTitle(e.target.value)}
+        <FeedbackDraftInput
+          raw={raw}
+          title={title}
+          body={body}
+          drafting={drafting}
+          setRaw={setRaw}
+          setTitle={setTitle}
+          setBody={setBody}
+          draftWithAi={() => void draftWithAi()}
         />
-        <textarea
-          className="studio-prompt-input feedback-body"
-          placeholder={"Issue body (Markdown)\n\n## What happened\n…"}
-          rows={7}
-          dir="auto"
-          value={body}
-          disabled={drafting}
-          onChange={(e) => setBody(e.target.value)}
+        <FeedbackIssueFields
+          raw={raw}
+          title={title}
+          body={body}
+          drafting={drafting}
+          setRaw={setRaw}
+          setTitle={setTitle}
+          setBody={setBody}
+          draftWithAi={() => void draftWithAi()}
         />
-
-        <label className="rec-opt feedback-diag">
-          <input
-            type="checkbox"
-            checked={includeDiag}
-            onChange={(e) => setIncludeDiag(e.target.checked)}
-          />
-          Append version info{diagLine ? ` — ${diagLine}` : ""}
-        </label>
-
-        {recentErrors.length > 0 && (
-          <>
-            <label className="rec-opt feedback-diag">
-              <input
-                type="checkbox"
-                checked={includeErrors}
-                onChange={(e) => setIncludeErrors(e.target.checked)}
-              />
-              {/* "shown as pop-ups" is the whole truth: the list is fed by
-                  `pushToast` alone, so a pane that crashed outright is not in
-                  it — the error boundary draws a card and raises no toast. */}
-              Append the {recentErrors.length} error message
-              {recentErrors.length === 1 ? "" : "s"} shown as pop-ups this
-              session
-            </label>
-            <p className="studio-prompt-hint">
-              Read them first — an error can name one of your files, and this
-              report goes to a public issue tracker.
-            </p>
-            <ul className="feedback-errors" data-testid="feedback-errors">
-              {recentErrors.map((e) => (
-                <li key={e.at + e.text} dir="auto">
-                  {e.text}
-                </li>
-              ))}
-            </ul>
-          </>
-        )}
+        <DiagnosticOption checked={includeDiag} diagLine={diagLine} onChange={setIncludeDiag} />
+        <ErrorLogOption errors={recentErrors} includeErrors={includeErrors} onChange={setIncludeErrors} />
 
         <div className="studio-prompt-actions">
           <button className="subtle" disabled={drafting} onClick={close}>

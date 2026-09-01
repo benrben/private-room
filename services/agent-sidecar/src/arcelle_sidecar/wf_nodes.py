@@ -56,7 +56,8 @@ from . import llm
 from .config import KEEP_ALIVE_WARM, ProviderConfig
 from .graph import CancelToken
 from .messages import user_message
-from .model_text import recover_json
+from .wf_route import build_extract_schema, pick_route_label, route_schema_of
+from .wf_serde import _bool_or, _clamp, _parse_or, _str_or_empty
 
 # --------------------------------------------------------------------------- #
 # the one model call — wf_generate's exact body, minus the HTTP hop
@@ -132,47 +133,6 @@ def _deps(config: RunnableConfig) -> NodeDeps:
     if STUDIO_DEPS is not None:  # pragma: no cover - dev-only path
         return STUDIO_DEPS
     raise RuntimeError("workflow node invoked without NodeDeps in config.configurable")
-
-
-# --------------------------------------------------------------------------- #
-# serde_json parity helpers
-# --------------------------------------------------------------------------- #
-
-
-def _bool_or(parsed: Any, key: str, default: bool) -> bool:
-    """``v[key].as_bool().unwrap_or(default)``.
-
-    ``as_bool`` is None for a non-object, a missing key, a string, a number —
-    so ``{"pass": "yes"}`` and ``[1,2]`` both take the default. The ``bool``
-    check must come first: in Python ``isinstance(1, int)`` and ``bool`` is a
-    subclass of ``int``, but ``1`` is NOT a serde bool."""
-    if isinstance(parsed, dict):
-        v = parsed.get(key)
-        if isinstance(v, bool):
-            return v
-    return default
-
-
-def _str_or_empty(parsed: Any, key: str) -> str:
-    """``v[key].as_str().unwrap_or_default()`` — "" unless it is a string."""
-    if isinstance(parsed, dict):
-        v = parsed.get(key)
-        if isinstance(v, str):
-            return v
-    return ""
-
-
-def _parse_or(raw: str, fallback: Any) -> Any:
-    """``serde_json::from_str(&recover_json(raw)).unwrap_or(fallback)``."""
-    try:
-        return json.loads(recover_json(raw))
-    except (ValueError, TypeError):
-        return fallback
-
-
-def _clamp(v: int, lo: int, hi: int) -> int:
-    """Rust ``i.clamp(lo, hi)``."""
-    return max(lo, min(hi, v))
 
 
 # --------------------------------------------------------------------------- #
@@ -325,15 +285,32 @@ async def map_plan(state: MapState, config: RunnableConfig) -> dict[str, Any]:
     )
     raw = await _deps(config).gen(prompt, PLAN_SCHEMA)
     parsed = _parse_or(raw, {"subtasks": []})
+    return {"subtasks": _plan_subtasks(parsed, width)}
+
+
+def _plan_subtasks(parsed: Any, width: int) -> list[str]:
+    if not isinstance(parsed, dict):
+        return []
+    candidates = parsed.get("subtasks")
+    if not isinstance(candidates, list):
+        return []
+    return _limited_subtasks(candidates, width)
+
+
+def _limited_subtasks(candidates: list[Any], width: int) -> list[str]:
     items: list[str] = []
-    if isinstance(parsed, dict) and isinstance(parsed.get("subtasks"), list):
-        # Rust: filter_map(as_str).map(trim).filter(!empty).take(width)
-        for s in parsed["subtasks"]:
-            if isinstance(s, str) and s.strip():
-                items.append(s.strip())
-            if len(items) == width:
-                break
-    return {"subtasks": items}
+    # Rust: filter_map(as_str).map(trim).filter(!empty).take(width)
+    for candidate in candidates:
+        subtask = _trimmed_subtask(candidate)
+        if subtask:
+            items.append(subtask)
+        if len(items) == width:
+            break
+    return items
+
+
+def _trimmed_subtask(candidate: Any) -> str:
+    return candidate.strip() if isinstance(candidate, str) else ""
 
 
 async def map_direct(state: MapState, config: RunnableConfig) -> dict[str, Any]:
@@ -516,46 +493,6 @@ async def run_vote(
 # structurally forbidden from moving (SPEC: the sidecar has no DB).
 # Their pure helpers moved WITH them and brought their Rust assertions along, so
 # nothing is implemented twice.
-
-
-def build_extract_schema(fields: list[str]) -> dict[str, Any]:
-    """Rust ``build_extract_schema``: every named field required, as a string."""
-    props: dict[str, Any] = {}
-    required: list[str] = []
-    for f in (f.strip() for f in fields):
-        if f:
-            props[f] = {"type": "string"}
-            required.append(f)
-    return {"type": "object", "properties": props, "required": required}
-
-
-def route_schema_of(labels: list[str]) -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {"label": {"type": "string", "enum": list(labels)}},
-        "required": ["label"],
-    }
-
-
-def pick_route_label(raw: str, labels: list[str]) -> str:
-    """Rust ``pick_route_label``, semantics preserved.
-
-    A structured ``{"label": …}`` wins on a case-insensitive match; else the
-    first label whose text appears anywhere; else the FIRST label — a route
-    always takes some branch rather than stalling the DAG.
-    """
-    parsed = _parse_or(raw, None)
-    if isinstance(parsed, dict):
-        label = parsed.get("label")
-        if isinstance(label, str):
-            for x in labels:
-                if x.casefold() == label.strip().casefold():
-                    return x
-    hay = raw.lower()
-    for x in labels:
-        if x.lower() in hay:
-            return x
-    return labels[0] if labels else ""
 
 
 async def run_extract(

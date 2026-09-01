@@ -46,6 +46,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { createRoom } from "./open.js";
+import { createWorkspaceRoom } from "../workspace/roomLayout.js";
 import { migrate } from "./migrate.js";
 import { roomCounts } from "./messages.js";
 import {
@@ -457,6 +458,14 @@ describe("inTransaction", () => {
     expect(count(), "the outer transaction still owns the outcome").toBe(1);
     db.close();
   });
+
+  it("preserves the body error when even best-effort rollback is unavailable", () => {
+    const db = freshRoom();
+    expect(() => inTransaction(db, () => {
+      db.close();
+      throw new Error("original fabricated write failure");
+    })).toThrow("original fabricated write failure");
+  });
 });
 
 describe("fileWithSameBytes", () => {
@@ -595,6 +604,7 @@ describe("fuzzy finders", () => {
     // "Invoices/" names a FOLDER — retrying on "" would match the newest file
     // in the room, a confident wrong answer where an error is the honest one.
     expect(() => findFileLikeQualified(db, "Invoices/")).toThrow();
+    expect(() => findFileLikeQualified(db, "Invoices/missing.pdf")).toThrow(/No file matching/);
     db.close();
   });
 });
@@ -1110,6 +1120,41 @@ describe("insertChunks atomicity (ported from db.rs's own mod tests)", () => {
     expect(Math.abs(latinChunks - chunks.length)).toBeLessThanOrEqual(2);
     db.close();
   });
+
+  it("keeps line boundaries while a huge paragraph rolls from short rows into word chunks", () => {
+    // A huge paragraph is split by lines before words. In particular, when a
+    // later long line arrives the preceding short row must be flushed first;
+    // otherwise a spreadsheet/log row silently merges into the word chunks.
+    const db = freshRoom();
+    const first = "first ".repeat(160).trim();
+    const second = "second ".repeat(160).trim();
+    const words = "word ".repeat(500).trim();
+    const id = addFile(db, "line-first.txt", `${first}\n   \n${second}\n${words}`);
+    const chunks = db
+      .prepare("SELECT text FROM chunks WHERE file_id = ? ORDER BY seq")
+      .pluck()
+      .all(id) as string[];
+
+    expect(chunks[0]).toBe(first);
+    expect(chunks[1]).toBe(second);
+    expect(chunks.slice(2).join(" ")).toContain("word word word");
+    for (const chunk of chunks) {
+      expect(Buffer.byteLength(chunk, "utf8")).toBeLessThanOrEqual(CHUNK_TARGET_CHARS);
+    }
+
+    // Paragraphs retain their boundary too: a second ordinary paragraph that
+    // would overflow the target starts the next chunk rather than creating a
+    // target-sized mega-paragraph.
+    const left = "a".repeat(800);
+    const right = "b".repeat(800);
+    const paragraphId = addFile(db, "paragraph-first.txt", `${left}\n\n${right}`);
+    const paragraphs = db
+      .prepare("SELECT text FROM chunks WHERE file_id = ? ORDER BY seq")
+      .pluck()
+      .all(paragraphId) as string[];
+    expect(paragraphs).toEqual([left, right]);
+    db.close();
+  });
 });
 
 // ===================================================== supplementary coverage
@@ -1223,6 +1268,40 @@ describe("supplementary coverage (not in the Rust suite)", () => {
     expect(fileNamesHint(db)).toBe(" This room has no files yet.");
     addFile(db, "lease.pdf", "x");
     expect(fileNamesHint(db)).toBe(" Files in this room: lease.pdf.");
+    db.close();
+  });
+
+  it("fileNamesHint degrades to the empty-room hint when its best-effort query fails", () => {
+    const db = freshRoom();
+    db.close();
+    expect(fileNamesHint(db)).toBe(" This room has no files yet.");
+  });
+
+  it("refuses legacy-byte insert and update operations against a workspace database", () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "db-files-workspace-"));
+    const root = path.join(tmpDir, "Workspace Room");
+    const created = createWorkspaceRoom(root, "correct horse battery staple", "Workspace");
+    try {
+      expect(() => insertFileFromUrl(created.db, "x.txt", "text/plain", Buffer.from("x"), "x", "upload", null))
+        .toThrow("Workspace rooms must create current files through WorkspaceService.");
+      expect(() => updateFileContent(created.db, "missing", Buffer.from("x"), "x"))
+        .toThrow("Workspace files must update current bytes through WorkspaceService.");
+    } finally {
+      created.db.close();
+    }
+  });
+
+  it("markSectionOnly keeps the already-created file usable when its best-effort update fails", () => {
+    const db = freshRoom();
+    const id = addFile(db, "sketch.json", "{}");
+    db.close();
+    expect(() => markSectionOnly(db, id, "sketch")).not.toThrow();
+  });
+
+  it("filesNameLike returns no matches for an empty search", () => {
+    const db = freshRoom();
+    addFile(db, "anything.txt", "x");
+    expect(filesNameLike(db, "   ")).toEqual([]);
     db.close();
   });
 

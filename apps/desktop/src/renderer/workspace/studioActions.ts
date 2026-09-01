@@ -4,6 +4,54 @@ import { resolveRefs } from "./composer";
 import { runGuarded, tryToast } from "./guard";
 import { WSState } from "./state";
 
+type AiActionPrompt = NonNullable<WSState["aiPrompt"]>;
+
+function aiActionQuestionIsReady(prompt: AiActionPrompt): boolean {
+  const needsAnswer = prompt.def.needsQuestion || prompt.def.needsLanguage;
+  return !needsAnswer || Boolean(prompt.question.trim());
+}
+
+function canRunAiAction(
+  prompt: AiActionPrompt | null,
+  isBusy: boolean,
+): prompt is AiActionPrompt {
+  return prompt !== null && !isBusy && aiActionQuestionIsReady(prompt);
+}
+
+function uniqueAiActionRefs(
+  savedRefs: string[] | null,
+  mentionedRefs: string[],
+): string[] | null {
+  const refs = Array.from(new Set([...(savedRefs ?? []), ...mentionedRefs]));
+  return refs.length ? refs : null;
+}
+
+function aiActionQuestion(prompt: AiActionPrompt): string | null {
+  return prompt.def.needsQuestion || prompt.def.needsLanguage
+    ? prompt.question
+    : null;
+}
+
+function aiActionOptions(
+  prompt: AiActionPrompt,
+  files: WSState["files"],
+  folders: WSState["folders"],
+  opId: string,
+): Parameters<typeof api.aiAction>[1] {
+  const { refIds } = resolveRefs(prompt.text, files, folders);
+  return {
+    scope: prompt.scope,
+    refs: uniqueAiActionRefs(prompt.refs, refIds),
+    instructions: prompt.text,
+    question: aiActionQuestion(prompt),
+    opId,
+  };
+}
+
+function aiActionOpId(): string {
+  return `ai-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 /** Studio Shelf + whole-room AI actions + room summary. Studio/summary results
  * now open themselves via the terminal job-progress event, so this only needs
  * `openOllamaApp` (recording) as the "model is down" remediation. */
@@ -221,26 +269,16 @@ export function makeStudioActions(
   }
 
   async function runAiActionFromModal() {
-    if (!s.aiPrompt || s.aiBusy) return;
     const p = s.aiPrompt;
-    // ADD-27: "translate" carries the target language in the question field.
-    if ((p.def.needsQuestion || p.def.needsLanguage) && !p.question.trim()) return;
-    const { refIds } = resolveRefs(p.text, s.files, s.folders);
-    const combined = [...(p.refs ?? []), ...refIds];
-    const refs = combined.length ? Array.from(new Set(combined)) : null;
+    if (!canRunAiAction(p, s.aiBusy)) return;
     // The id Stop will use. Minted here, like a Studio build's, so the host can
     // register the run's cancel flag under it before the model call starts.
-    const opId = `ai-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const opId = aiActionOpId();
+    const options = aiActionOptions(p, s.files, s.folders, opId);
     await runGuarded(
       s,
       async () => {
-        await api.aiAction(p.def.id, {
-          scope: p.scope,
-          refs,
-          instructions: p.text,
-          question: p.def.needsQuestion || p.def.needsLanguage ? p.question : null,
-          opId,
-        });
+        await api.aiAction(p.def.id, options);
         s.setFiles(await api.listFiles());
         s.setAiPrompt(null);
       },

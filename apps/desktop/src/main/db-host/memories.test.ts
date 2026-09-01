@@ -56,6 +56,13 @@ function rawContent(db: Database.Database, id: string): string {
 }
 
 describe("memoriesLike", () => {
+  it("treats a whitespace-only search as no query", () => {
+    const db = freshRoom();
+    addMemory(db, "a memory that must not match an empty query", null);
+    expect(memoriesLike(db, "   ")).toEqual([]);
+    db.close();
+  });
+
   // The sibling of `messages`' LIKE-wildcard test: all three of `search_all`'s
   // queries have to agree about what the same needle means.
   it("a_memory_search_takes_like_wildcards_literally", () => {

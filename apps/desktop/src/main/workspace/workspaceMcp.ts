@@ -72,244 +72,292 @@ export function createWorkspaceMcpBridge(
     return matches[0]!;
   };
 
+  type Result = Record<string, unknown>;
+  type Handler = (args: Record<string, unknown>) => Promise<Result>;
+  type EditPlan = { error: string } | { next: string; occurrences: number };
+
+  const readText = async (row: FileRow): Promise<string> =>
+    (await readAll(room().workspace!.readStream(row.id))).toString("utf8");
+  const saveText = async (row: FileRow, text: string, cause: string): Promise<void> => {
+    await room().workspace!.snapshotVersion(row.id, cause);
+    await room().workspace!.writeAtomic(
+      row.id,
+      Readable.from([Buffer.from(text)]),
+      row.content_sha256 ?? undefined,
+    );
+    setFileExtractedText(room().conn, row.id, text);
+  };
+  const createText = async (relative: string, content: string): Promise<void> => {
+    const created = await room().workspace!.createFile(
+      relative,
+      Readable.from([Buffer.from(content)]),
+      "agent",
+    );
+    setFileExtractedText(room().conn, created.fileId, content);
+  };
+  const fileExists = (relative: string): boolean => {
+    try {
+      file(relative);
+      return true;
+    } catch (error) {
+      if (error instanceof Error && error.message === "Workspace file not found.") return false;
+      throw error;
+    }
+  };
+  const existingForWrite = (relative: string): FileRow | undefined => {
+    try {
+      return file(relative);
+    } catch {
+      return undefined;
+    }
+  };
+  const parentPath = (parent: string, name: string): string => {
+    if (parent === ".") return name;
+    return path.posix.join(parent, name);
+  };
+  const editError = (oldText: string, newText: string): string | null => {
+    if (oldText === "") return "The edit needs different old and new text.";
+    if (oldText === newText) return "The edit needs different old and new text.";
+    return null;
+  };
+  const replacement = (current: string, oldText: string, newText: string, all: boolean): string => {
+    if (all) return current.split(oldText).join(newText);
+    return current.replace(oldText, newText);
+  };
+  const editInputs = (args: Record<string, unknown>, oldKey: string, newKey: string): [string, string] => [
+    String(args[oldKey] ?? ""),
+    String(args[newKey] ?? ""),
+  ];
+  const editPlan = (current: string, oldText: string, newText: string, all: boolean): EditPlan => {
+    const error = editError(oldText, newText);
+    if (error !== null) return { error };
+    const occurrences = current.split(oldText).length - 1;
+    if (occurrences === 0) return { error: "The old text was not found." };
+    if (occurrences > 1) {
+      if (!all) return { error: "The old text is not unique." };
+    }
+    return { next: replacement(current, oldText, newText, all), occurrences };
+  };
+  const standardRenameDestination = (row: FileRow, value: unknown): string | null => {
+    let newName = path.posix.basename(String(value ?? "").trim());
+    if (newName === "") return null;
+    if (path.extname(newName) === "" && path.extname(row.relative_path) !== "") {
+      newName += path.extname(row.relative_path);
+    }
+    return parentPath(path.posix.dirname(row.relative_path), newName);
+  };
+  const standardMoveDestination = (row: FileRow, value: unknown): string => {
+    const folder = String(value ?? "").trim().replace(/^\/+|\/+$/g, "");
+    const name = path.posix.basename(row.relative_path);
+    if (folder === "") return name;
+    return path.posix.join(folder, name);
+  };
+  const moveRow = async (row: FileRow, destination: string): Promise<Result> => {
+    await room().workspace!.move(row.id, destination, row.content_sha256 ?? undefined);
+    return { old_path: `/${row.relative_path}`, path: `/${destination}` };
+  };
+  const standardCreate: Handler = async (args) => {
+    const relative = virtualPath(args.name);
+    if (fileExists(relative)) return { error: "A workspace file already exists at that path." };
+    await createText(relative, String(args.content ?? ""));
+    return { path: `/${relative}`, created: true };
+  };
+  const standardWrite: Handler = async (args) => {
+    const row = fileLike(args.name);
+    if (!isText(row)) return { error: "This workspace tool edits text files only." };
+    await readText(row);
+    if (args.dry_run === true) return { path: `/${row.relative_path}`, occurrences: 1, dry_run: true };
+    await saveText(row, String(args.content ?? ""), "AI rewrite");
+    return { path: `/${row.relative_path}`, occurrences: 1 };
+  };
+  const standardEdit: Handler = async (args) => {
+    const row = fileLike(args.name);
+    if (!isText(row)) return { error: "This workspace tool edits text files only." };
+    const [oldText, newText] = editInputs(args, "old_text", "new_text");
+    const plan = editPlan(
+      await readText(row),
+      oldText,
+      newText,
+      args.all === true,
+    );
+    if ("error" in plan) return plan;
+    if (args.dry_run === true) return { path: `/${row.relative_path}`, occurrences: plan.occurrences, dry_run: true };
+    await saveText(row, plan.next, "AI edit");
+    return { path: `/${row.relative_path}`, occurrences: plan.occurrences };
+  };
+  const standardRename: Handler = async (args) => {
+    const row = fileLike(args.name);
+    const destination = standardRenameDestination(row, args.new_name);
+    if (destination === null) return { error: "The new file name is empty." };
+    return moveRow(row, destination);
+  };
+  const standardMove: Handler = async (args) => {
+    const row = fileLike(args.name);
+    return moveRow(row, standardMoveDestination(row, args.folder));
+  };
+  const standardTrash: Handler = async (args) => {
+    const names = Array.isArray(args.names) ? args.names : [];
+    const targets = names.map(fileLike);
+    for (const row of targets) {
+      await room().workspace!.trash(row.id, row.content_sha256 ?? undefined);
+    }
+    return { trashed: targets.map((row) => `/${row.relative_path}`) };
+  };
+  const listEntry = (row: FileRow, prefix: string): Result | null => {
+    if (!row.relative_path.startsWith(prefix)) return null;
+    const rest = row.relative_path.slice(prefix.length);
+    const [first, ...tail] = rest.split("/");
+    if (!first) return null;
+    const relative = prefix + first;
+    if (tail.length > 0) {
+      return { path: `/${relative}/`, is_dir: true, size: 0, modified_at: row.created_at };
+    }
+    return { path: `/${relative}`, is_dir: false, size: row.size_bytes, modified_at: row.created_at };
+  };
+  const list: Handler = async (args) => {
+    const base = virtualPath(args.path, true);
+    const prefix = base === "" ? "" : `${base}/`;
+    const entries = new Map<string, Result>();
+    for (const row of rows()) {
+      const entry = listEntry(row, prefix);
+      if (entry !== null) entries.set(String(entry.path), entry);
+    }
+    return { entries: [...entries.values()].sort((a, b) => String(a.path).localeCompare(String(b.path))) };
+  };
+  const read: Handler = async (args) => {
+    const row = file(virtualPath(args.path));
+    if (!isText(row)) return { error: "This workspace tool reads text files only." };
+    const lines = (await readText(row)).split(/\r?\n/);
+    const offset = Math.max(0, Number(args.offset) || 0);
+    const limit = Math.max(0, Math.min(2_000, Number(args.limit) || 2_000));
+    const end = Math.min(lines.length, offset + limit);
+    return {
+      file_data: { content: lines.slice(offset, end).join("\n"), encoding: "utf-8", created_at: row.created_at, modified_at: row.created_at },
+      total_lines: lines.length,
+      start_line: offset + 1,
+      end_line: end,
+      next_offset: end < lines.length ? end : null,
+    };
+  };
+  const requestedName = (value: unknown): string => typeof value === "string" ? value.trim() : "";
+  const safeRename = (value: unknown): string | null => {
+    const requested = requestedName(value);
+    if (["", ".", ".."].includes(requested)) return null;
+    if (requested.includes("/")) return null;
+    if (requested.includes("\\")) return null;
+    if (requested.toLocaleLowerCase("en-US") === ".arcelle") return null;
+    return requested;
+  };
+  const move: Handler = async (args) => moveRow(
+    file(virtualPath(args.source_path)), virtualPath(args.destination_path),
+  );
+  const rename: Handler = async (args) => {
+    const row = file(virtualPath(args.source_path));
+    const requested = safeRename(args.new_name);
+    if (requested === null) return { error: "The new name must be one safe file name." };
+    return moveRow(row, parentPath(path.posix.dirname(row.relative_path), requested));
+  };
+  const write: Handler = async (args) => {
+    const relative = virtualPath(args.path);
+    const content = String(args.content ?? "");
+    const row = existingForWrite(relative);
+    if (row === undefined) await createText(relative, content);
+    else await saveText(row, content, "Agent workspace rewrite");
+    return { path: `/${relative}` };
+  };
+  const edit: Handler = async (args) => {
+    const relative = virtualPath(args.path);
+    const row = file(relative);
+    if (!isText(row)) return { error: "This workspace tool edits text files only." };
+    const all = args.replace_all === true;
+    const [oldText, newText] = editInputs(args, "old_string", "new_string");
+    const plan = editPlan(await readText(row), oldText, newText, all);
+    if ("error" in plan) return plan;
+    await saveText(row, plan.next, "Agent workspace edit");
+    return { path: `/${relative}`, occurrences: all ? plan.occurrences : 1 };
+  };
+  const remove: Handler = async (args) => {
+    const relative = virtualPath(args.path);
+    const row = file(relative);
+    await room().workspace!.trash(row.id, row.content_sha256 ?? undefined);
+    return { path: `/${relative}` };
+  };
+  const globRelative = (row: FileRow, base: string): string | null => {
+    if (base === "") return row.relative_path;
+    if (row.relative_path === base) return "";
+    if (row.relative_path.startsWith(`${base}/`)) return row.relative_path.slice(base.length + 1);
+    return null;
+  };
+  const glob: Handler = async (args) => {
+    const base = virtualPath(args.path, true);
+    const pattern = String(args.pattern ?? "*");
+    const matches: Result[] = [];
+    for (const row of rows()) {
+      const relative = globRelative(row, base);
+      if (relative !== null && path.matchesGlob(relative, pattern)) {
+        matches.push({ path: `/${row.relative_path}`, is_dir: false, size: row.size_bytes, modified_at: row.created_at });
+      }
+    }
+    return { matches, truncated: false };
+  };
+  const isUnderGrepBase = (row: FileRow, base: string): boolean => {
+    if (base === "") return true;
+    return row.relative_path.startsWith(`${base}/`);
+  };
+  const grepFile = async (
+    row: FileRow, needle: string, maxCount: number, matches: Result[],
+  ): Promise<boolean> => {
+    for (const [index, line] of (await readText(row)).split(/\r?\n/).entries()) {
+      if (line.includes(needle)) matches.push({ path: `/${row.relative_path}`, line: index + 1, text: line });
+      if (matches.length >= maxCount) return true;
+    }
+    return false;
+  };
+  const grepInputs = (args: Record<string, unknown>): [string, string, number] => [
+    virtualPath(args.path, true),
+    String(args.pattern ?? ""),
+    Math.max(1, Math.min(1_000, Number(args.max_count) || 1_000)),
+  ];
+  const grep: Handler = async (args) => {
+    const [base, needle, maxCount] = grepInputs(args);
+    const matches: Result[] = [];
+    for (const row of rows()) {
+      if (!isText(row)) continue;
+      if (!isUnderGrepBase(row, base)) continue;
+      if (await grepFile(row, needle, maxCount, matches)) return { matches, truncated: true };
+    }
+    return { matches, truncated: false };
+  };
+  const standardHandlers: Record<string, Handler> = {
+    standard_create: standardCreate,
+    standard_write: standardWrite,
+    standard_edit: standardEdit,
+    standard_rename: standardRename,
+    standard_move: standardMove,
+    standard_trash: standardTrash,
+    standard_unsupported: async () => ({ error: "This multi-file or structured edit is not available for workspace rooms yet." }),
+  };
+  const regularHandlers: Record<string, Handler> = { list, read, move, rename, write, edit, delete: remove, glob, grep };
+  const writeOperations = new Set(["write", "edit", "delete", "move", "rename"]);
+  const dispatchStandard = async (operation: string, args: Record<string, unknown>): Promise<Result> => {
+    if (!writeEnabled) return { error: "This workspace bridge is read-only." };
+    const handler = standardHandlers[operation];
+    if (handler === undefined) return { error: `Unknown workspace operation: ${operation}` };
+    return handler(args);
+  };
+  const dispatchRegular = async (operation: string, args: Record<string, unknown>): Promise<Result> => {
+    const handler = regularHandlers[operation];
+    if (handler === undefined) return { error: `Unknown workspace operation: ${operation}` };
+    if (writeOperations.has(operation) && !writeEnabled) return { error: "This workspace bridge is read-only." };
+    return handler(args);
+  };
+  const dispatch = (operation: string, args: Record<string, unknown>): Promise<Result> =>
+    operation.startsWith("standard_") ? dispatchStandard(operation, args) : dispatchRegular(operation, args);
+
   return {
     async call(operation, args) {
       try {
-        if (operation.startsWith("standard_") && !writeEnabled) {
-          return { error: "This workspace bridge is read-only." };
-        }
-
-        if (operation === "standard_create") {
-          const relative = virtualPath(args.name);
-          try {
-            file(relative);
-            return { error: "A workspace file already exists at that path." };
-          } catch (error) {
-            if (error instanceof Error && error.message !== "Workspace file not found.") throw error;
-          }
-          const content = String(args.content ?? "");
-          const created = await room().workspace!.createFile(
-            relative,
-            Readable.from([Buffer.from(content)]),
-            "agent",
-          );
-          setFileExtractedText(room().conn, created.fileId, content);
-          return { path: `/${relative}`, created: true };
-        }
-
-        if (operation === "standard_write" || operation === "standard_edit") {
-          const row = fileLike(args.name);
-          if (!isText(row)) return { error: "This workspace tool edits text files only." };
-          const current = (await readAll(room().workspace!.readStream(row.id))).toString("utf8");
-          let next: string;
-          let occurrences = 1;
-          if (operation === "standard_write") {
-            next = String(args.content ?? "");
-          } else {
-            const oldText = String(args.old_text ?? "");
-            const newText = String(args.new_text ?? "");
-            if (oldText === "" || oldText === newText) return { error: "The edit needs different old and new text." };
-            occurrences = current.split(oldText).length - 1;
-            if (occurrences === 0) return { error: "The old text was not found." };
-            if (occurrences > 1 && args.all !== true) return { error: "The old text is not unique." };
-            next = args.all === true ? current.split(oldText).join(newText) : current.replace(oldText, newText);
-          }
-          if (args.dry_run === true) return { path: `/${row.relative_path}`, occurrences, dry_run: true };
-          await room().workspace!.snapshotVersion(
-            row.id,
-            operation === "standard_edit" ? "AI edit" : "AI rewrite",
-          );
-          await room().workspace!.writeAtomic(
-            row.id,
-            Readable.from([Buffer.from(next)]),
-            row.content_sha256 ?? undefined,
-          );
-          setFileExtractedText(room().conn, row.id, next);
-          return { path: `/${row.relative_path}`, occurrences };
-        }
-
-        if (operation === "standard_rename" || operation === "standard_move") {
-          const row = fileLike(args.name);
-          const parent = path.posix.dirname(row.relative_path);
-          let destination: string;
-          if (operation === "standard_rename") {
-            let newName = path.posix.basename(String(args.new_name ?? "").trim());
-            if (newName === "") return { error: "The new file name is empty." };
-            if (path.extname(newName) === "" && path.extname(row.relative_path) !== "") {
-              newName += path.extname(row.relative_path);
-            }
-            destination = parent === "." ? newName : path.posix.join(parent, newName);
-          } else {
-            const folder = String(args.folder ?? "").trim().replace(/^\/+|\/+$/g, "");
-            destination = folder === "" ? path.posix.basename(row.relative_path) : path.posix.join(folder, path.posix.basename(row.relative_path));
-          }
-          await room().workspace!.move(row.id, destination, row.content_sha256 ?? undefined);
-          return { old_path: `/${row.relative_path}`, path: `/${destination}` };
-        }
-
-        if (operation === "standard_trash") {
-          const names = Array.isArray(args.names) ? args.names : [];
-          const targets = names.map(fileLike);
-          for (const row of targets) {
-            await room().workspace!.trash(row.id, row.content_sha256 ?? undefined);
-          }
-          return { trashed: targets.map((row) => `/${row.relative_path}`) };
-        }
-
-        if (operation === "standard_unsupported") {
-          return { error: "This multi-file or structured edit is not available for workspace rooms yet." };
-        }
-
-        if (operation === "list") {
-          const base = virtualPath(args.path, true);
-          const prefix = base === "" ? "" : `${base}/`;
-          const entries = new Map<string, { path: string; is_dir: boolean; size: number; modified_at: string }>();
-          for (const row of rows()) {
-            if (!row.relative_path.startsWith(prefix)) continue;
-            const rest = row.relative_path.slice(prefix.length);
-            const [first, ...tail] = rest.split("/");
-            if (!first) continue;
-            const relative = prefix + first;
-            const displayed = `/${relative}${tail.length > 0 ? "/" : ""}`;
-            entries.set(displayed, {
-              path: displayed,
-              is_dir: tail.length > 0,
-              size: tail.length > 0 ? 0 : row.size_bytes,
-              modified_at: row.created_at,
-            });
-          }
-          return { entries: [...entries.values()].sort((a, b) => a.path.localeCompare(b.path)) };
-        }
-
-        if (operation === "read") {
-          const relative = virtualPath(args.path);
-          const row = file(relative);
-          if (!isText(row)) return { error: "This workspace tool reads text files only." };
-          const text = (await readAll(room().workspace!.readStream(row.id))).toString("utf8");
-          const lines = text.split(/\r?\n/);
-          const offset = Math.max(0, Number(args.offset) || 0);
-          const limit = Math.max(0, Math.min(2_000, Number(args.limit) || 2_000));
-          const end = Math.min(lines.length, offset + limit);
-          return {
-            file_data: {
-              content: lines.slice(offset, end).join("\n"),
-              encoding: "utf-8",
-              created_at: row.created_at,
-              modified_at: row.created_at,
-            },
-            total_lines: lines.length,
-            start_line: offset + 1,
-            end_line: end,
-            next_offset: end < lines.length ? end : null,
-          };
-        }
-
-        if (["write", "edit", "delete", "move", "rename"].includes(operation) && !writeEnabled) {
-          return { error: "This workspace bridge is read-only." };
-        }
-
-        if (operation === "move" || operation === "rename") {
-          const source = virtualPath(args.source_path);
-          const row = file(source);
-          let destination: string;
-          if (operation === "move") {
-            destination = virtualPath(args.destination_path);
-          } else {
-            const requested = typeof args.new_name === "string" ? args.new_name.trim() : "";
-            if (
-              requested === "" || requested === "." || requested === ".." ||
-              requested.includes("/") || requested.includes("\\") ||
-              requested.toLocaleLowerCase("en-US") === ".arcelle"
-            ) {
-              return { error: "The new name must be one safe file name." };
-            }
-            const parent = path.posix.dirname(row.relative_path);
-            destination = parent === "." ? requested : path.posix.join(parent, requested);
-          }
-          await room().workspace!.move(row.id, destination, row.content_sha256 ?? undefined);
-          return { old_path: `/${row.relative_path}`, path: `/${destination}` };
-        }
-
-        if (operation === "write") {
-          const relative = virtualPath(args.path);
-          const content = String(args.content ?? "");
-          let row: FileRow | undefined;
-          try { row = file(relative); } catch { row = undefined; }
-          if (row === undefined) {
-            const created = await room().workspace!.createFile(
-              relative,
-              Readable.from([Buffer.from(content)]),
-              "agent",
-            );
-            setFileExtractedText(room().conn, created.fileId, content);
-          } else {
-            await room().workspace!.snapshotVersion(row.id, "Agent workspace rewrite");
-            await room().workspace!.writeAtomic(
-              row.id,
-              Readable.from([Buffer.from(content)]),
-              row.content_sha256 ?? undefined,
-            );
-            setFileExtractedText(room().conn, row.id, content);
-          }
-          return { path: `/${relative}` };
-        }
-
-        if (operation === "edit") {
-          const relative = virtualPath(args.path);
-          const row = file(relative);
-          if (!isText(row)) return { error: "This workspace tool edits text files only." };
-          const current = (await readAll(room().workspace!.readStream(row.id))).toString("utf8");
-          const oldText = String(args.old_string ?? "");
-          const newText = String(args.new_string ?? "");
-          if (oldText === "" || oldText === newText) return { error: "The edit needs different old and new text." };
-          const occurrences = current.split(oldText).length - 1;
-          if (occurrences === 0) return { error: "The old text was not found." };
-          if (occurrences > 1 && args.replace_all !== true) return { error: "The old text is not unique." };
-          const next = args.replace_all === true ? current.split(oldText).join(newText) : current.replace(oldText, newText);
-          await room().workspace!.snapshotVersion(row.id, "Agent workspace edit");
-          await room().workspace!.writeAtomic(
-            row.id,
-            Readable.from([Buffer.from(next)]),
-            row.content_sha256 ?? undefined,
-          );
-          setFileExtractedText(room().conn, row.id, next);
-          return { path: `/${relative}`, occurrences: args.replace_all === true ? occurrences : 1 };
-        }
-
-        if (operation === "delete") {
-          const relative = virtualPath(args.path);
-          const row = file(relative);
-          await room().workspace!.trash(row.id, row.content_sha256 ?? undefined);
-          return { path: `/${relative}` };
-        }
-
-        if (operation === "glob") {
-          const base = virtualPath(args.path, true);
-          const pattern = String(args.pattern ?? "*");
-          const matches = rows()
-            .filter((row) => base === "" || row.relative_path === base || row.relative_path.startsWith(`${base}/`))
-            .filter((row) => path.matchesGlob(row.relative_path.slice(base === "" ? 0 : base.length + 1), pattern))
-            .map((row) => ({ path: `/${row.relative_path}`, is_dir: false, size: row.size_bytes, modified_at: row.created_at }));
-          return { matches, truncated: false };
-        }
-
-        if (operation === "grep") {
-          const base = virtualPath(args.path, true);
-          const needle = String(args.pattern ?? "");
-          const maxCount = Math.max(1, Math.min(1_000, Number(args.max_count) || 1_000));
-          const matches: Array<{ path: string; line: number; text: string }> = [];
-          for (const row of rows()) {
-            if (!isText(row) || (base !== "" && !row.relative_path.startsWith(`${base}/`))) continue;
-            const text = (await readAll(room().workspace!.readStream(row.id))).toString("utf8");
-            for (const [index, line] of text.split(/\r?\n/).entries()) {
-              if (line.includes(needle)) matches.push({ path: `/${row.relative_path}`, line: index + 1, text: line });
-              if (matches.length >= maxCount) return { matches, truncated: true };
-            }
-          }
-          return { matches, truncated: false };
-        }
-
-        return { error: `Unknown workspace operation: ${operation}` };
+        return await dispatch(operation, args);
       } catch (error) {
         return { error: error instanceof Error ? error.message : String(error) };
       }

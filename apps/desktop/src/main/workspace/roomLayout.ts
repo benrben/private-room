@@ -183,61 +183,91 @@ export function acquireWorkspaceLease(rootPath: string): WorkspaceLease {
   readWorkspaceMarker(rootPath);
   const lockPath = privatePath(rootPath, LOCK_FILE);
   const token = randomUUID();
-  const record = () => ({
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const lease = tryCreateWorkspaceLease(rootPath, lockPath, token);
+    if (lease !== null) return lease;
+    const existing = readExistingLease(lockPath);
+    if (leaseBelongsToCopiedRoot(existing, rootPath)) {
+      rmSync(lockPath, { force: true });
+      continue;
+    }
+    if (hasActiveLocalLease(existing)) throw new WorkspaceLeaseConflictError(false);
+    if (hasFreshRemoteLease(existing)) throw new WorkspaceLeaseConflictError(true);
+    rmSync(lockPath, { force: true });
+  }
+  throw new Error("Could not acquire the room write lease.");
+}
+
+interface LeaseRecord {
+  token?: string;
+  pid?: number;
+  host?: string;
+  rootPath?: string;
+  renewedAt?: string;
+  createdAt?: string;
+}
+
+function leaseRecord(token: string, rootPath: string): LeaseRecord {
+  return {
     token,
     pid: process.pid,
     host: os.hostname(),
     rootPath: path.resolve(rootPath),
     createdAt: new Date().toISOString(),
     renewedAt: new Date().toISOString(),
-  });
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const fd = openSync(lockPath, "wx", 0o600);
-      try { writeFileSync(fd, `${JSON.stringify(record())}\n`, "utf8"); } finally { closeSync(fd); }
-      const lease = { token, lockPath } as WorkspaceLease;
-      lease.renewal = setInterval(() => {
-        try {
-          const existing = JSON.parse(readFileSync(lease.lockPath, "utf8")) as { token?: string };
-          if (existing.token === token) {
-            writeFileSync(lease.lockPath, `${JSON.stringify(record())}\n`, { encoding: "utf8", mode: 0o600 });
-          }
-        } catch {
-          // A missing lease is handled as a lost lease by the next open or
-          // write lifecycle. Renewal never recreates a lock it no longer owns.
-        }
-      }, Math.floor(REMOTE_LEASE_STALE_MS / 3));
-      lease.renewal.unref?.();
-      return lease;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      let existing: {
-        pid?: number;
-        host?: string;
-        rootPath?: string;
-        renewedAt?: string;
-        createdAt?: string;
-      } = {};
-      try { existing = JSON.parse(readFileSync(lockPath, "utf8")); } catch { /* stale/corrupt */ }
-      // Finder copies `.arcelle/room.lock` together with the room. A lock
-      // explicitly naming another root never owns this copied folder.
-      if (existing.rootPath !== undefined && path.resolve(existing.rootPath) !== path.resolve(rootPath)) {
-        rmSync(lockPath, { force: true });
-        continue;
-      }
-      if (existing.host === os.hostname() && processIsAlive(Number(existing.pid))) {
-        throw new WorkspaceLeaseConflictError(false);
-      }
-      if (existing.host !== undefined && existing.host !== os.hostname()) {
-        const renewed = Date.parse(existing.renewedAt ?? existing.createdAt ?? "");
-        if (Number.isFinite(renewed) && Date.now() - renewed <= REMOTE_LEASE_STALE_MS) {
-          throw new WorkspaceLeaseConflictError(true);
-        }
-      }
-      rmSync(lockPath, { force: true });
-    }
+  };
+}
+
+function tryCreateWorkspaceLease(rootPath: string, lockPath: string, token: string): WorkspaceLease | null {
+  try {
+    const fd = openSync(lockPath, "wx", 0o600);
+    try { writeFileSync(fd, `${JSON.stringify(leaseRecord(token, rootPath))}\n`, "utf8"); } finally { closeSync(fd); }
+    return workspaceLeaseWithRenewal(rootPath, lockPath, token);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
+    throw error;
   }
-  throw new Error("Could not acquire the room write lease.");
+}
+
+function workspaceLeaseWithRenewal(rootPath: string, lockPath: string, token: string): WorkspaceLease {
+  const lease = { token, lockPath } as WorkspaceLease;
+  lease.renewal = setInterval(() => renewWorkspaceLease(rootPath, lease), Math.floor(REMOTE_LEASE_STALE_MS / 3));
+  lease.renewal.unref?.();
+  return lease;
+}
+
+function renewWorkspaceLease(rootPath: string, lease: WorkspaceLease): void {
+  try {
+    const existing = JSON.parse(readFileSync(lease.lockPath, "utf8")) as LeaseRecord;
+    if (existing.token === lease.token) {
+      writeFileSync(lease.lockPath, `${JSON.stringify(leaseRecord(lease.token, rootPath))}\n`, { encoding: "utf8", mode: 0o600 });
+    }
+  } catch {
+    // A missing lease is handled as a lost lease by the next open or write
+    // lifecycle. Renewal never recreates a lock it no longer owns.
+  }
+}
+
+function readExistingLease(lockPath: string): LeaseRecord {
+  try {
+    return JSON.parse(readFileSync(lockPath, "utf8")) as LeaseRecord;
+  } catch {
+    return {};
+  }
+}
+
+function leaseBelongsToCopiedRoot(existing: LeaseRecord, rootPath: string): boolean {
+  return existing.rootPath !== undefined && path.resolve(existing.rootPath) !== path.resolve(rootPath);
+}
+
+function hasActiveLocalLease(existing: LeaseRecord): boolean {
+  return existing.host === os.hostname() && processIsAlive(Number(existing.pid));
+}
+
+function hasFreshRemoteLease(existing: LeaseRecord): boolean {
+  if (existing.host === undefined || existing.host === os.hostname()) return false;
+  const renewed = Date.parse(existing.renewedAt ?? existing.createdAt ?? "");
+  return Number.isFinite(renewed) && Date.now() - renewed <= REMOTE_LEASE_STALE_MS;
 }
 
 /** Give a raw Finder copy a new identity after the user explicitly registers it. */

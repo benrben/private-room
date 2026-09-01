@@ -51,6 +51,14 @@ interface RecoveryWrap {
   ct: string;
 }
 
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function hasRecoveryWrapStrings(value: Record<string, unknown>): boolean {
+  return ["salt", "nonce", "ct"].every((field) => typeof value[field] === "string");
+}
+
 /**
  * Structural check standing in for serde's `RecoveryWrap` deserialization.
  * `v` must be a non-negative INTEGER — Rust's field is a `u32`, so a
@@ -63,14 +71,7 @@ function isRecoveryWrapShape(value: unknown): value is RecoveryWrap {
     return false;
   }
   const o = value as Record<string, unknown>;
-  return (
-    typeof o.v === "number" &&
-    Number.isInteger(o.v) &&
-    o.v >= 0 &&
-    typeof o.salt === "string" &&
-    typeof o.nonce === "string" &&
-    typeof o.ct === "string"
-  );
+  return isNonNegativeInteger(o.v) && hasRecoveryWrapStrings(o);
 }
 
 /** Stretch a (normalized) recovery code + salt into a 32-byte AES key. */
@@ -245,21 +246,19 @@ function decodeBase64Strict(value: string): Buffer {
 
 const CORRUPT = "The recovery file is corrupt.";
 
-/**
- * Recover the ROOM PASSWORD from its recovery sidecar + code, WITHOUT
- * opening the room. The app's recovery-unlock command needs the plaintext
- * password to hold in memory (for rekey / change-password / duplicate), so
- * this is split out from `openWithRecovery`. A wrong code (or a
- * missing/corrupt sidecar) rejects — never a crash.
- */
-export async function recoverPassword(roomPath: string, code: string): Promise<string> {
+interface DecodedRecoveryWrap {
+  salt: Buffer;
+  nonce: Buffer;
+  combined: Buffer;
+}
+
+async function readRecoveryWrap(roomPath: string): Promise<RecoveryWrap> {
   let json: string;
   try {
     json = await fsp.readFile(recoverySidecarPath(roomPath), "utf8");
   } catch {
     throw new Error("No recovery key was set up for this room.");
   }
-
   let parsed: unknown;
   try {
     parsed = JSON.parse(json);
@@ -269,39 +268,44 @@ export async function recoverPassword(roomPath: string, code: string): Promise<s
   if (!isRecoveryWrapShape(parsed)) {
     throw new Error("The recovery file is unreadable.");
   }
-  const wrap = parsed;
-  if (wrap.v !== 1) {
+  if (parsed.v !== 1) {
     throw new Error("This recovery file was written by a newer version.");
   }
+  return parsed;
+}
 
-  let salt: Buffer;
-  let nonce: Buffer;
-  let combined: Buffer;
+function decodeRecoveryWrap(wrap: RecoveryWrap): DecodedRecoveryWrap {
   try {
-    salt = decodeBase64Strict(wrap.salt);
-    nonce = decodeBase64Strict(wrap.nonce);
-    combined = decodeBase64Strict(wrap.ct);
+    return {
+      salt: decodeBase64Strict(wrap.salt),
+      nonce: decodeBase64Strict(wrap.nonce),
+      combined: decodeBase64Strict(wrap.ct),
+    };
   } catch {
     throw new Error(CORRUPT);
   }
+}
+
+function assertCiphertextShape(nonce: Buffer, combined: Buffer): void {
   if (nonce.length !== 12 || combined.length < 16) {
     throw new Error(CORRUPT);
   }
+}
 
-  const normalized = normalizeCode(code);
-  const key = deriveRecoveryKey(normalized, salt);
-  const body = combined.subarray(0, combined.length - 16);
-  const tag = combined.subarray(combined.length - 16);
-
-  let decrypted: Buffer;
+function decryptRecoveryPassword(code: string, decoded: DecodedRecoveryWrap): Buffer {
+  const key = deriveRecoveryKey(normalizeCode(code), decoded.salt);
+  const body = decoded.combined.subarray(0, decoded.combined.length - 16);
+  const tag = decoded.combined.subarray(decoded.combined.length - 16);
   try {
-    const decipher = createDecipheriv("aes-256-gcm", key, nonce);
+    const decipher = createDecipheriv("aes-256-gcm", key, decoded.nonce);
     decipher.setAuthTag(tag);
-    decrypted = Buffer.concat([decipher.update(body), decipher.final()]);
+    return Buffer.concat([decipher.update(body), decipher.final()]);
   } catch {
     throw new Error("That recovery code is not correct.");
   }
+}
 
+function decodedPassword(decrypted: Buffer): string {
   try {
     // `fatal: true` rejects invalid UTF-8 instead of silently substituting
     // U+FFFD, mirroring Rust's `String::from_utf8` returning `Err`.
@@ -309,6 +313,19 @@ export async function recoverPassword(roomPath: string, code: string): Promise<s
   } catch {
     throw new Error("That recovery code is not correct.");
   }
+}
+
+/**
+ * Recover the ROOM PASSWORD from its recovery sidecar + code, WITHOUT
+ * opening the room. The app's recovery-unlock command needs the plaintext
+ * password to hold in memory (for rekey / change-password / duplicate), so
+ * this is split out from `openWithRecovery`. A wrong code (or a
+ * missing/corrupt sidecar) rejects — never a crash.
+ */
+export async function recoverPassword(roomPath: string, code: string): Promise<string> {
+  const decoded = decodeRecoveryWrap(await readRecoveryWrap(roomPath));
+  assertCiphertextShape(decoded.nonce, decoded.combined);
+  return decodedPassword(decryptRecoveryPassword(code, decoded));
 }
 
 /**

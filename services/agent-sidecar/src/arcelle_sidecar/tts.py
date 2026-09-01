@@ -218,6 +218,43 @@ def _break_at(window: str) -> int:
     return at + 1 if at > 0 else len(window)
 
 
+def _flush_tts_piece(pieces: list[str], current: str) -> str:
+    """Append a buffered piece when it exists and reset that buffer."""
+    if current:
+        pieces.append(current)
+    return ""
+
+
+def _split_overlimit_tts_chunk(chunk: str, limit: int) -> tuple[list[str], str]:
+    """Return complete safe pieces and the final short remainder of ``chunk``."""
+    pieces: list[str] = []
+    while len(chunk) > limit:
+        cut = _break_at(chunk[:limit])
+        head = chunk[:cut].strip()
+        if head:
+            pieces.append(head)
+        chunk = chunk[cut:].lstrip()
+    return pieces, chunk
+
+
+def _buffer_tts_chunk(pieces: list[str], current: str, chunk: str, limit: int) -> str:
+    """Add a sentence-sized chunk to its piece buffer without crossing ``limit``."""
+    if current and len(current) + 1 + len(chunk) > limit:
+        pieces.append(current)
+        return chunk
+    return f"{current} {chunk}".strip()
+
+
+def _place_tts_chunk(pieces: list[str], current: str, chunk: str, limit: int) -> str:
+    """Record an over-limit chunk or buffer a sentence-sized one."""
+    if len(chunk) <= limit:
+        return _buffer_tts_chunk(pieces, current, chunk, limit)
+    current = _flush_tts_piece(pieces, current)
+    complete, remainder = _split_overlimit_tts_chunk(chunk, limit)
+    pieces.extend(complete)
+    return remainder
+
+
 def split_for_tts(text: str, limit: int = MAX_TTS_CHARS) -> list[str]:
     """Break one turn into pieces the service will accept, on sentence ends.
 
@@ -247,26 +284,8 @@ def split_for_tts(text: str, limit: int = MAX_TTS_CHARS) -> list[str]:
         chunk = chunk.strip()
         if not chunk:
             continue
-        if len(chunk) > limit:
-            if current:
-                pieces.append(current)
-                current = ""
-            while len(chunk) > limit:
-                cut = _break_at(chunk[:limit])
-                head = chunk[:cut].strip()
-                if head:
-                    pieces.append(head)
-                chunk = chunk[cut:].lstrip()
-            if chunk:
-                current = chunk
-            continue
-        if current and len(current) + 1 + len(chunk) > limit:
-            pieces.append(current)
-            current = chunk
-        else:
-            current = f"{current} {chunk}".strip()
-    if current:
-        pieces.append(current)
+        current = _place_tts_chunk(pieces, current, chunk, limit)
+    _flush_tts_piece(pieces, current)
     return pieces
 
 
@@ -286,6 +305,56 @@ def _wav_from_frames(frames: bytes, fs: int) -> bytes:
         w.setframerate(fs)
         w.writeframes(frames)
     return buf.getvalue()
+
+
+def _podcast_gap(gap_ms: int) -> bytes:
+    return b"\x00\x00" * int(PODCAST_SAMPLE_RATE * max(0, gap_ms) / 1000)
+
+
+def _podcast_offset_ms(frames: bytearray) -> int:
+    return int(len(frames) / 2 / PODCAST_SAMPLE_RATE * 1000)
+
+
+def _podcast_turn_settings(turn: dict[str, str]) -> tuple[str, str, str]:
+    return (
+        turn.get("voice") or DEFAULT_VOICE,
+        turn.get("rate") or DEFAULT_RATE,
+        turn.get("pitch") or DEFAULT_PITCH,
+    )
+
+
+async def _append_podcast_pieces(
+    frames: bytearray, text: str, voice: str, rate: str, pitch: str
+) -> None:
+    for piece in split_for_tts(text):
+        mp3 = await synthesize_mp3(piece, voice, rate, pitch)
+        wav = await asyncio.to_thread(mp3_to_wav, mp3, PODCAST_SAMPLE_RATE)
+        clip, fs = await asyncio.to_thread(_wav_frames, wav)
+        if fs != PODCAST_SAMPLE_RATE:  # afconvert was asked; belt and braces
+            raise TtsError(f"voice {voice} decoded at {fs} Hz, expected {PODCAST_SAMPLE_RATE}")
+        frames.extend(clip)
+
+
+async def _append_podcast_turn(
+    frames: bytearray, turn: dict[str, str], index: int, gap_frames: bytes
+) -> int:
+    text = (turn.get("text") or "").strip()
+    offset = _podcast_offset_ms(frames)
+    if not text:
+        return offset
+    if index:
+        frames.extend(gap_frames)
+        offset = _podcast_offset_ms(frames)
+    voice, rate, pitch = _podcast_turn_settings(turn)
+    await _append_podcast_pieces(frames, text, voice, rate, pitch)
+    return offset
+
+
+async def _normalized_podcast(frames: bytearray) -> tuple[bytes, int]:
+    duration_ms = _podcast_offset_ms(frames)
+    mixed = _wav_from_frames(bytes(frames), PODCAST_SAMPLE_RATE)
+    normalized = await asyncio.to_thread(normalize_wav, mixed, TARGET_LUFS)
+    return normalized, duration_ms
 
 
 async def synthesize_podcast(
@@ -309,43 +378,15 @@ async def synthesize_podcast(
     """
     if not turns:
         raise TtsError("a podcast needs at least one turn")
-    gap_frames = b"\x00\x00" * int(PODCAST_SAMPLE_RATE * max(0, gap_ms) / 1000)
+    gap_frames = _podcast_gap(gap_ms)
     frames = bytearray()
     offsets: list[int] = []
-
-    def ms_so_far() -> int:
-        return int(len(frames) / 2 / PODCAST_SAMPLE_RATE * 1000)
-
-    for i, turn in enumerate(turns):
-        text = (turn.get("text") or "").strip()
-        # An empty line still gets an offset, so the caller's turn list and the
-        # offsets list stay index-aligned — a silently shorter list would
-        # mis-stamp every following line in the transcript.
-        offsets.append(ms_so_far())
-        if not text:
-            continue
-        if i:
-            frames.extend(gap_frames)
-            offsets[-1] = ms_so_far()
-        voice = turn.get("voice") or DEFAULT_VOICE
-        rate = turn.get("rate") or DEFAULT_RATE
-        pitch = turn.get("pitch") or DEFAULT_PITCH
-        for piece in split_for_tts(text):
-            mp3 = await synthesize_mp3(piece, voice, rate, pitch)
-            wav = await asyncio.to_thread(mp3_to_wav, mp3, PODCAST_SAMPLE_RATE)
-            clip, fs = await asyncio.to_thread(_wav_frames, wav)
-            if fs != PODCAST_SAMPLE_RATE:  # afconvert was asked; belt and braces
-                raise TtsError(f"voice {voice} decoded at {fs} Hz, expected {PODCAST_SAMPLE_RATE}")
-            frames.extend(clip)
+    for index, turn in enumerate(turns):
+        offsets.append(await _append_podcast_turn(frames, turn, index, gap_frames))
     if not frames:
         raise TtsError("every turn was empty — nothing to record")
-    duration_ms = ms_so_far()
-    mixed = _wav_from_frames(bytes(frames), PODCAST_SAMPLE_RATE)
-    return (
-        await asyncio.to_thread(normalize_wav, mixed, TARGET_LUFS),
-        offsets,
-        duration_ms,
-    )
+    wav, duration_ms = await _normalized_podcast(frames)
+    return wav, offsets, duration_ms
 
 
 # --- BS.1770 loudness --------------------------------------------------------
@@ -397,33 +438,78 @@ def _biquad(samples: list[float], c: tuple[float, float, float, float, float]) -
     return out
 
 
+def _mean_square(samples: list[float]) -> float:
+    return sum(sample * sample for sample in samples) / max(1, len(samples))
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / max(1, len(values))
+
+
+def _lufs_for_power(mean_square: float, silence_lufs: float) -> float:
+    if mean_square > 0:
+        return -0.691 + 10.0 * math.log10(mean_square)
+    return silence_lufs
+
+
+def _k_weighted_samples(samples: list[float], fs: int) -> list[float]:
+    return _biquad(_biquad(samples, _shelf_coeffs(fs)), _highpass_coeffs(fs))
+
+
+def _block_powers(samples: list[float], block: int) -> list[float]:
+    hop = block // 4  # 75% overlap
+    return [
+        _mean_square(samples[start : start + block])
+        for start in range(0, len(samples) - block + 1, hop)
+    ]
+
+
+def _block_loudness(powers: list[float]) -> list[float]:
+    return [_lufs_for_power(power, -200.0) for power in powers]
+
+
+def _absolute_gated_powers(powers: list[float], loudness: list[float]) -> list[float]:
+    return [power for power, lufs in zip(powers, loudness) if lufs > -70.0]
+
+
+def _relative_gate(powers: list[float]) -> float:
+    return _lufs_for_power(_mean(powers), -200.0) - 10.0
+
+
+def _relative_gated_powers(
+    powers: list[float], loudness: list[float], relative_gate: float
+) -> list[float]:
+    return [
+        power
+        for power, lufs in zip(powers, loudness)
+        if lufs > -70.0 and lufs > relative_gate
+    ]
+
+
+def _gated_lufs(samples: list[float], block: int) -> float:
+    powers = _block_powers(samples, block)
+    loudness = _block_loudness(powers)
+    absolute_gated = _absolute_gated_powers(powers, loudness)
+    if not absolute_gated:
+        return -70.0
+    relative_gated = _relative_gated_powers(
+        powers, loudness, _relative_gate(absolute_gated)
+    )
+    selected = relative_gated or absolute_gated
+    return _lufs_for_power(_mean(selected), -200.0)
+
+
 def measure_lufs(samples: list[float], fs: int) -> float:
     """Integrated loudness (LUFS) of mono float samples, BS.1770-4 gated.
 
     Signals shorter than one 400 ms gating block fall back to the ungated
     mean square — sentence fragments must still normalize sanely.
     """
-    k = _biquad(_biquad(samples, _shelf_coeffs(fs)), _highpass_coeffs(fs))
+    k_weighted = _k_weighted_samples(samples, fs)
     block = int(0.4 * fs)
-    if len(k) < block or block == 0:
-        ms = sum(v * v for v in k) / max(1, len(k))
-        return -0.691 + 10.0 * math.log10(ms) if ms > 0 else -70.0
-    hop = block // 4  # 75% overlap
-    blocks: list[float] = []
-    for start in range(0, len(k) - block + 1, hop):
-        seg = k[start : start + block]
-        blocks.append(sum(v * v for v in seg) / block)
-    loud = [-0.691 + 10.0 * math.log10(z) if z > 0 else -200.0 for z in blocks]
-    # Absolute gate at -70 LUFS.
-    kept = [z for z, lz in zip(blocks, loud) if lz > -70.0]
-    if not kept:
-        return -70.0
-    # Relative gate 10 LU under the absolute-gated mean.
-    rel = -0.691 + 10.0 * math.log10(sum(kept) / len(kept)) - 10.0
-    final = [z for z, lz in zip(blocks, loud) if lz > -70.0 and lz > rel]
-    if not final:
-        final = kept
-    return -0.691 + 10.0 * math.log10(sum(final) / len(final))
+    if len(k_weighted) < block or block == 0:
+        return _lufs_for_power(_mean_square(k_weighted), -70.0)
+    return _gated_lufs(k_weighted, block)
 
 
 def _soft_limit(v: float, knee: float = LIMITER_KNEE) -> float:

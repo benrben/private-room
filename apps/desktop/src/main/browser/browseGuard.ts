@@ -20,11 +20,10 @@ import { checkPublicHttpUrl, resolvePublicAddr } from "./guard.js";
  * navigates under.
  */
 export async function browseGuardUrl(url: string): Promise<string> {
+  // `checkPublicHttpUrl` has already refused a URL without a host, so the
+  // hostname below is always present.
   const parsed = checkPublicHttpUrl(url);
   const host = parsed.hostname;
-  if (!host) {
-    throw new Error("Invalid URL: no host.");
-  }
   // Rust's `port_or_known_default()`: the URL's own port, else the scheme's.
   // `checkPublicHttpUrl` has already refused anything that is not http(s).
   const port = parsed.port ? Number(parsed.port) : parsed.protocol === "http:" ? 80 : 443;

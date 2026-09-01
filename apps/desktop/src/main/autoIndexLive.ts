@@ -14,6 +14,16 @@ import { summarizeOneFile } from "./summarizeTools.js";
 import type { EventSender } from "./turn.js";
 
 const FILLER_LIMIT = 50;
+type OpenRoom = NonNullable<RoomManagerState["room"]>;
+type SummaryFillerFile = ReturnType<typeof filesMissingSummary>[number];
+
+interface SummaryFillerPass {
+  epoch: number;
+  model: string;
+  room: OpenRoom;
+  roomPath: string;
+  state: RoomManagerState;
+}
 
 async function resolveEngine(state: RoomManagerState): Promise<{ chatModel: string; lane: Lane }> {
   if (state.room === null) throw new Error("No room is open.");
@@ -36,6 +46,99 @@ function installRecordingReadStarter(
   deps.jobQueue = { ...deps.jobQueue, starters };
 }
 
+function currentSummaryFillerRoom(
+  state: RoomManagerState,
+  roomPath: string,
+  epoch: number,
+): OpenRoom | null {
+  const room = state.room;
+  if (room === null) return null;
+  if (room.path !== roomPath) return null;
+  if (state.roomEpoch !== epoch) return null;
+  return room;
+}
+
+async function waitForSummaryFillerDelay(delaySecs: number): Promise<void> {
+  if (delaySecs > 0) await new Promise((resolve) => setTimeout(resolve, delaySecs * 1_000));
+}
+
+async function summaryFillerPass(
+  state: RoomManagerState,
+  roomPath: string,
+  epoch: number,
+): Promise<SummaryFillerPass | null> {
+  const models = await listModels();
+  if (models.length === 0) return null;
+  const room = currentSummaryFillerRoom(state, roomPath, epoch);
+  if (room === null) return null;
+  return { epoch, model: modelSetting(room.conn) ?? bestLocalDefault(models), room, roomPath, state };
+}
+
+async function summarizeFillerFile(
+  model: string,
+  name: string,
+  mime: string,
+  text: string,
+): Promise<string> {
+  return summarizeOneFile(model, name, mime, text, "2m").catch(() => "");
+}
+
+async function writeSummaryFillerFile(
+  pass: SummaryFillerPass,
+  [id, name, mime, sample]: SummaryFillerFile,
+): Promise<boolean | null> {
+  if (pass.state.cancel.cancels.size > 0) return null;
+  const room = currentSummaryFillerRoom(pass.state, pass.roomPath, pass.epoch);
+  if (room === null) return null;
+  const full = getFileExtractedText(room.conn, id) ?? sample;
+  const summary = await summarizeFillerFile(pass.model, name, mime, full);
+  if (summary === "") return null;
+  const current = currentSummaryFillerRoom(pass.state, pass.roomPath, pass.epoch);
+  if (current === null) return null;
+  setFileAiSummary(current.conn, id, summary);
+  return true;
+}
+
+async function fillMissingSummaries(pass: SummaryFillerPass): Promise<boolean | null> {
+  const batch = filesMissingSummary(pass.room.conn, FILLER_LIMIT);
+  let wrote = false;
+  for (const file of batch) {
+    const didWrite = await writeSummaryFillerFile(pass, file);
+    if (didWrite === null) return null;
+    wrote = wrote || didWrite;
+  }
+  return wrote;
+}
+
+async function runSummaryFiller(
+  state: RoomManagerState,
+  emit: EventSender,
+  roomPath: string,
+  delaySecs: number,
+  epoch: number,
+): Promise<void> {
+  await waitForSummaryFillerDelay(delaySecs);
+  const pass = await summaryFillerPass(state, roomPath, epoch);
+  if (pass === null) return;
+  const wrote = await fillMissingSummaries(pass);
+  if (wrote) emit("room-files-changed", {});
+}
+
+async function runSummaryFillerAndRelease(
+  state: RoomManagerState,
+  emit: EventSender,
+  roomPath: string,
+  delaySecs: number,
+  epoch: number,
+  release: () => void,
+): Promise<void> {
+  try {
+    await runSummaryFiller(state, emit, roomPath, delaySecs, epoch);
+  } finally {
+    release();
+  }
+}
+
 /** One bounded, single-flight quiet pass, matching the former host filler. */
 function createSummaryFiller(state: RoomManagerState, emit: EventSender) {
   let running = false;
@@ -43,32 +146,8 @@ function createSummaryFiller(state: RoomManagerState, emit: EventSender) {
     if (running) return;
     running = true;
     const epoch = state.roomEpoch;
-    void (async () => {
-      try {
-        if (delaySecs > 0) await new Promise((resolve) => setTimeout(resolve, delaySecs * 1_000));
-        const models = await listModels();
-        const open = state.room;
-        if (models.length === 0 || open === null || open.path !== roomPath || state.roomEpoch !== epoch) return;
-        const model = modelSetting(open.conn) ?? bestLocalDefault(models);
-        const batch = filesMissingSummary(open.conn, FILLER_LIMIT);
-        let wrote = false;
-        for (const [id, name, mime, sample] of batch) {
-          if (state.cancel.cancels.size > 0) return;
-          const room = state.room;
-          if (room === null || room.path !== roomPath || state.roomEpoch !== epoch) return;
-          const full = getFileExtractedText(room.conn, id) ?? sample;
-          const summary = await summarizeOneFile(model, name, mime, full, "2m").catch(() => "");
-          if (summary === "") return;
-          const current = state.room;
-          if (current === null || current.path !== roomPath || state.roomEpoch !== epoch) return;
-          setFileAiSummary(current.conn, id, summary);
-          wrote = true;
-        }
-        if (wrote) emit("room-files-changed", {});
-      } finally {
-        running = false;
-      }
-    })().catch((error) => console.error("summary filler failed:", error));
+    void runSummaryFillerAndRelease(state, emit, roomPath, delaySecs, epoch, () => { running = false; })
+      .catch((error) => console.error("summary filler failed:", error));
   };
 }
 

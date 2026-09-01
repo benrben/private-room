@@ -688,6 +688,17 @@ describe("pullCancellableAt", () => {
     });
   });
 
+  it("explains a successful response that has no stream body", async () => {
+    const base = await listenOn((_req, res) => {
+      res.writeHead(204);
+      res.end();
+    });
+    expect(await pullCancellableAt(base, "qwen2.5vl", new CancelFlag(), () => {})).toEqual({
+      kind: "error",
+      message: "Download failed: the sidecar returned no body",
+    });
+  });
+
   it("surfaces a refused connection as OLLAMA_DOWN", async () => {
     const outcome = await pullCancellableAt(await deadBaseUrl(), "qwen2.5vl", new CancelFlag(), () => {});
     expect(outcome).toEqual({ kind: "error", message: "OLLAMA_DOWN" });

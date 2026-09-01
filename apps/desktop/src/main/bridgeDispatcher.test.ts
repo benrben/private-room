@@ -19,6 +19,7 @@ import {
   AdvisorRuntime,
   MCP_RUN_TOOL,
   MCP_SEARCH_TOOL,
+  MAX_MCP_SEARCH_RESULTS,
   RoomToolDispatcher,
   WEB_LANES_ALL,
   arcelleToolAnnotations,
@@ -45,6 +46,7 @@ import {
   toolCancelFor,
   toolResult,
   createWebThrottle,
+  effectiveRoomToolNamesWith,
   withWebBrake,
   WEB_THROTTLE_COOLDOWN_MS,
   type RedactionPolicy,
@@ -95,6 +97,7 @@ describe("ToolScope predicates", () => {
   it("label: distinguishes CloudAdvisor+mcp from plain CloudAdvisor", () => {
     expect(scopeLabel(CLOUD_ADVISOR_MCP)).toBe("CloudAdvisor+mcp");
     expect(scopeLabel(CLOUD_ADVISOR_PLAIN)).toBe("CloudAdvisor");
+    expect(scopeLabel(CLOUD_ENGINE)).toBe("CloudEngine");
     expect(scopeLabel(LOCAL_ENGINE)).toBe("LocalEngine");
     expect(scopeLabel(EXTERNAL_AGENT)).toBe("ExternalAgent");
   });
@@ -936,6 +939,21 @@ describe("RoomToolDispatcher.callTool — search_mcp_tools / run_mcp_tool", () =
     expect(result.isError).toBe(true);
   });
 
+  it("reports a narrowed follow-up when connected-tool search has more than one page", async () => {
+    const routes = Array.from({ length: MAX_MCP_SEARCH_RESULTS + 1 }, (_, index): McpRoute => ({
+      catalogName: `acme_stock_${index}`,
+      toolName: `stock_${index}`,
+      serverName: "acme",
+      remote: false,
+      spec: { type: "function", function: { name: `acme_stock_${index}`, description: "Stock lookup", parameters: {} } },
+    }));
+    const dispatcher = new RoomToolDispatcher(baseOpts({ routes }));
+    const result = await dispatcher.callTool(LOCAL_ENGINE, MCP_SEARCH_TOOL, { query: "stock" });
+    const body = JSON.parse((result.content[0] as { text: string }).text);
+    expect(body).toMatchObject({ count: MAX_MCP_SEARCH_RESULTS, total_matches: MAX_MCP_SEARCH_RESULTS + 1 });
+    expect(body.next).toContain("Showing the");
+  });
+
   it("run_mcp_tool rewrites the dispatch to the target connector tool and calls it for real", async () => {
     let seenArgs: unknown;
     const dispatcher = new RoomToolDispatcher(
@@ -963,6 +981,25 @@ describe("RoomToolDispatcher.callTool — search_mcp_tools / run_mcp_tool", () =
     const result = await dispatcher.callTool(LOCAL_ENGINE, MCP_RUN_TOOL, { tool: "not_connected", arguments: {} });
     expect(result.isError).toBe(true);
     expect((result.content[0] as { text: string }).text).toContain("Unknown or disconnected");
+  });
+
+  it("describes an unsupported function-valued nested argument without throwing", async () => {
+    const dispatcher = new RoomToolDispatcher(baseOpts({ routes: [route] }));
+    const result = await dispatcher.callTool(LOCAL_ENGINE, MCP_RUN_TOOL, {
+      tool: route.catalogName,
+      arguments: (() => undefined) as unknown as Record<string, unknown>,
+    });
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain("not an object");
+  });
+});
+
+describe("effectiveRoomToolNamesWith", () => {
+  it("applies Cloud Privacy only to cloud-bound scopes", () => {
+    const cloud = effectiveRoomToolNamesWith(true, WEB_LANES_ALL, CLOUD_ENGINE, [], true);
+    const local = effectiveRoomToolNamesWith(true, WEB_LANES_ALL, LOCAL_ENGINE, [], true);
+    expect(cloud).not.toContain("view_media_frame");
+    expect(local).toContain("view_media_frame");
   });
 });
 
@@ -1146,6 +1183,14 @@ describe("RoomToolDispatcher.callTool — cloud redaction", () => {
 });
 
 describe("RoomToolDispatcher.callTool — effects sink", () => {
+  it("converts an unexpected non-Error dispatch throw into a tool-shaped failure", async () => {
+    const dispatcher = new RoomToolDispatcher(baseOpts({
+      execDeps: execDeps({ runtimeTool: async () => { throw { reason: "unexpected" }; } }),
+    }));
+    const result = await dispatcher.callTool(LOCAL_ENGINE, "browse_open", { url: "https://example.com" });
+    expect(result).toEqual({ isError: true, content: [{ type: "text", text: "[object Object]" }] });
+  });
+
   it("gives every interpreting provider the same exact frame bytes and SHA-256 receipt", async () => {
     const imageB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAIAAAUAAen63NgAAAAASUVORK5CYII=";
     const sha256 = createHash("sha256").update(Buffer.from(imageB64, "base64")).digest("hex");

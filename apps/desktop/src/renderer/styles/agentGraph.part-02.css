@@ -1,0 +1,144 @@
+
+/* Another 24px floor: this was an 11px glyph in a 15px box. */
+.agraph-inspect-close {
+  margin-inline-start: auto;
+  min-width: 24px;
+  min-height: 24px;
+  display: inline-grid;
+  place-items: center;
+  background: none;
+  border: 1px solid transparent;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  cursor: pointer;
+  padding: 0 var(--sp-1);
+  border-radius: var(--radius-xs);
+}
+.agraph-inspect-close:hover {
+  color: var(--text);
+  background: var(--hover);
+  border-color: var(--line);
+}
+.agraph-inspect-desc {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-meta);
+  color: var(--muted);
+  line-height: var(--lh-body);
+}
+.agraph-inspect-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--sp-1) var(--sp-3);
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-meta);
+}
+.agraph-inspect-facts dt {
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding-top: 1px;
+}
+.agraph-inspect-facts dd {
+  margin: 0;
+  color: var(--text);
+  min-width: 0;
+}
+.agraph-inspect-instruction {
+  line-height: var(--lh-body);
+}
+/* One delegation, as an outlined capsule. The glyph in front of it is what
+   carries the state; the hue only agrees. */
+.agraph-mini-chip {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px 999px 999px 999px / 14px 12px 14px 12px;
+  padding: 1px var(--sp-2);
+  margin: 0 4px 3px 0;
+}
+.agraph-mini-chip.done {
+  color: var(--sem-done);
+  border-color: color-mix(in srgb, var(--sem-done) 55%, var(--rule-strong));
+}
+.agraph-mini-chip.failed {
+  color: var(--sem-urgent);
+  border-color: color-mix(in srgb, var(--sem-urgent) 60%, var(--rule-strong));
+}
+.agraph-mini-chip.running {
+  color: var(--sem-linked);
+  border-color: color-mix(in srgb, var(--sem-linked) 60%, var(--rule-strong));
+}
+
+.agraph-inspect-steps {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  margin-top: var(--sp-2);
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--line-soft);
+}
+.agraph-inspect-steps-cap {
+  font-size: var(--fs-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--faint);
+}
+.agraph-inspect-empty {
+  font-size: var(--fs-meta);
+  color: var(--faint);
+}
+
+/* Motion is decoration here — every state is already carried by glyph, border,
+   dash and text, so removing it loses nothing. */
+@media (prefers-reduced-motion: reduce) {
+  .agraph-node,
+  .agraph-inspect,
+  .agraph-modal {
+    animation: none;
+  }
+  .agraph-node,
+  .agraph-expand {
+    transition: none;
+  }
+  .agraph-spin {
+    animation: none;
+    border-top-color: var(--sem-linked);
+  }
+}
+
+/* The specialist's actual report, in its own node's panel.
+ *
+ * The same words already went past as live text and were wiped by the next
+ * round — correctly, since that area shows the CURRENT round. This is the copy
+ * that stays, so "it reported back" can be read rather than taken on trust,
+ * and so a failed child can say why. Reports run from one line to several
+ * pages, hence the scroll box: a long one must not push the composer off the
+ * screen. */
+.agraph-report {
+  max-height: 18rem;
+  overflow: auto;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--raised) 62%, transparent);
+  color: var(--text);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  /* The report is prose the model wrote, with its own newlines and indentation
+     — `pre-wrap` keeps both without turning it into a code block. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* A failure reads as one. The marker edge down the left carries it rather than
+   the text colour, so the reason itself stays as legible as any other report —
+   and it rides with the "Why it failed" heading the panel already prints, so
+   the colour is never the only signal. */
+.agraph-report.failed {
+  border-color: color-mix(in srgb, var(--sem-urgent) 55%, var(--rule-strong));
+  box-shadow: inset 3px 0 0 var(--sem-urgent);
+}

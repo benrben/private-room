@@ -189,111 +189,173 @@ async def download_model(
     propagates — a cancelled/refused download never leaves a half model
     behind for `effective_model_path` to find later.
     """
-    global _downloading, _cancel_requested
-
     dest = model_path(models_dir)
     part = dest + ".part"
 
-    if os.path.exists(dest) or (bundled_path is not None and os.path.exists(bundled_path)):
-        # Nothing to download — but a `.part` left behind by a download the
-        # user quit out of would otherwise sit there for good.
-        with contextlib.suppress(OSError):
-            os.remove(part)
+    if _model_is_available(dest, bundled_path):
+        _remove_partial_download(part)
         return
 
-    if _downloading:
-        # Mirrors `STT_DOWNLOADING.swap(true, ...)` returning `true`: this
-        # call touches NOTHING else — no flag reset, no `.part` cleanup —
-        # because the download actually in flight owns that cleanup.
-        raise ModelDownloadError("The dictation model is already downloading.")
-    _downloading = True
-    # A Stop pressed against the PREVIOUS download must not kill this one.
-    _cancel_requested = False
+    _claim_download()
 
     try:
         os.makedirs(models_dir, exist_ok=True)
-        async with httpx.AsyncClient() as client:
-            try:
-                async with client.stream("GET", url) as resp:
-                    try:
-                        resp.raise_for_status()
-                    except httpx.HTTPStatusError as e:
-                        raise ModelDownloadError(f"download failed: {e}") from e
-
-                    raw_len = resp.headers.get("content-length")
-                    try:
-                        declared: int | None = int(raw_len) if raw_len is not None else None
-                    except ValueError:
-                        declared = None
-                    # An implausible declared size is refused before a byte
-                    # is written.
-                    if declared is not None and declared > MAX_MODEL_BYTES:
-                        raise ModelDownloadError(NOT_A_MODEL)
-                    total = declared if declared is not None else MODEL_SIZE_MB * 1024 * 1024
-
-                    got = 0
-                    last_pct = 0
-                    # The first four bytes decide whether this is a model at
-                    # all; kept rather than re-read because the file is
-                    # renamed straight into the place whisper.cpp mmaps from.
-                    head = bytearray()
-                    with open(part, "wb") as f:
-                        try:
-                            async for chunk in resp.aiter_bytes():
-                                if _cancel_requested:
-                                    # Raising (rather than returning) is what
-                                    # takes the .part file away below, so a
-                                    # stopped download leaves no half model
-                                    # behind and `installed` keeps telling
-                                    # the truth.
-                                    raise ModelDownloadError("Download stopped.")
-                                got += len(chunk)
-                                # A server that declares nothing (or lies) is
-                                # still bounded.
-                                if got > MAX_MODEL_BYTES:
-                                    raise ModelDownloadError(NOT_A_MODEL)
-                                if len(head) < 4:
-                                    head.extend(chunk[: 4 - len(head)])
-                                f.write(chunk)
-                                pct = got * 100 // max(total, 1)
-                                if pct != last_pct:
-                                    last_pct = pct
-                                    if on_progress is not None:
-                                        on_progress(got, total, pct)
-                        except httpx.HTTPError as e:
-                            raise ModelDownloadError(f"download interrupted: {e}") from e
-
-                    # Only now is it renamed into the path `effective_model_path`
-                    # prefers over the bundled copy. Nothing checked what
-                    # arrived before this port, so an error page served with a
-                    # 200 became "installed: true" and every transcription
-                    # afterwards failed on a file the app had told the user
-                    # it had. The exception path above (and the outer
-                    # cleanup below) removes the `.part`.
-                    if got < MIN_MODEL_BYTES or not looks_like_ggml_model(bytes(head)):
-                        raise ModelDownloadError(NOT_A_MODEL)
-                    os.replace(part, dest)
-            except httpx.HTTPError as e:
-                # Connection-establishment/status failures (DNS, refused,
-                # 4xx/5xx) — anything raised from inside the streaming loop
-                # above has ALREADY been converted to a `ModelDownloadError`
-                # by the inner handler and is a different exception type, so
-                # it passes through this `except httpx.HTTPError` untouched.
-                raise ModelDownloadError(f"download failed: {e}") from e
+        await _download_to_partial_file(url, part, dest, on_progress)
     except BaseException:
         # Catches `ModelDownloadError`, any stray `OSError`, and (a
         # deliberate strengthening past the literal Rust source, which has
         # no concept of task cancellation) `asyncio.CancelledError` if the
         # caller cancels the awaiting task outright — in every case the
         # half-written file must not survive.
-        with contextlib.suppress(OSError):
-            os.remove(part)
+        _remove_partial_download(part)
         raise
     finally:
         # Unconditional, success or failure — matches Rust's cleanup after
         # the `result` match, which runs regardless of `Ok`/`Err`.
-        _cancel_requested = False
-        _downloading = False
+        _release_download()
+
+
+def _model_is_available(dest: str, bundled_path: str | None) -> bool:
+    return os.path.exists(dest) or (bundled_path is not None and os.path.exists(bundled_path))
+
+
+def _remove_partial_download(part: str) -> None:
+    """Best-effort cleanup; a missing or concurrently removed `.part` is fine."""
+    with contextlib.suppress(OSError):
+        os.remove(part)
+
+
+def _claim_download() -> None:
+    """Reserve the singleton download slot without disturbing its current owner."""
+    global _cancel_requested, _downloading
+    if _downloading:
+        raise ModelDownloadError("The dictation model is already downloading.")
+    _downloading = True
+    # A Stop pressed against the PREVIOUS download must not kill this one.
+    _cancel_requested = False
+
+
+def _release_download() -> None:
+    global _cancel_requested, _downloading
+    _cancel_requested = False
+    _downloading = False
+
+
+async def _download_to_partial_file(
+    url: str,
+    part: str,
+    dest: str,
+    on_progress: Callable[[int, int, int], None] | None,
+) -> None:
+    """Fetch, verify, and install exactly one streamed response."""
+    async with httpx.AsyncClient() as client:
+        try:
+            async with client.stream("GET", url) as response:
+                _raise_for_bad_status(response)
+                got, head = await _read_download_response(response, part, on_progress)
+                _verify_and_install_model(part, dest, got, head)
+        except httpx.HTTPError as error:
+            raise ModelDownloadError(f"download failed: {error}") from error
+
+
+def _raise_for_bad_status(response: httpx.Response) -> None:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        raise ModelDownloadError(f"download failed: {error}") from error
+
+
+def _declared_download_size(response: httpx.Response) -> int | None:
+    raw_length = response.headers.get("content-length")
+    if raw_length is None:
+        return None
+    try:
+        return int(raw_length)
+    except ValueError:
+        return None
+
+
+def _reject_oversized_download(size: int | None) -> None:
+    if size is not None and size > MAX_MODEL_BYTES:
+        raise ModelDownloadError(NOT_A_MODEL)
+
+
+def _download_total(declared_size: int | None) -> int:
+    if declared_size is None:
+        return MODEL_SIZE_MB * 1024 * 1024
+    return declared_size
+
+
+async def _read_download_response(
+    response: httpx.Response,
+    part: str,
+    on_progress: Callable[[int, int, int], None] | None,
+) -> tuple[int, bytes]:
+    declared_size = _declared_download_size(response)
+    _reject_oversized_download(declared_size)
+    try:
+        return await _write_response_body(response, part, _download_total(declared_size), on_progress)
+    except httpx.HTTPError as error:
+        raise ModelDownloadError(f"download interrupted: {error}") from error
+
+
+async def _write_response_body(
+    response: httpx.Response,
+    part: str,
+    total: int,
+    on_progress: Callable[[int, int, int], None] | None,
+) -> tuple[int, bytes]:
+    got = 0
+    last_pct = 0
+    head = bytearray()
+    with open(part, "wb") as file:
+        async for chunk in response.aiter_bytes():
+            _raise_if_download_cancelled()
+            got += len(chunk)
+            _reject_oversized_download(got)
+            _append_model_head(head, chunk)
+            file.write(chunk)
+            last_pct = _report_download_progress(on_progress, got, total, last_pct)
+    return got, bytes(head)
+
+
+def _raise_if_download_cancelled() -> None:
+    if _cancel_requested:
+        raise ModelDownloadError("Download stopped.")
+
+
+def _append_model_head(head: bytearray, chunk: bytes) -> None:
+    if len(head) < 4:
+        head.extend(chunk[: 4 - len(head)])
+
+
+def _report_download_progress(
+    on_progress: Callable[[int, int, int], None] | None,
+    got: int,
+    total: int,
+    last_pct: int,
+) -> int:
+    pct = got * 100 // max(total, 1)
+    if pct == last_pct:
+        return last_pct
+    _notify_download_progress(on_progress, got, total, pct)
+    return pct
+
+
+def _notify_download_progress(
+    on_progress: Callable[[int, int, int], None] | None,
+    got: int,
+    total: int,
+    pct: int,
+) -> None:
+    if on_progress is not None:
+        on_progress(got, total, pct)
+
+
+def _verify_and_install_model(part: str, dest: str, got: int, head: bytes) -> None:
+    if got < MIN_MODEL_BYTES or not looks_like_ggml_model(head):
+        raise ModelDownloadError(NOT_A_MODEL)
+    os.replace(part, dest)
 
 
 def delete_model(models_dir: str) -> None:

@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { unzip } from "fflate";
 import { api } from "../api";
-import { Deck, parsePptx } from "./pptx";
+import { parsePptx, type Deck } from "./pptx";
 import { useFileBytes } from "./useFileBytes";
 import "./slides.css";
 
@@ -36,7 +36,11 @@ export default function SlidesView({
   dataB64?: string | null;
   target?: { quote?: string };
 }) {
-  const { bytes, error: readError, loading } = useFileBytes(mediaToken, dataB64);
+  const {
+    bytes,
+    error: readError,
+    loading,
+  } = useFileBytes(mediaToken, dataB64);
   const [deck, setDeck] = useState<Deck | null>(null);
   const [parseError, setParseError] = useState("");
   const [at, setAt] = useState(0);
@@ -48,7 +52,6 @@ export default function SlidesView({
   const [slideCount, setSlideCount] = useState(0);
   const [renderError, setRenderError] = useState("");
   const [rendering, setRendering] = useState(false);
-  const wanted = useRef(0);
 
   // ---- text side: outline, notes, and citation targeting -----------------
   useEffect(() => {
@@ -69,7 +72,8 @@ export default function SlidesView({
       try {
         const parsed = parsePptx(files);
         setDeck(parsed);
-        if (parsed.slides.length) setSlideCount((n) => n || parsed.slides.length);
+        if (parsed.slides.length)
+          setSlideCount((n) => n || parsed.slides.length);
       } catch {
         // A parse failure costs the outline and the notes, not the deck: the
         // pictures come from macOS and do not depend on this at all.
@@ -84,7 +88,6 @@ export default function SlidesView({
   // ---- picture side: ask macOS for the current slide ---------------------
   useEffect(() => {
     let alive = true;
-    wanted.current = at;
     if (images[at]) return;
     setRendering(true);
     setRenderError("");
@@ -152,118 +155,226 @@ export default function SlidesView({
       Array.from({ length: slideCount }, (_, i) => ({
         number: i + 1,
         title:
-          byNumber.get(i + 1)?.text.split("\n").find((l) => l.trim()) ??
-          `Slide ${i + 1}`,
+          byNumber
+            .get(i + 1)
+            ?.text.split("\n")
+            .find((l) => l.trim()) ?? `Slide ${i + 1}`,
       })),
     [byNumber, slideCount],
   );
   const notes = byNumber.get(at + 1)?.notes ?? "";
 
+  const empty = emptySlides(
+    loading,
+    readError,
+    slideCount,
+    renderError,
+    rendering,
+  );
+  if (empty) return empty;
+  return (
+    <SlidesBody
+      at={at}
+      images={images}
+      notes={notes}
+      outline={outline}
+      parseError={parseError}
+      renderError={renderError}
+      setAt={setAt}
+      setShowNotes={setShowNotes}
+      showNotes={showNotes}
+      slideCount={slideCount}
+    />
+  );
+}
+
+function emptySlides(
+  loading: boolean,
+  readError: string,
+  slideCount: number,
+  renderError: string,
+  rendering: boolean,
+) {
   if (loading) return <div className="empty-hint">Opening presentation…</div>;
   if (readError) return <div className="empty-hint">{readError}</div>;
-  if (!slideCount && renderError) {
+  if (slideCount) return null;
+  if (renderError)
     return (
       <div className="empty-hint">
         This presentation could not be drawn ({renderError}). Its text is still
-        stored and searchable, and <strong>Export</strong> saves the original out
-        unchanged.
+        stored and searchable, and <strong>Export</strong> saves the original
+        out unchanged.
       </div>
     );
-  }
-  // The terminal branch: the read, the parse and the render have all been
-  // ruled out and there is still no slide. It used to say "Reading slides…"
-  // whether or not anything was running, so a deck that resolves to zero
-  // slides looked permanently busy instead of permanently unreadable —
-  // and the reader waited rather than reaching for Export.
-  if (!slideCount)
-    return rendering ? (
-      <div className="empty-hint">Opening presentation…</div>
-    ) : (
-      <div className="empty-hint">
-        No slides were found in this presentation. Its text is still stored and
-        searchable, and <strong>Export</strong> saves the original out
-        unchanged.
-      </div>
-    );
+  if (rendering) return <div className="empty-hint">Opening presentation…</div>;
+  return (
+    <div className="empty-hint">
+      No slides were found in this presentation. Its text is still stored and
+      searchable, and <strong>Export</strong> saves the original out unchanged.
+    </div>
+  );
+}
 
+type Outline = { number: number; title: string };
+type SlidesBodyProps = {
+  at: number;
+  images: Record<number, string>;
+  notes: string;
+  outline: Outline[];
+  parseError: string;
+  renderError: string;
+  setAt: (value: number | ((value: number) => number)) => void;
+  setShowNotes: (value: boolean | ((value: boolean) => boolean)) => void;
+  showNotes: boolean;
+  slideCount: number;
+};
+
+function SlidesBody({
+  at,
+  images,
+  notes,
+  outline,
+  parseError,
+  renderError,
+  setAt,
+  setShowNotes,
+  showNotes,
+  slideCount,
+}: SlidesBodyProps) {
   const last = slideCount - 1;
-  const current = images[at];
-
   return (
     <div className="sl-view">
-      <div className="sl-bar">
-        <button className="nb-btn" disabled={at <= 0} onClick={() => setAt((n) => Math.max(0, n - 1))}>
-          ‹ Previous
-        </button>
-        {/* "Slide 3 of 12" is a count pencilled beside the deck — see
-            `.sl-where`. The class is additive, so the status keeps whatever
-            `.viewer-status` gives it. */}
-        <span className="viewer-status sl-where">
-          Slide {at + 1} of {slideCount}
-        </span>
+      <SlideToolbar
+        at={at}
+        last={last}
+        notes={notes}
+        parseError={parseError}
+        setAt={setAt}
+        setShowNotes={setShowNotes}
+        showNotes={showNotes}
+        slideCount={slideCount}
+      />
+      <SlideStage
+        at={at}
+        current={images[at]}
+        outline={outline}
+        renderError={renderError}
+      />
+      <SlideNotes notes={notes} show={showNotes} />
+      <SlideRail at={at} outline={outline} setAt={setAt} />
+    </div>
+  );
+}
+
+function SlideToolbar({
+  at,
+  last,
+  notes,
+  parseError,
+  setAt,
+  setShowNotes,
+  showNotes,
+  slideCount,
+}: Omit<SlidesBodyProps, "images" | "outline" | "renderError"> & {
+  last: number;
+}) {
+  return (
+    <div className="sl-bar">
+      <button
+        className="nb-btn"
+        disabled={at <= 0}
+        onClick={() => setAt((n) => Math.max(0, n - 1))}
+      >
+        ‹ Previous
+      </button>
+      <span className="viewer-status sl-where">
+        Slide {at + 1} of {slideCount}
+      </span>
+      <button
+        className="nb-btn"
+        disabled={at >= last}
+        onClick={() => setAt((n) => Math.min(last, n + 1))}
+      >
+        Next ›
+      </button>
+      {notes && (
         <button
           className="nb-btn"
-          disabled={at >= last}
-          onClick={() => setAt((n) => Math.min(last, n + 1))}
+          aria-pressed={showNotes}
+          onClick={() => setShowNotes((shown) => !shown)}
         >
-          Next ›
+          {showNotes ? "Hide notes" : "Speaker notes"}
         </button>
-        {notes && (
-          <button
-            className="nb-btn"
-            aria-pressed={showNotes}
-            onClick={() => setShowNotes((s) => !s)}
-          >
-            {showNotes ? "Hide notes" : "Speaker notes"}
-          </button>
-        )}
-        {/* Said where the missing thing is missing from, not over the deck:
-            the slides are drawn either way, but their titles and notes are not
-            available to read. */}
-        {parseError && (
-          <span className="viewer-status">
-            No slide titles or notes ({parseError})
-          </span>
-        )}
-      </div>
-      <div className="sl-stage">
-        {current ? (
-          <img
-            className="sl-image"
-            src={`data:image/png;base64,${current}`}
-            alt={outline[at]?.title ?? `Slide ${at + 1}`}
-          />
-        ) : (
-          /* This had a ternary with the same string in both branches, so it
-             looked like it told two states apart and did not. There is only
-             one to tell: a slide with no picture and no error always has a
-             render in flight, or one the effect issues in this same tick —
-             every other outcome sets `renderError`. */
-          <div className="empty-hint">{renderError || "Drawing slide…"}</div>
-        )}
-      </div>
-      {showNotes && notes && (
-        <div className="sl-notes" dir="auto">
-          {notes}
-        </div>
       )}
-      {/* A plain nav with aria-current, not a tablist: a tablist promises
-          arrow-key roving and a tabpanel, and this rail has neither. Same
-          choice, for the same reason, as the sheet tabs in SheetView. */}
-      <nav className="sl-rail" aria-label="Slides">
-        {outline.map((o, i) => (
-          <button
-            key={o.number}
-            aria-current={i === at ? "true" : undefined}
-            className={`sl-thumb${i === at ? " active" : ""}`}
-            onClick={() => setAt(i)}
-            title={o.title}
-          >
-            <span className="sl-thumb-n">{o.number}</span>
-            <span className="sl-thumb-t">{o.title}</span>
-          </button>
-        ))}
-      </nav>
+      {parseError && (
+        <span className="viewer-status">
+          No slide titles or notes ({parseError})
+        </span>
+      )}
     </div>
+  );
+}
+
+function SlideStage({
+  at,
+  current,
+  outline,
+  renderError,
+}: {
+  at: number;
+  current?: string;
+  outline: Outline[];
+  renderError: string;
+}) {
+  if (!current)
+    return (
+      <div className="sl-stage">
+        <div className="empty-hint">{renderError || "Drawing slide…"}</div>
+      </div>
+    );
+  return (
+    <div className="sl-stage">
+      <img
+        className="sl-image"
+        src={`data:image/png;base64,${current}`}
+        alt={outline[at]?.title ?? `Slide ${at + 1}`}
+      />
+    </div>
+  );
+}
+
+function SlideNotes({ notes, show }: { notes: string; show: boolean }) {
+  if (!show || !notes) return null;
+  return (
+    <div className="sl-notes" dir="auto">
+      {notes}
+    </div>
+  );
+}
+
+function SlideRail({
+  at,
+  outline,
+  setAt,
+}: {
+  at: number;
+  outline: Outline[];
+  setAt: SlidesBodyProps["setAt"];
+}) {
+  return (
+    <nav className="sl-rail" aria-label="Slides">
+      {outline.map((slide, index) => (
+        <button
+          key={slide.number}
+          aria-current={index === at ? "true" : undefined}
+          className={`sl-thumb${index === at ? " active" : ""}`}
+          onClick={() => setAt(index)}
+          title={slide.title}
+        >
+          <span className="sl-thumb-n">{slide.number}</span>
+          <span className="sl-thumb-t">{slide.title}</span>
+        </button>
+      ))}
+    </nav>
   );
 }

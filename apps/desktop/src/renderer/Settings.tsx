@@ -6,12 +6,8 @@ import "./settingsA11y.css";
 import { Props } from "./settings/types";
 import ModelSection from "./settings/ModelSection";
 import BehaviorSection from "./settings/BehaviorSection";
-import VoiceSection from "./settings/VoiceSection";
-import MicSection from "./settings/MicSection";
-import SavedVoicesSection from "./settings/SavedVoicesSection";
 import CloudPrivacySection from "./settings/CloudPrivacySection";
 import PrivacySection from "./settings/PrivacySection";
-import CheckpointsSection from "./settings/CheckpointsSection";
 import OnlineSection from "./settings/OnlineSection";
 import AdvisorsSection from "./settings/AdvisorsSection";
 import RemoteAiSection from "./settings/RemoteAiSection";
@@ -21,12 +17,7 @@ import HelpersSection from "./settings/HelpersSection";
 import SupportMatrixSection from "./settings/SupportMatrixSection";
 import HarnessDiagnosticsSection from "./settings/HarnessDiagnosticsSection";
 import RecoverySection from "./settings/RecoverySection";
-import AboutSection from "./settings/AboutSection";
-import AppearanceSection from "./settings/AppearanceSection";
-import InterfaceSection from "./settings/InterfaceSection";
 import AiProvidersSection from "./settings/AiProvidersSection";
-import { bestLocalModel } from "./workspace/localModel";
-import { RECOMMENDED_MODELS } from "./workspace/constants";
 import { useFocusTrap } from "./settings/useFocusTrap";
 import { useModelManagement } from "./settings/useModelManagement";
 import { useBehaviorSettings } from "./settings/useBehaviorSettings";
@@ -39,56 +30,23 @@ import { useRemoteAi } from "./settings/useRemoteAi";
 import { useRoomServer } from "./settings/useRoomServer";
 import { useRoles } from "./settings/useRoles";
 import { useRecovery } from "./settings/useRecovery";
-
-/** Settings is split into focused PAGES rather than one long technical scroll.
- * Each group is a page; `sections` lists the anchor ids it owns, which is what
- * routes a deep-link (the status-bar trust chip → Cloud privacy) to the right
- * page. Ids ONLY: each id used to carry a second, human label for in-page jump
- * links that were never built, so nothing rendered them — and two had already
- * drifted away from the headings they named ("Lock & password" for a section
- * titled Privacy, "Online search" for Online features). A label nothing draws
- * cannot be noticed when it goes wrong, so the headings are the single copy. */
-const SETTINGS_GROUPS: { key: string; label: string; sections: string[] }[] = [
-  {
-    key: "ai",
-    label: "AI & behavior",
-    sections: [
-      "set-model",
-      "set-behavior",
-      "set-role",
-      "set-helpers",
-      "set-support-matrix",
-      "set-agent-harness",
-      "set-advisors",
-    ],
-  },
-  {
-    key: "voice",
-    label: "Voice",
-    sections: ["set-voice", "set-mic", "set-voice-ids"],
-  },
-  {
-    key: "privacy",
-    label: "Privacy & recovery",
-    sections: ["set-cloud-privacy", "set-privacy", "set-recovery"],
-  },
-  {
-    key: "connections",
-    label: "Connections",
-    sections: ["set-ai-providers", "set-online", "set-closet", "set-leash"],
-  },
-  { key: "history", label: "History & storage", sections: ["set-checkpoints"] },
-  {
-    key: "app",
-    label: "App",
-    sections: ["set-appearance", "set-interface", "set-about"],
-  },
-];
-
-/** section id → the page it lives on, so a deep-link opens the right page. */
-const GROUP_OF_SECTION: Record<string, string> = Object.fromEntries(
-  SETTINGS_GROUPS.flatMap((g) => g.sections.map((id) => [id, g.key])),
-);
+import {
+  SETTINGS_GROUPS,
+  SettingsClosePrompt,
+  SettingsModelError,
+  SettingsNavigation,
+  SettingsAppPage,
+  SettingsHistoryPage,
+  SettingsVoicePage,
+  defaultAiFallbackModel,
+  dismissStaleCloseConfirmation,
+  hasUnsavedSettingsWork,
+  initialSettingsGroup,
+  settingsDirtyPages,
+  settingsGroupNavigationTarget,
+  useInitialSectionNavigation,
+  useSettingsPageScroll,
+} from "./settings/SettingsShell";
 
 export default function Settings({
   ai,
@@ -100,27 +58,14 @@ export default function Settings({
   initialSection,
   onApplyPreset,
 }: Props) {
-  // Each section owns its state + handlers via a per-concern hook. The shell
-  // only threads those returns to the presentational section components and
-  // owns cross-hook wiring (Behavior's Save clears the shared model error).
-  // CLOSING MUST NOT DESTROY WORK. Most of Settings applies on change, but
-  // five things do not — custom instructions, the creativity slider, the voice
-  // choice, the remote-AI address and the whole internet section — and Escape
-  // or a click on the backdrop closed the modal instantly, taking a paragraph
-  // of carefully written instructions with it and saying nothing. Deliberate
-  // exits (Save, then close) are unaffected; only an exit that would DROP
-  // something now stops to ask.
-  //
-  // Read through a ref because `useFocusTrap` owns the Escape key and has to be
-  // set up before the section hooks that know whether anything is dirty exist.
+  // Deferred settings must survive accidental close attempts. A ref lets the
+  // focus-trap callback see current dirty state even though it is installed
+  // before the per-section hooks below have run.
   const unsavedRef = useRef(false);
   const [confirmClose, setConfirmClose] = useState(false);
   const keepEditingRef = useRef<HTMLButtonElement>(null);
   function requestClose() {
     if (unsavedRef.current) {
-      // Escape RAISED the question, so Escape has to be able to answer it: the
-      // repeat press only re-set the same flag, so the second and third press
-      // did nothing at all and the modal read as frozen.
       if (confirmClose) {
         keepEditing();
         return;
@@ -130,21 +75,14 @@ export default function Settings({
     }
     onClose();
   }
-  // Dropping the strip leaves focus on a button that no longer exists, i.e. on
-  // <body>, outside the trap — the same hole `refocusModal` covers for the
-  // backdrop click.
   function keepEditing() {
     setConfirmClose(false);
     refocusModal();
   }
   const { modalRef, onModalKeyDown, refocusModal } = useFocusTrap(requestClose);
-  // The strip is announced (role="alert") but focus stayed where it was, several
-  // Tab stops before either answer, in DOM order behind the page index.
   useEffect(() => {
     if (confirmClose) keepEditingRef.current?.focus();
   }, [confirmClose]);
-  // A backdrop click with unsaved work leaves the modal open and focus on
-  // <body>, outside the trap — see `refocusModal`.
   function backdropClick() {
     requestClose();
     if (unsavedRef.current) refocusModal();
@@ -157,21 +95,15 @@ export default function Settings({
   // Which settings page is showing. Deep-links (initialSection) open on the page
   // that owns the section; otherwise start on AI & behavior.
   const [activeGroup, setActiveGroup] = useState<string>(
-    (initialSection && GROUP_OF_SECTION[initialSection]) || SETTINGS_GROUPS[0].key,
+    initialSettingsGroup(initialSection),
   );
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
   // A tablist is driven by the arrows, and the selection follows them — the
   // index is six buttons that all do the same kind of thing, so moving through
   // it is the whole interaction.
   function onNavKeyDown(e: ReactKeyboardEvent<HTMLElement>) {
-    const last = SETTINGS_GROUPS.length - 1;
-    const at = SETTINGS_GROUPS.findIndex((g) => g.key === activeGroup);
-    let next = -1;
-    if (e.key === "ArrowDown") next = at >= last ? 0 : at + 1;
-    else if (e.key === "ArrowUp") next = at <= 0 ? last : at - 1;
-    else if (e.key === "Home") next = 0;
-    else if (e.key === "End") next = last;
-    if (next < 0) return;
+    const next = settingsGroupNavigationTarget(e.key, activeGroup);
+    if (next === null) return;
     e.preventDefault();
     setActiveGroup(SETTINGS_GROUPS[next].key);
     tabRefs.current[next]?.focus();
@@ -179,24 +111,7 @@ export default function Settings({
 
   // Deep-link (e.g. the status-bar trust chip → Cloud privacy): switch to the
   // owning page, then once it has painted jump to the section and flag it.
-  useEffect(() => {
-    if (!initialSection) return;
-    const group = GROUP_OF_SECTION[initialSection];
-    if (group) setActiveGroup(group);
-    const t = window.setTimeout(() => {
-      const el = document.getElementById(initialSection);
-      if (!el) return;
-      el.scrollIntoView({ block: "start" });
-      // The trap put focus on Close while the viewport showed a section three
-      // pages down: a keyboard user arriving from the trust chip had to tab
-      // back to what they were sent to look at.
-      el.tabIndex = -1;
-      el.focus({ preventScroll: true });
-      el.classList.add("settings-section-flash");
-      window.setTimeout(() => el.classList.remove("settings-section-flash"), 1400);
-    }, 40);
-    return () => window.clearTimeout(t);
-  }, [initialSection]);
+  useInitialSectionNavigation(initialSection, setActiveGroup);
 
   // All six pages share one scrolling element (.settings-body), toggled with
   // `hidden` rather than mounted/unmounted, so without this a page opens
@@ -210,10 +125,7 @@ export default function Settings({
   // as intended. When a deep-link DOES change pages, this effect's synchronous
   // reset always lands before the deep-link's own scroll, which is deferred
   // behind a setTimeout.
-  useEffect(() => {
-    const el = bodyRef.current;
-    if (el) el.scrollTop = 0;
-  }, [activeGroup]);
+  useSettingsPageScroll(activeGroup, bodyRef);
 
   const {
     pullName,
@@ -374,8 +286,12 @@ export default function Settings({
   // Every Save-button section that can hold work the room does not have yet.
   // Written on each render (idempotent) so the Escape handler above, which was
   // created before these hooks ran, sees the current answer.
-  const unsaved =
-    tuningDirty || voiceSettings.voiceDirty || webDirty || closetDirty;
+  const unsaved = hasUnsavedSettingsWork(
+    tuningDirty,
+    voiceSettings.voiceDirty,
+    webDirty,
+    closetDirty,
+  );
   unsavedRef.current = unsaved;
   // …and WHICH page is holding it, so the index can say so. This is a display
   // of the four dirty flags above, not a fifth source of truth: only sections
@@ -384,13 +300,10 @@ export default function Settings({
   // a lie. Custom instructions + creativity live on AI & behavior; the voice
   // choice on Voice; the internet switch and the remote-AI address both on
   // Connections.
-  const dirtyPages = new Set<string>();
-  if (tuningDirty) dirtyPages.add("ai");
-  if (voiceSettings.voiceDirty) dirtyPages.add("voice");
-  if (webDirty || closetDirty) dirtyPages.add("connections");
+  const dirtyPages = settingsDirtyPages(tuningDirty, voiceSettings.voiceDirty, webDirty, closetDirty);
   // A section that got saved while the warning was up leaves nothing to warn
   // about — drop the strip rather than make the user dismiss a stale question.
-  if (confirmClose && !unsaved) setConfirmClose(false);
+  dismissStaleCloseConfirmation(confirmClose, unsaved, setConfirmClose);
 
   return (
     // ADD-25: consent surface — the agent UI driver must never see or operate
@@ -423,61 +336,20 @@ export default function Settings({
             <CloseIcon size={14} />
           </button>
         </div>
-        {confirmClose && (
-          <div className="settings-unsaved" role="alert">
-            <AlertIcon size={16} />
-            <span>
-              Some changes on this page haven't been saved yet — closing now
-              would discard them.
-            </span>
-            <button className="subtle" ref={keepEditingRef} onClick={keepEditing}>
-              Keep editing
-            </button>
-            <button className="subtle danger" onClick={onClose}>
-              Discard &amp; close
-            </button>
-          </div>
-        )}
+        <SettingsClosePrompt
+          visible={confirmClose}
+          keepEditingRef={keepEditingRef}
+          onKeepEditing={keepEditing}
+          onDiscard={onClose}
+        />
         <div className="settings-main">
-          {/* One focused page at a time. The rail selects the page; the section
-              anchors below (and deep-links) still resolve within the open page. */}
-          <nav
-            className="settings-nav"
-            role="tablist"
-            aria-orientation="vertical"
-            aria-label="Settings pages"
+          <SettingsNavigation
+            activeGroup={activeGroup}
+            dirtyPages={dirtyPages}
+            tabRefs={tabRefs}
             onKeyDown={onNavKeyDown}
-          >
-            {SETTINGS_GROUPS.map((g, i) => (
-              <button
-                key={g.key}
-                type="button"
-                role="tab"
-                id={`settings-tab-${g.key}`}
-                aria-controls={`settings-page-${g.key}`}
-                aria-selected={activeGroup === g.key}
-                // One tab stop for the whole index instead of six before the
-                // first control; the arrows move within it.
-                tabIndex={activeGroup === g.key ? 0 : -1}
-                ref={(el) => {
-                  tabRefs.current[i] = el;
-                }}
-                className={`settings-nav-item${activeGroup === g.key ? " is-active" : ""}`}
-                onClick={() => setActiveGroup(g.key)}
-              >
-                <span className="settings-nav-label">{g.label}</span>
-                {/* The flag is a WORD on a marker strip, not a coloured dot:
-                    it has to be readable in greyscale and it has to reach a
-                    screen reader, which it does by joining the button's own
-                    accessible name ("Voice, Unsaved"). */}
-                {dirtyPages.has(g.key) && (
-                  <span className="nb-tape nb-sem-pending settings-nav-flag">
-                    Unsaved
-                  </span>
-                )}
-              </button>
-            ))}
-          </nav>
+            setActiveGroup={setActiveGroup}
+          />
           <div className="settings-body" ref={bodyRef}>
             <div
               className="settings-page"
@@ -523,11 +395,7 @@ export default function Settings({
                   open — a pull that failed here printed its reason on Voice,
                   attached to nothing. They belong on the page that produced
                   them. */}
-              {error && (
-                <div className="gate-error" role="alert">
-                  {error}
-                </div>
-              )}
+              <SettingsModelError error={error} />
               <BehaviorSection
                 temperature={temperature}
                 setTemperature={setTemperature}
@@ -581,16 +449,10 @@ export default function Settings({
               />
             </div>
 
-            <div
-              className="settings-page"
-              id="settings-page-voice"
-              role="tabpanel"
-              aria-labelledby="settings-tab-voice"
-              hidden={activeGroup !== "voice"}>
-              <VoiceSection {...voiceSettings} />
-              <MicSection />
-              <SavedVoicesSection />
-            </div>
+            <SettingsVoicePage
+              activeGroup={activeGroup}
+              voiceSettings={voiceSettings}
+            />
 
             <div
               className="settings-page"
@@ -670,12 +532,7 @@ export default function Settings({
                 // 400s on /api/chat), and `ai.defaultModel` echoes the room's
                 // saved model — in a cloud room that IS the model being
                 // disconnected. Ask in the host's own preference order instead.
-                fallbackModel={
-                  bestLocalModel(
-                    ai?.models ?? [],
-                    RECOMMENDED_MODELS.map((m) => m.name),
-                  ) ?? RECOMMENDED_MODELS[0].name
-                }
+                fallbackModel={defaultAiFallbackModel(ai)}
                 onModelChange={onModelChange}
                 onChanged={onModelsChanged}
               />
@@ -723,25 +580,15 @@ export default function Settings({
               />
             </div>
 
-            <div
-              className="settings-page"
-              id="settings-page-history"
-              role="tabpanel"
-              aria-labelledby="settings-tab-history"
-              hidden={activeGroup !== "history"}>
-              <CheckpointsSection {...checkpoints} busy={busy} />
-            </div>
-
-            <div
-              className="settings-page"
-              id="settings-page-app"
-              role="tabpanel"
-              aria-labelledby="settings-tab-app"
-              hidden={activeGroup !== "app"}>
-              <AppearanceSection />
-              <InterfaceSection onApplyPreset={onApplyPreset} />
-              <AboutSection />
-            </div>
+            <SettingsHistoryPage
+              activeGroup={activeGroup}
+              checkpoints={checkpoints}
+              busy={busy}
+            />
+            <SettingsAppPage
+              activeGroup={activeGroup}
+              onApplyPreset={onApplyPreset}
+            />
           </div>
         </div>
       </div>

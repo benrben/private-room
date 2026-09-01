@@ -47,16 +47,16 @@ export type { Podcast, PodcastHost, PodcastTurn };
 /** `str::eq_ignore_ascii_case` — ASCII-only folding. Deliberately NOT
  * `toLowerCase()`: JS folds the full Unicode table, so `K` (U+212A) would
  * equal `k`, which is not what Rust's byte-for-byte ASCII fold reports. */
+function asciiLowerCode(code: number): number {
+  return code >= 65 && code <= 90 ? code + 32 : code;
+}
+
 export function eqIgnoreAsciiCase(a: string, b: string): boolean {
   if (a.length !== b.length) {
     return false;
   }
   for (let i = 0; i < a.length; i++) {
-    let x = a.charCodeAt(i);
-    let y = b.charCodeAt(i);
-    if (x >= 65 && x <= 90) x += 32;
-    if (y >= 65 && y <= 90) y += 32;
-    if (x !== y) {
+    if (asciiLowerCode(a.charCodeAt(i)) !== asciiLowerCode(b.charCodeAt(i))) {
       return false;
     }
   }
@@ -108,34 +108,41 @@ function trimStartUnicode(s: string): string {
  * string index (what `text.slice()` needs) as it scans, so the returned
  * index is a JS string index used consistently by {@link stripSpeakerLabel}.
  */
-function labelLen(text: string, speaker: string): number | null {
-  const name = speaker.trim();
-  if (name === "") {
-    return null;
-  }
+function labelColon(text: string): number | null {
   let byteIdx = 0;
   let strIdx = 0;
-  let colonAt: number | null = null;
   for (const ch of text) {
     if (byteIdx > MAX_LABEL_BYTES) {
       break;
     }
     if (ch === ":") {
-      colonAt = strIdx;
-      break;
+      return strIdx;
     }
     byteIdx += Buffer.byteLength(ch, "utf8");
     strIdx += ch.length;
   }
+  return null;
+}
+
+function labelMatchesSpeaker(prefix: string, name: string): boolean {
+  if (prefix === "") {
+    return false;
+  }
+  const firstWord = name.split(/\p{White_Space}+/u).find((word) => word !== "") ?? name;
+  return eqIgnoreAsciiCase(prefix, name) || eqIgnoreAsciiCase(prefix, firstWord);
+}
+
+function labelLen(text: string, speaker: string): number | null {
+  const name = speaker.trim();
+  if (name === "") {
+    return null;
+  }
+  const colonAt = labelColon(text);
   if (colonAt === null) {
     return null;
   }
   const prefix = trimDecor(text.slice(0, colonAt));
-  if (prefix === "") {
-    return null;
-  }
-  const firstWord = name.split(/\p{White_Space}+/u).find((w) => w !== "") ?? name;
-  return eqIgnoreAsciiCase(prefix, name) || eqIgnoreAsciiCase(prefix, firstWord) ? colonAt + 1 : null;
+  return labelMatchesSpeaker(prefix, name) ? colonAt + 1 : null;
 }
 
 /**
@@ -188,30 +195,37 @@ export function stripSpeakerLabels(turns: PodcastTurn[]): void {
  * script rather than as a failed read (`podcast_row`'s own comment: the page
  * is still in the library and still opens; what is lost is the ability to
  * record it). */
-function parseTurnsColumn(raw: string): PodcastTurn[] {
-  let parsed: unknown;
+function parseJsonArray(raw: string): unknown[] | null {
   try {
-    parsed = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : null;
   } catch {
-    return [];
+    return null;
   }
-  if (!Array.isArray(parsed)) {
+}
+
+function turnFrom(item: unknown): PodcastTurn | null {
+  const value = objectRecord(item);
+  if (value === null) {
+    return null;
+  }
+  const speaker = requiredString(value, "speaker");
+  const line = requiredString(value, "line");
+  return speaker === null || line === null ? null : { speaker, line };
+}
+
+function parseTurnsColumn(raw: string): PodcastTurn[] {
+  const parsed = parseJsonArray(raw);
+  if (parsed === null) {
     return [];
   }
   const out: PodcastTurn[] = [];
   for (const item of parsed) {
-    if (
-      typeof item !== "object" ||
-      item === null ||
-      typeof (item as Record<string, unknown>).speaker !== "string" ||
-      typeof (item as Record<string, unknown>).line !== "string"
-    ) {
+    const turn = turnFrom(item);
+    if (turn === null) {
       return [];
     }
-    out.push({
-      speaker: (item as Record<string, unknown>).speaker as string,
-      line: (item as Record<string, unknown>).line as string,
-    });
+    out.push(turn);
   }
   return out;
 }
@@ -219,28 +233,49 @@ function parseTurnsColumn(raw: string): PodcastTurn[] {
 /** Same shape-validating parse as {@link parseTurnsColumn}, for the
  * `cast_json` column (`Vec<PodcastHost>` — `name` required, the rest
  * `#[serde(default)]`). */
-function parseCastColumn(raw: string): PodcastHost[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return [];
+function objectRecord(item: unknown): Record<string, unknown> | null {
+  return typeof item === "object" && item !== null ? (item as Record<string, unknown>) : null;
+}
+
+function requiredString(value: Record<string, unknown>, name: string): string | null {
+  const field = value[name];
+  return typeof field === "string" ? field : null;
+}
+
+function optionalHostField(value: Record<string, unknown>, name: string): string {
+  const field = value[name];
+  return typeof field === "string" ? field : "";
+}
+
+function castHostFrom(item: unknown): PodcastHost | null {
+  const value = objectRecord(item);
+  if (value === null) {
+    return null;
   }
-  if (!Array.isArray(parsed)) {
+  const name = requiredString(value, "name");
+  if (name === null) {
+    return null;
+  }
+  return {
+    name,
+    voice: optionalHostField(value, "voice"),
+    rate: optionalHostField(value, "rate"),
+    pitch: optionalHostField(value, "pitch"),
+  };
+}
+
+function parseCastColumn(raw: string): PodcastHost[] {
+  const parsed = parseJsonArray(raw);
+  if (parsed === null) {
     return [];
   }
   const out: PodcastHost[] = [];
   for (const item of parsed) {
-    if (typeof item !== "object" || item === null || typeof (item as Record<string, unknown>).name !== "string") {
+    const host = castHostFrom(item);
+    if (host === null) {
       return [];
     }
-    const o = item as Record<string, unknown>;
-    out.push({
-      name: o.name as string,
-      voice: typeof o.voice === "string" ? o.voice : "",
-      rate: typeof o.rate === "string" ? o.rate : "",
-      pitch: typeof o.pitch === "string" ? o.pitch : "",
-    });
+    out.push(host);
   }
   return out;
 }

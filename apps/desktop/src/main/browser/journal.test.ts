@@ -8,7 +8,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createRoom } from "../db-host/open.js";
 import { insertBrowseJournal, journal, nowIso, type JournalSink } from "./journal.js";
 
@@ -61,6 +61,22 @@ describe("insertBrowseJournal", () => {
       db.close();
     }
   });
+
+  it("keeps the inserted row when best-effort retention cannot run", () => {
+    const inserted = { lastInsertRowid: 5_001 };
+    const row = { id: 5_001, session: "sit", kind: "open", url: "https://example.com", detail: "", at: "now" };
+    const insert = { run: vi.fn(() => inserted) };
+    const select = { get: vi.fn(() => row) };
+    const trim = { run: vi.fn(() => { throw new Error("fabricated trim failure"); }) };
+    const db = {
+      prepare: vi.fn((sql: string) => sql.startsWith("INSERT")
+        ? insert
+        : sql.trimStart().startsWith("DELETE") ? trim : select),
+    } as unknown as Parameters<typeof insertBrowseJournal>[0];
+
+    expect(insertBrowseJournal(db, "sit", "open", "https://example.com", "")).toEqual(row);
+    expect(trim.run).toHaveBeenCalledWith(4_999);
+  });
 });
 
 describe("journal", () => {
@@ -97,6 +113,16 @@ describe("journal", () => {
     expect(row.kind).toBe("blocked");
     expect(row.url).toBe("http://127.0.0.1/");
     expect(row.detail).toBe("Navigation blocked");
+  });
+
+  it("falls back to a live-only row when the room database rejects the write", () => {
+    const db = realRoom();
+    db.close();
+    const emitted: unknown[] = [];
+
+    expect(() => journal({ db, emit: (row) => emitted.push(row) }, "sit", "open", "https://example.com", "failed write")).not.toThrow();
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({ id: -1, session: "sit", kind: "open", detail: "failed write" });
   });
 });
 

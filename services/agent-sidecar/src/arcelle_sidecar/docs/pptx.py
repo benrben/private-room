@@ -64,86 +64,142 @@ def extract_pptx(data: bytes) -> str | None:
 
 def _extract_pptx_budgeted(data: bytes, budget: int) -> str | None:
     names = zip_entry_names(data)
-    slides = sorted(
-        (n for n in names if n.startswith(_SLIDE_PREFIX) and n.endswith(_SLIDE_SUFFIX)),
-        key=lambda n: slide_number(n) or 0,
+    output = _BudgetedText(budget)
+    _append_slides(data, _slide_entries(names), output)
+    _append_chart_and_diagram_text(data, names, output)
+    return output.result()
+
+
+class _BudgetedText:
+    """The extracted text and the shared byte budget used to read it."""
+
+    def __init__(self, budget: int) -> None:
+        self.budget = budget
+        self.chunks: list[str] = []
+        self.out_bytes = 0
+
+    def remaining(self) -> int:
+        return self.budget - self.out_bytes
+
+    def emit(self, text: str) -> None:
+        self.chunks.append(text)
+        self.out_bytes += len(text.encode("utf-8"))
+
+    def result(self) -> str | None:
+        output = "".join(self.chunks)
+        return output if output.strip() else None
+
+
+def _slide_entries(names: list[str]) -> list[str]:
+    return sorted(
+        (name for name in names if name.startswith(_SLIDE_PREFIX) and name.endswith(_SLIDE_SUFFIX)),
+        key=lambda name: slide_number(name) or 0,
     )
 
-    chunks: list[str] = []
-    out_bytes = 0
 
-    def remaining() -> int:
-        return budget - out_bytes
-
-    def emit(text: str) -> None:
-        nonlocal out_bytes
-        chunks.append(text)
-        out_bytes += len(text.encode("utf-8"))
-
-    for i, entry in enumerate(slides):
+def _append_slides(data: bytes, slides: list[str], output: _BudgetedText) -> None:
+    for index, entry in enumerate(slides):
         # The per-slide cap alone lets hundreds of near-cap slides balloon
         # the total, so all slides share one aggregate budget; downstream
         # truncates extracted text anyway, so stopping early loses nothing.
-        if remaining() <= 0:
+        if output.remaining() <= 0:
             break
-        xml = read_zip_entry_capped(data, entry, remaining())
-        if xml is not None:
-            emit(f"[slide {i + 1}]\n" + xml_paras_to_text(xml, "</a:p>") + "\n")
+        _append_slide_body(data, entry, index, output)
+        _append_slide_notes(data, entry, index, output)
 
-        # The speaker notes belong to the slide, and in a real deck they
-        # carry the argument, the numbers and the narration the headline
-        # only hints at. Reading slide bodies alone left the assistant
-        # answering from titles, confidently missing content plainly in the
-        # file.
-        slide_no = slide_number(entry)
-        if slide_no is None:
-            slide_no = i + 1
-        notes_entry = notes_part(data, entry, slide_no) if remaining() > 0 else None
-        if notes_entry is not None:
-            notes_xml = read_zip_entry_capped(data, notes_entry, remaining())
-            if notes_xml is not None:
-                notes = xml_paras_to_text(notes_xml, "</a:p>")
-                # The notes part of an un-annotated slide still exists and
-                # still renders the slide number; only real prose is worth
-                # it.
-                if len(notes.split()) > 1:
-                    emit(f"[slide {i + 1} notes]\n" + notes + "\n")
 
+def _append_slide_body(data: bytes, entry: str, index: int, output: _BudgetedText) -> None:
+    xml = read_zip_entry_capped(data, entry, output.remaining())
+    if xml is not None:
+        output.emit(f"[slide {index + 1}]\n" + xml_paras_to_text(xml, "</a:p>") + "\n")
+
+
+def _append_slide_notes(data: bytes, entry: str, index: int, output: _BudgetedText) -> None:
+    # The speaker notes belong to the slide, and in a real deck they carry
+    # the argument, the numbers and the narration the headline only hints
+    # at. Reading slide bodies alone left the assistant answering from
+    # titles, confidently missing content plainly in the file.
+    if output.remaining() <= 0:
+        return
+    notes_entry = notes_part(data, entry, _slide_number_or_index(entry, index))
+    if notes_entry is None:
+        return
+    notes_xml = read_zip_entry_capped(data, notes_entry, output.remaining())
+    if notes_xml is None:
+        return
+    notes = xml_paras_to_text(notes_xml, "</a:p>")
+    # The notes part of an un-annotated slide still exists and still renders
+    # the slide number; only real prose is worth it.
+    if len(notes.split()) <= 1:
+        return
+    output.emit(f"[slide {index + 1} notes]\n" + notes + "\n")
+
+
+def _slide_number_or_index(entry: str, index: int) -> int:
+    number = slide_number(entry)
+    return index + 1 if number is None else number
+
+
+def _append_chart_and_diagram_text(
+    data: bytes, names: list[str], output: _BudgetedText
+) -> None:
     # Chart data and SmartArt/diagram text live in their own parts, so a
     # deck whose numbers are all in charts extracted to headings only.
     for prefix, label in (("ppt/charts/chart", "chart"), ("ppt/diagrams/data", "diagram")):
-        parts = sorted(n for n in names if n.startswith(prefix) and n.endswith(".xml"))
-        for entry in parts:
-            if remaining() <= 0:
-                break
-            xml = read_zip_entry_capped(data, entry, remaining())
-            if xml is None:
-                continue
-            text = xml_paras_to_text(xml, "</a:p>")
-            if len(text.split()) > 1:
-                emit(f"[{label}]\n" + text + "\n")
+        _append_labeled_parts(data, _matching_xml_parts(names, prefix), label, output)
 
-    out = "".join(chunks)
-    return out if out.strip() else None
+
+def _matching_xml_parts(names: list[str], prefix: str) -> list[str]:
+    return sorted(name for name in names if name.startswith(prefix) and name.endswith(".xml"))
+
+
+def _append_labeled_parts(
+    data: bytes, entries: list[str], label: str, output: _BudgetedText
+) -> None:
+    for entry in entries:
+        if output.remaining() <= 0:
+            break
+        _append_labeled_part(data, entry, label, output)
+
+
+def _append_labeled_part(
+    data: bytes, entry: str, label: str, output: _BudgetedText
+) -> None:
+    xml = read_zip_entry_capped(data, entry, output.remaining())
+    if xml is None:
+        return
+    text = xml_paras_to_text(xml, "</a:p>")
+    if len(text.split()) <= 1:
+        return
+    output.emit(f"[{label}]\n" + text + "\n")
 
 
 def slide_number(entry: str) -> int | None:
     """The `N` in `ppt/slides/slideN.xml` -- the archive order the slides
     arrive in is not necessarily that numbering.
     """
-    s = entry
-    while s.startswith(_SLIDE_PREFIX):
-        s = s[len(_SLIDE_PREFIX) :]
-    while s.endswith(_SLIDE_SUFFIX):
-        s = s[: -len(_SLIDE_SUFFIX)]
+    s = _slide_file_stem(entry)
     # `str::parse::<u32>()`: an optional single leading `+`, decimal digits
     # only (no underscores, no whitespace -- unlike Python's own lenient
     # `int()`), and the value must fit in 32 bits.
     digits = s[1:] if s.startswith("+") else s
-    if not digits or any(c not in "0123456789" for c in digits):
+    if not _is_decimal_digits(digits):
         return None
     value = int(digits)
     return value if value <= 0xFFFFFFFF else None
+
+
+def _slide_file_stem(entry: str) -> str:
+    stem = entry
+    while stem.startswith(_SLIDE_PREFIX):
+        stem = stem[len(_SLIDE_PREFIX) :]
+    while stem.endswith(_SLIDE_SUFFIX):
+        stem = stem[: -len(_SLIDE_SUFFIX)]
+    return stem
+
+
+def _is_decimal_digits(text: str) -> bool:
+    return bool(text) and all(char in "0123456789" for char in text)
 
 
 def notes_part(data: bytes, slide_entry: str, slide_no: int) -> str | None:
@@ -190,17 +246,23 @@ def notes_rel_target(rels_xml: str) -> str | None:
     notes.
     """
     for tag in rels_xml.split("<"):
-        if not tag.startswith("Relationship"):
-            continue
-        kind = xml_attr(tag, "Type")
-        if kind is None:
-            continue
-        if not kind.endswith("/notesSlide"):
-            continue
-        target = xml_attr(tag, "Target")
+        target = _notes_target(tag)
         if target is not None:
             return target
     return None
+
+
+def _notes_target(tag: str) -> str | None:
+    if not _is_notes_relationship(tag):
+        return None
+    return xml_attr(tag, "Target")
+
+
+def _is_notes_relationship(tag: str) -> bool:
+    if not tag.startswith("Relationship"):
+        return False
+    kind = xml_attr(tag, "Type")
+    return kind is not None and kind.endswith("/notesSlide")
 
 
 def resolve_part(part_dir: str, target: str) -> str:
@@ -211,16 +273,27 @@ def resolve_part(part_dir: str, target: str) -> str:
     """
     if target.startswith("/"):
         return target[1:]
+    return _resolve_relative_part(part_dir, target)
+
+
+def _resolve_relative_part(part_dir: str, target: str) -> str:
     parts = [s for s in part_dir.split("/") if s]
     for seg in target.split("/"):
-        if seg in ("", "."):
-            continue
-        if seg == "..":
-            if parts:
-                parts.pop()
-        else:
-            parts.append(seg)
+        if _is_part_segment(seg):
+            _append_part_segment(parts, seg)
     return "/".join(parts)
+
+
+def _is_part_segment(segment: str) -> bool:
+    return segment not in ("", ".")
+
+
+def _append_part_segment(parts: list[str], segment: str) -> None:
+    if segment == "..":
+        if parts:
+            parts.pop()
+        return
+    parts.append(segment)
 
 
 __all__ = [

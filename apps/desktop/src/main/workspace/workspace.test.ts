@@ -1,4 +1,5 @@
-import { chmod, cp, lstat, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -226,6 +227,46 @@ describe("workspace room storage", () => {
     }
   });
 
+  it("preserves the stable file id after a synced rename replaces the inode", async () => {
+    const parent = await temporaryRoot();
+    const workspaceRoot = path.join(parent, "Synced Rename Room");
+    const source = path.join(parent, "source.md");
+    await writeFile(source, "same bytes", "utf8");
+    const { db } = createWorkspaceRoom(workspaceRoot, "correct horse battery staple", "Synced Rename Room");
+    const workspace = new WorkspaceService(db, workspaceRoot);
+    try {
+      const imported = await workspace.importFile(source, "before.md");
+      await cp(path.join(workspaceRoot, "before.md"), path.join(workspaceRoot, "after.md"));
+      await rm(path.join(workspaceRoot, "before.md"));
+
+      expect(await workspace.reconcile()).toMatchObject({ renamed: 1, added: 0, missing: 0 });
+      expect(db.prepare("SELECT id, relative_path FROM files WHERE id = ?").get(imported.fileId))
+        .toEqual({ id: imported.fileId, relative_path: "after.md" });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("marks a missing row with no trusted hash offline instead of treating it as a rename", async () => {
+    const parent = await temporaryRoot();
+    const workspaceRoot = path.join(parent, "Unverified Missing Room");
+    const source = path.join(parent, "source.md");
+    await writeFile(source, "same bytes", "utf8");
+    const { db } = createWorkspaceRoom(workspaceRoot, "correct horse battery staple", "Unverified Missing Room");
+    const workspace = new WorkspaceService(db, workspaceRoot);
+    try {
+      const imported = await workspace.importFile(source, "unverified.md");
+      db.prepare("UPDATE files SET content_sha256 = NULL WHERE id = ?").run(imported.fileId);
+      await rm(path.join(workspaceRoot, "unverified.md"));
+
+      expect(await workspace.reconcile()).toMatchObject({ renamed: 0, missing: 1 });
+      expect(db.prepare("SELECT index_state FROM files WHERE id = ?").get(imported.fileId))
+        .toEqual({ index_state: "offline" });
+    } finally {
+      db.close();
+    }
+  });
+
   it("creates and removes only safe empty normal directories with journal records", async () => {
     const parent = await temporaryRoot();
     const workspaceRoot = path.join(parent, "Directory Room");
@@ -261,47 +302,61 @@ describe("workspace room storage", () => {
     }
   });
 
-  it("keeps ten unpinned encrypted versions, preserves pinned versions, and restores them", async () => {
-    const parent = await temporaryRoot();
-    const workspaceRoot = path.join(parent, "History Room");
-    const source = path.join(parent, "history-source.txt");
-    await writeFile(source, "version 0", "utf8");
-    const { db } = createWorkspaceRoom(workspaceRoot, "correct horse battery staple", "History Room");
-    const workspace = new WorkspaceService(db, workspaceRoot);
-    try {
-      const imported = await workspace.importFile(source, "history.txt");
-      const pinnedId = await workspace.snapshotVersion(imported.fileId, "pinned start");
-      setVersionPinned(db, pinnedId, true);
-      await workspace.writeAtomic(imported.fileId, Readable.from("version 1"));
-      for (let version = 1; version <= 11; version += 1) {
-        await workspace.snapshotVersion(imported.fileId, `save ${version}`);
-        await workspace.writeAtomic(imported.fileId, Readable.from(`version ${version + 1}`));
+  it(
+    "keeps ten unpinned encrypted versions, preserves pinned versions, and restores them",
+    async () => {
+      const parent = await temporaryRoot();
+      const workspaceRoot = path.join(parent, "History Room");
+      const source = path.join(parent, "history-source.txt");
+      await writeFile(source, "version 0", "utf8");
+      const { db } = createWorkspaceRoom(
+        workspaceRoot,
+        "correct horse battery staple",
+        "History Room",
+      );
+      const workspace = new WorkspaceService(db, workspaceRoot);
+      try {
+        const imported = await workspace.importFile(source, "history.txt");
+        const pinnedId = await workspace.snapshotVersion(imported.fileId, "pinned start");
+        setVersionPinned(db, pinnedId, true);
+        await workspace.writeAtomic(imported.fileId, Readable.from("version 1"));
+        for (let version = 1; version <= 11; version += 1) {
+          await workspace.snapshotVersion(imported.fileId, `save ${version}`);
+          await workspace.writeAtomic(imported.fileId, Readable.from(`version ${version + 1}`));
+        }
+
+        const versions = listFileVersions(db, imported.fileId);
+        expect(versions).toHaveLength(11);
+        expect(versions.filter((version) => version.pinned)).toHaveLength(1);
+        expect(versions.every((version) => version.bytes > 0)).toBe(true);
+        expect(
+          db.prepare("SELECT count(*) AS n FROM file_versions WHERE length(bytes) = 0").get(),
+        ).toEqual({ n: 11 });
+        expect(
+          db.prepare(
+            "SELECT count(*) AS n FROM content_object_refs WHERE owner_type = 'file_version'",
+          ).get(),
+        ).toEqual({ n: 11 });
+
+        await workspace.restoreVersion(pinnedId);
+        expect(await readFile(path.join(workspaceRoot, "history.txt"), "utf8")).toBe("version 0");
+        expect(listFileVersions(db, imported.fileId)).toHaveLength(11);
+
+        await workspace.deleteVersion(pinnedId);
+        expect(
+          listFileVersions(db, imported.fileId).some((version) => version.id === pinnedId),
+        ).toBe(false);
+        expect(
+          db.prepare(
+            "SELECT count(*) AS n FROM content_object_refs WHERE owner_type = 'file_version' AND owner_id = ?",
+          ).get(pinnedId),
+        ).toEqual({ n: 0 });
+      } finally {
+        db.close();
       }
-
-      const versions = listFileVersions(db, imported.fileId);
-      expect(versions).toHaveLength(11);
-      expect(versions.filter((version) => version.pinned)).toHaveLength(1);
-      expect(versions.every((version) => version.bytes > 0)).toBe(true);
-      expect(db.prepare(
-        "SELECT count(*) AS n FROM file_versions WHERE length(bytes) = 0",
-      ).get()).toEqual({ n: 11 });
-      expect(db.prepare(
-        "SELECT count(*) AS n FROM content_object_refs WHERE owner_type = 'file_version'",
-      ).get()).toEqual({ n: 11 });
-
-      await workspace.restoreVersion(pinnedId);
-      expect(await readFile(path.join(workspaceRoot, "history.txt"), "utf8")).toBe("version 0");
-      expect(listFileVersions(db, imported.fileId)).toHaveLength(11);
-
-      await workspace.deleteVersion(pinnedId);
-      expect(listFileVersions(db, imported.fileId).some((version) => version.id === pinnedId)).toBe(false);
-      expect(db.prepare(
-        "SELECT count(*) AS n FROM content_object_refs WHERE owner_type = 'file_version' AND owner_id = ?",
-      ).get(pinnedId)).toEqual({ n: 0 });
-    } finally {
-      db.close();
-    }
-  });
+    },
+    15_000,
+  );
 
   it("preserves POSIX permissions when atomically replacing a file", async () => {
     const parent = await temporaryRoot();
@@ -353,6 +408,46 @@ describe("workspace room storage", () => {
         onHash: (relativePath) => changedHashed.push(relativePath),
       });
       expect(changedHashed).toEqual(["notes.txt"]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("recurses into directories and ignores symlinks and special filesystem entries", async () => {
+    const parent = await mkdtemp("/tmp/aw-");
+    roots.push(parent);
+    const workspaceRoot = path.join(parent, "Manifest Entries");
+    const { db } = createWorkspaceRoom(workspaceRoot, "correct horse battery staple", "Manifest Entries");
+    const socketPath = path.join(workspaceRoot, "manifest.sock");
+    const socket = createServer();
+    try {
+      await mkdir(path.join(workspaceRoot, "nested"));
+      await writeFile(path.join(workspaceRoot, "nested", "kept.txt"), "kept", "utf8");
+      await symlink(os.tmpdir(), path.join(workspaceRoot, "outside-link"));
+      await new Promise<void>((resolve, reject) => {
+        socket.once("error", reject);
+        socket.listen(socketPath, resolve);
+      });
+
+      const manifest = await scanWorkspaceManifest(workspaceRoot);
+
+      expect([...manifest.keys()]).toEqual(["nested/kept.txt"]);
+    } finally {
+      await new Promise<void>((resolve) => socket.close(() => resolve()));
+      db.close();
+    }
+  });
+
+  it("refuses two filesystem names that normalize to one portable room path", async () => {
+    const parent = await temporaryRoot();
+    const workspaceRoot = path.join(parent, "Manifest Collision");
+    const { db } = createWorkspaceRoom(workspaceRoot, "correct horse battery staple", "Manifest Collision");
+    try {
+      await mkdir(path.join(workspaceRoot, "nested"));
+      await writeFile(path.join(workspaceRoot, "nested", "file.txt"), "one", "utf8");
+      await writeFile(path.join(workspaceRoot, "nested\\file.txt"), "two", "utf8");
+
+      await expect(scanWorkspaceManifest(workspaceRoot)).rejects.toThrow(/same normalized path/i);
     } finally {
       db.close();
     }

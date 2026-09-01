@@ -10,14 +10,16 @@
  * `dispose()` deviation `cancel.ts`'s own module doc requires of this file.
  */
 
-import { mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
+import { Readable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { createRoom } from "./db-host/open.js";
-import { fileByExactName, getFileMeta, insertFile, type FileMeta } from "./db-host/files.js";
+import { fileByExactName, getFileMeta, insertFile, setFileExtractedText, type FileMeta } from "./db-host/files.js";
 import { getPodcast as getPodcastRow } from "./db-host/podcasts.js";
 import { setSetting } from "./db-host/settings.js";
 import {
@@ -32,6 +34,7 @@ import { NOTEBOOK_CSS } from "./docsHtml.js";
 import * as obs from "./obs.js";
 import {
   cleanStudioHtml,
+  cleanupBrowserPreviews,
   execStudio,
   cleanupBrowserPreviewsOlderThan,
   createHtmlPreviews,
@@ -62,6 +65,8 @@ import {
   type StudioLog,
   type StudioSpec,
 } from "./studiosCmds.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 
 // ============================================================================
 // fixture room
@@ -80,6 +85,13 @@ function freshRoom(name = "Test Room"): Database.Database {
   tmpDir = mkdtempSync(path.join(os.tmpdir(), "studios-cmds-"));
   const roomPath = path.join(tmpDir, `t-${randomUUID()}.roomai`);
   return createRoom(roomPath, "correct horse battery staple", name);
+}
+
+function freshWorkspaceRoom(name = "Workspace Room"): { db: Database.Database; root: string; workspace: WorkspaceService } {
+  tmpDir = mkdtempSync(path.join(os.tmpdir(), "studios-cmds-workspace-"));
+  const root = path.join(tmpDir, "Room");
+  const { db } = createWorkspaceRoom(root, "correct horse battery staple", name);
+  return { db, root, workspace: new WorkspaceService(db, root) };
 }
 
 function addFile(db: Database.Database, name: string, text: string | null, mime = "text/plain"): string {
@@ -222,6 +234,20 @@ describe("gatherScopeText", () => {
     const db = freshRoom();
     expect(() => gatherScopeText(db, null, "Empty Room")).toThrow("no readable text to work with yet");
   });
+
+  it("skips blank files and stops before reading beyond the whole-room byte budget", () => {
+    const db = freshRoom();
+    addFile(db, "after-limit.md", "this must not be gathered");
+    for (let index = 0; index < 9; index += 1) {
+      addFile(db, `part-${index}.md`, "x".repeat(1_500));
+    }
+    addFile(db, "blank.md", "   ");
+
+    const [, text] = gatherScopeText(db, null, "Room");
+
+    expect(text).not.toContain("blank.md");
+    expect(text).not.toContain("after-limit.md");
+  });
 });
 
 describe("gatherFilesText", () => {
@@ -247,6 +273,14 @@ describe("gatherFilesText", () => {
   it("throws when nothing in the list has readable text", () => {
     const db = freshRoom();
     expect(() => gatherFilesText(db, ["nope"])).toThrow("no readable text to work with");
+  });
+
+  it("stops once previously gathered referenced files reach the byte budget", () => {
+    const db = freshRoom();
+    const ids = Array.from({ length: 6 }, (_, index) => addFile(db, `part-${index}.md`, "x".repeat(3_000)));
+    const [, text] = gatherFilesText(db, ids);
+    expect(text).toContain("part-3.md");
+    expect(text).not.toContain("part-4.md");
   });
 });
 
@@ -398,6 +432,7 @@ describe("openHtmlInBrowser", () => {
       })
     ).rejects.toThrow("Couldn't open your browser: no default browser");
   });
+
 });
 
 describe("sweepPreviewsOlderThan / cleanupBrowserPreviewsOlderThan", () => {
@@ -419,6 +454,41 @@ describe("sweepPreviewsOlderThan / cleanupBrowserPreviewsOlderThan", () => {
 
   it("does nothing (never throws) when the directory was never created", () => {
     expect(() => cleanupBrowserPreviewsOlderThan(60_000)).not.toThrow();
+  });
+
+  it("leaves unreadable and non-removable entries alone while continuing the best-effort sweep", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "studios-preview-errors-"));
+    const dangling = path.join(dir, "dangling.html");
+    const staleDirectory = path.join(dir, "stale-directory.html");
+    symlinkSync(path.join(dir, "gone.html"), dangling);
+    mkdirSync(staleDirectory);
+    const longAgo = new Date(Date.now() - 600_000);
+    utimesSync(staleDirectory, longAgo, longAgo);
+
+    expect(() => sweepPreviewsOlderThan(path.join(dir, "missing"), 0)).not.toThrow();
+    expect(() => sweepPreviewsOlderThan(dir, 0)).not.toThrow();
+    expect(statSync(staleDirectory).isDirectory()).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("cleans the startup preview folder without making cleanup failures fatal", () => {
+    cleanupBrowserPreviews();
+    expect(() => cleanupBrowserPreviews()).not.toThrow();
+  });
+});
+
+describe("stagePreviewHtmlCore defensive store boundary", () => {
+  it("does not loop forever if a malformed full store reports no keys", () => {
+    const map = {
+      get size(): number {
+        return PREVIEW_MAX;
+      },
+      keys: (): IterableIterator<string> => [][Symbol.iterator](),
+      delete: vi.fn(),
+      set: vi.fn(),
+    } as unknown as Map<string, string>;
+    const previews = { next: 0, map } as HtmlPreviews;
+    expect(stagePreviewHtmlCore(previews, "<p>safe</p>")).toBe("0");
   });
 });
 
@@ -544,6 +614,48 @@ describe("runStudioCore / runStudio — the shared pipeline", () => {
     expect(emitted[0]).toEqual(["studio-step", { step: "Reading the material…", local: true }]);
   });
 
+  it("keeps running when cosmetic Studio events throw", async () => {
+    const db = freshRoom("Room");
+    addFile(db, "src.md", "text");
+    const rooms = fakeRoomSource({ db, path: "p", name: "Room" });
+    const deps = testDeps(rooms, {
+      emit: () => {
+        throw new Error("window closed");
+      },
+      chatStructured: (async () => JSON.stringify({ html: `<!doctype html><html><body>${"e".repeat(60)}</body></html>` })) as never,
+    });
+
+    await expect(runStudio(deps, testSpec(), null, null, null, null, null)).resolves.toMatchObject({ name: "Test Artifact - Room.html" });
+  });
+
+  it("refuses to save into a room closed after generation but before the artifact commit", async () => {
+    const db = freshRoom("Room");
+    addFile(db, "src.md", "text");
+    const rooms = fakeRoomSource({ db, path: "p", name: "Room" });
+    const deps = testDeps(rooms, {
+      chatStructured: (async () => {
+        rooms.set(null);
+        return JSON.stringify({ html: `<!doctype html><html><body>${"e".repeat(60)}</body></html>` });
+      }) as never,
+    });
+
+    await expect(runStudioCore(deps, testSpec(), null, null, null, new CancelFlag(), null)).rejects.toThrow("No room is open.");
+  });
+
+  it("commits generated Studio pages through a workspace room's filesystem service", async () => {
+    const { db, root, workspace } = freshWorkspaceRoom();
+    const source = await workspace.createFile("src.md", Readable.from([Buffer.from("workspace source")]), "upload");
+    setFileExtractedText(db, source.fileId, "workspace source");
+    const rooms = fakeRoomSource({ db, path: root, name: "Workspace Room", workspace });
+    const deps = testDeps(rooms, {
+      chatStructured: (async () => JSON.stringify({ html: `<!doctype html><html><body>${"w".repeat(60)}</body></html>` })) as never,
+    });
+
+    const meta = await runStudio(deps, testSpec(), null, null, null, null, null);
+
+    expect(statSync(path.join(root, meta.name)).isFile()).toBe(true);
+  });
+
   it("falls back to the structured render when the model's HTML isn't usable", async () => {
     const db = freshRoom("My Room");
     addFile(db, "src.md", "Source material.");
@@ -610,6 +722,36 @@ describe("runStudioCore / runStudio — the shared pipeline", () => {
     await expect(runStudioCore(deps, testSpec(), null, null, null, new CancelFlag(), "room-a.roomai")).rejects.toThrow(
       "the room this job belongs to was closed"
     );
+  });
+
+  it("refuses before model work when a pinned job begins in a different room", async () => {
+    const db = freshRoom("Room A");
+    addFile(db, "src.md", "text");
+    const rooms = fakeRoomSource({ db, path: "room-a.roomai", name: "Room A" });
+    const listModels = vi.fn(async () => ["qwen3.5:4b"]);
+    await expect(runStudioCore(testDeps(rooms, { listModels }), testSpec(), null, null, null, new CancelFlag(), "room-b.roomai")).rejects.toThrow(
+      "the room this job belongs to was closed"
+    );
+    expect(listModels).not.toHaveBeenCalled();
+  });
+
+  it("emits the cloud disclosure when the room explicitly selects an external engine", async () => {
+    const db = freshRoom("Room");
+    addFile(db, "src.md", "text");
+    setSetting(db, "model", "claude-cli");
+    const rooms = fakeRoomSource({ db, path: "p", name: "Room" });
+    const emitted: Array<[string, unknown]> = [];
+    const deps = testDeps(rooms, {
+      emit: (event, payload) => emitted.push([event, payload]),
+      chatStructured: (async () => JSON.stringify({ html: `<!doctype html><html><body>${"c".repeat(60)}</body></html>` })) as never,
+    });
+
+    await runStudio(deps, testSpec(), null, null, null, null, null);
+
+    expect(emitted).toContainEqual([
+      "studio-step",
+      { step: "Building it — your cloud AI is writing (content leaves this Mac)…", local: false },
+    ]);
   });
 
   it("throws \"Stopped.\" when cancelled between HTML generation and commit", async () => {
@@ -967,6 +1109,107 @@ describe("studioSpecFor: prototype safety", () => {
       );
     } finally {
       delete proto.mindmap;
+    }
+  });
+});
+
+describe("openHtmlInBrowser filesystem failures", () => {
+  it("reports distinct preview-folder and preview-file errors", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs/promises", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("node:fs/promises")>();
+      return { ...actual, mkdir: async () => Promise.reject(new Error("mkdir denied")) };
+    });
+    try {
+      const isolated = await import("./studiosCmds.js");
+      await expect(isolated.openHtmlInBrowser("x", "<p>hi</p>", async () => {})).rejects.toThrow(
+        "Couldn't create the preview folder: mkdir denied"
+      );
+    } finally {
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
+
+    vi.doMock("node:fs/promises", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("node:fs/promises")>();
+      return { ...actual, writeFile: async () => Promise.reject(new Error("disk full")) };
+    });
+    try {
+      const isolated = await import("./studiosCmds.js");
+      await expect(isolated.openHtmlInBrowser("x", "<p>hi</p>", async () => {})).rejects.toThrow(
+        "Couldn't write the preview file: disk full"
+      );
+    } finally {
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+      rmSync(path.join(os.tmpdir(), "arcelle-preview"), { recursive: true, force: true });
+    }
+  });
+});
+
+describe("studiosCmds OS and receipt boundaries", () => {
+  it("waits for the mocked operating-system browser launch without spawning a real browser", async () => {
+    vi.resetModules();
+    vi.doMock("node:child_process", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("node:child_process")>();
+      return {
+        ...actual,
+        spawn: () => {
+          const child = new EventEmitter();
+          queueMicrotask(() => child.emit("spawn"));
+          return child;
+        },
+      };
+    });
+    try {
+      const isolated = await import("./studiosCmds.js");
+      const filePath = await isolated.openHtmlInBrowser("system-open", "<p>hi</p>");
+      expect(path.basename(filePath)).toMatch(/^system-open-\d+\.html$/);
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+      rmSync(path.join(os.tmpdir(), "arcelle-preview"), { recursive: true, force: true });
+    }
+  });
+
+  it("keeps startup preview cleanup best-effort when the filesystem refuses removal", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("node:fs")>();
+      return { ...actual, rmSync: () => { throw new Error("permission denied"); } };
+    });
+    try {
+      const isolated = await import("./studiosCmds.js");
+      expect(() => isolated.cleanupBrowserPreviews()).not.toThrow();
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
+  it("refuses a Studio success whose saved artifact cannot be reopened for its receipt", async () => {
+    vi.resetModules();
+    vi.doMock("./workspace/roomContent.js", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("./workspace/roomContent.js")>();
+      return {
+        ...actual,
+        readRoomFile: async () => ({ bytes: null }),
+      };
+    });
+    try {
+      const isolated = await import("./studiosCmds.js");
+      const db = freshRoom("Receipt Room");
+      addFile(db, "src.md", "text");
+      const rooms = fakeRoomSource({ db, path: "receipt.roomai", name: "Receipt Room" });
+      const deps = testDeps(rooms, {
+        chatStructured: (async () => JSON.stringify({ html: `<!doctype html><html><body>${"r".repeat(60)}</body></html>` })) as never,
+      });
+      await expect(isolated.execStudio(deps, testSpec(), null, {})).rejects.toThrow(
+        'Studio artifact "Test Artifact - Receipt Room.html" could not be verified after it was saved.'
+      );
+    } finally {
+      vi.doUnmock("./workspace/roomContent.js");
+      vi.resetModules();
     }
   });
 });

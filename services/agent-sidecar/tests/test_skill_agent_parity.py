@@ -23,19 +23,20 @@ import pytest
 
 from arcelle_sidecar.agents import REGISTRY
 
-TOOL_SPECS_TS = (
-    Path(__file__).resolve().parents[3]
-    / "apps" / "desktop" / "src" / "main" / "toolSpecs.ts"
+TOOL_SPECS_DIR = (
+    Path(__file__).resolve().parents[3] / "apps" / "desktop" / "src" / "main"
 )
+TOOL_SPECS_TYPES_TS = TOOL_SPECS_DIR / "toolSpecsTypes.ts"
+TOOL_SPECS_CATALOG_TS = TOOL_SPECS_DIR / "toolSpecsCatalog.ts"
 
 
 def _host_skill_agent_ids() -> list[str]:
-    """Parse `SKILL_AGENT_IDS` out of the Electron host source."""
-    src = TOOL_SPECS_TS.read_text(encoding="utf-8")
+    """Parse `SKILL_AGENT_IDS` out of its canonical Electron source."""
+    src = TOOL_SPECS_TYPES_TS.read_text(encoding="utf-8")
     m = re.search(
         r"export const SKILL_AGENT_IDS:[^=]+?= \[(.*?)\];", src, re.S
     )
-    assert m, "SKILL_AGENT_IDS not found in toolSpecs.ts — was it renamed?"
+    assert m, "SKILL_AGENT_IDS not found in toolSpecsTypes.ts — was it renamed?"
     return re.findall(r'"([^"]+)"', m.group(1))
 
 
@@ -71,7 +72,7 @@ def test_the_tool_description_documents_every_id_it_offers(host_ids: list[str]) 
     """The enum and its prose must not drift apart either — the description
     explains what each id MEANS, and an undocumented value is one a model
     cannot choose sensibly."""
-    src = TOOL_SPECS_TS.read_text(encoding="utf-8")
+    src = TOOL_SPECS_CATALOG_TS.read_text(encoding="utf-8")
     m = re.search(r'name: "save_skill".*?(?=\n\s*\{\n\s*type: "function")', src, re.S)
     assert m, "save_skill spec not found"
     spec_text = m.group(0)

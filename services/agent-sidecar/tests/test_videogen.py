@@ -122,6 +122,38 @@ async def test_a_room_picture_rides_inline_as_the_first_frame(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
+async def test_all_optional_submission_controls_keep_their_wire_shape(monkeypatch) -> None:
+    """False audio is an explicit provider instruction, not an omission."""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = httpx.Response(200, content=request.content).json()
+        return httpx.Response(202, json={"job_id": " vid_456 "})
+
+    mock_client(monkeypatch, handler)
+    out = await videogen.submit(
+        prompt="a boat leaves the harbour",
+        model="openrouter::vendor/filmer",
+        provider=config(),
+        seconds=6,
+        resolution=" 1080p ",
+        aspect_ratio=" 16:9 ",
+        frames=[{"b64": PNG_B64, "mime": "image/png", "frame_type": "first_frame"}],
+        references=[{"b64": PNG_B64, "mime": "image/jpeg"}],
+        references_ack=True,
+        generate_audio=False,
+    )
+
+    assert seen["body"]["duration"] == 6
+    assert seen["body"]["resolution"] == "1080p"
+    assert seen["body"]["aspect_ratio"] == "16:9"
+    assert seen["body"]["generate_audio"] is False
+    assert seen["body"]["frame_images"]
+    assert seen["body"]["input_references"]
+    assert out == {"video_id": "vid_456", "privacy": None}
+
+
+@pytest.mark.asyncio
 async def test_an_unknown_frame_slot_is_refused_before_it_is_billed() -> None:
     with pytest.raises(videogen.VideoGenError) as caught:
         await videogen.submit(
@@ -225,10 +257,12 @@ async def test_an_acknowledged_picture_goes_but_the_prompt_is_still_redacted(mon
 
 @pytest.mark.asyncio
 async def test_status_separates_still_working_from_over(monkeypatch) -> None:
-    # Patched ONCE and the answer varied per call: re-patching inside the loop
-    # would wrap the already-patched factory and pass `transport` twice.
     current = {"status": "pending"}
-    mock_client(monkeypatch, lambda request: httpx.Response(200, json=dict(current)))
+
+    async def fake_call(*args, **kwargs):
+        return dict(current)
+
+    monkeypatch.setattr(videogen, "_call", fake_call)
 
     for raw, expect_done, expect_failed in [
         ("pending", False, False),
@@ -249,7 +283,11 @@ async def test_status_separates_still_working_from_over(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_an_unrecognized_status_keeps_waiting_rather_than_guessing(monkeypatch) -> None:
     """Calling it done loses a paid clip; calling it failed abandons a live one."""
-    mock_client(monkeypatch, lambda request: httpx.Response(200, json={"status": "warming_up"}))
+
+    async def fake_call(*args, **kwargs):
+        return {"status": "warming_up"}
+
+    monkeypatch.setattr(videogen, "_call", fake_call)
     state = await videogen.status(
         model="openrouter::vendor/filmer", video_id="vid_123", provider=config()
     )
@@ -260,18 +298,27 @@ async def test_an_unrecognized_status_keeps_waiting_rather_than_guessing(monkeyp
 
 @pytest.mark.asyncio
 async def test_a_failure_carries_the_providers_own_words(monkeypatch) -> None:
-    mock_client(
-        monkeypatch,
-        lambda request: httpx.Response(
-            200,
-            json={"status": "failed", "error": {"message": "Content policy refused this."}},
-        ),
-    )
+    async def fake_call(*args, **kwargs):
+        return {"status": "failed", "error": {"message": "Content policy refused this."}}
+
+    monkeypatch.setattr(videogen, "_call", fake_call)
     state = await videogen.status(
         model="openrouter::vendor/filmer", video_id="vid_123", provider=config()
     )
     assert state["failed"] is True
     assert state["error"] == "Content policy refused this."
+
+
+def test_a_provider_error_falls_back_to_the_http_status_when_its_body_is_unusable() -> None:
+    response = httpx.Response(502, text="<html>bad gateway</html>")
+
+    assert videogen._error_message(response) == "the provider refused the request (502)"
+
+
+def test_a_provider_error_can_be_a_direct_message() -> None:
+    response = httpx.Response(402, json={"error": " Insufficient credits. "})
+
+    assert videogen._error_message(response) == "Insufficient credits."
 
 
 @pytest.mark.asyncio
@@ -318,6 +365,43 @@ async def test_an_empty_download_is_an_error_not_an_empty_file(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_a_refused_download_keeps_the_provider_error(monkeypatch) -> None:
+    mock_client(
+        monkeypatch,
+        lambda request: httpx.Response(402, json={"error": {"message": "Insufficient credits."}}),
+    )
+
+    with pytest.raises(videogen.VideoGenError, match="Insufficient credits"):
+        await videogen.fetch(
+            model="openrouter::vendor/filmer", video_id="vid_123", provider=config()
+        )
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_download_is_refused_before_it_is_encoded(monkeypatch) -> None:
+    monkeypatch.setattr(videogen, "MAX_CLIP_BYTES", 3)
+    mock_client(monkeypatch, lambda request: httpx.Response(200, content=b"four"))
+
+    with pytest.raises(videogen.VideoGenError, match="over this room's"):
+        await videogen.fetch(
+            model="openrouter::vendor/filmer", video_id="vid_123", provider=config()
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_download_connection_error_is_named(monkeypatch) -> None:
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("offline", request=request)
+
+    mock_client(monkeypatch, unavailable)
+
+    with pytest.raises(videogen.VideoGenError, match="could not download the clip: offline"):
+        await videogen.fetch(
+            model="openrouter::vendor/filmer", video_id="vid_123", provider=config()
+        )
+
+
+@pytest.mark.asyncio
 async def test_a_submission_that_names_no_id_is_refused(monkeypatch) -> None:
     """Without an id there is nothing to poll — silence here would hang."""
     mock_client(monkeypatch, lambda request: httpx.Response(202, json={"status": "pending"}))
@@ -355,3 +439,24 @@ def test_a_local_model_is_left_entirely_alone() -> None:
     )
     assert sent == "Dana turns to the sea"
     assert report is None
+
+
+def test_a_reference_picture_keeps_its_validation_errors() -> None:
+    with pytest.raises(videogen.VideoGenError, match="was empty"):
+        videogen._data_url("  ", "image/png")
+    with pytest.raises(videogen.VideoGenError, match="could not be read"):
+        videogen._data_url("not base64", "image/png")
+    with pytest.raises(videogen.VideoGenError, match="not a picture"):
+        videogen._data_url(PNG_B64, "application/pdf")
+
+
+def test_frame_parts_defaults_the_frame_slot_and_normalizes_the_picture_mime() -> None:
+    parts = videogen.frame_parts([{"b64": PNG_B64, "mime": " Image/JPEG "}])
+
+    assert parts == [
+        {
+            "type": "image_url",
+            "frame_type": "first_frame",
+            "image_url": {"url": f"data:image/jpeg;base64,{PNG_B64}"},
+        }
+    ]

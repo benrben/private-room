@@ -43,52 +43,110 @@ function nonEmptyString(value: unknown, field: string): string {
   return value;
 }
 
-function parseManifest(raw: unknown): SharedAgentManifest {
-  if (typeof raw !== "object" || raw === null) throw new Error("Agent manifest must be an object.");
-  const value = raw as Record<string, unknown>;
-  if (value.version !== 1 || !Array.isArray(value.agents)) throw new Error("Unsupported agent manifest version.");
-  const defaults = value.defaults as Record<string, unknown> | undefined;
-  if (defaults === undefined) throw new Error("Agent manifest defaults are missing.");
+export function parseManifest(raw: unknown): SharedAgentManifest {
+  const value = manifestRecord(raw);
+  const entries = manifestAgentEntries(value);
+  const defaults = manifestDefaults(value);
   const ids = new Set<string>();
-  const agents = value.agents.map((entry, index): SharedAgentDefinition => {
-    if (typeof entry !== "object" || entry === null) throw new Error(`Agent manifest entry ${index} is invalid.`);
-    const agent = entry as Record<string, unknown>;
-    const id = nonEmptyString(agent.id, `agents[${index}].id`);
-    if (ids.has(id)) throw new Error(`Agent manifest contains duplicate id ${id}.`);
-    ids.add(id);
-    if (!Array.isArray(agent.tools) || !agent.tools.every((tool) => typeof tool === "string" && tool.length > 0)) {
-      throw new Error(`Agent manifest tools for ${id} are invalid.`);
-    }
-    if (agent.permission !== "read" && agent.permission !== "write") {
-      throw new Error(`Agent manifest permission for ${id} is invalid.`);
-    }
-    return {
-      id,
-      label: nonEmptyString(agent.label, `${id}.label`),
-      tag: typeof agent.tag === "string" ? agent.tag : "",
-      graph: nonEmptyString(agent.graph, `${id}.graph`),
-      instructions: nonEmptyString(agent.instructions, `${id}.instructions`),
-      tools: [...agent.tools],
-      permission: agent.permission,
-      capability: nonEmptyString(agent.capability, `${id}.capability`),
-    };
-  });
+  const agents = entries.map((entry, index) => parseAgent(entry, index, ids));
+  validateAgentCatalog(agents);
+  return {
+    version: 1,
+    defaults: parseDefaults(defaults),
+    agents,
+  };
+}
+
+function manifestRecord(raw: unknown): Record<string, unknown> {
+  if (!isRecord(raw)) throw new Error("Agent manifest must be an object.");
+  return raw;
+}
+
+function manifestAgentEntries(manifest: Record<string, unknown>): unknown[] {
+  if (manifest.version !== 1 || !Array.isArray(manifest.agents)) {
+    throw new Error("Unsupported agent manifest version.");
+  }
+  return manifest.agents;
+}
+
+function manifestDefaults(manifest: Record<string, unknown>): Record<string, unknown> {
+  const defaults = manifest.defaults as Record<string, unknown> | undefined;
+  if (defaults === undefined) throw new Error("Agent manifest defaults are missing.");
+  return defaults;
+}
+
+function parseAgent(
+  entry: unknown,
+  index: number,
+  ids: Set<string>,
+): SharedAgentDefinition {
+  const agent = manifestAgentEntry(entry, index);
+  const id = nonEmptyString(agent.id, `agents[${index}].id`);
+  reserveAgentId(id, ids);
+  const tools = agentTools(agent.tools, id);
+  const permission = agentPermission(agent.permission, id);
+  return {
+    id,
+    label: nonEmptyString(agent.label, `${id}.label`),
+    tag: typeof agent.tag === "string" ? agent.tag : "",
+    graph: nonEmptyString(agent.graph, `${id}.graph`),
+    instructions: nonEmptyString(agent.instructions, `${id}.instructions`),
+    tools,
+    permission,
+    capability: nonEmptyString(agent.capability, `${id}.capability`),
+  };
+}
+
+function manifestAgentEntry(entry: unknown, index: number): Record<string, unknown> {
+  if (!isRecord(entry)) throw new Error(`Agent manifest entry ${index} is invalid.`);
+  return entry;
+}
+
+function reserveAgentId(id: string, ids: Set<string>): void {
+  if (ids.has(id)) throw new Error(`Agent manifest contains duplicate id ${id}.`);
+  ids.add(id);
+}
+
+function agentTools(value: unknown, id: string): string[] {
+  if (!Array.isArray(value) || !value.every(isNamedTool)) {
+    throw new Error(`Agent manifest tools for ${id} are invalid.`);
+  }
+  return [...value];
+}
+
+function isNamedTool(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function agentPermission(value: unknown, id: string): AgentPermission {
+  if (isAgentPermission(value)) return value;
+  throw new Error(`Agent manifest permission for ${id} is invalid.`);
+}
+
+function validateAgentCatalog(agents: SharedAgentDefinition[]): void {
   if (agents.length !== 16 || new Set(agents.map((agent) => agent.graph)).size !== 8) {
     throw new Error("Agent manifest must contain the supported sixteen specialists and eight graph shapes.");
   }
+}
+
+function parseDefaults(defaults: Record<string, unknown>): SharedAgentManifest["defaults"] {
   const permission = defaults.permission;
-  if (permission !== "read" && permission !== "write") throw new Error("Agent manifest default permission is invalid.");
+  if (!isAgentPermission(permission)) throw new Error("Agent manifest default permission is invalid.");
   return {
-    version: 1,
-    defaults: {
-      timeoutSeconds: Number(defaults.timeoutSeconds),
-      maxRounds: Number(defaults.maxRounds),
-      privacy: nonEmptyString(defaults.privacy, "defaults.privacy"),
-      outputSchema: nonEmptyString(defaults.outputSchema, "defaults.outputSchema"),
-      permission,
-    },
-    agents,
+    timeoutSeconds: Number(defaults.timeoutSeconds),
+    maxRounds: Number(defaults.maxRounds),
+    privacy: nonEmptyString(defaults.privacy, "defaults.privacy"),
+    outputSchema: nonEmptyString(defaults.outputSchema, "defaults.outputSchema"),
+    permission,
   };
+}
+
+function isAgentPermission(value: unknown): value is AgentPermission {
+  return value === "read" || value === "write";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 let cached: SharedAgentManifest | null = null;

@@ -19,15 +19,31 @@ export const EMU_PER_INCH = 914_400;
  * `ppt/media/image1.png`), and getting this wrong is the classic reason a deck
  * renders with every picture missing.
  */
-export function resolvePath(base: string, target: string): string {
-  if (/^[a-z][a-z0-9+.-]*:/i.test(target)) return target; // absolute URL — not ours
-  if (target.startsWith("/")) return target.slice(1);
+function isAbsoluteTarget(target: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:/i.test(target);
+}
+
+function baseParts(base: string): string[] {
+  if (!base.includes("/")) return [];
   const baseDir = base.includes("/") ? base.slice(0, base.lastIndexOf("/")) : "";
-  const parts = baseDir ? baseDir.split("/") : [];
+  return baseDir ? baseDir.split("/") : [];
+}
+
+function applyTargetSegment(parts: string[], segment: string) {
+  if (segment === "" || segment === ".") return;
+  if (segment === "..") {
+    parts.pop();
+    return;
+  }
+  parts.push(segment);
+}
+
+export function resolvePath(base: string, target: string): string {
+  if (isAbsoluteTarget(target)) return target; // absolute URL — not ours
+  if (target.startsWith("/")) return target.slice(1);
+  const parts = baseParts(base);
   for (const seg of target.split("/")) {
-    if (seg === "" || seg === ".") continue;
-    if (seg === "..") parts.pop();
-    else parts.push(seg);
+    applyTargetSegment(parts, seg);
   }
   return parts.join("/");
 }

@@ -15,6 +15,15 @@ function stateWith(row: { baseline_completed: number; status: string } | undefin
 }
 
 describe("createDeepWorkspaceBridgeGrant", () => {
+  it("refuses an invalid run id and a non-workspace room before issuing a bridge", () => {
+    expect(() => createDeepWorkspaceBridgeGrant(stateWith(undefined), "not/a-run", false)).toThrow(
+      "The agent run ID is invalid."
+    );
+    expect(() => createDeepWorkspaceBridgeGrant({ room: null } as RoomManagerState, "run-1", false)).toThrow(
+      "The Deep Harness requires an unlocked workspace room."
+    );
+  });
+
   it("keeps ordinary and read-only runs unprivileged", () => {
     const grant = createDeepWorkspaceBridgeGrant(stateWith(undefined), "run-1", false);
     expect(grant.wireAuthority).toEqual({ workspaceWrite: false, baselineRunId: "" });

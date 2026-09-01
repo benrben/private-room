@@ -195,6 +195,32 @@ function splitOnce(line: string, sep: string): [string, string] | null {
   return [line.slice(0, at), line.slice(at + sep.length)];
 }
 
+function isStyledHeading(raw: string, marker: string): boolean {
+  return raw.startsWith(marker) && trimEndMatches(raw, ":").endsWith(marker);
+}
+
+function isMarkedHeading(raw: string): boolean {
+  if (raw.startsWith("#")) return true;
+  return isStyledHeading(raw, "**") || isStyledHeading(raw, "__");
+}
+
+function headingName(raw: string): string {
+  const split = splitOnce(raw, ":");
+  return bare(split === null ? raw : split[0]);
+}
+
+function isReservedHeadingName(name: string): boolean {
+  return name === "" || isSectionWord(name) || isFieldLabel(name);
+}
+
+function headingHasPunctuation(name: string): boolean {
+  return name.includes(".") || name.includes(",") || name.includes(";");
+}
+
+function isUnmarkedPersonHeading(raw: string, name: string, wordy: boolean, punctuated: boolean): boolean {
+  return raw.includes(":") && !wordy && !punctuated && looksLikeAName(name);
+}
+
 /**
  * Is this line the start of a new person? Exported because `castparse.rs`'s own
  * `mod tests` calls it directly.
@@ -205,34 +231,22 @@ function splitOnce(line: string, sep: string): [string, string] | null {
  */
 export function isPersonHeading(line: string): boolean {
   const raw = line.trim();
-  if (raw === "") {
-    return false;
-  }
+  if (raw === "") return false;
   // A markdown heading is unambiguous — but `# Characters` is a section title,
   // not a person, and is filtered out by the name test below.
-  const marked =
-    raw.startsWith("#") ||
-    (raw.startsWith("**") && trimEndMatches(raw, ":").endsWith("**")) ||
-    (raw.startsWith("__") && trimEndMatches(raw, ":").endsWith("__"));
-  // For a `head: value` line the NAME is only what precedes the colon.
-  const split = splitOnce(raw, ":");
-  const head = split !== null ? split[0] : raw;
-  const name = bare(head);
-  if (name === "" || isSectionWord(name) || isFieldLabel(name)) {
-    return false;
-  }
+  const marked = isMarkedHeading(raw);
+  const name = headingName(raw);
+  if (isReservedHeadingName(name)) return false;
   // A name is short and has no sentence punctuation in it. Four words covers
   // "Captain Mira Halloran" without swallowing a line of prose.
   const wordy = splitWhitespace(name).length > 4;
-  const punctuated = name.includes(".") || name.includes(",") || name.includes(";");
-  if (marked) {
-    return !wordy && !punctuated;
-  }
+  const punctuated = headingHasPunctuation(name);
+  if (marked) return !wordy && !punctuated;
   // Unmarked, so the bar is higher: only `Name:` opening a line, and only when
   // the head reads like a name rather than a clause. Without the capitalisation
   // test, "The tide turns: the rope goes slack" opens a hero called "The tide
   // turns" — and the whole scene lands in his description.
-  return raw.includes(":") && !wordy && !punctuated && looksLikeAName(name);
+  return isUnmarkedPersonHeading(raw, name, wordy, punctuated);
 }
 
 /** Split `label: value` when the label is one we know. */
@@ -263,73 +277,83 @@ function tidy(lines: readonly string[]): string {
  * description and the rest as the story — the order character sheets are
  * conventionally written in, and the only guess in this file.
  */
+type BlockField = "looks" | "story";
+
+interface BlockSplitState {
+  readonly looks: string[];
+  readonly story: string[];
+  labelledAny: boolean;
+  current: BlockField | null;
+}
+
+interface LabelledBlockLine {
+  readonly field: BlockField;
+  readonly value: string;
+}
+
 function splitBlock(block: readonly string[]): [string, string] {
-  const looks: string[] = [];
-  const story: string[] = [];
-  let labelledAny = false;
-  // Which labelled field the following unlabelled lines continue.
-  let current: "looks" | "story" | null = null;
+  const state = scanBlock(block);
+  if (state.labelledAny) return [tidy(state.looks), tidy(state.story)];
+  return splitUnlabelledBlock(state.looks);
+}
 
-  for (const line of block) {
-    const trimmed = line.trim();
-    if (trimmed === "") {
-      current = null;
-      if (labelledAny) {
-        continue;
-      }
-      looks.push("");
-      continue;
-    }
-    const lookValue = labelled(trimmed, LOOK_LABELS);
-    if (lookValue !== null) {
-      labelledAny = true;
-      current = "looks";
-      if (lookValue !== "") {
-        looks.push(lookValue);
-      }
-      continue;
-    }
-    const storyValue = labelled(trimmed, STORY_LABELS);
-    if (storyValue !== null) {
-      labelledAny = true;
-      current = "story";
-      if (storyValue !== "") {
-        story.push(storyValue);
-      }
-      continue;
-    }
-    if (current === "looks") {
-      looks.push(trimmed);
-    } else if (current === "story") {
-      story.push(trimmed);
-    } else if (labelledAny) {
-      story.push(trimmed);
-    } else {
-      looks.push(trimmed);
-    }
-  }
+function scanBlock(block: readonly string[]): BlockSplitState {
+  const state: BlockSplitState = { looks: [], story: [], labelledAny: false, current: null };
+  for (const line of block) addBlockLine(state, line);
+  return state;
+}
 
-  if (labelledAny) {
-    return [tidy(looks), tidy(story)];
-  }
-  // Unlabelled: first paragraph describes, the rest is who they are.
-  const first: string[] = [];
-  const rest: string[] = [];
-  let past = false;
-  for (const line of looks) {
-    if (line.trim() === "") {
-      if (first.length > 0) {
-        past = true;
-      }
-      continue;
-    }
-    if (past) {
-      rest.push(line);
+function addBlockLine(state: BlockSplitState, line: string): void {
+  const trimmed = line.trim();
+  if (trimmed === "") return addBlockBlank(state);
+  const labelledLine = labelledBlockLine(trimmed);
+  if (labelledLine !== null) return addLabelledBlockLine(state, labelledLine);
+  addBlockContinuation(state, trimmed);
+}
+
+function addBlockBlank(state: BlockSplitState): void {
+  state.current = null;
+  if (!state.labelledAny) state.looks.push("");
+}
+
+function labelledBlockLine(line: string): LabelledBlockLine | null {
+  const lookValue = labelled(line, LOOK_LABELS);
+  if (lookValue !== null) return { field: "looks", value: lookValue };
+  const storyValue = labelled(line, STORY_LABELS);
+  return storyValue === null ? null : { field: "story", value: storyValue };
+}
+
+function addLabelledBlockLine(state: BlockSplitState, line: LabelledBlockLine): void {
+  state.labelledAny = true;
+  state.current = line.field;
+  if (line.value !== "") blockFieldLines(state, line.field).push(line.value);
+}
+
+function addBlockContinuation(state: BlockSplitState, line: string): void {
+  const field = state.current ?? (state.labelledAny ? "story" : "looks");
+  blockFieldLines(state, field).push(line);
+}
+
+function blockFieldLines(state: BlockSplitState, field: BlockField): string[] {
+  return field === "looks" ? state.looks : state.story;
+}
+
+function splitUnlabelledBlock(lines: readonly string[]): [string, string] {
+  const splitAt = firstParagraphBreak(lines);
+  if (splitAt === null) return [tidy(lines), ""];
+  return [tidy(lines.slice(0, splitAt)), tidy(lines.slice(splitAt + 1))];
+}
+
+function firstParagraphBreak(lines: readonly string[]): number | null {
+  let hasContent = false;
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index]!.trim() === "") {
+      if (hasContent) return index;
     } else {
-      first.push(line);
+      hasContent = true;
     }
   }
-  return [tidy(first), tidy(rest)];
+  return null;
 }
 
 /**
@@ -359,47 +383,51 @@ function rustLines(text: string): string[] {
  * shows that as "this file does not look like a character sheet", which is a
  * fact the reader can act on, unlike one invented hero.
  */
+interface CastParseState {
+  readonly found: ParsedMember[];
+  name: string;
+  block: string[];
+}
+
 export function parseCast(text: string): ParsedMember[] {
-  const found: ParsedMember[] = [];
-  // The block of lines belonging to the person currently open.
-  let name = "";
-  let block: string[] = [];
-
-  const close = (): void => {
-    if (name === "") {
-      block = [];
-      return;
-    }
-    const [description, story] = splitBlock(block);
-    found.push({ name, description, story });
-    name = "";
-    block = [];
-  };
-
+  const state: CastParseState = { found: [], name: "", block: [] };
   for (const line of rustLines(text)) {
-    if (isPersonHeading(line)) {
-      close();
-      if (found.length >= MAX_FOUND) {
-        return found;
-      }
-      const raw = line.trim();
-      // `Mira: tall, grey coat` — the heading carries the first fact.
-      const split = splitOnce(raw, ":");
-      if (split !== null) {
-        const [head, rest] = split;
-        name = bare(head);
-        if (rest.trim() !== "") {
-          block.push(rest.trim());
-        }
-      } else {
-        name = bare(raw);
-      }
-      continue;
-    }
-    if (name !== "") {
-      block.push(line);
-    }
+    if (collectCastLine(state, line)) return state.found;
   }
-  close();
-  return found.filter((m) => m.name !== "");
+  closeCastMember(state);
+  return state.found.filter((member) => member.name !== "");
+}
+
+function collectCastLine(state: CastParseState, line: string): boolean {
+  if (!isPersonHeading(line)) {
+    if (state.name !== "") state.block.push(line);
+    return false;
+  }
+  closeCastMember(state);
+  if (state.found.length >= MAX_FOUND) return true;
+  openCastMember(state, line);
+  return false;
+}
+
+function closeCastMember(state: CastParseState): void {
+  if (state.name === "") {
+    state.block = [];
+    return;
+  }
+  const [description, story] = splitBlock(state.block);
+  state.found.push({ name: state.name, description, story });
+  state.name = "";
+  state.block = [];
+}
+
+function openCastMember(state: CastParseState, line: string): void {
+  const raw = line.trim();
+  const split = splitOnce(raw, ":");
+  if (split === null) {
+    state.name = bare(raw);
+    return;
+  }
+  const [head, rest] = split;
+  state.name = bare(head);
+  if (rest.trim() !== "") state.block.push(rest.trim());
 }

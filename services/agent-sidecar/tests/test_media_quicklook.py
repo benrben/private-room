@@ -60,10 +60,26 @@ def _extensionless_leftovers() -> int:
 # ------------------------------------------------ (1) empty bytes -> no disk
 
 
-def test_empty_bytes_are_not_written_to_disk_at_all() -> None:
-    before = set(os.listdir(_TMP_DIR))
+def test_empty_bytes_are_not_written_to_disk_at_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fast refusal must not even ask for a temp path.
+
+    This used to snapshot the shared OS temp directory, which made the test
+    race unrelated tests creating directories such as ``relay-deploy-*``.
+    An isolated directory plus seams that fail on a write-path call checks the
+    actual contract more directly: empty bytes do not allocate a temp name or
+    write a file at all.
+    """
+
+    def _unexpected_temp_access(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("empty input must not access the temp-file path")
+
+    monkeypatch.setattr(ql, "temp_path_for", _unexpected_temp_access)
+    monkeypatch.setattr(ql, "write_private", _unexpected_temp_access)
+    before = set(tmp_path.iterdir())
     assert ql.preview_png("thing.key", b"") is None
-    after = set(os.listdir(_TMP_DIR))
+    after = set(tmp_path.iterdir())
     assert after == before, "empty input touched the temp directory"
 
 

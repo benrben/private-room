@@ -1,0 +1,490 @@
+/* ---------- the private browser ----------
+ *
+ * THE CONSTRAINT THAT SHAPES EVERY RULE BELOW: the page is a NATIVE child
+ * webview positioned by the platform ON TOP of this window. It is not in the
+ * stacking context, so no z-index here can put anything above it.
+ * `.browser-stage` is an empty hole whose rect is handed to Rust, the chrome
+ * sits ABOVE the hole in normal flow, and the journal and the reading view
+ * SHRINK the hole rather than overlaying it. Nothing here may become a
+ * popover, a dropdown or a tooltip that extends into the stage: it would
+ * simply vanish behind the page.
+ *
+ * Two surfaces here are exceptions, and they are exceptions because the page
+ * is PARKED AT 1x1 while they show: the start screen and the search results
+ * page. Those are ordinary React surfaces and can be drawn freely.
+ *
+ * THE NOTEBOOK. This area is drawn on the same sheet as the rest of the app:
+ * the chrome, the panels and the start page are transparent frames with drawn
+ * edges, so the dotted paper laid down by paper.css runs straight through
+ * them. The one thing that is genuinely opaque is the native page itself, and
+ * that is not ours to draw.
+ *
+ * Three faces, three jobs, and in this area the split is load-bearing rather
+ * than decorative:
+ *   IBM Plex Mono  the address, journal URLs, timestamps, result breadcrumbs.
+ *                  A URL is technical data and the origin is a security
+ *                  signal — it is never set in the hand.
+ *   Kalam          the Private badge, the journal's descriptions of what the
+ *                  agent did, counts, and the empty-state direction. Short
+ *                  annotations only.
+ *   Figtree        everything else, including every explanation and every
+ *                  control label.
+ */
+
+/* ==========================================================================
+   0. DRAWN GLYPHS
+   The five marks section 23 asks to be hand-drawn — search, back, forward,
+   reload and save — plus the stop cross that shares the reload button.
+
+   Same mechanism as paper.css's .nb-ico family: an SVG used as a MASK, so the
+   paint comes from `background-color: currentColor` and each mark inherits
+   theme and semantic colour for free. Back and forward are paper.css's OWN
+   arrow rather than two new files — one flipped, one not — because the
+   library's rule is to compose from the shared primitives rather than mint a
+   glyph per button.
+
+   The three genuinely new ones are scoped to `.browser-area` rather than
+   added to :root: they are this area's vocabulary, not the product's, and
+   paper.css is the single place a product-wide glyph belongs.
+   ========================================================================== */
+
+.browser-area {
+  /* A near-closed circle drawn as five curve segments with a barbed head at
+     the gap. Deliberately a few tenths off true — a wobbly loop reads as
+     drawn, a perfect one reads as clip art. */
+  --bico-glyph-reload: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M15.9 5.3C19.4 6.6 21 9.9 20.4 13.2 19.8 16.6 16.6 19.3 13 19.6 9.2 19.9 5.5 17.4 4.5 13.9 3.4 10.2 5.2 6.2 8.6 4.7 8.9 4.5 9.3 4.4 9.6 4.3'/><path d='M6.9 7.6 9.6 4.3 5.5 3.1'/></svg>");
+  /* The magnifier: an uneven ring and one straight handle. */
+  --bico-glyph-search: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M10.6 5.3C13.4 5.4 15.6 7.6 15.5 10.3 15.4 13 13.1 15.2 10.4 15.1 7.7 15 5.6 12.7 5.7 10 5.8 7.4 8 5.3 10.6 5.3'/><path d='M14.1 13.9 19.6 19.4'/></svg>");
+  /* Save: a stroke coming DOWN into an open tray. "Into the room" is the
+     whole meaning of this button, so the mark is a direction, not a disk. */
+  --bico-glyph-save: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M12.1 3.7 11.9 14.1'/><path d='M8.3 10.3 11.9 14.4 15.6 10.1'/><path d='M4.7 14.8 4.9 20.1 19.2 19.9 19.3 14.6'/></svg>");
+  /* Stop: two pen strokes crossing, neither of them quite square. */
+  --bico-glyph-stop: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.1' stroke-linecap='round' stroke-linejoin='round'><path d='M6.6 6.4 17.5 17.6'/><path d='M17.4 6.5 6.5 17.5'/></svg>");
+}
+
+/* The mask longhands are written twice — prefixed and not — for the same
+   reason paper.css writes them twice: the app ships on whatever WebKit the
+   host macOS has, and the unprefixed properties only landed in Safari 15.4. */
+.bico {
+  display: inline-block;
+  flex: none;
+  width: var(--nb-ico-size, 1em);
+  height: var(--nb-ico-size, 1em);
+  background-color: currentColor;
+  -webkit-mask-image: var(--nb-glyph, var(--nb-glyph-none));
+  mask-image: var(--nb-glyph, var(--nb-glyph-none));
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+  pointer-events: none;
+}
+
+.bico-forward {
+  --nb-glyph: var(--nb-glyph-arrow);
+}
+/* One arrow in the bundle, turned around — the same trick .nb-arrow-curve
+   uses for its four directions. */
+.bico-back {
+  --nb-glyph: var(--nb-glyph-arrow);
+  transform: scaleX(-1);
+}
+.bico-reload {
+  --nb-glyph: var(--bico-glyph-reload);
+}
+.bico-stop {
+  --nb-glyph: var(--bico-glyph-stop);
+}
+.bico-search {
+  --nb-glyph: var(--bico-glyph-search);
+}
+.bico-save {
+  --nb-glyph: var(--bico-glyph-save);
+}
+
+/* ==========================================================================
+   1. THE AREA
+   ========================================================================== */
+
+.browser-area {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  /* Transparent: the dotted sheet runs under the chrome and the panels, and
+     the only opaque thing in this area is the native page, which draws
+     itself. */
+  background: transparent;
+}
+
+/* ==========================================================================
+   2. CHROME — the toolbar strip
+   A flat strip of actions, never a menu bar. That is not a style choice: a
+   dropdown opened here would be drawn under the native page.
+   ========================================================================== */
+
+/* OPAQUE, AND THAT IS THE POINT (product audit P1, 2026-08-15).
+   This strip used to be transparent, on the doctrine that the dotted sheet runs
+   under every frame in the app. That doctrine is right everywhere else and
+   wrong here: this area's neighbour is not the app's own sheet, it is an
+   arbitrary web page, and on a white one the address bar and its controls
+   visually dissolved into the page below — worst with the assistant pane open,
+   where the strip is narrowest. Browser chrome is the app speaking, and the app
+   must be distinguishable from the document it is showing you. It gets its own
+   ground, its own rule, and a shadow that reads as "this is in front".
+
+   The stage keeps the sheet. Only the chrome and the banner rows are lifted. */
+.browser-chrome {
+  position: relative;
+  display: flex;
+  align-items: center;
+  /* Wraps rather than overflows. The centre pane is resizable and the strip
+     carries eight controls; when they stop fitting, a second row costs the
+     stage a few pixels of height — which the ResizeObserver in BrowserView
+     pushes to Rust — whereas an overflowing row silently hides a control. */
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 10px;
+  border-bottom: 1px solid var(--rule-strong);
+  background: var(--panel);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--ink) 6%, transparent);
+  flex: 0 0 auto;
+}
+
+.browser-nav {
+  display: flex;
+  flex: none;
+  gap: 3px;
+}
+
+/* ----- the secondary control of this whole area -----
+   Transparent with a drawn edge that only appears under the pointer, and a
+   marker swash that wipes in from the left — the same recipe as paper.css's
+   .nb-btn, written here because these buttons carry their own geometry (a
+   28px icon square, a 26px one inside a result card) and are used by the
+   reading view and the results page too. */
+.browser-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: none;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0 9px;
+  color: var(--muted);
+  background-color: transparent;
+  background-image: linear-gradient(
+    98deg,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 32%, transparent) 0%,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 20%, transparent) 62%,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 28%, transparent) 100%
+  );
+  background-repeat: no-repeat;
+  background-position: left center;
+  background-size: 0% 100%;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xs);
+  font: inherit;
+  font-family: var(--sans);
+  font-size: var(--fs-meta);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background-size var(--dur) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen),
+    color var(--dur-fast) var(--ease-pen),
+    transform var(--dur-fast) var(--ease-pen);
+}
+
+/* background-color is restated because base.css paints an accent ghost behind
+   every hovered button; under this swash the two would mix into mud. */
+.browser-btn:hover:not(:disabled) {
+  color: var(--text);
+  background-color: transparent;
+  background-size: 100% 100%;
+  border-color: var(--rule-strong);
+}
+
+/* Pressed against the paper, never lit up. */
+.browser-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.browser-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.browser-btn:focus-visible,
+.browser-shield:focus-visible,
+.browser-takeover:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* A toggle that is ON reads as wiped in — the marker swash left on the paper
+   plus a drawn edge, rather than the swash appearing only under the pointer.
+   Without this, Read as text, Journal and the results Peek all carried
+   `aria-pressed` with nothing on screen to match it. */
+.browser-btn[aria-pressed="true"] {
+  color: var(--text);
+  background-size: 100% 100%;
+  border-color: var(--rule-strong);
+}
+
+/* Icon-only: square, and 28px so it clears the 24px minimum target with its
+   border included. */
+.browser-btn-ico {
+  width: 28px;
+  min-width: 28px;
+  padding: 0;
+  --nb-ico-size: 15px;
+}
+
+/* Erasing the journal cannot be undone, so the one button that does it is
+   drawn in the urgent ink — and its label is the word "Erase", so the colour
+   is never carrying that on its own. The border is the full --sem-urgent
+   rather than a wash of it: a 62% red measures ~2.4:1 on the dark sheet,
+   under the 3:1 a control edge owes. */
+.browser-btn-danger {
+  --mk: var(--sem-urgent-fill);
+  color: var(--sem-urgent);
+  border-color: var(--sem-urgent);
+}
+.browser-btn-danger:hover:not(:disabled) {
+  color: var(--sem-urgent);
+  border-color: var(--sem-urgent);
+}
+
+/* ----- Save into the room -----
+   The one control in this strip that files something INTO the notebook, so it
+   is the one that keeps a drawn edge at rest: an action you have to hover to
+   discover is an action nobody uses. Its swash is the pink the whole product
+   uses for "saved", and while the Save strip is open the button stays wiped
+   in — the pressed state of a control whose panel is a row below it. */
+.browser-save-btn {
+  --mk: var(--sem-saved-fill);
+  color: var(--text);
+  border-color: var(--rule-strong);
+}
+
+.browser-save-btn:hover:not(:disabled),
+.browser-save-btn[aria-expanded="true"] {
+  color: var(--text);
+  border-color: var(--sem-saved);
+}
+
+.browser-save-btn[aria-expanded="true"] {
+  background-size: 100% 100%;
+}
+
+/* ----- the address: a long notebook label -----
+   A drawn rectangle with a second stroke just outside it, as though the pen
+   went round twice — not a pill. The label is the widest thing in the strip,
+   so its identity has to come from the drawn edge and the writing, which is
+   exactly what a label on a binder spine is.
+
+   THE TEXT IS A URL. Mono, never the hand, and never truncated: an <input>
+   SCROLLS its overflow and rests at the start of the value, so the origin —
+   the part that is a security signal — is the part that stays on screen. Do
+   not add text-overflow here; it would hide the host in favour of the path. */
+.browser-address {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  /* A 240px basis, so the strip wraps the BUTTONS onto a second row rather
+     than crushing the address into an unreadable slot. */
+  flex: 1 1 240px;
+  min-width: 0;
+  height: 30px;
+  padding: 0 11px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--raised) 62%, transparent);
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: 5px 4px 6px 4px / 4px 6px 4px 5px;
+}
+
+/* The quick pen redraw. Inert, and it can never be clipped: the chrome row
+   does not hide its overflow. */
+.browser-address::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border: 1px solid color-mix(in srgb, var(--sketch) 30%, transparent);
+  border-radius: var(--radius-xs);
+  pointer-events: none;
+}
+
+/* Focus goes over the line twice and then rings it, the way .nb-field does.
+   The ring sits at 4px so it clears the redraw rather than colliding with it;
+   an outline costs no layout, and 4 + 2 is inside the strip's 8px gap. */
+.browser-address:focus-within {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 42%, transparent);
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+
+.browser-address input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+}
+
+/* The wrapper's :focus-within rule fires in exactly the same state, so there
+   is always precisely one focus indicator on screen and never zero. base.css
+   also gives a focused input its own inset stroke, which on a borderless
+   field would draw a hairline box inside the label. */
+.browser-address input:focus,
+.browser-address input:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.browser-address input::placeholder {
+  color: var(--faint);
+  font-family: var(--sans);
+}
+
+/* The scheme mark. Neutral for HTTPS on purpose — a green padlock overstates
+   what encryption proves — and the full urgent ink for plain HTTP, where it
+   rides with the words "Not secure" so the colour is never the only signal. */
+.browser-scheme {
+  display: inline-flex;
+  flex: none;
+  color: var(--muted);
+}
+
+.browser-scheme.insecure {
+  color: var(--sem-urgent);
+}
+
+.browser-insecure {
+  flex: none;
+  color: var(--sem-urgent);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* ----- the Private badge -----
+   The SANS, and the rule below says so again where it is easy to miss: this
+   badge is the app's one visible claim about whether the browsing store is
+   ephemeral, which makes it a security string, and the brief bars handwriting
+   on those. Set at --fs-body, larger than the 11.5px it replaced — a
+   private-browsing indicator that is hard to read is a safety problem, not a
+   style choice.
+
+   FOUR states, because the badge used to make TWO claims off ONE check.
+   "Trackers blocked." rode on the storage-ephemerality probe, which knows
+   nothing about blocking — so a browser whose block list had failed to compile
+   wore the same green capsule as one where it had worked (product audit P0,
+   2026-08-15). The blocker now answers for itself, and the weaker of the two
+   facts sets the state:
+
+     verified   done-green ink   store ephemeral AND the block list is loaded
+     checking   neutral ink      one of the two checks has not come back
+     degraded   caution ink      store ephemeral, block list NOT running
+     breached   urgent-red ink   the store is NOT ephemeral
+
+   NO STATE IS SIGNALLED BY COLOUR ALONE — each carries its own word:
+   "Private", "Checking", "Partly private", "Not private". That is stricter
+   than the three-state badge this replaces, where verified and unchecked
+   deliberately shared a word and differed only by the badge withholding its
+   claim ink. Withholding ink is legible as caution; it is not legible as
+   "which of two things is wrong", and with a fourth state to tell apart the
+   words have to do the work.
+
+   Contrast, measured against the sheet in both themes: 5.8:1 dark and 4.8:1
+   light for the green, 5.8:1 / 4.8:1 for the red. Hover is a wash of the
+   badge's OWN hue at 8%, not --hover: the neutral hover ground is darker than
+   the light-mode sheet and would drop the green to 4.4:1. */
+.browser-shield {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  position: relative;
+  flex: none;
+  height: 28px;
+  padding: 0 11px;
+  color: var(--sem-done);
+  background: transparent;
+  border: var(--stroke-w) solid var(--sem-done);
+  border-radius: 999px 999px 999px 999px / 14px 12px 14px 12px;
+  /* The SANS, not the hand. This badge is the app's one visible statement
+     about whether the browsing store is ephemeral, which makes it a security
+     string, and the brief bars handwriting on those. The badge stays notebook-
+     native through its drawn capsule edge and its three-state ink — the face
+     was never what was doing that work. */
+  font-family: var(--sans);
+  font-size: var(--fs-body);
+  font-weight: 600;
+  line-height: 1.1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+/* border-color is restated in every hover state below: base.css takes a
+   hovered button's edge to the neutral pen, which would quietly strip the
+   badge of the one colour that is making a claim. */
+.browser-shield:hover {
+  background: color-mix(in srgb, var(--sem-done-fill) 8%, transparent);
+  border-color: var(--sem-done);
+}
+
+/* The claim has not been checked yet. It says the same word, so this is not
+   colour carrying a state on its own — it is the badge WITHHOLDING the ink it
+   uses for a verified fact until the webview has actually answered. The
+   accessible name and the title already spell the difference out. */
+.browser-shield.checking {
+  color: var(--muted);
+  border-color: var(--rule-strong);
+}
+.browser-shield.checking:hover {
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+  border-color: var(--sketch);
+}
+
+/* Storage is ephemeral, the tracker blocker is not running. Caution ink rather
+   than urgent: the browser IS still private in the sense the room promises —
+   nothing is written to disk — and spending the red on this would leave nothing
+   louder for the state where that promise has actually broken. */
+.browser-shield.degraded {
+  color: var(--sem-pending);
+  border-color: var(--sem-pending);
+}
+.browser-shield.degraded:hover {
+  background: color-mix(in srgb, var(--sem-pending-fill) 10%, transparent);
+  border-color: var(--sem-pending);
+}
+
+.browser-shield.breached {
+  color: var(--sem-urgent);
+  border-color: var(--sem-urgent);
+}
+.browser-shield.breached:hover {
+  background: color-mix(in srgb, var(--sem-urgent-fill) 10%, transparent);
+  border-color: var(--sem-urgent);
+}
+
+/* The badge is also the journal toggle. Pressed reads as circled — a second
+   stroke round the outside, in the badge's own ink rather than the pen, so
+   the ring never argues with what the colour is saying. */
+.browser-shield[aria-pressed="true"]::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border: 1px solid currentColor;
+  border-radius: inherit;
+  opacity: 0.45;
+  pointer-events: none;
+}

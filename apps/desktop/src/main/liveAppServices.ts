@@ -154,49 +154,86 @@ async function coldWorkspaceVisualFrame(
   deadline: number,
 ): Promise<CachedVisualFrame | null> {
   if (openRoom.workspace === undefined) return null;
-  const remaining = (): number => Math.max(0, deadline - Date.now());
-  if (remaining() === 0) return null;
-  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "arcelle-visual-index-")).catch(() => null);
+  if (visualIndexRemaining(deadline) === 0) return null;
+  const tempDir = await visualIndexStagingDirectory();
   if (tempDir === null) return null;
-  const staged = path.join(tempDir, `source.${extension || "bin"}`);
+  const staged = visualIndexSourcePath(tempDir, extension);
   const controller = new AbortController();
-  const budget = setTimeout(() => controller.abort(), remaining());
+  const budget = setTimeout(() => controller.abort(), visualIndexRemaining(deadline));
   let cleanupDeferred = false;
   const cleanup = async (): Promise<void> => {
     await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   };
   try {
-    await pipeline(
-      openRoom.workspace.readStream(fileId),
-      fs.createWriteStream(staged, { flags: "wx", mode: 0o600 }),
-      { signal: controller.signal },
+    await stageWorkspaceVisualSource(openRoom, fileId, staged, controller);
+    if (visualIndexRemaining(deadline) === 0) return null;
+    const captureOperation = startColdVisualIndexWork(
+      staged, sourceSha256, seconds, visualIndexRemaining(deadline), visualIndex, cleanup,
     );
-    if (remaining() === 0) return null;
-    // The exact 56m production fixture needs ~55s for a full 1-FPS cold
-    // index. Build that under the background 120s budget for later requests,
-    // while the latency-critical endpoint captures only this exact second for
-    // the current answer. Both share this one private staged source.
-    const warmOperation = visualIndex.warm(
-      staged,
-      sourceSha256,
-      VIDEO_VISUAL_WARM_TIMEOUT_MS,
-    );
-    const captureOperation = visualIndex.capture(staged, seconds, remaining());
-    // Deleting after the fast capture alone would make the full warm's
-    // post-capture source re-hash fail. Retain staging until BOTH settle.
     cleanupDeferred = true;
-    void Promise.allSettled([warmOperation, captureOperation]).then(cleanup);
-    const captureBeforeDeadline = await beforeDeadline(
-      captureOperation,
-      deadline,
-    );
-    return captureBeforeDeadline.timedOut ? null : captureBeforeDeadline.value;
+    return deadlineValue(await beforeDeadline(captureOperation, deadline));
   } catch {
     return null;
   } finally {
-    clearTimeout(budget);
-    if (!cleanupDeferred) await cleanup();
+    await finishVisualIndexStaging(budget, cleanupDeferred, cleanup);
   }
+}
+
+function visualIndexRemaining(deadline: number): number {
+  return Math.max(0, deadline - Date.now());
+}
+
+async function visualIndexStagingDirectory(): Promise<string | null> {
+  return fs.promises.mkdtemp(path.join(os.tmpdir(), "arcelle-visual-index-")).catch(() => null);
+}
+
+function visualIndexSourcePath(tempDir: string, extension: string): string {
+  return path.join(tempDir, `source.${extension || "bin"}`);
+}
+
+async function stageWorkspaceVisualSource(
+  openRoom: NonNullable<RoomManagerState["room"]>,
+  fileId: string,
+  staged: string,
+  controller: AbortController,
+): Promise<void> {
+  await pipeline(
+    openRoom.workspace!.readStream(fileId),
+    fs.createWriteStream(staged, { flags: "wx", mode: 0o600 }),
+    { signal: controller.signal },
+  );
+}
+
+function startColdVisualIndexWork(
+  staged: string,
+  sourceSha256: string,
+  seconds: number,
+  budget: number,
+  visualIndex: Pick<VideoVisualIndexClient, "capture" | "frame" | "warm">,
+  cleanup: () => Promise<void>,
+): Promise<CachedVisualFrame | null> {
+  // The exact 56m production fixture needs ~55s for a full 1-FPS cold index.
+  // Build that under the background 120s budget for later requests, while the
+  // latency-critical endpoint captures only this exact second for this answer.
+  const warmOperation = visualIndex.warm(staged, sourceSha256, VIDEO_VISUAL_WARM_TIMEOUT_MS);
+  const captureOperation = visualIndex.capture(staged, seconds, budget);
+  // Deleting after the fast capture alone would make the full warm's
+  // post-capture source re-hash fail. Retain staging until BOTH settle.
+  void Promise.allSettled([warmOperation, captureOperation]).then(cleanup);
+  return captureOperation;
+}
+
+function deadlineValue<T>(result: BeforeDeadline<T | null>): T | null {
+  return result.timedOut ? null : result.value;
+}
+
+async function finishVisualIndexStaging(
+  budget: ReturnType<typeof setTimeout>,
+  cleanupDeferred: boolean,
+  cleanup: () => Promise<void>,
+): Promise<void> {
+  clearTimeout(budget);
+  if (!cleanupDeferred) await cleanup();
 }
 
 /** Resolve, stage and ask the live renderer for one video frame.
@@ -213,65 +250,99 @@ export async function requestLiveMediaFrame(
   args: Record<string, unknown>,
   visualIndex: Pick<VideoVisualIndexClient, "capture" | "frame" | "warm"> = videoVisualIndex,
 ): Promise<unknown> {
-  if (state.room === null) throw new Error("No room is open.");
-  const [id] = findMentionedMediaFile(state.room.conn, args.name);
-  const meta = getFileMeta(state.room.conn, id);
+  const openRoom = state.room;
+  if (openRoom === null) throw new Error("No room is open.");
+  const [id] = findMentionedMediaFile(openRoom.conn, args.name);
+  const meta = getFileMeta(openRoom.conn, id);
   const streamMime = playableVideoMime(meta.name, meta.mimeType);
   if (streamMime === null) {
     throw new Error(`“${meta.name}” is not a supported video file.`);
   }
 
   const seconds = parseTimestamp(args.at);
-  let token: string;
-  if (state.room.workspace !== undefined) {
-    const row = state.room.conn.prepare(
-      `SELECT size_bytes, content_sha256 FROM files
-       WHERE id = ? AND storage_kind = 'workspace' AND trashed_at IS NULL`,
-    ).get(id) as { size_bytes: number; content_sha256: string | null } | undefined;
-    if (row === undefined) throw new Error("That video is unavailable in the workspace.");
-    // Cache hits return the exact same renderer response shape, so the MCP
-    // bridge's SHA verification, pending-image drain and Cloud Privacy image
-    // valve remain unchanged. A missing, stale or corrupt derived entry is
-    // only a miss; the ordinary hidden renderer remains the source of truth.
-    if (row.content_sha256 !== null) {
-      const deadline = Date.now() + INTERACTIVE_VISUAL_INDEX_BUDGET_MS;
-      const hit = await beforeDeadline(
-        visualIndex.frame(row.content_sha256, seconds, deadline - Date.now()),
-        deadline,
-      );
-      let cached = hit.timedOut ? null : hit.value;
-      if (cached === null) {
-        cached = await coldWorkspaceVisualFrame(
-          state.room,
-          id,
-          row.content_sha256,
-          extensionOf(meta.name),
-          seconds,
-          visualIndex,
-          deadline,
-        );
-      }
-      if (cached !== null) return cached;
-    }
-    const openRoom = state.room;
-    token = stageMediaStream(
-      files.mediaStreams,
-      row.size_bytes,
-      streamMime,
-      async () => openRoom.workspace!.readStream(id),
-      async (start, end) => openRoom.workspace!.readStream(id, { start, end }),
+  if (openRoom.workspace !== undefined) {
+    const row = workspaceVideoRow(openRoom, id);
+    const cached = await workspaceVisualFrame(openRoom, id, row, meta.name, seconds, visualIndex);
+    if (cached !== null) return cached;
+    return requestRendererMediaFrame(
+      stageWorkspaceMedia(files, openRoom, id, row.size_bytes, streamMime),
+      streamMime, seconds, agentUi, emit,
     );
-  } else {
-    const bytes = getFileBytes(state.room.conn, id);
-    if (bytes === null) throw new Error("That video has no saved bytes to decode.");
-    token = stageMediaBytes(files.mediaStreams, bytes, streamMime);
   }
+  return requestRendererMediaFrame(
+    stageSavedMedia(files, openRoom, id, streamMime), streamMime, seconds, agentUi, emit,
+  );
+}
 
-  return requestAgentUi(agentUi, emit, "media_frame", {
-    token,
-    mime: streamMime,
-    seconds,
-  });
+type WorkspaceVideoRow = { size_bytes: number; content_sha256: string | null };
+
+function workspaceVideoRow(openRoom: NonNullable<RoomManagerState["room"]>, id: string): WorkspaceVideoRow {
+  const row = openRoom.conn.prepare(
+    `SELECT size_bytes, content_sha256 FROM files
+     WHERE id = ? AND storage_kind = 'workspace' AND trashed_at IS NULL`,
+  ).get(id) as WorkspaceVideoRow | undefined;
+  if (row === undefined) throw new Error("That video is unavailable in the workspace.");
+  return row;
+}
+
+async function workspaceVisualFrame(
+  openRoom: NonNullable<RoomManagerState["room"]>,
+  id: string,
+  row: WorkspaceVideoRow,
+  name: string,
+  seconds: number,
+  visualIndex: Pick<VideoVisualIndexClient, "capture" | "frame" | "warm">,
+): Promise<CachedVisualFrame | null> {
+  const sourceSha256 = row.content_sha256;
+  if (sourceSha256 === null) return null;
+  const deadline = Date.now() + INTERACTIVE_VISUAL_INDEX_BUDGET_MS;
+  const cached = deadlineValue(await beforeDeadline(
+    visualIndex.frame(sourceSha256, seconds, visualIndexRemaining(deadline)),
+    deadline,
+  ));
+  if (cached !== null) return cached;
+  // A missing, stale or corrupt derived entry is only a miss; the ordinary
+  // hidden renderer remains the source of truth.
+  return coldWorkspaceVisualFrame(
+    openRoom, id, sourceSha256, extensionOf(name), seconds, visualIndex, deadline,
+  );
+}
+
+function stageWorkspaceMedia(
+  files: Pick<FileRuntimeStores, "mediaStreams">,
+  openRoom: NonNullable<RoomManagerState["room"]>,
+  id: string,
+  size: number,
+  mime: string,
+): string {
+  return stageMediaStream(
+    files.mediaStreams,
+    size,
+    mime,
+    async () => openRoom.workspace!.readStream(id),
+    async (start, end) => openRoom.workspace!.readStream(id, { start, end }),
+  );
+}
+
+function stageSavedMedia(
+  files: Pick<FileRuntimeStores, "mediaStreams">,
+  openRoom: NonNullable<RoomManagerState["room"]>,
+  id: string,
+  mime: string,
+): string {
+  const bytes = getFileBytes(openRoom.conn, id);
+  if (bytes === null) throw new Error("That video has no saved bytes to decode.");
+  return stageMediaBytes(files.mediaStreams, bytes, mime);
+}
+
+function requestRendererMediaFrame(
+  token: string,
+  mime: string,
+  seconds: number,
+  agentUi: AgentUiRuntime,
+  emit: EventSender,
+): Promise<unknown> {
+  return requestAgentUi(agentUi, emit, "media_frame", { token, mime, seconds });
 }
 
 function schemaObject(value: unknown): Record<string, unknown> {
@@ -280,36 +351,72 @@ function schemaObject(value: unknown): Record<string, unknown> {
     : { type: "object", properties: {} };
 }
 
+type McpServer = McpManager["servers"][number];
+type McpTool = McpServer["tools"][number];
+
+interface RoutedMcpTool {
+  server: McpServer;
+  tool: McpTool;
+}
+
 export function liveMcpRoutes(state: RoomManagerState, manager: McpManager): McpRoute[] {
-  const disabled = state.room === null
-    ? {}
-    : parseToolPrefs(getSetting(state.room.conn, MCP_TOOL_PREFS_KEY) ?? "{}");
+  const disabled = disabledMcpTools(state);
   const taken = new Set(BUILTIN_TOOL_NAMES);
-  const routes: McpRoute[] = [];
+  return routedMcpTools(manager, disabled).map(({ server, tool }) => mcpRoute(server, tool, taken));
+}
+
+function disabledMcpTools(state: RoomManagerState): Record<string, Set<string>> {
+  if (state.room === null) return {};
+  return parseToolPrefs(getSetting(state.room.conn, MCP_TOOL_PREFS_KEY) ?? "{}");
+}
+
+function routedMcpTools(manager: McpManager, disabled: Record<string, Set<string>>): RoutedMcpTool[] {
+  const routed: RoutedMcpTool[] = [];
   for (const server of manager.servers) {
     if (server.status !== "connected" || server.client === null) continue;
     for (const tool of server.tools) {
       if (disabled[server.name]?.has(tool.name)) continue;
-      const base = `${sanitizeToolName(server.name)}_${sanitizeToolName(tool.name)}`;
-      let catalogName = base;
-      for (let n = 2; taken.has(catalogName); n += 1) catalogName = `${base}_${n}`;
-      taken.add(catalogName);
-      const fn: Record<string, unknown> = {
-        name: catalogName,
-        description: tool.description.length > 2_000 ? `${tool.description.slice(0, 1_997)}…` : tool.description,
-        parameters: schemaObject(tool.schema),
-      };
-      if (tool.annotations !== null) fn.annotations = tool.annotations;
-      routes.push({
-        catalogName,
-        toolName: tool.name,
-        serverName: server.name,
-        remote: server.remote,
-        spec: { type: "function", function: fn } as OllamaToolSpec,
-      });
+      routed.push({ server, tool });
     }
   }
-  return routes;
+  return routed;
+}
+
+function mcpRoute(server: McpServer, tool: McpTool, taken: Set<string>): McpRoute {
+  const catalogName = uniqueMcpCatalogName(server.name, tool.name, taken);
+  return {
+    catalogName,
+    toolName: tool.name,
+    serverName: server.name,
+    remote: server.remote,
+    spec: { type: "function", function: mcpToolFunction(catalogName, tool) } as OllamaToolSpec,
+  };
+}
+
+function uniqueMcpCatalogName(serverName: string, toolName: string, taken: Set<string>): string {
+  const base = `${sanitizeToolName(serverName)}_${sanitizeToolName(toolName)}`;
+  let catalogName = base;
+  let suffix = 2;
+  while (taken.has(catalogName)) {
+    catalogName = `${base}_${suffix}`;
+    suffix += 1;
+  }
+  taken.add(catalogName);
+  return catalogName;
+}
+
+function mcpToolFunction(catalogName: string, tool: McpTool): Record<string, unknown> {
+  const fn: Record<string, unknown> = {
+    name: catalogName,
+    description: mcpToolDescription(tool.description),
+    parameters: schemaObject(tool.schema),
+  };
+  if (tool.annotations !== null) fn.annotations = tool.annotations;
+  return fn;
+}
+
+function mcpToolDescription(description: string): string {
+  return description.length > 2_000 ? `${description.slice(0, 1_997)}…` : description;
 }
 
 function identityRemoteSeam(): RemoteSeam {

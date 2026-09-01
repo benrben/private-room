@@ -14,6 +14,7 @@
  */
 
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createCipheriv, pbkdf2Sync } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -22,6 +23,7 @@ import {
   generateRecoveryCode,
   hasRecovery,
   normalizeCode,
+  RECOVERY_PBKDF2_ITERS,
   openWithRecovery,
   RECOVERY_ALPHABET,
   recoverPassword,
@@ -194,6 +196,13 @@ describe("recoverPassword error messages", () => {
         "The recovery file is unreadable."
       );
 
+      for (const scalar of ["null", "42"]) {
+        writeFileSync(recoverySidecarPath(p), scalar);
+        await expect(recoverPassword(p, "whatever")).rejects.toThrow(
+          "The recovery file is unreadable."
+        );
+      }
+
       writeFileSync(recoverySidecarPath(p), JSON.stringify({ v: 1, salt: "abc" }));
       await expect(recoverPassword(p, "whatever")).rejects.toThrow(
         "The recovery file is unreadable."
@@ -231,6 +240,29 @@ describe("recoverPassword error messages", () => {
       );
       await expect(recoverPassword(p, "whatever")).rejects.toThrow(
         "This recovery file was written by a newer version."
+      );
+    });
+  });
+
+  it("rejects authenticated recovery plaintext that is not valid UTF-8", async () => {
+    await withFreshTmpDir(async () => {
+      const p = tempRoomPath();
+      const code = "AAAA-BBBB-CCCC-DDDD-EEEE-FFFF";
+      const salt = Buffer.alloc(16, 1);
+      const nonce = Buffer.alloc(12, 2);
+      const key = pbkdf2Sync(normalizeCode(code), salt, RECOVERY_PBKDF2_ITERS, 32, "sha256");
+      const cipher = createCipheriv("aes-256-gcm", key, nonce);
+      const body = Buffer.concat([cipher.update(Buffer.from([0xff])), cipher.final()]);
+      const combined = Buffer.concat([body, cipher.getAuthTag()]);
+      writeFileSync(recoverySidecarPath(p), JSON.stringify({
+        v: 1,
+        salt: salt.toString("base64"),
+        nonce: nonce.toString("base64"),
+        ct: combined.toString("base64"),
+      }));
+
+      await expect(recoverPassword(p, code)).rejects.toThrow(
+        "That recovery code is not correct.",
       );
     });
   });

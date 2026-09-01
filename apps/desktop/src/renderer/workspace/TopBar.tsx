@@ -13,41 +13,441 @@ import {
   SparkIcon,
   WorkflowsIcon,
 } from "../icons";
-import LayoutMenu from "./LayoutMenu";
-import { saveDetail } from "./RecordingsPage";
-import { WorkflowGlyph } from "./workflows/workflowGlyph";
-import { isCloudRoute, isExternalEngine, isModelReady, trustState } from "./markup";
-import { WSState } from "./state";
-import { WSActions } from "./actions";
-import EngineModelPicker from "./EngineModelPicker";
-import { QuickActionsMenu, QuickAction } from "./QuickActions";
 import { LayoutApi } from "../shell/useLayout";
 import { toggleTheme } from "../theme";
+import EngineModelPicker from "./EngineModelPicker";
+import LayoutMenu from "./LayoutMenu";
+import { isCloudRoute, isExternalEngine, isModelReady, trustState } from "./markup";
+import { QuickAction, QuickActionsMenu } from "./QuickActions";
+import { saveDetail } from "./RecordingsPage";
+import { WSActions } from "./actions";
+import { WSState } from "./state";
+import { WorkflowGlyph } from "./workflows/workflowGlyph";
 
-/** The room toolbar: brand seal, room name, the ⌘K command entry, pinned
- * workflow/script shortcuts, the engine pill with its truthful local/cloud
- * route badge, Layout, Assistant, the room menu, and Lock.
- *
- * Two things arrived here in the navigation redesign, both from the sidebar:
- * LAYOUT, which owns showing and hiding the two side panes (they were three
- * buttons at the top of a list of destinations, which is not what they are),
- * and ASSISTANT, which is that pane's own toggle plus the two marks that say
- * whether anything is waiting on you.
- *
- * WHICH MAKES THIS BAR THE CROWDED SURFACE NOW, and it is worth saying so
- * plainly rather than discovering it later. Counting conditionals, it can
- * carry eleven controls at once: seal, room name, ⌘K, recording chip, pinned
- * workflows, pinned scripts, engine, privacy, Layout, Assistant, ⋯, Lock. The
- * sidebar got calmer partly by pushing density up here. Nothing in this pass
- * addresses that; the next one should.
- *
- * Every popover this bar can raise shares ONE open slot (`s.openMenu`), so
- * opening any of them closes the rest and Escape closes whichever is up. That
- * used to be a convention enforced by hand at each open site — and the scripts
- * menu never joined it, so it stacked over the model picker.
- *
- * What has always stayed is what is true right now and cannot wait: a live
- * recording, the engine, where this room's content goes, and the lock. */
+type TopBarProps = {
+  s: WSState;
+  a: WSActions;
+  info: RoomInfo;
+  layout: LayoutApi;
+  sidebarTitle: string;
+  onRenamed?: (info: RoomInfo) => void;
+  approvals?: number;
+  running?: number;
+};
+
+function useRoomRename(
+  info: RoomInfo,
+  s: WSState,
+  onRenamed: ((info: RoomInfo) => void) | undefined,
+) {
+  const [nameDraft, setNameDraft] = useState<string | null>(null);
+  const commitRename = async () => {
+    const typed = (nameDraft ?? "").trim();
+    setNameDraft(null);
+    if (!typed || typed === info.name) return;
+    try {
+      onRenamed?.(await api.renameRoom(typed));
+      s.pushToast("success", `This room is now called “${typed}”.`);
+    } catch (error) {
+      s.pushToast("error", `Could not rename this room: ${String(error)}`);
+    }
+  };
+  return { nameDraft, setNameDraft, commitRename };
+}
+
+function useTopBarEscape(menuOpen: boolean, setOpenMenu: WSState["setOpenMenu"]) {
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.stopPropagation();
+      setOpenMenu(null);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [menuOpen, setOpenMenu]);
+}
+
+function pinnedWorkflowActions(s: WSState, a: WSActions): QuickAction[] {
+  return s.workflows
+    .filter((workflow) => workflow.pinned && workflow.status === "active" && workflow.binding.scope === "general")
+    .map((workflow) => ({
+      id: workflow.id,
+      label: workflow.name,
+      icon: <WorkflowGlyph emoji={workflow.emoji} size={14} />,
+      hint: workflow.name,
+      onRun: () => void a.runWorkflowNow(workflow.id),
+    }));
+}
+
+function globalScriptActions(s: WSState, a: WSActions): QuickAction[] {
+  return s.scripts
+    .filter((script) => script.shortcut === "global")
+    .map((script) => ({
+      id: script.fileId,
+      label: script.name,
+      icon: <PlayIcon size={14} />,
+      hint: `Run ${script.name}`,
+      onRun: () => void a.runScript(script.fileId),
+    }));
+}
+
+function RoomIdentity({
+  info,
+  nameDraft,
+  onStartRename,
+  onChange,
+  onCommit,
+  onCancel,
+}: {
+  info: RoomInfo;
+  nameDraft: string | null;
+  onStartRename: () => void;
+  onChange: (name: string) => void;
+  onCommit: () => void;
+  onCancel: () => void;
+}) {
+  const handleKey = (key: string) => {
+    if (key === "Enter") onCommit();
+    if (key === "Escape") onCancel();
+  };
+  return (
+    <div className="room-identity" title={info.path}>
+      <div className="room-identity-text">
+        {nameDraft === null ? (
+          <button
+            type="button"
+            className="room-name room-name-btn"
+            title="Rename this room"
+            onClick={onStartRename}
+          >
+            {info.name}
+          </button>
+        ) : (
+          <input
+            className="room-name room-name-input"
+            aria-label="Room name"
+            autoFocus
+            value={nameDraft}
+            maxLength={120}
+            onChange={(event) => onChange(event.target.value)}
+            onBlur={onCommit}
+            onKeyDown={(event) => handleKey(event.key)}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function CommandButton({ s }: { s: WSState }) {
+  const openSearch = () => {
+    s.setSearchSel(0);
+    s.setShowSearch(true);
+  };
+  return (
+    <div className="command-wrap">
+      <button className="command-button" type="button" onClick={openSearch}>
+        <SearchIcon size={14} />
+        <span>Search room or run a command…</span>
+        <kbd>⌘ K</kbd>
+      </button>
+    </div>
+  );
+}
+
+function recordingTitle(
+  recording: NonNullable<WSState["recLive"]>,
+  save: WSState["recSave"],
+) {
+  if (recording.status === "saving") return `${saveDetail(save)} — click to open it`;
+  if (recording.status === "paused") {
+    return "Recording paused — the microphone is closed. Nothing is lost; click to open it and resume.";
+  }
+  return "A live recording is running — click to open it";
+}
+
+function recordingLabel(recording: NonNullable<WSState["recLive"]>) {
+  if (recording.status === "recording") return "Recording";
+  if (recording.status === "paused") return "Recording paused";
+  return "Saving…";
+}
+
+function RecordingIndicator({ s, onOpen }: { s: WSState; onOpen: (fileId: string) => void }) {
+  if (!s.recLive) return null;
+  const recording = s.recLive;
+  const pulsing = recording.status === "recording" ? "pulsing" : "";
+  return (
+    <button
+      className={`rec-indicator ${recording.status}`}
+      title={recordingTitle(recording, s.recSave)}
+      onClick={() => onOpen(recording.fileId)}
+    >
+      <span className={`rec-dot ${pulsing}`} />
+      {recordingLabel(recording)}
+    </button>
+  );
+}
+
+function ShortcutMenus({ s, a }: { s: WSState; a: WSActions }) {
+  const workflows = pinnedWorkflowActions(s, a);
+  const scripts = globalScriptActions(s, a);
+  const { setOpenMenu } = s;
+  return (
+    <>
+      {workflows.length > 0 && (
+        <QuickActionsMenu
+          actions={workflows}
+          open={s.openMenu === "workflows"}
+          onOpenChange={(open) => setOpenMenu(open ? "workflows" : null)}
+          buttonLabel="Workflows"
+          buttonIcon={<WorkflowsIcon size={14} />}
+          inlineMax={3}
+          pill
+          footer={{ label: "All workflows…", onClick: a.openWorkflows }}
+        />
+      )}
+      {scripts.length > 0 && (
+        <QuickActionsMenu
+          actions={scripts}
+          open={s.openMenu === "scripts"}
+          onOpenChange={(open) => setOpenMenu(open ? "scripts" : null)}
+          buttonLabel="Scripts"
+          buttonIcon={<ScriptIcon size={14} />}
+          inlineMax={2}
+          pill
+          footer={{ label: "All scripts…", onClick: a.openScripts }}
+        />
+      )}
+    </>
+  );
+}
+
+function modelPillTitle(ai: NonNullable<WSState["ai"]>, ready: boolean, cloud: boolean) {
+  if (!ai.running) return "Ollama not running";
+  if (ready || cloud) return "AI ready — click to switch engine";
+  return "Model not downloaded";
+}
+
+function modelDotClass(ai: NonNullable<WSState["ai"]>, model: string, ready: boolean) {
+  if (isExternalEngine(model)) return "ok";
+  if (!ai.running) return "down";
+  return ready ? "ok" : "warn";
+}
+
+function shouldKeepModelMenuOpen(model: string, engineModels: WSState["engineModels"]) {
+  const [engine, submodel, effort] = splitExternalModel(model);
+  if (!ENGINE_LABELS[engine]) return false;
+  if (!submodel || effort) return false;
+  const selected = engineModels[engine]?.find((candidate) => candidate.slug === submodel);
+  return (selected?.efforts.length ?? 0) > 0;
+}
+
+function ModelMenu({
+  s,
+  a,
+}: {
+  s: WSState;
+  a: WSActions;
+}) {
+  if (s.openMenu !== "model" || !s.ai) return null;
+  const selectModel = (model: string) => {
+    a.changeModel(model);
+    if (!shouldKeepModelMenuOpen(model, s.engineModels)) s.setOpenMenu(null);
+  };
+  return (
+    <>
+      <div className="menu-backdrop" onMouseDown={() => s.setOpenMenu(null)} />
+      <div className="pop-menu model-menu">
+        <EngineModelPicker
+          ai={s.ai}
+          model={s.model}
+          engineModels={s.engineModels}
+          onModelsLoaded={a.recordEngineModels}
+          onSelect={selectModel}
+        />
+      </div>
+    </>
+  );
+}
+
+function ModelControl({ s, a }: { s: WSState; a: WSActions }) {
+  const ai = s.ai;
+  if (!ai || (ai.models.length === 0 && ai.external.length === 0)) {
+    return <button className="subtle" onClick={a.refreshAi}>Check AI</button>;
+  }
+  const ready = isModelReady(ai, s.model);
+  const cloud = isCloudRoute(s.model, ai);
+  const toggleModelMenu = () => s.setOpenMenu(s.openMenu === "model" ? null : "model");
+  return (
+    <div className="model-pill-wrap">
+      <button
+        className="model-pill"
+        onClick={toggleModelMenu}
+        aria-haspopup="menu"
+        aria-expanded={s.openMenu === "model"}
+        title={modelPillTitle(ai, ready, cloud)}
+      >
+        <span className={`model-dot ${modelDotClass(ai, s.model, ready)}`} />
+        <span className="model-pill-name">{a.engineLabelOf(s.model)}</span>
+        <ChevronDownIcon size={12} className="model-pill-caret" />
+      </button>
+      <ModelMenu s={s} a={a} />
+    </div>
+  );
+}
+
+function PrivacyBadge({ s }: { s: WSState }) {
+  const cloud = isCloudRoute(s.model, s.ai);
+  const trust = trustState(cloud, s.privacyOn);
+  return (
+    <div className={`privacy-badge ${trust.tone}`} title={trust.title}>
+      {cloud ? <CloudIcon size={12} /> : <span className="status-dot" aria-hidden />}
+      <span>{trust.label}</span>
+    </div>
+  );
+}
+
+function assistantLabel(aiShowing: boolean, approvals: number, running: number) {
+  if (aiShowing) return "Hide the assistant (⌘2)";
+  if (approvals > 0) {
+    const subject = approvals === 1 ? "thing needs" : "things need";
+    return `Show the assistant (⌘2) — ${approvals} ${subject} your approval`;
+  }
+  if (running > 0) return "Show the assistant (⌘2) — background work is running";
+  return "Show the assistant (⌘2)";
+}
+
+function AssistantMarker({
+  aiShowing,
+  approvals,
+  running,
+}: {
+  aiShowing: boolean;
+  approvals: number;
+  running: number;
+}) {
+  if (aiShowing || approvals > 0) return null;
+  if (running === 0) return null;
+  return <span className="pill-live nb-sem-linked" aria-hidden />;
+}
+
+function ApprovalMarker({ aiShowing, approvals }: { aiShowing: boolean; approvals: number }) {
+  if (aiShowing || approvals === 0) return null;
+  const count = approvals > 99 ? "99+" : approvals;
+  return <span className="pill-count nb-circled nb-sem-pending" aria-hidden>{count}</span>;
+}
+
+function AssistantToggle({
+  layout,
+  approvals,
+  running,
+}: {
+  layout: LayoutApi;
+  approvals: number;
+  running: number;
+}) {
+  const aiShowing = layout.visible.includes("ai");
+  return (
+    <button
+      className="pill-btn assistant-toggle"
+      type="button"
+      data-testid="assistant-toggle"
+      aria-pressed={aiShowing}
+      aria-label={assistantLabel(aiShowing, approvals, running)}
+      onClick={() => layout.togglePane("ai")}
+    >
+      <SparkIcon size={14} />
+      <span>Assistant</span>
+      <ApprovalMarker aiShowing={aiShowing} approvals={approvals} />
+      <AssistantMarker aiShowing={aiShowing} approvals={approvals} running={running} />
+    </button>
+  );
+}
+
+function RoomMenu({ s, a, info }: { s: WSState; a: WSActions; info: RoomInfo }) {
+  if (s.openMenu !== "room") return null;
+  const close = () => s.setOpenMenu(null);
+  const saveCheckpoint = () => {
+    close();
+    api
+      .createRoomCheckpoint("")
+      .then((meta) => s.pushToast("success", `Saved checkpoint “${meta.name}”. Roll back in Settings → Checkpoints.`))
+      .catch((error) => s.pushToast("error", String(error)));
+  };
+  const exportFiles = () => {
+    a.exportAllFiles();
+    close();
+  };
+  const revealRoom = () => {
+    revealItemInDir(info.path).catch(() => {});
+    close();
+  };
+  const showShortcuts = () => {
+    s.setShowShortcuts(true);
+    close();
+  };
+  const showFeedback = () => {
+    s.setShowFeedback(true);
+    close();
+  };
+  const changeTheme = () => {
+    toggleTheme();
+    close();
+  };
+  return (
+    <div className="room-menu-wrap">
+      <button
+        className="icon-btn"
+        data-tip="Room actions"
+        aria-label="Open the room actions menu"
+        aria-haspopup="menu"
+        aria-expanded
+        onClick={close}
+      >
+        <DotsIcon size={16} />
+      </button>
+      <div className="menu-backdrop" onMouseDown={close} />
+      <div className="pop-menu room-menu" role="menu">
+        <button className="pop-item" role="menuitem" onClick={changeTheme}>Theme</button>
+        <button className="pop-item" role="menuitem" onClick={saveCheckpoint}>Save a checkpoint</button>
+        {s.files.length > 0 && (
+          <button className="pop-item" role="menuitem" onClick={exportFiles}>Export all files…</button>
+        )}
+        <button className="pop-item" role="menuitem" onClick={revealRoom}>Reveal in Finder</button>
+        <button className="pop-item" role="menuitem" onClick={showShortcuts}>Keyboard shortcuts (⌘/)</button>
+        <button className="pop-item" role="menuitem" onClick={showFeedback}>Send feedback…</button>
+      </div>
+    </div>
+  );
+}
+
+function RoomMenuTrigger({ s }: { s: WSState }) {
+  const toggle = () => s.setOpenMenu("room");
+  return (
+    <div className="room-menu-wrap">
+      <button
+        className="icon-btn"
+        data-tip="Room actions"
+        aria-label="Open the room actions menu"
+        aria-haspopup="menu"
+        aria-expanded={false}
+        onClick={toggle}
+      >
+        <DotsIcon size={16} />
+      </button>
+    </div>
+  );
+}
+
+function LockButton({ onLock }: { onLock: () => void | Promise<void> }) {
+  return (
+    <button className="lock-btn btn-ic" title="Lock this room (⌘L)" data-agent-blocked onClick={onLock}>
+      <LockIcon size={14} /> Lock
+    </button>
+  );
+}
+
 export default function TopBar({
   s,
   a,
@@ -57,453 +457,39 @@ export default function TopBar({
   onRenamed,
   approvals = 0,
   running = 0,
-}: {
-  s: WSState;
-  a: WSActions;
-  info: RoomInfo;
-  layout: LayoutApi;
-  /** The active destination's name for its second column, for the Layout
-   * menu's ⌘1 row. Passed in rather than derived: the shell owns the rule that
-   * turns three flags and `s.area` into one destination, and a second copy of
-   * it here is a second answer waiting to disagree. */
-  sidebarTitle: string;
-  onRenamed?: (info: RoomInfo) => void;
-  /** How many things are WAITING ON THE READER. Drawn on the Assistant button
-   * as a hand-circled number, because that is where answering them happens. */
-  approvals?: number;
-  /** How many jobs are running BY THEMSELVES. A quiet dot: news, not a
-   * request. */
-  running?: number;
-}) {
-  const { ai, model } = s;
-  // The room name, while it is being typed. `null` = not renaming. Local to
-  // the bar: nothing else in the app cares about a half-typed name, and the
-  // committed name comes back from the backend as a fresh RoomInfo.
-  const [nameDraft, setNameDraft] = useState<string | null>(null);
-  async function commitRename() {
-    const typed = (nameDraft ?? "").trim();
-    setNameDraft(null);
-    if (!typed || typed === info.name) return;
-    try {
-      onRenamed?.(await api.renameRoom(typed));
-      s.pushToast("success", `This room is now called “${typed}”.`);
-    } catch (e) {
-      s.pushToast("error", `Could not rename this room: ${String(e)}`);
-    }
-  }
-  // One dismissal grammar for the toolbar popovers: Escape closes whichever
-  // is open (and never leaks to deeper layers while one is). One slot, so
-  // this closes the open menu whatever it is — including the two the
-  // navigation redesign added, which under the old flag-per-menu scheme would
-  // each have needed remembering here and at every other menu's open site.
-  const menuOpen = s.openMenu !== null;
-  const { setOpenMenu } = s;
-  useEffect(() => {
-    if (!menuOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      e.stopPropagation();
-      setOpenMenu(null);
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [menuOpen, setOpenMenu]);
-  // Wave 4a: pinned general-purpose workflows as one-click top-bar shortcuts.
-  const pinnedActions: QuickAction[] = s.workflows
-    .filter((w) => w.pinned && w.status === "active" && w.binding.scope === "general")
-    .map((w) => ({
-      id: w.id,
-      label: w.name,
-      icon: <WorkflowGlyph emoji={w.emoji} size={14} />,
-      hint: w.name,
-      onRun: () => void a.runWorkflowNow(w.id),
-    }));
-  // Wave 5 (Idea 13): `room-shortcut: global` scripts as one-click top-bar runs.
-  const globalScriptActions: QuickAction[] = s.scripts
-    .filter((sc) => sc.shortcut === "global")
-    .map((sc) => ({
-      id: sc.fileId,
-      label: sc.name,
-      icon: <PlayIcon size={14} />,
-      hint: `Run ${sc.name}`,
-      onRun: () => void a.runScript(sc.fileId),
-    }));
-  const modelReady = isModelReady(ai, model);
-  const cloud = isCloudRoute(model, ai);
-  // What is ON SCREEN, not what is stored. In a narrow window one pane shows
-  // at a time, so the assistant can be "not hidden" and still not visible —
-  // and a pressed-looking button beside a pane you cannot see is a lie.
-  const aiShowing = layout.visible.includes("ai");
+}: TopBarProps) {
+  const rename = useRoomRename(info, s, onRenamed);
+  useTopBarEscape(s.openMenu !== null, s.setOpenMenu);
   return (
     <header className="pr-topbar">
-      <div className="pr-brandmark" aria-label="Arcelle" title={info.path}>
-        <Logomark size={26} />
-      </div>
-      <div className="room-identity" title={info.path}>
-        <div className="room-identity-text">
-          {/* The room's name lives in its own encrypted `meta`, not in the file
-              path — renaming the .roomai in Finder changes nothing — so this is
-              the only place it can be changed. Inline, the same grammar the
-              file and folder renames use. */}
-          {nameDraft === null ? (
-            <button
-              type="button"
-              className="room-name room-name-btn"
-              title="Rename this room"
-              onClick={() => setNameDraft(info.name)}
-            >
-              {info.name}
-            </button>
-          ) : (
-            <input
-              className="room-name room-name-input"
-              aria-label="Room name"
-              autoFocus
-              value={nameDraft}
-              maxLength={120}
-              onChange={(e) => setNameDraft(e.target.value)}
-              onBlur={() => void commitRename()}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void commitRename();
-                if (e.key === "Escape") setNameDraft(null);
-              }}
-            />
-          )}
-        </div>
-      </div>
-      <div className="command-wrap">
-        <button
-          className="command-button"
-          type="button"
-          onClick={() => {
-            s.setSearchSel(0);
-            s.setShowSearch(true);
-          }}
-        >
-          <SearchIcon size={14} />
-          <span>Search room or run a command…</span>
-          <kbd>⌘ K</kbd>
-        </button>
-      </div>
+      <div className="pr-brandmark" aria-label="Arcelle" title={info.path}><Logomark size={26} /></div>
+      <RoomIdentity
+        info={info}
+        nameDraft={rename.nameDraft}
+        onStartRename={() => rename.setNameDraft(info.name)}
+        onChange={rename.setNameDraft}
+        onCommit={rename.commitRename}
+        onCancel={() => rename.setNameDraft(null)}
+      />
+      <CommandButton s={s} />
       <div className="top-actions">
-        {/* ADD-27: a recording keeps running while you work elsewhere — this
-         * chip is the always-visible way back to it. */}
-        {s.recLive && (
-          <button
-            className={`rec-indicator ${s.recLive.status}`}
-            /* One sentence per phase, because the chip has three. While the
-               save drains, "a live recording is running" is not what is
-               happening and "Saving…" alone reads as "your recording is not
-               safe yet" — the audio is on disk from the first event; the
-               Recordings page already says which stage this is in the room's
-               own words, so the chip borrows that sentence rather than
-               inventing a second one. Paused is the same lie the other way
-               round: the label says paused and the microphone is closed, so the
-               hover must not answer that a recording is running. */
-            title={
-              s.recLive.status === "saving"
-                ? `${saveDetail(s.recSave)} — click to open it`
-                : s.recLive.status === "paused"
-                  ? "Recording paused — the microphone is closed. Nothing is lost; click to open it and resume."
-                  : "A live recording is running — click to open it"
-            }
-            onClick={() => void a.viewFile(s.recLive!.fileId)}
-          >
-            <span className={`rec-dot ${s.recLive.status === "recording" ? "pulsing" : ""}`} />
-            {s.recLive.status === "recording"
-              ? "Recording"
-              : s.recLive.status === "paused"
-                ? "Recording paused"
-                : "Saving…"}
-          </button>
-        )}
-        {/* Wave 4a: pinned-workflow shortcuts, left of the model pill (⌘J).
-            Only when something is actually pinned — an empty shortcut rack is
-            not a shortcut, and Workflows is one click away in the rail. */}
-        {pinnedActions.length > 0 && (
-          <QuickActionsMenu
-            actions={pinnedActions}
-            open={s.openMenu === "workflows"}
-            onOpenChange={(o) => setOpenMenu(o ? "workflows" : null)}
-            buttonLabel="Workflows"
-            buttonIcon={<WorkflowsIcon size={14} />}
-            inlineMax={3}
-            pill
-            footer={{ label: "All workflows…", onClick: a.openWorkflows }}
-          />
-        )}
-        {/* Wave 5: global-shortcut scripts, beside the workflow pins (only when
-            a script opts into `room-shortcut: global`). */}
-        {globalScriptActions.length > 0 && (
-          <QuickActionsMenu
-            actions={globalScriptActions}
-            /* This menu used to own a LOCAL open flag, so it was the one
-               toolbar popover outside the "only one at a time" rule and could
-               stack over the model picker. One slot, no exception. */
-            open={s.openMenu === "scripts"}
-            onOpenChange={(o) => setOpenMenu(o ? "scripts" : null)}
-            buttonLabel="Scripts"
-            buttonIcon={<ScriptIcon size={14} />}
-            inlineMax={2}
-            pill
-            footer={{ label: "All scripts…", onClick: a.openScripts }}
-          />
-        )}
-        {ai && (ai.models.length > 0 || ai.external.length > 0) ? (
-          <div className="model-pill-wrap">
-            <button
-              className="model-pill"
-              onClick={() =>
-                setOpenMenu(s.openMenu === "model" ? null : "model")
-              }
-              aria-haspopup="menu"
-              aria-expanded={s.openMenu === "model"}
-              title={
-                ai?.running
-                  ? modelReady || cloud
-                    ? "AI ready — click to switch engine"
-                    : "Model not downloaded"
-                  : "Ollama not running"
-              }
-            >
-              <span
-                className={`model-dot ${
-                  // External CLIs need no daemon; a `:cloud` model still rides
-                  // through the local Ollama daemon, so its dot tracks it.
-                  isExternalEngine(model)
-                    ? "ok"
-                    : ai?.running
-                      ? modelReady
-                        ? "ok"
-                        : "warn"
-                      : "down"
-                }`}
-              />
-              <span className="model-pill-name">{a.engineLabelOf(model)}</span>
-              <ChevronDownIcon size={12} className="model-pill-caret" />
-            </button>
-            {s.openMenu === "model" && (
-              <>
-                <div
-                  className="menu-backdrop"
-                  onMouseDown={() => setOpenMenu(null)}
-                />
-                <div className="pop-menu model-menu">
-                  <EngineModelPicker
-                    ai={ai}
-                    model={model}
-                    engineModels={s.engineModels}
-                    onModelsLoaded={a.recordEngineModels}
-                    onSelect={(m) => {
-                      a.changeModel(m);
-                      // Keep the menu open only when the pick is a cloud model
-                      // that still has an effort to choose (its chips just
-                      // appeared); otherwise this is a final choice — close.
-                      const [engine, sub, effort] = splitExternalModel(m);
-                      const hasEfforts =
-                        !!ENGINE_LABELS[engine] &&
-                        !!sub &&
-                        !effort &&
-                        (s.engineModels[engine]?.find((x) => x.slug === sub)?.efforts.length ?? 0) > 0;
-                      if (!hasEfforts) setOpenMenu(null);
-                    }}
-                  />
-                </div>
-              </>
-            )}
-          </div>
-        ) : (
-          <button className="subtle" onClick={a.refreshAi}>
-            Check AI
-          </button>
-        )}
-        {/* The truthful route badge — same vocabulary and colour as the
-            status-bar trust chip (workspace/markup.ts trustState), so this room
-            can never say two different things about where its content goes. */}
-        {(() => {
-          const trust = trustState(cloud, s.privacyOn);
-          return (
-            <div
-              className={`privacy-badge ${trust.tone}`}
-              title={trust.title}
-            >
-              {cloud ? (
-                <CloudIcon size={12} />
-              ) : (
-                <span className="status-dot" aria-hidden />
-              )}
-              <span>{trust.label}</span>
-            </div>
-          );
-        })()}
-        {/* The window's arrangement — the three pane buttons that used to sit
-            at the top of the sidebar's list of destinations. See LayoutMenu
-            for why they are not places and never were. */}
+        <RecordingIndicator s={s} onOpen={a.viewFile} />
+        <ShortcutMenus s={s} a={a} />
+        <ModelControl s={s} a={a} />
+        <PrivacyBadge s={s} />
         <LayoutMenu
           layout={layout}
           sidebarTitle={sidebarTitle}
           open={s.openMenu === "layout"}
-          onOpenChange={(o) => setOpenMenu(o ? "layout" : null)}
+          onOpenChange={(open) => s.setOpenMenu(open ? "layout" : null)}
         />
-
-        {/* The assistant, and the two facts that used to live on the rail's AI
-            pane toggle.
-            They belong on THIS button now for one reason: the toggle they were
-            attached to is gone, and a count that only appears while the pane
-            is already open is a count nobody needs. Here they are visible
-            precisely when the pane is shut — which is the only time "two
-            things are waiting on you" is news.
-            Two facts, two shapes, and they can both be true at once: an
-            approval is a REQUEST and gets the hand-circled number in the
-            pending yellow; a running job is the software working on its own
-            and gets the quiet dot in the linked blue Room Home already uses
-            for it. Summing them into one number claimed N things needed you
-            when N-1 did not. Both stay aria-hidden — the button's own label
-            carries the words, and a control whose accessible name changed
-            every time a job finished would be worse, not better. */}
-        <button
-          className="pill-btn assistant-toggle"
-          type="button"
-          data-testid="assistant-toggle"
-          aria-pressed={aiShowing}
-          aria-label={
-            aiShowing
-              ? "Hide the assistant (⌘2)"
-              : approvals > 0
-                ? `Show the assistant (⌘2) — ${approvals} ${approvals === 1 ? "thing needs" : "things need"} your approval`
-                : running > 0
-                  ? "Show the assistant (⌘2) — background work is running"
-                  : "Show the assistant (⌘2)"
-          }
-          onClick={() => layout.togglePane("ai")}
-        >
-          <SparkIcon size={14} />
-          <span>Assistant</span>
-          {!aiShowing && approvals > 0 && (
-            <span className="pill-count nb-circled nb-sem-pending" aria-hidden>
-              {approvals > 99 ? "99+" : approvals}
-            </span>
-          )}
-          {!aiShowing && approvals === 0 && running > 0 && (
-            <span className="pill-live nb-sem-linked" aria-hidden />
-          )}
-        </button>
-
-        <div className="room-menu-wrap">
-          <button
-            className="icon-btn"
-            data-tip="Room actions"
-            aria-label="Open the room actions menu"
-            aria-haspopup="menu"
-            aria-expanded={s.openMenu === "room"}
-            onClick={() => setOpenMenu(s.openMenu === "room" ? null : "room")}
-          >
-            <DotsIcon size={16} />
-          </button>
-          {s.openMenu === "room" && (
-            <>
-              <div
-                className="menu-backdrop"
-                onMouseDown={() => setOpenMenu(null)}
-              />
-              <div className="pop-menu room-menu" role="menu">
-                {/* Theme is a quick-access convenience, not a second home for
-                    the control — its real home is Settings → Appearance, so
-                    this row stays exactly one word. Same handler as before
-                    (Overlays.tsx "theme" carries the same toggle from ⌘K).
-                    Room settings was removed from this menu entirely (P1-9):
-                    the rail's persistent Settings button is the one entry
-                    point, and a second name for the same modal in a second
-                    menu was redundant chrome, not a convenience. */}
-                <button
-                  className="pop-item"
-                  role="menuitem"
-                  onClick={() => {
-                    toggleTheme();
-                    setOpenMenu(null);
-                  }}
-                >
-                  Theme
-                </button>
-                {/* Idea 9: one-click "commit" — a named checkpoint (default
-                    name "Checkpoint — {date}") with a toast that names it.
-                    Rolling back stays gated in Settings → Checkpoints. */}
-                <button
-                  className="pop-item"
-                  role="menuitem"
-                  onClick={() => {
-                    setOpenMenu(null);
-                    api
-                      .createRoomCheckpoint("")
-                      .then((meta) =>
-                        s.pushToast(
-                          "success",
-                          `Saved checkpoint “${meta.name}”. Roll back in Settings → Checkpoints.`,
-                        ),
-                      )
-                      .catch((e) => s.pushToast("error", String(e)));
-                  }}
-                >
-                  Save a checkpoint
-                </button>
-                {s.files.length > 0 && (
-                  <button
-                    className="pop-item"
-                    role="menuitem"
-                    onClick={() => {
-                      a.exportAllFiles();
-                      setOpenMenu(null);
-                    }}
-                  >
-                    Export all files…
-                  </button>
-                )}
-                <button
-                  className="pop-item"
-                  role="menuitem"
-                  onClick={() => {
-                    revealItemInDir(info.path).catch(() => {});
-                    setOpenMenu(null);
-                  }}
-                >
-                  Reveal in Finder
-                </button>
-                {/* The one discoverable way in to the shortcut list — the
-                    keys themselves were only learnable from tooltips. */}
-                <button
-                  className="pop-item"
-                  role="menuitem"
-                  onClick={() => {
-                    s.setShowShortcuts(true);
-                    setOpenMenu(null);
-                  }}
-                >
-                  Keyboard shortcuts (⌘/)
-                </button>
-                {/* ADD-28: feedback → GitHub issue (opens in YOUR browser). */}
-                <button
-                  className="pop-item"
-                  role="menuitem"
-                  onClick={() => {
-                    s.setShowFeedback(true);
-                    setOpenMenu(null);
-                  }}
-                >
-                  Send feedback…
-                </button>
-              </div>
-            </>
-          )}
-        </div>
-        {/* ADD-25: locking the room is the user's call, never the agent's. */}
-        <button
-          className="lock-btn btn-ic"
-          title="Lock this room (⌘L)"
-          data-agent-blocked
-          onClick={a.handleLock}
-        >
-          <LockIcon size={14} /> Lock
-        </button>
+        <AssistantToggle layout={layout} approvals={approvals} running={running} />
+        {s.openMenu === "room" ? (
+          <RoomMenu s={s} a={a} info={info} />
+        ) : (
+          <RoomMenuTrigger s={s} />
+        )}
+        <LockButton onLock={a.handleLock} />
       </div>
     </header>
   );

@@ -1,0 +1,496 @@
+
+
+/* A control's own label — the name of the field under it. Block, and at the
+   same weight as a small heading, because that is what it is. */
+.settings-label {
+  display: block;
+  margin: var(--sp-4) 0 var(--sp-2);
+  color: var(--text);
+  font-size: var(--fs-body);
+  font-weight: 600;
+  line-height: var(--lh-body);
+}
+
+/* A label that IS the control (it wraps a checkbox) is a sentence, not a
+   heading: normal weight, and a target tall enough to click at.
+
+   It stays a BLOCK deliberately. Several of these labels contain inline
+   <code> and <strong> inside the sentence, and a flex container would promote
+   every one of those to its own flex item — the sentence would come apart
+   into a row of fragments that no longer wraps. Inline flow keeps the words a
+   sentence; the checkbox's own vertical-align below puts it on the first
+   line. :has() has shipped in WebKit since 15.4 and a browser without it
+   simply renders these at heading weight, which is the old behaviour. */
+.settings-label:has(> input[type="checkbox"]),
+.settings-label:has(> input[type="radio"]) {
+  min-height: 28px;
+  padding: 3px 0;
+  font-weight: 400;
+  cursor: pointer;
+}
+
+.settings-sheet textarea,
+.settings textarea {
+  width: 100%;
+  resize: vertical;
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+
+/* ==========================================================================
+   6. NOTES AND MARKER LABELS
+   A consequence, drawn as a note pinned to the control that decides it.
+
+   These are a deliberate re-statement of the Connectors page's `.mkt-note`
+   rather than a reuse of it: that class belongs to marketplace.css, which
+   owns a different surface, and a privacy warning here must not change shape
+   because someone retuned a card over there. Same recipe on purpose — a note
+   that means "look at this" should look the same everywhere in the product.
+
+   The edge is --mk-ink, never a marker fill: a 3px stroke is meaningful
+   non-text and owes 3:1, and a fill measures about 1.7:1 on ivory paper.
+   ========================================================================== */
+
+.set-note {
+  position: relative;
+  margin: var(--sp-3) 0;
+  padding: 0 0 0 var(--sp-3);
+  box-shadow: inset 1px 0 0 var(--line);
+  color: var(--text);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  max-width: 74ch;
+}
+
+.set-note--flag {
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-sm);
+  box-shadow: inset 3px 0 0 var(--mk-ink, var(--sem-pending));
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--mk, var(--sem-pending-fill)) 20%, transparent) 0%,
+    color-mix(in srgb, var(--mk, var(--sem-pending-fill)) 10%, transparent) 62%,
+    color-mix(in srgb, var(--mk, var(--sem-pending-fill)) 15%, transparent) 100%
+  );
+}
+
+/* A consequence that is the product's core promise — what leaves this Mac,
+   and what cannot be taken back — is instruction copy of the highest kind, so
+   it is set at the lead rung rather than at body size. */
+.set-note--lead {
+  font-size: var(--fs-lead);
+}
+
+/* An inline glyph inside a note — the warning triangle the copy already
+   carried. It takes the note's own meaning ink, so the mark and the edge
+   agree. */
+.set-note svg,
+.set-note .warn-ic {
+  flex: none;
+  vertical-align: -3px;
+  margin-right: 5px;
+  color: var(--mk-ink, var(--muted));
+}
+
+.set-note b,
+.set-note strong {
+  color: var(--text-strong);
+}
+
+.set-note code {
+  overflow-wrap: anywhere;
+}
+
+/* The tape label on a note. Every one of these is a phrase lifted VERBATIM
+   from the sentence it now heads — "The door is open", "Not saved yet", "On",
+   "Off" — so the mark carries emphasis the copy already had and not one word
+   was invented to decorate a warning.
+
+   It is deliberately allowed to wrap. Two of these labels are full clauses,
+   and nowrap on a 30-character strip is how a note ends up wider than the
+   column it sits in on a narrow window. */
+/* The lifted opening clause of a privacy note — "The door is open", "There is
+   no password reset", "Spoken answers use a cloud voice".
+
+   It inherits the paragraph's OWN size and takes its emphasis from weight and
+   the marker wash, rather than from .nb-tape's --fs-micro. The tape primitive
+   is built for a badge sitting beside something; used inline at the head of a
+   16px paragraph it rendered the singled-out clause at 12px — four pixels
+   SMALLER than the sentence it introduces. Emphasis set smaller than its own
+   body text is de-emphasis, and one of these ("Spoken answers use a cloud
+   voice") had been a full-size <b> before the change. */
+.set-note-tag {
+  margin-right: 2px;
+  font-size: inherit;
+  font-weight: 700;
+}
+
+/* ==========================================================================
+   7. DISCLOSURE
+   The mechanics behind a setting. A native <details>, so every word stays in
+   the DOM, in the accessibility tree, and in find-in-page — this is a fold,
+   not a cut. Same summary treatment as the Connectors page's two disclosures.
+   ========================================================================== */
+
+.set-more {
+  margin: var(--sp-3) 0;
+  padding-top: var(--sp-2);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 1%,
+    var(--line-soft) 97%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+
+.set-more > summary {
+  cursor: pointer;
+  padding: var(--sp-1) 0;
+  min-height: var(--sp-6);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  user-select: none;
+}
+
+.set-more > summary:hover {
+  color: var(--text);
+}
+
+.set-more > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The disclosed copy keeps the same size and colour it would have had in the
+   open — folding it away must not also demote it. */
+.set-more[open] > summary {
+  color: var(--text);
+  margin-bottom: var(--sp-1);
+}
+
+.set-more .settings-hint:last-child {
+  margin-bottom: 0;
+}
+
+/* ==========================================================================
+   8. CONTROLS
+   Native elements, styled. Nothing here is replaced by a div: every checkbox,
+   radio, select and range on this surface is the real control, with its own
+   role, checked state, keyboard handling and label association.
+   ========================================================================== */
+
+/* Everything clickable clears the 24px minimum target with room to spare.
+   Scoped to the sheet so the two sibling modals keep their own proportions. */
+.settings-sheet button {
+  min-height: 28px;
+  min-width: 28px;
+}
+
+/* …except a control that lives INSIDE a sentence, where WCAG's inline
+   exception applies and a 28px box would break the line it sits in. */
+.settings-sheet .linkish {
+  min-height: 0;
+  min-width: 0;
+}
+
+/* Native boxes, sized up. `accent-color` (base.css) already puts the pen in
+   them; this only makes them big enough to see and to hit. The negative
+   vertical-align sits a 16px box on the baseline of a 14px line, which is
+   what keeps a checkbox-in-a-sentence label aligned without flex.
+   The painted toggle in settings-annotations.css overrides this — its input
+   is a full-size transparent hit target, not a visible box. */
+.settings-sheet input[type="checkbox"],
+.settings-sheet input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  margin: 0 var(--sp-1) 0 0;
+  vertical-align: -3px;
+}
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin-top: var(--sp-3);
+}
+
+.settings-form input {
+  width: 100%;
+  font-size: var(--fs-body);
+}
+
+.temp-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  margin: var(--sp-2) 0 var(--sp-3);
+}
+
+.temp-row input[type="range"] {
+  flex: 1;
+  min-width: 140px;
+  min-height: var(--sp-6);
+  padding: 0;
+  border: 0;
+  background: none;
+  accent-color: var(--accent);
+}
+
+.temp-row .settings-hint {
+  margin: 0;
+  flex: none;
+}
+
+/* A live readout beside a slider. Mono with tabular figures, so the value
+   does not jitter sideways while the thumb is being dragged — the same
+   treatment .nb-num gives every other counting figure, at the size of the
+   line it sits in rather than shrunk to metadata. */
+.set-figure {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.pull-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: var(--sp-3) 0;
+}
+
+.pull-row input {
+  flex: 1;
+  min-width: 200px;
+  font-size: var(--fs-body);
+}
+
+/* ----- segmented control -----
+   One exclusive choice, applied immediately (no Save gate): the response
+   style, the theme, the voice archetype. It is a real radiogroup of real
+   role="radio" buttons in the markup; the chosen option is circled the way
+   .nb-chip circles a chosen filter — the pen on the ring, a wash inside — and
+   never by colour alone, since aria-checked plus the heavier ink carry it. */
+.style-seg {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: var(--sp-2) 0 var(--sp-3);
+}
+
+.style-seg-opt {
+  flex: 1 1 120px;
+  min-height: var(--sp-8);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--rule-strong);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--fs-body);
+  cursor: pointer;
+  text-align: center;
+}
+
+.style-seg-opt:hover {
+  color: var(--text);
+  border-color: var(--sketch);
+}
+
+.style-seg-opt.active {
+  border-color: var(--accent);
+  background: var(--accent-ghost);
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+/* ----- saved / pending confirmations ----- */
+
+.settings-confirm {
+  color: var(--sem-done);
+  font-size: var(--fs-body);
+}
+
+/* duplicate-room destination row sits left, not pushed to the edge */
+.settings-actions.dup-dest-row {
+  justify-content: flex-start;
+  margin-top: var(--sp-2);
+}
+
+/* A filesystem path fragment is technical data: mono, exact, never the hand. */
+.dup-dest {
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* inline two-step delete confirm on a model row */
+.model-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.model-confirm .settings-hint {
+  margin: 0;
+  font-size: var(--fs-meta);
+}
+
+.model-confirm .confirm-yes {
+  color: var(--sem-done);
+  font-weight: 600;
+}
+
+.model-confirm .confirm-no {
+  color: var(--sem-urgent);
+  font-weight: 600;
+}
+
+/* ==========================================================================
+   9. LISTS
+   Model rows, role rows, checkpoints, blocked items. Rows are drawn on the
+   sheet; only the selected one takes a wash.
+   ========================================================================== */
+
+.model-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin-bottom: var(--sp-3);
+}
+
+.model-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  min-height: var(--sp-8);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+}
+
+/* Selected: the pen. A wash plus the ring, exactly as .nb-chip draws a chosen
+   filter, and never the only cue — the radio or the label says it too. */
+.model-row.active {
+  background: var(--accent-ghost);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 46%, transparent);
+}
+
+/* "…installed" reports a FACT rather than a choice, so it takes the green
+   semantic, not the selection wash — the two used to share `.active` and
+   collapsing them made reading a confirmation as a selection easy to do. The
+   check glyph beside it carries the same meaning, so this is never colour
+   alone. Do not merge these two rules again. */
+.model-row.active.is-ok {
+  background: color-mix(in srgb, var(--sem-done-fill) 16%, transparent);
+  box-shadow: inset 3px 0 0 var(--sem-done);
+}
+
+.model-row label {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-body);
+  cursor: pointer;
+}
+
+/* friendly model name with the raw id as secondary text */
+.model-label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: var(--fs-body);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.model-id {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--muted);
+}
+
+/* ----- provider card -----
+   One drawn card per provider. Connected is stated in a word beside the name
+   AND drawn on the edge, so the state survives greyscale. */
+.provider-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-radius: var(--radius);
+  background: transparent;
+}
+
+.provider-card.connected {
+  border-color: var(--sem-done);
+}
+
+.provider-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+
+.provider-card-head strong {
+  font-size: var(--fs-card);
+  color: var(--text-strong);
+}
+
+.provider-card-head .settings-hint {
+  margin: var(--sp-1) 0 0;
+}
+
+.provider-state {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex: none;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+}
+
+.provider-state.connected,
+.provider-message.good {
+  color: var(--sem-done);
+}
+
+.provider-key-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.provider-key-row input {
+  flex: 1;
+  min-width: 200px;
+}
+
+.provider-message {
+  color: var(--sem-urgent);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+
+/* ----- checkpoints ----- */
+
+.ckpt-create {
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.ckpt-create input {
+  flex: 1;
+  min-width: 200px;
+}

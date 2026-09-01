@@ -54,73 +54,80 @@ function delimFieldWritten(value: string): DelimField {
  * keeping each field's original quoting for the writer. Ported from
  * `spreadsheet::parse_delim_quoted`. */
 export function parseDelimQuoted(text: string, delim: string): DelimField[][] {
-  const rows: DelimField[][] = [];
-  let row: DelimField[] = [];
-  let field: DelimField = { value: "", quoted: false };
-  let inQuotes = false;
   const chars = [...text];
+  const state = newDelimitedParser();
   let i = 0;
-  const pushField = (): void => {
-    row.push(field);
-    field = { value: "", quoted: false };
-  };
-  const pushRow = (): void => {
-    pushField();
-    rows.push(row);
-    row = [];
-  };
   while (i < chars.length) {
-    const c = chars[i]!;
-    if (inQuotes) {
-      if (c === '"') {
-        if (chars[i + 1] === '"') {
-          field.value += '"';
-          i += 2;
-        } else {
-          inQuotes = false;
-          i += 1;
-        }
-        continue;
-      }
-      field.value += c;
-      i += 1;
-      continue;
-    }
-    if (c === '"' && field.value === "") {
-      inQuotes = true;
-      field.quoted = true;
-      i += 1;
-      continue;
-    }
-    // A bare CR ENDS THE ROW. Classic Mac exports ("CSV (Macintosh)") still
-    // use CR alone, and dropping it fused the last field of each line to the
-    // first of the next.
-    if (c === "\r") {
-      i += 1;
-      if (chars[i] === "\n") {
-        i += 1;
-      }
-      pushRow();
-      continue;
-    }
-    if (c === "\n") {
-      i += 1;
-      pushRow();
-      continue;
-    }
-    if (c === delim) {
-      pushField();
-      i += 1;
-      continue;
-    }
-    field.value += c;
-    i += 1;
+    i = consumeDelimitedCharacter(state, chars, i, delim);
   }
-  if (field.value !== "" || row.length > 0) {
-    row.push(field);
-    rows.push(row);
+  return completedDelimitedRows(state);
+}
+
+interface DelimitedParser {
+  readonly rows: DelimField[][];
+  row: DelimField[];
+  field: DelimField;
+  inQuotes: boolean;
+}
+
+function newDelimitedParser(): DelimitedParser {
+  return { rows: [], row: [], field: { value: "", quoted: false }, inQuotes: false };
+}
+
+function consumeDelimitedCharacter(state: DelimitedParser, chars: readonly string[], i: number, delim: string): number {
+  return state.inQuotes ? consumeQuotedCharacter(state, chars, i) : consumeBareCharacter(state, chars, i, delim);
+}
+
+function consumeQuotedCharacter(state: DelimitedParser, chars: readonly string[], i: number): number {
+  const character = chars[i]!;
+  if (character !== '"') {
+    state.field.value += character;
+    return i + 1;
   }
-  return rows;
+  if (chars[i + 1] === '"') {
+    state.field.value += '"';
+    return i + 2;
+  }
+  state.inQuotes = false;
+  return i + 1;
+}
+
+function consumeBareCharacter(state: DelimitedParser, chars: readonly string[], i: number, delim: string): number {
+  const character = chars[i]!;
+  if (character === '"' && state.field.value === "") {
+    state.inQuotes = true;
+    state.field.quoted = true;
+    return i + 1;
+  }
+  if (character === "\r" || character === "\n") {
+    return commitDelimitedRow(state, chars, i, character);
+  }
+  if (character === delim) {
+    commitDelimitedField(state);
+    return i + 1;
+  }
+  state.field.value += character;
+  return i + 1;
+}
+
+function commitDelimitedRow(state: DelimitedParser, chars: readonly string[], i: number, character: string): number {
+  commitDelimitedField(state);
+  state.rows.push(state.row);
+  state.row = [];
+  return character === "\r" && chars[i + 1] === "\n" ? i + 2 : i + 1;
+}
+
+function commitDelimitedField(state: DelimitedParser): void {
+  state.row.push(state.field);
+  state.field = { value: "", quoted: false };
+}
+
+function completedDelimitedRows(state: DelimitedParser): DelimField[][] {
+  if (state.field.value !== "" || state.row.length > 0) {
+    commitDelimitedField(state);
+    state.rows.push(state.row);
+  }
+  return state.rows;
 }
 
 /** The same parse, discarding quoting info. Ported from
@@ -144,16 +151,23 @@ function firstLineBreak(text: string): string | null {
   let inQuotes = false;
   const chars = [...text];
   for (let i = 0; i < chars.length; i++) {
-    const c = chars[i]!;
-    if (c === '"') {
+    if (chars[i] === '"') {
       inQuotes = !inQuotes;
-    } else if (c === "\r" && !inQuotes) {
-      return chars[i + 1] === "\n" ? "\r\n" : "\r";
-    } else if (c === "\n" && !inQuotes) {
-      return "\n";
+      continue;
+    }
+    const lineBreak = lineBreakAt(chars, i);
+    if (lineBreak !== null && !inQuotes) {
+      return lineBreak;
     }
   }
   return null;
+}
+
+function lineBreakAt(chars: readonly string[], i: number): string | null {
+  if (chars[i] === "\r") {
+    return chars[i + 1] === "\n" ? "\r\n" : "\r";
+  }
+  return chars[i] === "\n" ? "\n" : null;
 }
 
 /** Read the conventions off the file we are about to rewrite. Ported from
@@ -213,30 +227,49 @@ const SEP_WEIGHTS: ReadonlyArray<readonly [string, number]> = [
  * address "B2" names. Counted outside quotes over the first 1024 characters;
  * a file with none of them is a comma. Ported from `spreadsheet::guess_sep`. */
 export function guessSep(text: string): string {
+  return SEP_WEIGHTS[bestSeparatorIndex(separatorCounts(text))]![0];
+}
+
+function separatorCounts(text: string): number[] {
   const counts = SEP_WEIGHTS.map(() => 0);
   let inQuotes = false;
   let seen = 0;
-  for (const c of text) {
+  for (const character of text) {
     if (seen >= 1024) {
       break;
     }
     seen += 1;
-    if (c === '"') {
+    if (character === '"') {
       inQuotes = !inQuotes;
     } else if (!inQuotes) {
-      const idx = SEP_WEIGHTS.findIndex(([s]) => s === c);
-      if (idx !== -1) {
-        counts[idx] = counts[idx]! + 1;
-      }
+      countSeparator(counts, character);
     }
   }
-  let bestIdx = 0;
+  return counts;
+}
+
+function countSeparator(counts: number[], character: string): void {
+  const index = SEP_WEIGHTS.findIndex(([separator]) => separator === character);
+  if (index !== -1) {
+    counts[index] = counts[index]! + 1;
+  }
+}
+
+function bestSeparatorIndex(counts: readonly number[]): number {
+  let bestIndex = 0;
   for (let i = 1; i < SEP_WEIGHTS.length; i++) {
-    if (counts[i]! > counts[bestIdx]! || (counts[i]! === counts[bestIdx]! && SEP_WEIGHTS[i]![1] > SEP_WEIGHTS[bestIdx]![1])) {
-      bestIdx = i;
+    if (isBetterSeparator(i, bestIndex, counts)) {
+      bestIndex = i;
     }
   }
-  return SEP_WEIGHTS[bestIdx]![0];
+  return bestIndex;
+}
+
+function isBetterSeparator(candidate: number, current: number, counts: readonly number[]): boolean {
+  if (counts[candidate]! !== counts[current]!) {
+    return counts[candidate]! > counts[current]!;
+  }
+  return SEP_WEIGHTS[candidate]![1] > SEP_WEIGHTS[current]![1];
 }
 
 /** How a delimited file is read, so a write lands on the cell the grid
@@ -252,16 +285,25 @@ interface DelimRead {
 }
 
 function readAs(text: string): DelimRead {
-  if (text.length >= 6 && text.startsWith("sep=") && text.charCodeAt(4) <= 0x7f) {
-    const sep = text[4]!;
-    if (text[5] === "\r" && text[6] === "\n") {
-      return { header: text.slice(0, 7), body: text.slice(7), delim: sep };
-    }
-    if (text[5] === "\r" || text[5] === "\n") {
-      return { header: text.slice(0, 6), body: text.slice(6), delim: sep };
-    }
+  const headerLength = excelHeaderLength(text);
+  if (headerLength !== null) {
+    return { header: text.slice(0, headerLength), body: text.slice(headerLength), delim: text[4]! };
   }
   return { header: "", body: text, delim: guessSep(text) };
+}
+
+function excelHeaderLength(text: string): number | null {
+  if (!hasExcelSeparatorPrefix(text)) {
+    return null;
+  }
+  if (text[5] === "\r" && text[6] === "\n") {
+    return 7;
+  }
+  return text[5] === "\r" || text[5] === "\n" ? 6 : null;
+}
+
+function hasExcelSeparatorPrefix(text: string): boolean {
+  return text.length >= 6 && text.startsWith("sep=") && text.charCodeAt(4) <= 0x7f;
 }
 
 // ---------------------------------------------------------------- set a cell
@@ -301,47 +343,69 @@ export function setCellInBytes(
   if (parsed === null) {
     return { ok: false, error: `"${cell}" is not a cell — use A1 notation like B7.` };
   }
-  const [row, col] = parsed;
+  return updateCellByExtension(name, bytes, parsed, value);
+}
+
+function updateCellByExtension(name: string, bytes: Uint8Array, cell: readonly [number, number], value: string): SetCellResult {
   const ext = extensionOf(name);
   if (ext === "csv" || ext === "tsv") {
-    // Bytes that aren't UTF-8 read back as replacement characters, and writing
-    // them out would destroy the file's accented letters for good. Refuse
-    // rather than corrupt.
-    let text: string;
-    try {
-      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    } catch {
-      return { ok: false, error: nonUtf8Error(name) };
-    }
-    // Split the file the way it is READ. The delimiter used to come from the
-    // extension, so a semicolon- or pipe-separated .csv — and any file with
-    // Excel's `sep=` line — was written on a grid that was not the one the
-    // user clicked in.
-    const read = readAs(text);
-    const rows = parseDelimQuoted(read.body, read.delim);
-    while (rows.length <= row) {
-      rows.push([]);
-    }
-    while (rows[row]!.length <= col) {
-      rows[row]!.push({ value: "", quoted: false });
-    }
-    rows[row]![col] = delimFieldWritten(value);
-    // Keep the file's own line endings and final-newline convention, so a
-    // one-cell edit reads as a one-line change everywhere else.
-    const out = read.header + serializeFieldsStyled(rows, read.delim, delimStyle(read.body));
-    return { ok: true, bytes: Buffer.from(out, "utf8"), text: out };
+    return updateDelimitedCell(name, bytes, cell, value);
   }
-  if (ext === "xlsx") {
-    return {
-      ok: false,
-      error:
-        `Setting cells in "${name}" is not supported by this port yet — binary spreadsheet ` +
-        `(.xlsx) writing needs a full OOXML reader/writer this project does not have. ` +
-        `Nothing was changed. Use a .csv/.tsv file instead.`,
-    };
+  return unsupportedSpreadsheetResult(name, ext);
+}
+
+function updateDelimitedCell(
+  name: string,
+  bytes: Uint8Array,
+  [row, col]: readonly [number, number],
+  value: string
+): SetCellResult {
+  const text = decodeUtf8(bytes);
+  if (text === null) {
+    return { ok: false, error: nonUtf8Error(name) };
+  }
+  const read = readAs(text);
+  const rows = parseDelimQuoted(read.body, read.delim);
+  setDelimitedValue(rows, row, col, value);
+  const out = read.header + serializeFieldsStyled(rows, read.delim, delimStyle(read.body));
+  return { ok: true, bytes: Buffer.from(out, "utf8"), text: out };
+}
+
+function decodeUtf8(bytes: Uint8Array): string | null {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+function setDelimitedValue(rows: DelimField[][], row: number, col: number, value: string): void {
+  while (rows.length <= row) {
+    rows.push([]);
+  }
+  const target = rows[row]!;
+  while (target.length <= col) {
+    target.push({ value: "", quoted: false });
+  }
+  target[col] = delimFieldWritten(value);
+}
+
+function unsupportedSpreadsheetResult(name: string, extension: string): SetCellResult {
+  if (extension === "xlsx") {
+    return unsupportedXlsxResult(name);
   }
   return {
     ok: false,
     error: `"${name}" is not an editable spreadsheet — cell editing works on .xlsx and .csv files.`,
+  };
+}
+
+function unsupportedXlsxResult(name: string): SetCellResult {
+  return {
+    ok: false,
+    error:
+      `Setting cells in "${name}" is not supported by this port yet — binary spreadsheet ` +
+      `(.xlsx) writing needs a full OOXML reader/writer this project does not have. ` +
+      `Nothing was changed. Use a .csv/.tsv file instead.`,
   };
 }

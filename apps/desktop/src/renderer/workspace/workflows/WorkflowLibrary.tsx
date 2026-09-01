@@ -144,6 +144,56 @@ function lastRunBadge(run: WorkflowRun | null | undefined) {
   );
 }
 
+function workflowCountdown(schedule: Schedule | null, status: Workflow["status"], now: number): string {
+  // The scheduler only picks up ACTIVE workflows, but saving one stores a real
+  // next_run_at — a draft can say when it is scheduled, but not count down to
+  // a run that will never happen.
+  if (!schedule?.enabled) return "";
+  if (status !== "active") return "not until you activate it";
+  return countdown(schedule.nextRunAt, now);
+}
+
+type WorkflowCardProps = {
+  workflow: Workflow;
+  schedule: Schedule | null;
+  lastRun: WorkflowRun | null;
+  now: number;
+  onOpen: () => void;
+};
+
+function WorkflowCard({ workflow, schedule, lastRun, now, onOpen }: WorkflowCardProps) {
+  const binding = bindingBadge(workflow);
+  const cadence = cadenceOf(schedule, workflow.binding);
+  return (
+    <div
+      className={`wf-card ${cadence.mark}`}
+      {...cardButton(onOpen)}
+    >
+      <div className="wf-card-top">
+        <span className="wf-card-emoji">
+          <WorkflowGlyph emoji={workflow.emoji} size={16} />
+        </span>
+        <span className="wf-card-name">{workflow.name}</span>
+        {workflow.pinned && (
+          <span className="wf-card-pin" title="Pinned to the top bar" aria-label="Pinned to the top bar">
+            <PinIcon size={14} />
+          </span>
+        )}
+      </div>
+      {workflow.description && <div className="wf-card-desc">{workflow.description}</div>}
+      <div className="wf-card-foot">
+        <CadenceNote cadence={cadence} countdown={workflowCountdown(schedule, workflow.status, now)} />
+        <div className="wf-badges">
+          {workflow.status === "draft" && <span className="wf-badge draft">Draft</span>}
+          {lastRunBadge(lastRun)}
+          {workflow.createdBy === "agent" && <span className="wf-badge agent">Drafted by the agent</span>}
+          {binding && <span className="wf-badge">{binding}</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function WorkflowLibrary({ s, a }: Props) {
   const [templates, setTemplates] = useState<WorkflowTemplate[]>([]);
   const [schedules, setSchedules] = useState<Record<string, Schedule | null>>({});
@@ -288,54 +338,15 @@ export function WorkflowLibrary({ s, a }: Props) {
       )}
       <div className="wf-grid nb-frame-set">
         {visible.map((w) => {
-          const sc = schedules[w.id];
-          const bb = bindingBadge(w);
-          // Cadence drives the card's identity EDGE; the badges below carry
-          // run status as words. Two treatments, so a failed daily workflow
-          // never has to choose which of the two its colour is talking about.
-          const cad = cadenceOf(sc, w.binding);
           return (
-            <div
+            <WorkflowCard
               key={w.id}
-              className={`wf-card ${cad.mark}`}
-              {...cardButton(() => a.openWorkflowDetail(w.id))}
-            >
-              <div className="wf-card-top">
-                <span className="wf-card-emoji">
-                  <WorkflowGlyph emoji={w.emoji} size={16} />
-                </span>
-                <span className="wf-card-name">{w.name}</span>
-                {w.pinned && (
-                  <span className="wf-card-pin" title="Pinned to the top bar" aria-label="Pinned to the top bar">
-                    <PinIcon size={14} />
-                  </span>
-                )}
-              </div>
-              {w.description && <div className="wf-card-desc">{w.description}</div>}
-              <div className="wf-card-foot">
-                {/* The scheduler only picks up ACTIVE workflows, but saving one
-                    stores a real next_run_at — so a freshly-instantiated
-                    template read "Draft · every day at 08:00 · in 5h" for a run
-                    that was never going to happen. A stored schedule is worth
-                    saying; a countdown to it is not. */}
-                <CadenceNote
-                  cadence={cad}
-                  countdown={
-                    !sc?.enabled
-                      ? ""
-                      : w.status === "active"
-                        ? countdown(sc.nextRunAt, now)
-                        : "not until you activate it"
-                  }
-                />
-                <div className="wf-badges">
-                  {w.status === "draft" && <span className="wf-badge draft">Draft</span>}
-                  {lastRunBadge(lastRuns[w.id])}
-                  {w.createdBy === "agent" && <span className="wf-badge agent">Drafted by the agent</span>}
-                  {bb && <span className="wf-badge">{bb}</span>}
-                </div>
-              </div>
-            </div>
+              workflow={w}
+              schedule={schedules[w.id]}
+              lastRun={lastRuns[w.id]}
+              now={now}
+              onOpen={() => a.openWorkflowDetail(w.id)}
+            />
           );
         })}
       </div>

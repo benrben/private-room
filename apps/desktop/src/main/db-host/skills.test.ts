@@ -19,6 +19,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type Database from "better-sqlite3-multiple-ciphers";
 import { afterEach, describe, expect, it } from "vitest";
 import { createRoom } from "./open.js";
 import {
@@ -285,5 +286,29 @@ describe("a missing resource is explained in words, and lists what is there", ()
     expect(getSkillResource(db, id, "references/policy.md").content.toString()).toBe("policy");
 
     db.close();
+  });
+
+  it("falls back to generic wording when both explanatory lookups fail", () => {
+    const db = {
+      prepare(sql: string) {
+        return {
+          raw() {
+            return {
+              get() {
+                if (sql.includes("skill_resources WHERE skill_id=? AND path=?")) return undefined;
+                throw new Error("fabricated unavailable explanatory lookup");
+              },
+              all() {
+                throw new Error("fabricated unavailable resource listing");
+              },
+            };
+          },
+        };
+      },
+    } as unknown as Database.Database;
+
+    expect(() => getSkillResource(db, "missing-skill", "references/missing.md")).toThrow(
+      "That skill has no file at references/missing.md — no files travel with it at all.",
+    );
   });
 });

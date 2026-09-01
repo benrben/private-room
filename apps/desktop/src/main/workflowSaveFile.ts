@@ -49,32 +49,44 @@ function splitWhitespace(s: string): string[] {
   return s.split(/\p{White_Space}+/u).filter((t) => t !== "");
 }
 
+function saveNameCharacter(ch: string): string {
+  const codePoint = ch.codePointAt(0) ?? 0;
+  return isControlCodePoint(codePoint) || ch === "/" || ch === "\\" ? " " : ch;
+}
+
+function flattenedSaveName(raw: string): string {
+  let flat = "";
+  for (const ch of raw) {
+    flat += saveNameCharacter(ch);
+  }
+  return splitWhitespace(flat).join(" ");
+}
+
+function limitedSaveName(name: string): string {
+  const chars = Array.from(name);
+  if (chars.length <= MAX_SAVE_NAME_CHARS) {
+    return name;
+  }
+  // `.trim_end()` stand-in — see `workflowModel.ts`'s own documented,
+  // accepted `.trim()` deviation (JS also trims U+FEFF, Rust also trims
+  // U+0085); the same standing gap applies to `trimEnd()`.
+  return chars.slice(0, MAX_SAVE_NAME_CHARS).join("").trimEnd();
+}
+
+function defaultSaveName(name: string): string {
+  return name === "" ? "Workflow output" : name;
+}
+
 /**
  * Flatten and bound a save_file name: one line, no path separators, and short
  * enough to be a file name rather than a pasted paragraph. Ported from
  * `clean_save_name`.
  */
 export function cleanSaveName(raw: string): string {
-  let flat = "";
-  for (const ch of raw) {
-    const cp = ch.codePointAt(0) ?? 0;
-    flat += isControlCodePoint(cp) || ch === "/" || ch === "\\" ? " " : ch;
-  }
-  let name = splitWhitespace(flat).join(" ");
   // `.chars().count()` / `.chars().take(N)` — Unicode SCALAR VALUES, so an
   // astral-plane run (emoji, some CJK extension blocks) counts as it would in
   // Rust rather than as two UTF-16 units each.
-  const chars = Array.from(name);
-  if (chars.length > MAX_SAVE_NAME_CHARS) {
-    // `.trim_end()` stand-in — see `workflowModel.ts`'s own documented,
-    // accepted `.trim()` deviation (JS also trims U+FEFF, Rust also trims
-    // U+0085); the same standing gap applies to `trimEnd()`.
-    name = chars.slice(0, MAX_SAVE_NAME_CHARS).join("").trimEnd();
-  }
-  if (name === "") {
-    name = "Workflow output";
-  }
-  return name;
+  return defaultSaveName(limitedSaveName(flattenedSaveName(raw)));
 }
 
 /** `to_ascii_lowercase()`: rewrites ONLY the ASCII letters A-Z, one unit in,

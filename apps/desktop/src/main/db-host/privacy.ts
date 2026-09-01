@@ -41,23 +41,17 @@ export interface PrivacyEntity {
  * read a redacted answer ("[Person A] met [Person B] at [Address A]"). Ported
  * verbatim from `series_for`. */
 function seriesFor(category: string): string {
-  switch (category) {
-    case "person":
-      return "Person";
-    case "address":
-      return "Address";
-    case "phone":
-      return "Phone";
-    case "email":
-      return "Email";
-    case "id":
-      return "ID";
-    case "org":
-      return "Org";
-    default:
-      return "Private";
-  }
+  return PRIVACY_SERIES[category] ?? "Private";
 }
+
+const PRIVACY_SERIES: Readonly<Record<string, string>> = {
+  person: "Person",
+  address: "Address",
+  phone: "Phone",
+  email: "Email",
+  id: "ID",
+  org: "Org",
+};
 
 /** A..Z, then AA..AZ, BA.. — stable, readable, never runs out. A bijective
  * base-26 counter, ported verbatim from `letters`. */
@@ -130,6 +124,13 @@ export function addPrivacyEntity(
   source: string
 ): PrivacyEntity {
   const real = realText.trim();
+  validatePrivacyEntityText(real);
+  const existing = findEntityIgnoringCase(db, real);
+  if (existing !== null) return existingPrivacyEntity(db, existing, source);
+  return createPrivacyEntity(db, real, category, source);
+}
+
+function validatePrivacyEntityText(real: string): void {
   // The redactor's own floor, counted the way the message states it and the
   // way the redactor applies it: in CODE POINTS. `real.length` (UTF-16 units)
   // or a byte count would accept a single Hebrew or accented letter the panel
@@ -137,26 +138,49 @@ export function addPrivacyEntity(
   if (!isProtectable(real)) {
     throw new Error(`A protected detail needs at least ${MIN_PROTECTED_CHARS} characters.`);
   }
-  const existing = findEntityIgnoringCase(db, real);
-  if (existing !== null) {
-    if (source === "user" && existing.source !== "user") {
-      executeOne(db, "UPDATE privacy_entities SET source = 'user' WHERE id = ?", [existing.id]);
-    }
-    return existing;
+}
+
+function existingPrivacyEntity(
+  db: Database.Database,
+  existing: PrivacyEntity,
+  source: string
+): PrivacyEntity {
+  if (source === "user" && existing.source !== "user") {
+    executeOne(db, "UPDATE privacy_entities SET source = 'user' WHERE id = ?", [existing.id]);
   }
+  return existing;
+}
+
+function createPrivacyEntity(
+  db: Database.Database,
+  real: string,
+  category: string,
+  source: string
+): PrivacyEntity {
+  const id = randomUUID();
+  const placeholder = nextPrivacyPlaceholder(db, category);
+  executeOne(
+    db,
+    `INSERT INTO privacy_entities(id, real_text, placeholder, category, source)
+     VALUES (?, ?, ?, ?, ?)`,
+    [id, real, placeholder, category, source]
+  );
+  return { id, realText: real, placeholder, category, source };
+}
+
+function nextPrivacyPlaceholder(db: Database.Database, category: string): string {
   const series = seriesFor(category);
   // Next free letter in this series: count existing placeholders of the series,
   // then walk forward past any that are already taken.
-  const count = queryOne(
+  let index = queryOne(
     db,
     "SELECT count(*) FROM privacy_entities WHERE placeholder LIKE ?",
     [`[${series} %`],
     (r) => r[0] as number
   );
-  let n = count;
   let placeholder = "";
   for (;;) {
-    const candidate = `[${series} ${letters(n)}]`;
+    const candidate = `[${series} ${letters(index)}]`;
     const taken = queryOne(
       db,
       "SELECT count(*) FROM privacy_entities WHERE placeholder = ?",
@@ -167,16 +191,9 @@ export function addPrivacyEntity(
       placeholder = candidate;
       break;
     }
-    n += 1;
+    index += 1;
   }
-  const id = randomUUID();
-  executeOne(
-    db,
-    `INSERT INTO privacy_entities(id, real_text, placeholder, category, source)
-     VALUES (?, ?, ?, ?, ?)`,
-    [id, real, placeholder, category, source]
-  );
-  return { id, realText: real, placeholder, category, source };
+  return placeholder;
 }
 
 /** Every protected entity, user block-list rows first, then by recency. Ported

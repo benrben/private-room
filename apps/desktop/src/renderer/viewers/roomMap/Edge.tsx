@@ -49,95 +49,80 @@ export default function Edge({
   showTip,
   setTip,
 }: EdgeProps) {
-  const lit =
-    hovered === a.id || hovered === b.id || focusId === a.id || focusId === b.id;
+  const lit = edgeIsLit(a, b, hovered, focusId);
   const style = styleFor(se.edge.kind);
   const title = `${a.name} ${se.edge.directed ? "→" : "↔"} ${b.name}`;
   const lines = edgeLines(se.edge);
   // Not the array index the parent keys on: a repaint reuses the component at
   // index i for a different link, and the tip must not survive that either.
   const identity = `${se.edge.a}|${se.edge.b}|${se.edge.kind}`;
-
-  useEffect(
-    () => () => {
-      if (tipOwner === identity) {
-        tipOwner = null;
-        setTip(null);
-      }
-    },
-    [identity, setTip],
-  );
-
-  // A directed line stops short of the target star, or its arrowhead is drawn
-  // underneath the node (edges render before nodes) and reads as no arrow.
-  let x2 = b.x;
-  let y2 = b.y;
-  if (se.edge.directed) {
-    const dx = b.x - a.x;
-    const dy = b.y - a.y;
-    const dist = Math.hypot(dx, dy) || 1;
-    const back = nodeRadius(degree.get(b.id) ?? 0) + 3.5;
-    if (dist > back) {
-      x2 = b.x - (dx / dist) * back;
-      y2 = b.y - (dy / dist) * back;
-    }
-  }
+  useOwnedTipCleanup(identity, setTip);
+  const target = edgeTarget(a, b, se, degree);
 
   return (
     <g>
-      {/* fat invisible hit line for easy "why linked" hovering */}
-      <line
-        x1={a.x}
-        y1={a.y}
-        x2={b.x}
-        y2={b.y}
-        stroke="transparent"
-        strokeWidth={7 / view.k}
-        style={{ cursor: "help" }}
-        onMouseEnter={(ev) => {
-          tipOwner = identity;
-          showTip(ev, title, lines);
-        }}
-        onMouseMove={(ev) => {
-          tipOwner = identity;
-          showTip(ev, title, lines);
-        }}
-        onMouseLeave={() => {
-          if (tipOwner === identity) tipOwner = null;
-          setTip(null);
-        }}
-      />
-      <line
-        className="room-map-edge"
-        data-kind={se.edge.kind}
-        x1={a.x}
-        y1={a.y}
-        x2={x2}
-        y2={y2}
-        style={{
-          stroke: style.color,
-          // Weight is the second strength channel beside opacity. The floor is
-          // 0.7 rather than 0.5 because the thinnest kind multiplies it by 0.9
-          // and a sub-half-pixel dotted line does not survive being broken into
-          // round dots — it just disappears.
-          strokeWidth: ((0.7 + se.edge.weight * 1.1) * style.widthMul) / view.k,
-        }}
-        // Dashes are in world units, so they have to be unscaled like the width
-        // or they vanish into a solid line as you zoom out.
-        strokeDasharray={
-          style.dash
-            ? style.dash
-                .split(" ")
-                .map((n) => Number(n) / view.k)
-                .join(" ")
-            : undefined
-        }
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeOpacity={edgeInk(se.edge, lit)}
-        markerEnd={se.edge.directed ? `url(#rm-arrow-${se.edge.kind})` : undefined}
-        pointerEvents="none"
-      />
+      <EdgeHitLine a={a} b={b} view={view} identity={identity} title={title} lines={lines} showTip={showTip} setTip={setTip} />
+      <VisibleEdge a={a} target={target} se={se} view={view} color={style.color} widthMultiplier={style.widthMul} dash={style.dash} lit={lit} />
     </g>
   );
+}
+
+function edgeIsLit(a: SimNode, b: SimNode, hovered: string | null, focusId: string | null): boolean {
+  return hovered === a.id || hovered === b.id || focusId === a.id || focusId === b.id;
+}
+
+function useOwnedTipCleanup(identity: string, setTip: (tip: Tip | null) => void) {
+  useEffect(() => () => clearOwnedTip(identity, setTip), [identity, setTip]);
+}
+
+function clearOwnedTip(identity: string, setTip: (tip: Tip | null) => void) {
+  if (tipOwner !== identity) return;
+  tipOwner = null;
+  setTip(null);
+}
+
+function edgeTarget(a: SimNode, b: SimNode, se: SimEdge, degree: Map<string, number>) {
+  if (!se.edge.directed) return { x: b.x, y: b.y };
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const distance = Math.hypot(dx, dy) || 1;
+  const back = nodeRadius(degree.get(b.id) ?? 0) + 3.5;
+  if (distance <= back) return { x: b.x, y: b.y };
+  return { x: b.x - (dx / distance) * back, y: b.y - (dy / distance) * back };
+}
+
+function EdgeHitLine({ a, b, view, identity, title, lines, showTip, setTip }: {
+  a: SimNode;
+  b: SimNode;
+  view: View;
+  identity: string;
+  title: string;
+  lines: string[];
+  showTip: EdgeProps["showTip"];
+  setTip: EdgeProps["setTip"];
+}) {
+  return <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="transparent" strokeWidth={7 / view.k} style={{ cursor: "help" }} onMouseEnter={(event) => showOwnedTip(event, identity, title, lines, showTip)} onMouseMove={(event) => showOwnedTip(event, identity, title, lines, showTip)} onMouseLeave={() => clearOwnedTip(identity, setTip)} />;
+}
+
+function showOwnedTip(event: React.MouseEvent, identity: string, title: string, lines: string[], showTip: EdgeProps["showTip"]) {
+  tipOwner = identity;
+  showTip(event, title, lines);
+}
+
+function VisibleEdge({ a, target, se, view, color, widthMultiplier, dash, lit }: {
+  a: SimNode;
+  target: { x: number; y: number };
+  se: SimEdge;
+  view: View;
+  color: string;
+  widthMultiplier: number;
+  dash: string | null;
+  lit: boolean;
+}) {
+  return <line className="room-map-edge" data-kind={se.edge.kind} x1={a.x} y1={a.y} x2={target.x} y2={target.y} style={{ stroke: color, strokeWidth: ((0.7 + se.edge.weight * 1.1) * widthMultiplier) / view.k }} strokeDasharray={scaledDash(dash, view.k)} strokeLinecap="round" strokeLinejoin="round" strokeOpacity={edgeInk(se.edge, lit)} markerEnd={se.edge.directed ? `url(#rm-arrow-${se.edge.kind})` : undefined} pointerEvents="none" />;
+}
+
+function scaledDash(dash: string | null, zoom: number): string | undefined {
+  if (!dash) return undefined;
+  return dash.split(" ").map((value) => Number(value) / zoom).join(" ");
 }

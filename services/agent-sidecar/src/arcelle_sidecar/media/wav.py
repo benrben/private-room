@@ -54,39 +54,42 @@ def encode_wav(samples: np.ndarray) -> bytes:
     return header + truncated.tobytes()
 
 
-def decode_wav(data: bytes) -> np.ndarray:
-    """Parse any RIFF/WAVE with a fmt chunk and a data chunk into mono f32.
+def _is_wav(data: bytes) -> bool:
+    """Whether ``data`` has the minimum RIFF/WAVE envelope."""
+    return len(data) >= 44 and data[0:4] == b"RIFF" and data[8:12] == b"WAVE"
 
-    Any channel count is averaged down to mono (matching Rust's
-    `acc / channels as f32 / 32768.0`). Chunks are walked generically —
-    including chunks that appear before `data`, and the odd-size padding byte
-    (`size & 1`) required by the RIFF spec. Chunks after `data` are never
-    reached: like the Rust code, this stops at the first `data` chunk found.
-    """
-    if len(data) < 44 or data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
-        raise ValueError("not a WAV file")
 
+def _chunk_header(data: bytes, pos: int) -> tuple[bytes, int, int]:
+    """Return a chunk id, declared body size, and body offset."""
+    return data[pos : pos + 4], struct.unpack_from("<I", data, pos + 4)[0], pos + 8
+
+
+def _chunk_channels(data: bytes, chunk_id: bytes, body: int, n: int, current: int) -> int:
+    """Read a usable channel count from a fmt chunk, retaining the default."""
+    if chunk_id == b"fmt " and body + 4 <= n:
+        return max(1, struct.unpack_from("<H", data, body + 2)[0])
+    return current
+
+
+def _find_data_chunk(data: bytes) -> tuple[int, int | None, int]:
+    """Find the first data chunk while accumulating preceding fmt metadata."""
     channels = 1
     pos = 12
-    data_start: int | None = None
-    data_size = 0
     n = len(data)
 
     while pos + 8 <= n:
-        chunk_id = data[pos : pos + 4]
-        size = struct.unpack_from("<I", data, pos + 4)[0]
-        body = pos + 8
-        if chunk_id == b"fmt " and body + 4 <= n:
-            channels = max(1, struct.unpack_from("<H", data, body + 2)[0])
-        elif chunk_id == b"data":
-            data_start = body
-            data_size = min(size, max(0, n - body))
-            break
+        chunk_id, size, body = _chunk_header(data, pos)
+        channels = _chunk_channels(data, chunk_id, body, n, channels)
+        if chunk_id == b"data":
+            return channels, body, min(size, max(0, n - body))
         pos = body + size + (size & 1)
+    return channels, None, 0
 
-    if data_start is None:
-        raise ValueError("WAV has no data chunk")
 
+def _decode_pcm(
+    data: bytes, data_start: int, data_size: int, channels: int
+) -> np.ndarray:
+    """Average complete little-endian int16 frames into mono float32 samples."""
     frame = 2 * channels
     frames = data_size // frame
 
@@ -101,6 +104,24 @@ def decode_wav(data: bytes) -> np.ndarray:
     samples = raw.astype(np.float32).reshape(frames, channels)
     pcm = samples.sum(axis=1) / channels / 32768.0
     return pcm.astype(np.float32)
+
+
+def decode_wav(data: bytes) -> np.ndarray:
+    """Parse any RIFF/WAVE with a fmt chunk and a data chunk into mono f32.
+
+    Any channel count is averaged down to mono (matching Rust's
+    `acc / channels as f32 / 32768.0`). Chunks are walked generically —
+    including chunks that appear before `data`, and the odd-size padding byte
+    (`size & 1`) required by the RIFF spec. Chunks after `data` are never
+    reached: like the Rust code, this stops at the first `data` chunk found.
+    """
+    if not _is_wav(data):
+        raise ValueError("not a WAV file")
+
+    channels, data_start, data_size = _find_data_chunk(data)
+    if data_start is None:
+        raise ValueError("WAV has no data chunk")
+    return _decode_pcm(data, data_start, data_size, channels)
 
 
 def resample_to_16k(input: np.ndarray, from_rate: int) -> np.ndarray:

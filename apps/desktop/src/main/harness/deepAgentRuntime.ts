@@ -12,7 +12,7 @@ import {
   providerRuntimeConfig,
   providerRuntimeConfigWire,
 } from "../providers.js";
-import { runViaSidecar, type SidecarOutcome } from "../sidecar.js";
+import { runViaSidecar, type RunViaSidecarRequest, type SidecarOutcome } from "../sidecar.js";
 import { AsyncEventQueue } from "./eventQueue.js";
 import { safeProviderFailure } from "./failureSafety.js";
 import { createDeepWorkspaceBridgeGrant } from "./deepWorkspaceBridge.js";
@@ -54,6 +54,235 @@ function isLoopbackBaseUrl(value: string): boolean {
   }
 }
 
+type LegacyEventContext = Pick<HarnessContext, "provider" | "runId">;
+type LegacyEventNormalizer = (context: LegacyEventContext, value: unknown) => HarnessEvent | null;
+
+function eventRow(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+}
+
+function legacyAgentId(row: Record<string, unknown>, value: unknown): string {
+  if (typeof row.id === "string") return row.id;
+  if (typeof row.agent === "string") return row.agent;
+  return text(value);
+}
+
+function legacyPlanUpdated(context: LegacyEventContext, value: unknown): HarnessEvent {
+  return { type: "plan_updated", runId: context.runId, text: text(value) };
+}
+
+function legacyAgentStarted(context: LegacyEventContext, value: unknown): HarnessEvent {
+  const row = eventRow(value);
+  return {
+    type: "agent_started",
+    runId: context.runId,
+    agentId: legacyAgentId(row, value) || "chat.answer",
+    ...(typeof row.label === "string" ? { label: row.label } : {}),
+  };
+}
+
+function legacyTextDelta(context: LegacyEventContext, value: unknown): HarnessEvent {
+  return { type: "text_delta", runId: context.runId, text: text(value) };
+}
+
+function legacyToolStarted(context: LegacyEventContext, value: unknown): HarnessEvent {
+  const row = eventRow(value);
+  const label = typeof row.label === "string" ? row.label : text(value);
+  return { type: "tool_started", runId: context.runId, tool: label || "workspace" };
+}
+
+function legacyToolReport(context: LegacyEventContext, value: unknown): HarnessEvent {
+  const row = eventRow(value);
+  const failed = row.ok === false;
+  return {
+    type: "tool_completed",
+    runId: context.runId,
+    tool: typeof row.node === "string" ? row.node : "specialist",
+    result: failed ? undefined : typeof row.text === "string" ? row.text : value,
+    ...(failed ? { error: safeProviderFailure(context.provider, "tool") } : {}),
+  };
+}
+
+function legacyToolStatus(context: LegacyEventContext, value: unknown): HarnessEvent | null {
+  const row = eventRow(value);
+  // Only ordinary room tools carry their exact name. Specialist asks
+  // intentionally do not: ask-report above is their one completion.
+  const tool = typeof row.tool === "string" ? row.tool.trim() : "";
+  if (tool === "") return null;
+  return {
+    type: "tool_completed",
+    runId: context.runId,
+    tool,
+    ...(row.ok !== true ? { error: safeProviderFailure(context.provider, "tool") } : {}),
+  };
+}
+
+function legacyUsageUpdated(context: LegacyEventContext, value: unknown): HarnessEvent {
+  const row = eventRow(value);
+  return {
+    type: "usage_updated",
+    runId: context.runId,
+    inputTokens: numeric(row, "inputTokens", "input_tokens", "prompt_eval_count"),
+    outputTokens: numeric(row, "outputTokens", "output_tokens", "eval_count"),
+    costUsd: numeric(row, "costUsd", "cost_usd"),
+  };
+}
+
+const legacyEventNormalizers: Readonly<Record<string, LegacyEventNormalizer>> = {
+  "ask-plan": legacyPlanUpdated,
+  "ask-agent": legacyAgentStarted,
+  "ask-delta": legacyTextDelta,
+  "ask-step": legacyToolStarted,
+  "ask-report": legacyToolReport,
+  "ask-step-status": legacyToolStatus,
+  "ask-token-usage": legacyUsageUpdated,
+};
+
+function normalizeLegacyEvent(
+  event: string,
+  raw: unknown,
+  context: LegacyEventContext,
+): HarnessEvent | null {
+  const normalize = legacyEventNormalizers[event];
+  return normalize === undefined ? null : normalize(context, payloadValue(raw));
+}
+
+function createLegacyEventSender(
+  output: AsyncEventQueue<HarnessEvent>,
+  context: LegacyEventContext,
+): EventSender {
+  return (event, raw) => {
+    const normalized = normalizeLegacyEvent(event, raw, context);
+    if (normalized !== null) output.push(normalized);
+  };
+}
+
+type DeepWorkspaceGrant = ReturnType<typeof createDeepWorkspaceBridgeGrant>;
+
+function workspaceFolderRoot(state: RoomManagerState): string | null {
+  const descriptor = state.room?.descriptor;
+  return descriptor?.kind === "workspace-folder" ? descriptor.rootPath : null;
+}
+
+function usesRoomWorkspace(context: HarnessContext, realRoot: string | null): boolean {
+  return realRoot !== null && path.resolve(context.workspacePath) === path.resolve(realRoot);
+}
+
+function deepWorkspace(
+  context: HarnessContext,
+  grant: DeepWorkspaceGrant,
+  realRoot: string | null,
+  mirrorBackend: typeof createMirrorWorkspaceBackend,
+  cloudPrivacyBackend: typeof createCloudPrivacyWorkspaceBackend,
+) {
+  if (usesRoomWorkspace(context, realRoot)) return grant.workspace;
+  const mirror = mirrorBackend(context.workspacePath, context.writeEnabled);
+  if (context.privacyMode === "cloud-redacted") {
+    return cloudPrivacyBackend(mirror, grant.workspace, { routeExactMoveRenameToReal: true });
+  }
+  return mirror;
+}
+
+function deepScope(provider: string) {
+  return provider === "ollama-local" ? { kind: "LocalEngine" as const } : { kind: "CloudEngine" as const };
+}
+
+async function openDeepBridge(
+  state: RoomManagerState,
+  emit: EventSender,
+  services: LiveAppServices | undefined,
+  scope: ReturnType<typeof deepScope>,
+  workspace: ReturnType<typeof deepWorkspace>,
+  privacyMode: HarnessContext["privacyMode"],
+): Promise<RunningBridge> {
+  const dispatcher = roomServerDispatcherFactory(state, emit, services)(
+    false,
+    scope,
+    WEB_LANES_ALL,
+    { workspace, privacyBypass: privacyMode === "cloud-direct" },
+  );
+  return createRoomBridge({ scope, dispatcher });
+}
+
+function openRouterRuntimeConfig(model: string): Record<string, unknown> {
+  const config = providerRuntimeConfig(model);
+  if (config === null) throw new Error("Choose an OpenRouter model for the OpenRouter harness.");
+  return providerRuntimeConfigWire(config);
+}
+
+async function sidecarProvider(context: HarnessContext): Promise<Record<string, unknown> | null> {
+  if (context.provider !== "openrouter") return null;
+  await ensureProviderCatalog(context.model);
+  return openRouterRuntimeConfig(context.model);
+}
+
+function validatedOllamaBaseUrl(context: HarnessContext): string {
+  const ollamaBaseUrl = resolvedBaseUrl();
+  if (context.provider !== "ollama-local") return ollamaBaseUrl;
+  if (isLoopbackBaseUrl(ollamaBaseUrl)) return ollamaBaseUrl;
+  throw new Error("Local Ollama must use a loopback server on this Mac.");
+}
+
+function systemMessages(context: HarnessContext): RunViaSidecarRequest["messages"] {
+  return context.systemPrompt ? [{ role: "system", content: context.systemPrompt }] : [];
+}
+
+function deepSidecarRequest(
+  context: HarnessContext,
+  input: HarnessInput,
+  bridge: RunningBridge,
+  grant: DeepWorkspaceGrant,
+  provider: Record<string, unknown> | null,
+  ollamaBaseUrl: string,
+): RunViaSidecarRequest {
+  return {
+    model: context.model,
+    question: input.text,
+    harness: "deep",
+    temperature: 0,
+    messages: systemMessages(context),
+    ollamaBaseUrl,
+    mcp: {
+      url: `http://127.0.0.1:${bridge.port}/mcp`,
+      token: bridge.token,
+      ...grant.wireAuthority,
+    },
+    routing: { write: context.writeEnabled },
+    webEnabled: false,
+    runId: context.runId,
+    provider,
+  };
+}
+
+function pushSidecarOutcome(
+  output: AsyncEventQueue<HarnessEvent>,
+  context: HarnessContext,
+  outcome: SidecarOutcome,
+  aborted: boolean,
+): void {
+  if (outcome.kind === "failed") {
+    output.push({ type: "run_failed", runId: context.runId, error: safeProviderFailure(context.provider) });
+    return;
+  }
+  output.push({
+    type: "run_completed",
+    runId: context.runId,
+    status: aborted ? "cancelled" : "completed",
+  });
+}
+
+function pushStartupFailure(output: AsyncEventQueue<HarnessEvent>, context: HarnessContext): void {
+  output.push({
+    type: "run_failed",
+    runId: context.runId,
+    error: safeProviderFailure(context.provider, "startup"),
+  });
+}
+
+async function stopBridge(bridge: RunningBridge | null): Promise<void> {
+  await bridge?.stopAndWait().catch(() => undefined);
+}
+
 /** Built-in provider-neutral Deep Agents runtime over Arcelle's MCP bridge. */
 export class DeepAgentRuntime implements HarnessRuntime {
   readonly name = "arcelle-deep" as const;
@@ -76,168 +305,37 @@ export class DeepAgentRuntime implements HarnessRuntime {
     const abort = new AbortController();
     let bridge: RunningBridge | null = null;
     let finished: Promise<void> = Promise.resolve();
-
-    const sendOldEvent: EventSender = (event, raw) => {
-      const value = payloadValue(raw);
-      switch (event) {
-        case "ask-plan":
-          output.push({ type: "plan_updated", runId: context.runId, text: text(value) });
-          break;
-        case "ask-agent": {
-          const row = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
-          const agentId = typeof row.id === "string" ? row.id : typeof row.agent === "string" ? row.agent : text(value);
-          output.push({
-            type: "agent_started",
-            runId: context.runId,
-            agentId: agentId || "chat.answer",
-            ...(typeof row.label === "string" ? { label: row.label } : {}),
-          });
-          break;
-        }
-        case "ask-delta":
-          output.push({ type: "text_delta", runId: context.runId, text: text(value) });
-          break;
-        case "ask-step": {
-          const row = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
-          const label = typeof row.label === "string" ? row.label : text(value);
-          output.push({ type: "tool_started", runId: context.runId, tool: label || "workspace" });
-          break;
-        }
-        case "ask-report": {
-          const row = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
-          const failed = row.ok === false;
-          output.push({
-            type: "tool_completed",
-            runId: context.runId,
-            tool: typeof row.node === "string" ? row.node : "specialist",
-            result: failed ? undefined : typeof row.text === "string" ? row.text : value,
-            ...(failed ? { error: safeProviderFailure(context.provider, "tool") } : {}),
-          });
-          break;
-        }
-        case "ask-step-status": {
-          const row = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
-          // Only ordinary room tools carry their exact name. Specialist asks
-          // intentionally do not: ask-report above is their one completion.
-          const tool = typeof row.tool === "string" ? row.tool.trim() : "";
-          if (tool === "") break;
-          const failed = row.ok !== true;
-          output.push({
-            type: "tool_completed",
-            runId: context.runId,
-            tool,
-            ...(failed ? { error: safeProviderFailure(context.provider, "tool") } : {}),
-          });
-          break;
-        }
-        case "ask-token-usage": {
-          const row = typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
-          output.push({
-            type: "usage_updated",
-            runId: context.runId,
-            inputTokens: numeric(row, "inputTokens", "input_tokens", "prompt_eval_count"),
-            outputTokens: numeric(row, "outputTokens", "output_tokens", "eval_count"),
-            costUsd: numeric(row, "costUsd", "cost_usd"),
-          });
-          break;
-        }
-        default:
-          // Round/lane/privacy/status remain represented by normalized plan,
-          // tool and terminal events; no provider-specific wire reaches UI.
-          break;
-      }
-    };
+    const sendOldEvent = createLegacyEventSender(output, context);
 
     const run = async (): Promise<void> => {
       output.push({ type: "run_started", runId: context.runId, harness: this.name });
       try {
         const grant = createDeepWorkspaceBridgeGrant(this.state, context.runId, context.writeEnabled);
-        const realRoot = this.state.room?.descriptor?.kind === "workspace-folder"
-          ? this.state.room.descriptor.rootPath
-          : null;
         // Deep Agents access files through MCP rather than a raw cwd. When
         // Cloud Privacy supplies a redacted mirror, the MCP backend must point
         // at that mirror too; otherwise a cloud tool can bypass placeholder
         // validation and mutate the real workspace directly.
-        const usesRealWorkspace = realRoot !== null
-          && path.resolve(context.workspacePath) === path.resolve(realRoot);
-        const workspace = usesRealWorkspace
-          ? grant.workspace
-          : context.privacyMode === "cloud-redacted"
-            ? this.cloudPrivacyBackend(
-                this.mirrorBackend(context.workspacePath, context.writeEnabled),
-                grant.workspace,
-                { routeExactMoveRenameToReal: true },
-              )
-            : this.mirrorBackend(context.workspacePath, context.writeEnabled);
-        const cloud = context.provider !== "ollama-local";
-        const scope = cloud ? { kind: "CloudEngine" as const } : { kind: "LocalEngine" as const };
-        const dispatcher = roomServerDispatcherFactory(this.state, this.emit, this.services)(
-          false,
-          scope,
-          WEB_LANES_ALL,
-          {
-            workspace,
-            privacyBypass: context.privacyMode === "cloud-direct",
-          },
+        const workspace = deepWorkspace(
+          context,
+          grant,
+          workspaceFolderRoot(this.state),
+          this.mirrorBackend,
+          this.cloudPrivacyBackend,
         );
-        bridge = await createRoomBridge({ scope, dispatcher });
-
-        let provider: Record<string, unknown> | null = null;
-        if (context.provider === "openrouter") {
-          await ensureProviderCatalog(context.model);
-          const config = providerRuntimeConfig(context.model);
-          if (config === null) throw new Error("Choose an OpenRouter model for the OpenRouter harness.");
-          provider = providerRuntimeConfigWire(config);
-        }
+        const scope = deepScope(context.provider);
+        bridge = await openDeepBridge(this.state, this.emit, this.services, scope, workspace, context.privacyMode);
+        const provider = await sidecarProvider(context);
         const owner = new TurnId(context.runId, input.threadId ?? "");
-        const ollamaBaseUrl = resolvedBaseUrl();
-        if (context.provider === "ollama-local" && !isLoopbackBaseUrl(ollamaBaseUrl)) {
-          throw new Error("Local Ollama must use a loopback server on this Mac.");
-        }
+        const ollamaBaseUrl = validatedOllamaBaseUrl(context);
         const outcome: SidecarOutcome = await this.runSidecar(
-          {
-            model: context.model,
-            question: input.text,
-            harness: "deep",
-            // Agent file work must be repeatable. Leaving this unset delegates
-            // to the model's Modelfile (qwen3.5:4b-mlx defaults to 1), which can
-            // randomly answer without making the required workspace tool call.
-            temperature: 0,
-            messages: context.systemPrompt ? [{ role: "system", content: context.systemPrompt }] : [],
-            ollamaBaseUrl,
-            mcp: {
-              url: `http://127.0.0.1:${bridge.port}/mcp`,
-              token: bridge.token,
-              ...grant.wireAuthority,
-            },
-            // The UI's explicit Allow file changes choice is authoritative.
-            // Prompt keyword inference must not silently remove a granted,
-            // baseline-protected write capability.
-            routing: { write: context.writeEnabled },
-            webEnabled: false,
-            runId: context.runId,
-            provider,
-          },
+          deepSidecarRequest(context, input, bridge, grant, provider, ollamaBaseUrl),
           { turn: owner, onEvent: sendOldEvent, signal: abort.signal },
         );
-        if (outcome.kind === "failed") {
-          output.push({ type: "run_failed", runId: context.runId, error: safeProviderFailure(context.provider) });
-        } else {
-          output.push({
-            type: "run_completed",
-            runId: context.runId,
-            status: abort.signal.aborted ? "cancelled" : "completed",
-          });
-        }
-      } catch (error) {
-        output.push({
-          type: "run_failed",
-          runId: context.runId,
-          error: safeProviderFailure(context.provider, "startup"),
-        });
+        pushSidecarOutcome(output, context, outcome, abort.signal.aborted);
+      } catch {
+        pushStartupFailure(output, context);
       } finally {
-        await bridge?.stopAndWait().catch(() => undefined);
+        await stopBridge(bridge);
         bridge = null;
         output.end();
       }

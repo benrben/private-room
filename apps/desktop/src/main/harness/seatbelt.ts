@@ -82,28 +82,44 @@ function providerEnvironmentKey(provider: NativeWorkspaceSandbox["provider"], ke
     : key.startsWith("CODEX_") || key.startsWith("OPENAI_");
 }
 
-function nativeSandboxEnvironment(
-  provider: NativeWorkspaceSandbox["provider"],
-  runtimePath: string,
-  ...explicitSources: Array<NodeJS.ProcessEnv | undefined>
-): NodeJS.ProcessEnv {
+function nativeSandboxBaseEnvironment(): NodeJS.ProcessEnv {
   const username = os.userInfo().username;
-  const env: NodeJS.ProcessEnv = {
+  return {
     HOME: os.homedir(),
     USER: username,
     LOGNAME: username,
     PATH: process.env.PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
     SHELL: process.env.SHELL ?? "/bin/zsh",
   };
+}
+
+function copyAmbientEnvironment(target: NodeJS.ProcessEnv): void {
   for (const key of SAFE_AMBIENT_ENV_KEYS) {
     const value = process.env[key];
-    if (value !== undefined) env[key] = value;
+    if (value !== undefined) target[key] = value;
   }
+}
+
+function copyProviderEnvironment(
+  provider: NativeWorkspaceSandbox["provider"],
+  target: NodeJS.ProcessEnv,
+  source: NodeJS.ProcessEnv,
+): void {
+  for (const [key, value] of Object.entries(source)) {
+    if (providerEnvironmentKey(provider, key) && value !== undefined) target[key] = value;
+  }
+}
+
+export function nativeWorkspaceSandboxEnvironment(
+  provider: NativeWorkspaceSandbox["provider"],
+  runtimePath: string,
+  ...explicitSources: Array<NodeJS.ProcessEnv | undefined>
+): NodeJS.ProcessEnv {
+  const env = nativeSandboxBaseEnvironment();
+  copyAmbientEnvironment(env);
   for (const source of explicitSources) {
     if (source === undefined) continue;
-    for (const [key, value] of Object.entries(source)) {
-      if (providerEnvironmentKey(provider, key) && value !== undefined) env[key] = value;
-    }
+    copyProviderEnvironment(provider, env, source);
   }
   env.TMPDIR = runtimePath;
   env.CLAUDE_TMPDIR = runtimePath;
@@ -165,18 +181,22 @@ export function nativeWorkspaceSandboxSupported(): boolean {
 }
 
 function containsExposedSymlink(rootPath: string): boolean {
-  if (lstatSync(rootPath).isSymbolicLink()) return true;
-  const walk = (directory: string, root: boolean): boolean => {
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      if (root && entry.name.toLocaleLowerCase("en-US") === ".arcelle") continue;
-      const candidate = path.join(directory, entry.name);
-      const info = lstatSync(candidate);
-      if (info.isSymbolicLink()) return true;
-      if (info.isDirectory() && walk(candidate, false)) return true;
-    }
-    return false;
-  };
-  return walk(rootPath, true);
+  return pathContainsExposedSymlink(rootPath, true);
+}
+
+function pathContainsExposedSymlink(candidate: string, root: boolean): boolean {
+  const info = lstatSync(candidate);
+  if (info.isSymbolicLink()) return true;
+  if (!info.isDirectory()) return false;
+  return directoryContainsExposedSymlink(candidate, root);
+}
+
+function directoryContainsExposedSymlink(directory: string, root: boolean): boolean {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (root && entry.name.toLocaleLowerCase("en-US") === ".arcelle") continue;
+    if (pathContainsExposedSymlink(path.join(directory, entry.name), false)) return true;
+  }
+  return false;
 }
 
 /** Tests room access, `.arcelle` denial and sibling read/write denial. */
@@ -212,7 +232,7 @@ export function verifyNativeWorkspaceSandbox(options: NativeWorkspaceSandbox): b
         encoding: "utf8",
         timeout: 5_000,
         cwd: workspace,
-        env: nativeSandboxEnvironment(options.provider, canonicalRuntime, options.env),
+        env: nativeWorkspaceSandboxEnvironment(options.provider, canonicalRuntime, options.env),
       },
     );
     return result.status === 0;
@@ -240,7 +260,7 @@ export function verifyNativeHarnessExecutable(
     ["-p", nativeWorkspaceSeatbeltProfile(options), executable, ...args],
     {
       cwd: canonical(options.workspacePath),
-      env: nativeSandboxEnvironment(options.provider, runtime, options.env),
+      env: nativeWorkspaceSandboxEnvironment(options.provider, runtime, options.env),
       stdio: "ignore",
       timeout: 5_000,
     },
@@ -264,7 +284,7 @@ export function spawnWithNativeWorkspaceSandbox(
     ["-p", nativeWorkspaceSeatbeltProfile(options), executable, ...args],
     {
       cwd: spawnOptions.cwd,
-      env: nativeSandboxEnvironment(options.provider, runtime, options.env, spawnOptions.env),
+      env: nativeWorkspaceSandboxEnvironment(options.provider, runtime, options.env, spawnOptions.env),
       signal: spawnOptions.signal,
       // Give every native harness its own process group. Codex and Claude can
       // create helper processes, so killing only sandbox-exec can otherwise

@@ -474,6 +474,54 @@ async def test_e2e_arc_027_retranscribe_terminal_and_pending_contract() -> None:
     assert "check later" not in pending.final
 
 
+def test_arc_027_ignores_unrelated_status_and_names_an_unseen_action_honestly() -> None:
+    """Only a status receipt tied to this action can establish completion."""
+    from arcelle_sidecar.graphs import _check_transcription_terminal
+
+    unrelated_status = _check_transcription_terminal(
+        {
+            "tool_events": [
+                {
+                    "name": "retranscribe_file",
+                    "arguments": {"name": "brief.m4a"},
+                    "result": "queued for transcription",
+                },
+                {"name": "list_room_files", "result": "brief.m4a"},
+                {
+                    "name": "job_status",
+                    "result": "job other-recording completed transcript: unrelated",
+                },
+            ],
+            "tools": [],
+        }
+    )
+    assert unrelated_status["repair_needed"] is False
+    assert "brief.m4a is still pending" in unrelated_status["final_text"]
+
+    missing_action = _check_transcription_terminal(
+        {
+            "tool_events": [{"name": "stt_status", "result": "ready"}],
+            "tools": [{"function": {"name": "job_status"}}],
+        }
+    )
+    assert missing_action["repair_needed"] is True
+    assert "the requested recording" in missing_action["corrections"][-1]
+
+    terminal_action = _check_transcription_terminal(
+        {
+            "tool_events": [
+                {
+                    "name": "retranscribe_file",
+                    "arguments": {"name": "brief.m4a"},
+                    "result": "completed transcript: ready",
+                }
+            ],
+            "tools": [],
+        }
+    )
+    assert terminal_action == {"repair_needed": False}
+
+
 async def test_e2e_arc_029_antigravity_empty_success_retries_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3-multiple-ciphers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { migrate, CURRENT_USER_VERSION } from "./migrate.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -116,6 +116,155 @@ describe("migrate", () => {
     ).c;
     expect(embedded, "reopening a brand-new room erased its embeddings").toBe(1);
     expect(db.pragma("user_version", { simple: true })).toBe(CURRENT_USER_VERSION);
+  });
+
+  it("adopts pre-chat messages into one legacy conversation when adding messages.chat_id", () => {
+    const db = openWithFullSchema();
+    db.exec(
+      `DROP TABLE messages;
+       CREATE TABLE messages (
+         id TEXT PRIMARY KEY,
+         role TEXT NOT NULL,
+         content TEXT NOT NULL,
+         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+       );
+       INSERT INTO messages(id, role, content) VALUES ('m1', 'user', 'before chats'), ('m2', 'assistant', 'still here');`,
+    );
+
+    migrate(db);
+
+    const chats = db.prepare("SELECT title FROM chats WHERE title = 'Earlier conversation'").all() as Array<{ title: string }>;
+    const linked = db.prepare("SELECT DISTINCT chat_id FROM messages").all() as Array<{ chat_id: string | null }>;
+    expect(chats).toHaveLength(1);
+    expect(linked).toHaveLength(1);
+    expect(linked[0]?.chat_id).not.toBeNull();
+  });
+
+  it("rebuilds a stale chunks FTS table with porter stemming before installing current triggers", () => {
+    const db = openWithFullSchema();
+    db.exec(
+      `DROP TRIGGER IF EXISTS chunks_fts_ai;
+       DROP TRIGGER IF EXISTS chunks_fts_ad;
+       DROP TRIGGER IF EXISTS chunks_fts_au;
+       DROP TABLE chunks_fts;
+       CREATE VIRTUAL TABLE chunks_fts USING fts5(text, content='chunks', content_rowid='rowid');`,
+    );
+
+    migrate(db);
+
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'chunks_fts'").get() as { sql: string };
+    expect(row.sql).toContain("porter unicode61");
+    expect(db.prepare("SELECT count(*) AS c FROM sqlite_master WHERE type = 'trigger' AND name = 'chunks_fts_ai'").get())
+      .toEqual({ c: 1 });
+  });
+
+  it("marks legacy agent runs with baseline rows writable while adding their missing columns", () => {
+    const db = openWithFullSchema();
+    db.exec(
+      `DROP TABLE agent_run_files;
+       DROP TABLE agent_runs;
+       CREATE TABLE agent_runs (run_id TEXT PRIMARY KEY);
+       CREATE TABLE agent_run_files (
+         run_id TEXT NOT NULL,
+         file_id TEXT NOT NULL,
+         baseline_object_id TEXT,
+         PRIMARY KEY (run_id, file_id)
+       );
+       INSERT INTO agent_runs(run_id) VALUES ('run-1'), ('run-2');
+       INSERT INTO agent_run_files(run_id, file_id) VALUES ('run-1', 'file-1');`,
+    );
+
+    migrate(db);
+
+    const runs = db.prepare("SELECT run_id, write_enabled FROM agent_runs ORDER BY run_id").all() as Array<{
+      run_id: string;
+      write_enabled: number;
+    }>;
+    expect(runs).toEqual([
+      { run_id: "run-1", write_enabled: 1 },
+      { run_id: "run-2", write_enabled: 0 },
+    ]);
+    expect(columnExists(db, "agent_run_files", "rollback_state")).toBe(true);
+  });
+
+  it("splits a large CRLF Hebrew extraction without losing its ordered text", () => {
+    const db = openWithFullSchema();
+    const text = `opening line\r\n${"דִּבְרֵי ".repeat(650)}\r\nclosing line`;
+    db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, extracted_text)
+       VALUES ('f1', 'large-hebrew.txt', 'text/plain', 1, 'upload', x'00', ?)`,
+    ).run(text);
+    db.prepare("INSERT INTO chunks(id, file_id, seq, text) VALUES ('c1', 'f1', 0, ?)").run("דִּבְרֵי");
+
+    migrate(db);
+
+    const rows = db.prepare("SELECT text FROM chunks WHERE file_id = 'f1' ORDER BY seq").all() as Array<{ text: string }>;
+    expect(rows.length).toBeGreaterThan(2);
+    const rebuilt = rows.map((row) => row.text).join(" ");
+    expect(rebuilt).toContain("opening line");
+    expect(rebuilt).toContain("closing line");
+    expect(rebuilt).not.toContain("ִ");
+  });
+
+  it("moves reindexed chunks to trashed_chunks when the source was trashed before repair", () => {
+    const db = openWithFullSchema();
+    db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, extracted_text, trashed_at)
+       VALUES ('f1', 'old-hebrew.txt', 'text/plain', 1, 'upload', x'00', 'דִּבְרֵי', '2026-01-01T00:00:00Z')`,
+    ).run();
+    db.prepare("INSERT INTO chunks(id, file_id, seq, text) VALUES ('c1', 'f1', 0, 'דִּבְרֵי')").run();
+    db.pragma("user_version = 1");
+
+    migrate(db);
+
+    const live = db.prepare("SELECT count(*) AS c FROM chunks WHERE file_id = 'f1'").get() as { c: number };
+    const trashed = db.prepare("SELECT text FROM trashed_chunks WHERE file_id = 'f1'").all() as Array<{ text: string }>;
+    expect(live.c).toBe(0);
+    expect(trashed.map((row) => row.text)).toEqual(["דברי"]);
+  });
+
+  it("uses a caller transaction for reindexing instead of opening a nested transaction", () => {
+    const db = openWithFullSchema();
+    db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, extracted_text)
+       VALUES ('f1', 'inside-transaction.txt', 'text/plain', 1, 'upload', x'00', 'דִּבְרֵי')`,
+    ).run();
+    db.prepare("INSERT INTO chunks(id, file_id, seq, text) VALUES ('c1', 'f1', 0, 'דִּבְרֵי')").run();
+
+    db.transaction(() => migrate(db))();
+
+    const row = db.prepare("SELECT text FROM chunks WHERE file_id = 'f1'").get() as { text: string };
+    expect(row.text).toBe("דברי");
+  });
+
+  it("preserves a schema failure instead of treating every ADD COLUMN error as idempotence", () => {
+    const db = openWithFullSchema();
+    const exec = db.exec.bind(db);
+    const spy = vi.spyOn(db, "exec").mockImplementation((sql) => {
+      if (sql === "ALTER TABLE file_versions ADD COLUMN text TEXT") throw new Error("disk full");
+      return exec(sql);
+    });
+
+    expect(() => migrate(db)).toThrow("disk full");
+    spy.mockRestore();
+  });
+
+  it("preserves the reindex failure when both best-effort rollback paths also fail", () => {
+    const db = openWithFullSchema();
+    db.prepare(
+      `INSERT INTO files(id, name, mime_type, size_bytes, source, original_bytes, extracted_text)
+       VALUES ('f1', 'bible.pdf', 'application/pdf', 1, 'upload', x'00', 'קֹהֶלֶת')`,
+    ).run();
+    db.prepare("INSERT INTO chunks(id, file_id, seq, text) VALUES ('c1', 'f1', 0, 'קֹהֶלֶת')").run();
+    db.exec("CREATE TRIGGER boom BEFORE INSERT ON chunks BEGIN SELECT RAISE(ABORT, 'boom'); END;");
+    const exec = db.exec.bind(db);
+    const spy = vi.spyOn(db, "exec").mockImplementation((sql) => {
+      if (sql === "ROLLBACK" || sql.startsWith("ROLLBACK TO")) throw new Error("rollback failed");
+      return exec(sql);
+    });
+
+    expect(() => migrate(db)).toThrow("boom");
+    spy.mockRestore();
   });
 
   it("fts5 is available (HLT-3 precondition)", () => {
@@ -299,12 +448,14 @@ describe("migrate", () => {
   it("CURRENT_USER_VERSION covers every one-time repair migrate() runs (born-current invariant)", () => {
     // CURRENT_USER_VERSION is what stops a brand-new room running the
     // one-time repairs (repair #1 nulls every embedding in the room). Its
-    // correctness is a promise about a number in ANOTHER part of this file —
+    // correctness is a promise about a number in the migration implementation —
     // "raise this in lockstep with the last `userVersion < N` block" — and a
     // promise in a doc comment is not a guard. Read the source and check, the
     // way schema.rs's own `the_born_current_stamp_covers_every_one_time_repair`
     // does via `include_str!`.
-    const src = readFileSync(path.join(__dirname, "migrate.ts"), "utf8");
+    const src = ["migrate.ts", "migrateChunkIndex.ts"]
+      .map((name) => readFileSync(path.join(__dirname, name), "utf8"))
+      .join("\n");
     const matches = [...src.matchAll(/userVersion < (\d+)/g)].map((m) => Number(m[1]));
     expect(matches.length, "migrate() has no one-time repairs at all — did they move?").toBeGreaterThan(0);
     const highest = Math.max(...matches);

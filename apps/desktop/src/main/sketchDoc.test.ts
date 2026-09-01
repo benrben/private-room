@@ -21,6 +21,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyScript,
+  asI32,
   asciiLower,
   CANVAS_H,
   CANVAS_W,
@@ -34,9 +35,11 @@ import {
   type GraphNode,
   type Ink,
   inkParse,
+  inkFillHex,
   layoutGraph,
   layoutReport,
   MAX_ELEMENTS,
+  MAX_SCRIPT_LINES,
   plainElement,
   type Point,
   type Rect,
@@ -84,6 +87,22 @@ function apply(doc: Sketch, script: string): ScriptOutcome {
     throw new Error(`script should apply: ${out.error}`);
   }
   return out.value;
+}
+
+/** A runtime-mutable document can lose an element after pass 1, before pass 2.
+ * Keep this proxy at the public `applyScript` boundary to test that defensive
+ * no-op behavior without exporting its private statement applicator. */
+function documentWithFailedFinds(setup: string): Sketch {
+  const doc = draw(setup);
+  doc.elements = new Proxy(doc.elements, {
+    get(elements, property, receiver) {
+      if (property === "findIndex") {
+        return () => -1;
+      }
+      return Reflect.get(elements, property, receiver);
+    },
+  });
+  return doc;
 }
 
 function points(e: Element): Point[] {
@@ -318,15 +337,34 @@ describe("the synonyms a model reaches for unprompted", () => {
     ]);
   });
 
-  it("accepts every verb synonym `canon_verb` lists", () => {
-    const d = draw(
-      'box 10 10 50 50 blue "a"\ncircle 100 10 50 50 red "b"\nnote 10 300 green 20 "c"\nstroke blue 1 1 2 2 3 3\n' +
-        'connect e1 e2 green "j"\nnudge e1 0 400\nrename e1 "a2"\nrecolour e1 red\npage 1700 900'
-    );
-    expect(d.elements.map((e) => e.shape.type)).toEqual(["rect", "ellipse", "text", "pen", "arrow"]);
-    expect((d.elements[0] as Element).label).toBe("a2");
-    expect((d.elements[0] as Element).ink).toBe("red");
-    expect([d.width, d.height]).toEqual([1700, 900]);
+  it("makes every verb alias indistinguishable from its canonical command", () => {
+    const cases = [
+      { canonical: "rect", aliases: ["rect", "rectangle", "box", "square"], args: " 10 20 30 40 blue \"shape\"" },
+      { canonical: "ellipse", aliases: ["ellipse", "circle", "oval", "round"], args: " 10 20 30 40 red \"shape\"" },
+      { canonical: "text", aliases: ["text", "note", "label_at", "write"], args: " 10 20 green 18 \"words\"" },
+      { canonical: "arrow", aliases: ["arrow"], args: " 10 20 30 40 blue \"points\"" },
+      { canonical: "line", aliases: ["line"], args: " 10 20 30 40 blue" },
+      { canonical: "pen", aliases: ["pen", "stroke", "draw", "path"], args: " blue 10 20 30 40" },
+      { canonical: "link", aliases: ["link", "connect", "join"], setup: "rect 10 20 30 40\nrect 100 20 30 40", args: " e1 e2 green \"joins\"" },
+      { canonical: "move", aliases: ["move", "nudge", "shift"], setup: "rect 10 20 30 40", args: " e1 5 6" },
+      { canonical: "label", aliases: ["label", "rename", "retitle"], setup: "rect 10 20 30 40", args: " e1 \"renamed\"" },
+      { canonical: "ink", aliases: ["ink", "color", "colour", "recolor", "recolour"], setup: "rect 10 20 30 40", args: " e1 red" },
+      { canonical: "delete", aliases: ["delete", "remove", "erase", "del"], setup: "rect 10 20 30 40", args: " e1" },
+      { canonical: "clear", aliases: ["clear", "reset"], setup: "rect 10 20 30 40", args: "" },
+      { canonical: "canvas", aliases: ["canvas", "page", "size"], args: " 1700 900" },
+    ];
+
+    for (const { canonical, aliases, setup = "", args } of cases) {
+      const prefix = setup === "" ? "" : `${setup}\n`;
+      for (const alias of aliases) {
+        const aliased = defaultSketch();
+        const canonicalized = defaultSketch();
+        expect(applyScript(aliased, `${prefix}${alias}${args}`)).toMatchObject({ ok: true });
+        expect(applyScript(canonicalized, `${prefix}${canonical}${args}`)).toMatchObject({ ok: true });
+        expect(aliased, alias).toEqual(canonicalized);
+      }
+    }
+    expect(refuse(defaultSketch(), "misspelled 10 20")).toContain("`misspelled` is not a command");
   });
 
   it("takes the fill flag as a bare word, a synonym, or a named value", () => {
@@ -367,6 +405,18 @@ describe("two-pass validation", () => {
     expect(err).toContain("line 2");
     expect(err).toContain("line 3");
     expect(err).toContain("sqaure");
+  });
+
+  it("keeps original source line numbers and leaves a prior drawing untouched after filtered comments", () => {
+    const d = draw('rect 10 10 100 100 blue "before"');
+    const before = JSON.stringify(d);
+    const out = applyScript(
+      d,
+      '# heading comment\n\ncanvas 2400 1200\n// ignored note\nrect 1 2 3 blue "bad"\nrect 20 20 100 100 red "after"',
+    );
+    expect(out.ok).toBe(false);
+    expect(out.ok === false && out.error).toContain("line 5");
+    expect(JSON.stringify(d)).toBe(before);
   });
 
   it("an unknown colour word is refused rather than silently substituted", () => {
@@ -417,6 +467,32 @@ describe("two-pass validation", () => {
     expect(refuse(draw('rect 10 10 100 100 blue "a"'), "link e1 e1")).toContain("itself");
     expect(refuse(defaultSketch(), 'rect 10 10 100 100 blue "a"\nlink #1 #1')).toContain("itself");
   });
+
+  it.each([
+    ["text rejects an unknown word", 'text 10 20 unexpected "words"', "unexpected"],
+    ["text requires X", 'text "words"', "needs an X position"],
+    ["text requires Y", 'text 10 "words"', "needs a Y position"],
+    ["text requires quoted words", "text 10 20", "needs the words to write"],
+    ["lines reject an unknown word", "line 1 2 3 4 unexpected", "unexpected"],
+    ["lines require four coordinates", "line 1 2 3", "needs four numbers"],
+    ["lines reject identical ends", "line 1 2 1 2", "start and end are the same point"],
+    ["pen rejects an unknown word", "pen 1 2 3 4 unexpected", "unexpected"],
+    ["pen requires whole coordinate pairs", "pen 1 2 3", "needs an even list"],
+    ["links reject an unknown word", 'rect 1 1 20 20\nrect 100 1 20 20\nlink e1 e2 unexpected', "unexpected"],
+    ["links need two references", "rect 1 1 20 20\nlink e1", "needs two things to connect"],
+    ["links report an unknown source", "rect 1 1 20 20\nlink e9 e1", "there is no `e9`"],
+    ["links report an unknown destination", "rect 1 1 20 20\nlink e1 e9", "there is no `e9`"],
+    ["moves need a target", "move 1 2", "needs the id"],
+    ["moves need DX", "rect 1 1 20 20\nmove e1", "needs how far to move across"],
+    ["moves need DY", "rect 1 1 20 20\nmove e1 1", "needs how far to move down"],
+    ["labels need a target", 'label "new name"', "needs the id"],
+    ["labels need quoted words", "rect 1 1 20 20\nlabel e1", "needs the new label"],
+    ["ink changes need a target", "ink blue", "needs the id"],
+    ["ink changes need a colour", "rect 1 1 20 20\nink e1", "needs a colour"],
+    ["deletes need a target", "delete", "needs the id"],
+  ])("%s", (_name, script, expected) => {
+    expect(refuse(defaultSketch(), script)).toContain(expected);
+  });
 });
 
 describe("ids and receipts", () => {
@@ -445,6 +521,28 @@ describe("ids and receipts", () => {
     const summary = scriptOutcomeSummary(out);
     expect(summary).toContain("e2");
     expect(summary).toContain("e1");
+  });
+
+  it("relabels text content rather than its element label", () => {
+    const doc = draw('text 10 20 blue 18 "before"');
+    const out = apply(doc, 'label e1 "after"');
+    expect((doc.elements[0] as Element).shape).toMatchObject({ type: "text", text: "after" });
+    expect((doc.elements[0] as Element).label).toBeNull();
+    expect(out.changed).toEqual(["e1"]);
+  });
+
+  it("keeps validated mutations defensive when a mutable document loses their targets", () => {
+    for (const script of ["move e1 5 6", 'label e1 "renamed"', "ink e1 red", "delete e1"]) {
+      const doc = documentWithFailedFinds('rect 10 10 100 100 blue "one"');
+      const out = apply(doc, script);
+      expect(doc.elements).toHaveLength(1);
+      expect(out.steps, script).toEqual([]);
+    }
+
+    const linked = documentWithFailedFinds('rect 10 10 100 100 blue "one"\nrect 300 10 100 100 red "two"');
+    const out = apply(linked, "link e1 e2");
+    expect(linked.elements).toHaveLength(2);
+    expect(out.steps).toEqual(["skipped a link whose ends went away"]);
   });
 
   it("a long id list is elided the way Rust's `id_list` elides it", () => {
@@ -666,6 +764,20 @@ describe("layoutReport", () => {
     expect(notes).toContain("both say");
   });
 
+  it("reports an off-page in-memory shape and ignores an incomplete in-memory arrow", () => {
+    const doc = defaultSketch();
+    doc.elements.push({
+      ...plainElement(),
+      id: "e1",
+      shape: { type: "rect", x: -100, y: 1050, w: 50, h: 100 },
+      label: "Outside",
+    });
+    doc.elements.push({ ...plainElement(), id: "e2", shape: { type: "arrow", points: [[20, 20]] } });
+    expect(layoutReport(doc)).toEqual([
+      "e1 sits outside the 1600×1000 page (at -100 1050, 50×100) — move it back on.",
+    ]);
+  });
+
   it("a tidy drawing has nothing to report", () => {
     expect(
       layoutReport(draw('rect 100 100 300 150 blue "One"\nrect 900 100 300 150 green "Two"\nlink e1 e2 blue "flows to"'))
@@ -736,6 +848,25 @@ describe("toSvg", () => {
     expect(svg.startsWith("<svg ")).toBe(true);
     expect(svg).toContain("#f4f1e8");
     expect(svg.endsWith("</svg>")).toBe(true);
+  });
+
+  it("skips malformed incomplete shapes while retaining empty pen output and blank labels", () => {
+    const doc = defaultSketch();
+    doc.elements.push(
+      { ...plainElement(), id: "e1", shape: { type: "rect", x: 10, y: 10, w: 100, h: 50 } },
+      { ...plainElement(), id: "e2", shape: { type: "arrow", points: [[10, 100], [100, 100]] } },
+      { ...plainElement(), id: "e3", shape: { type: "pen", points: [] } }
+    );
+    const expected = toSvg(doc);
+    expect(expected).not.toContain("<text ");
+    expect(expected).toContain('d="" fill="none" stroke="#2563b0" stroke-width="4"');
+
+    doc.elements.push(
+      { ...plainElement(), id: "e4", shape: { type: "line", points: [[10, 10]] } },
+      { ...plainElement(), id: "e5", shape: { type: "arrow", points: [[10, 10]] } },
+      { ...plainElement(), id: "e6", shape: { type: "unknown" } as unknown as Shape }
+    );
+    expect(toSvg(doc)).toBe(expected);
   });
 });
 
@@ -817,6 +948,80 @@ describe("sketchToJson / sketchFromJson", () => {
         '{"version":1,"width":1600,"height":1000,"seq":0,"elements":[{"id":"e1","type":"rect","x":0,"y":0,"w":1,"h":1,"ink":"magenta"}]}'
       )
     ).toThrow(/ink/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Refactor guardrails — deterministic edge paths through the public API
+// ---------------------------------------------------------------------------
+
+describe("parser and script edge-path guardrails", () => {
+  it("keeps impossible numeric/color/bounding inputs on their explicit fallback paths", () => {
+    expect(asI32(Number.NaN)).toBe(0);
+    expect(asI32(-1e20)).toBe(0);
+    expect(inkFillHex("pink")).toBe("#f2dbe8");
+    expect(inkFillHex("yellow")).toBe("#f0e6c4");
+    expect(inkFillHex("green")).toBe("#d7ecdf");
+    expect(
+      elementBbox({ ...plainElement(), id: "empty", shape: { type: "pen", points: [] } }),
+    ).toEqual({ x: 0, y: 0, w: 0, h: 0 });
+  });
+
+  it("keeps malformed JSON fields on the same all-or-nothing read failures", () => {
+    const bad = (raw: string) => expect(() => sketchFromJson(raw)).toThrow(/could not be read/);
+    bad("[]");
+    bad('{"version":-1,"width":1600,"height":1000,"seq":0,"elements":[]}');
+    bad('{"version":1,"width":1600,"height":1000,"seq":0,"elements":[{"id":7,"type":"rect","x":0,"y":0,"w":1,"h":1}]}');
+    bad('{"version":1,"width":1600,"height":1000,"seq":0,"elements":[{"id":"e1","type":"rect","x":0,"y":0,"w":1,"h":1,"label":7}]}');
+    bad('{"version":1,"width":1600,"height":1000,"seq":0,"elements":[{"id":"e1","type":"rect","x":0,"y":0,"w":1,"h":1,"fill":"yes"}]}');
+    bad('{"version":1,"width":1600,"height":1000,"seq":0,"elements":[{"id":"e1","type":"arrow"}]}');
+    bad('{"version":1,"width":1600,"height":1000,"seq":0,"elements":[{"id":"e1","type":"arrow","points":[[0,"bad"]]}]}');
+  });
+
+  it("drops an invalid id suffix from counter recovery and trims a cut label with Rust whitespace", () => {
+    const invalidId = sketchFromJson(
+      '{"version":1,"width":1600,"height":1000,"seq":0,"elements":[{"id":"e","type":"rect","x":0,"y":0,"w":1,"h":1}]}'
+    );
+    expect(invalidId.seq).toBe(0);
+
+    const doc = defaultSketch();
+    const label = `${"a".repeat(199)}\u0085ZZ`;
+    expect(applyScript(doc, `rect 10 10 20 20 blue "${label}"`).ok).toBe(true);
+    expect((doc.elements[0] as Element).label).toBe("a".repeat(199));
+  });
+
+  it("keeps unlike id/back references distinct and retains text movement", () => {
+    const doc = draw('rect 10 10 20 20 blue "existing"');
+    expect(applyScript(doc, 'rect 30 30 20 20 red "new"\nlink e1 #1').ok).toBe(true);
+    expect(applyScript(doc, 'text 20 30 blue 20 "move"\nmove e4 5 7').ok).toBe(true);
+    expect((doc.elements[3] as Element).shape).toMatchObject({ type: "text", x: 25, y: 37 });
+  });
+
+  it("keeps source command and validation-report caps separate", () => {
+    const tooManyLines = Array.from({ length: MAX_SCRIPT_LINES + 1 }, () => "clear").join("\n");
+    expect(refuse(defaultSketch(), tooManyLines)).toContain(`${MAX_SCRIPT_LINES}`);
+
+    const errors = Array.from({ length: 13 }, () => "sqaure 1 2 3 4").join("\n");
+    const message = refuse(defaultSketch(), errors);
+    expect(message).toContain("more lines may also be wrong");
+  });
+
+  it("formats one-based back-reference ordinals and handles a non-finite route direction", () => {
+    expect(refuse(defaultSketch(), "link #1 e1")).toContain("1st shape");
+    expect(refuse(defaultSketch(), "link #2 e1")).toContain("2nd shape");
+    expect(refuse(defaultSketch(), "link #3 e1")).toContain("3rd shape");
+    const unbounded: Rect = { x: 0, y: 0, w: Infinity, h: Infinity };
+    expect(route(unbounded, unbounded)).toEqual([
+      [Infinity, Infinity],
+      [Infinity, Infinity],
+    ]);
+  });
+
+  it("uses clampWords' no-space fallback for long graph notes", () => {
+    const note = "x".repeat(100);
+    const doc = layoutGraph([{ id: "a", label: "A", note }], []);
+    const text = (doc.elements.find((element) => element.shape.type === "text") as Element).shape as { text: string };
+    expect(text.text).toBe(`${"x".repeat(60)}…`);
   });
 });
 

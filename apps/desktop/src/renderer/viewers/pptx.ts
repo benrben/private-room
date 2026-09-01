@@ -76,7 +76,9 @@ function kids(el: Element, local: string): Element[] {
   return Array.from(el.children).filter((c) => c.localName === local);
 }
 function descendants(root: Element | Document, local: string): Element[] {
-  return Array.from(root.getElementsByTagName("*")).filter((e) => e.localName === local);
+  return Array.from(root.getElementsByTagName("*")).filter(
+    (e) => e.localName === local,
+  );
 }
 function firstKid(el: Element, local: string): Element | null {
   return kids(el, local)[0] ?? null;
@@ -102,56 +104,107 @@ function colorUnder(el: Element | null): string | null {
   return val && /^[0-9a-fA-F]{6}$/.test(val) ? `#${val}` : null;
 }
 
-function readParagraphs(txBody: Element): Paragraph[] {
-  const out: Paragraph[] = [];
-  for (const p of kids(txBody, "p")) {
-    const pPr = firstKid(p, "pPr");
-    const level = num(pPr ? attr(pPr, "lvl") : null) ?? 0;
-    const rawAlign = pPr ? attr(pPr, "algn") : null;
-    const align =
-      rawAlign === "ctr"
-        ? "center"
-        : rawAlign === "r"
-          ? "right"
-          : rawAlign === "just"
-            ? "justify"
-            : rawAlign === "l"
-              ? "left"
-              : null;
+type Frame = { x: number; y: number; w: number; h: number };
+type RawFrame = {
+  x: number | null;
+  y: number | null;
+  cx: number | null;
+  cy: number | null;
+};
+type CompleteFrame = { x: number; y: number; cx: number; cy: number };
+
+const ALIGN_BY_OOXML: Record<string, NonNullable<Paragraph["align"]>> = {
+  ctr: "center",
+  r: "right",
+  just: "justify",
+  l: "left",
+};
+
+function optionalAttr(el: Element | null, local: string): string | null {
+  return el ? attr(el, local) : null;
+}
+
+function paragraphLevel(properties: Element | null): number {
+  return num(optionalAttr(properties, "lvl")) ?? 0;
+}
+
+function paragraphAlign(properties: Element | null): Paragraph["align"] {
+  return ALIGN_BY_OOXML[optionalAttr(properties, "algn") ?? ""] ?? null;
+}
+
+function paragraphBullet(properties: Element | null, level: number): boolean {
+  if (!properties || firstKid(properties, "buNone")) return false;
+  return level > 0 || !!firstKid(properties, "buChar");
+}
+
+function lineBreakRun(): Run {
+  return {
+    text: "\n",
+    bold: false,
+    italic: false,
+    underline: false,
+    sizePt: null,
+    color: null,
+  };
+}
+
+function isTextRun(child: Element): boolean {
+  return ["r", "fld"].includes(child.localName);
+}
+
+function formattedRun(child: Element): Run | null {
+  const textNode = firstKid(child, "t");
+  if (!textNode) return null;
+  const text = textNode.textContent;
+  if (!text) return null;
+  const properties = firstKid(child, "rPr");
+  const size = num(optionalAttr(properties, "sz"));
+  const underline = optionalAttr(properties, "u");
+  return {
+    text,
+    bold: optionalAttr(properties, "b") === "1",
+    italic: optionalAttr(properties, "i") === "1",
+    underline: !!underline && underline !== "none",
+    // OOXML stores size in hundredths of a point.
+    sizePt: size != null ? size / 100 : null,
+    color: colorUnder(properties),
+  };
+}
+
+function paragraphRun(child: Element): Run | null {
+  if (child.localName === "br") return lineBreakRun();
+  return isTextRun(child) ? formattedRun(child) : null;
+}
+
+function readRuns(paragraph: Element): Run[] {
+  const runs: Run[] = [];
+  for (const child of Array.from(paragraph.children)) {
+    const run = paragraphRun(child);
+    if (run) runs.push(run);
+  }
+  return runs;
+}
+
+function readParagraph(paragraph: Element): Paragraph | null {
+  const properties = firstKid(paragraph, "pPr");
+  const runs = readRuns(paragraph);
+  if (!runs.length) return null;
+  const level = paragraphLevel(properties);
+  return {
+    runs,
+    level,
+    align: paragraphAlign(properties),
     // `<a:buNone/>` is how a paragraph opts OUT; anything else at level 0+
     // inside a body placeholder is bulleted by the layout.
-    const bullet = !!pPr && !firstKid(pPr, "buNone") && (level > 0 || !!firstKid(pPr, "buChar"));
-    const runs: Run[] = [];
-    for (const child of Array.from(p.children)) {
-      if (child.localName === "br") {
-        runs.push({
-          text: "\n",
-          bold: false,
-          italic: false,
-          underline: false,
-          sizePt: null,
-          color: null,
-        });
-        continue;
-      }
-      // `<a:fld>` is a field (slide number, date) and carries text like a run.
-      if (child.localName !== "r" && child.localName !== "fld") continue;
-      const t = firstKid(child, "t");
-      const text = t?.textContent ?? "";
-      if (!text) continue;
-      const rPr = firstKid(child, "rPr");
-      const sz = num(rPr ? attr(rPr, "sz") : null);
-      runs.push({
-        text,
-        bold: (rPr && attr(rPr, "b")) === "1",
-        italic: (rPr && attr(rPr, "i")) === "1",
-        underline: !!rPr && !!attr(rPr, "u") && attr(rPr, "u") !== "none",
-        // OOXML stores size in hundredths of a point.
-        sizePt: sz != null ? sz / 100 : null,
-        color: colorUnder(rPr),
-      });
-    }
-    if (runs.length) out.push({ runs, level, align, bullet });
+    bullet: paragraphBullet(properties, level),
+  };
+}
+
+function readParagraphs(txBody: Element): Paragraph[] {
+  const out: Paragraph[] = [];
+  for (const paragraph of kids(txBody, "p")) {
+    const value = readParagraph(paragraph);
+    if (value) out.push(value);
   }
   return out;
 }
@@ -159,25 +212,44 @@ function readParagraphs(txBody: Element): Paragraph[] {
 /** Position + size, as fractions of the slide. Returns null for a shape with
  * no explicit geometry (it inherits from the layout, which this renderer
  * deliberately does not resolve — see the note in `parsePptx`). */
-function readFrame(
-  sp: Element,
-  slideW: number,
-  slideH: number,
-): { x: number; y: number; w: number; h: number } | null {
-  const xfrm = descendants(sp, "xfrm")[0];
-  if (!xfrm) return null;
+function rawFrame(xfrm: Element): RawFrame {
   const off = firstKid(xfrm, "off");
   const ext = firstKid(xfrm, "ext");
-  const x = num(off ? attr(off, "x") : null);
-  const y = num(off ? attr(off, "y") : null);
-  const cx = num(ext ? attr(ext, "cx") : null);
-  const cy = num(ext ? attr(ext, "cy") : null);
-  if (x == null || y == null || cx == null || cy == null) return null;
-  return { x: x / slideW, y: y / slideH, w: cx / slideW, h: cy / slideH };
+  return {
+    x: num(optionalAttr(off, "x")),
+    y: num(optionalAttr(off, "y")),
+    cx: num(optionalAttr(ext, "cx")),
+    cy: num(optionalAttr(ext, "cy")),
+  };
+}
+
+function completeFrame(frame: RawFrame): frame is CompleteFrame {
+  return (
+    frame.x !== null &&
+    frame.y !== null &&
+    frame.cx !== null &&
+    frame.cy !== null
+  );
+}
+
+function readFrame(sp: Element, slideW: number, slideH: number): Frame | null {
+  const xfrm = descendants(sp, "xfrm")[0];
+  if (!xfrm) return null;
+  const frame = rawFrame(xfrm);
+  if (!completeFrame(frame)) return null;
+  return {
+    x: frame.x / slideW,
+    y: frame.y / slideH,
+    w: frame.cx / slideW,
+    h: frame.cy / slideH,
+  };
 }
 
 /** relationship id → target path, resolved against the slide part. */
-function readRels(files: Record<string, Uint8Array>, partPath: string): Map<string, string> {
+function readRels(
+  files: Record<string, Uint8Array>,
+  partPath: string,
+): Map<string, string> {
   const dir = partPath.slice(0, partPath.lastIndexOf("/"));
   const file = partPath.slice(partPath.lastIndexOf("/") + 1);
   const relsPath = `${dir}/_rels/${file}.rels`;
@@ -217,9 +289,204 @@ export function slideOrder(files: Record<string, Uint8Array>): string[] {
   return Object.keys(files)
     .filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n))
     .sort((a, b) => {
-      const n = (s: string) => Number(/slide(\d+)\.xml$/.exec(s)?.[1] ?? 0);
+      const n = (s: string) =>
+        Number(s.slice("ppt/slides/slide".length, -".xml".length));
       return n(a) - n(b);
     });
+}
+
+const DEFAULT_SLIDE_WIDTH = 12_192_000;
+const DEFAULT_SLIDE_HEIGHT = 6_858_000;
+
+interface DeckGeometry {
+  slideW: number;
+  slideH: number;
+  aspect: number;
+}
+
+function deckGeometry(files: Record<string, Uint8Array>): DeckGeometry {
+  const presentation = parseXml(
+    bytesToText(findEntry(files, "ppt/presentation.xml")),
+  );
+  const size = presentation ? descendants(presentation, "sldSz")[0] : null;
+  const slideW = num(optionalAttr(size, "cx")) ?? DEFAULT_SLIDE_WIDTH;
+  const slideH = num(optionalAttr(size, "cy")) ?? DEFAULT_SLIDE_HEIGHT;
+  return {
+    slideW,
+    slideH,
+    aspect: slideH > 0 ? slideW / slideH : DEFAULT_ASPECT,
+  };
+}
+
+function textFallback(index: number): Frame {
+  return { x: 0.08, y: 0.1 + index * 0.12, w: 0.84, h: 0.1 };
+}
+
+function textShape(paragraphs: Paragraph[], frame: Frame): Shape {
+  return { kind: "text", ...frame, paragraphs };
+}
+
+function shapeText(
+  sp: Element,
+  geometry: DeckGeometry,
+  shapeIndex: number,
+): Shape | null {
+  const body = descendants(sp, "txBody")[0];
+  if (!body) return null;
+  const paragraphs = readParagraphs(body);
+  if (!paragraphs.length) return null;
+  const frame =
+    readFrame(sp, geometry.slideW, geometry.slideH) ?? textFallback(shapeIndex);
+  return textShape(paragraphs, frame);
+}
+
+function appendTextShapes(
+  doc: Document,
+  shapes: Shape[],
+  geometry: DeckGeometry,
+): void {
+  for (const sp of descendants(doc, "sp")) {
+    const shape = shapeText(sp, geometry, shapes.length);
+    if (shape) shapes.push(shape);
+  }
+}
+
+function pictureFallback(): Frame {
+  return { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
+}
+
+function pictureTarget(
+  pic: Element,
+  rels: Map<string, string>,
+): string | undefined {
+  const blip = descendants(pic, "blip")[0];
+  const id = optionalAttr(blip, "embed");
+  return id ? rels.get(id) : undefined;
+}
+
+function unsupportedPicture(target: string, frame: Frame): Shape {
+  const extension = target.slice(target.lastIndexOf(".") + 1).toUpperCase();
+  return { kind: "placeholder", ...frame, note: `${extension} image` };
+}
+
+function resolvedPicture(
+  target: string,
+  frame: Frame,
+  files: Record<string, Uint8Array>,
+): Shape {
+  if (!isRenderableImage(target)) return unsupportedPicture(target, frame);
+  const bytes = findEntry(files, target);
+  if (!bytes) return { kind: "placeholder", ...frame, note: "missing picture" };
+  return {
+    kind: "image",
+    ...frame,
+    src: toDataUrl(bytes, mimeForPath(target)),
+  };
+}
+
+function pictureShape(
+  pic: Element,
+  geometry: DeckGeometry,
+  rels: Map<string, string>,
+  files: Record<string, Uint8Array>,
+): Shape {
+  const frame =
+    readFrame(pic, geometry.slideW, geometry.slideH) ?? pictureFallback();
+  const target = pictureTarget(pic, rels);
+  return target
+    ? resolvedPicture(target, frame, files)
+    : { kind: "placeholder", ...frame, note: "picture" };
+}
+
+function appendPictures(
+  doc: Document,
+  shapes: Shape[],
+  geometry: DeckGeometry,
+  rels: Map<string, string>,
+  files: Record<string, Uint8Array>,
+): void {
+  for (const pic of descendants(doc, "pic")) {
+    shapes.push(pictureShape(pic, geometry, rels, files));
+  }
+}
+
+function graphicLabel(uri: string): string {
+  if (uri.includes("chart")) return "chart";
+  if (uri.includes("table")) return "table";
+  if (uri.includes("diagram")) return "diagram";
+  return "object";
+}
+
+function graphicFrameFallback(): Frame {
+  return { x: 0.1, y: 0.5, w: 0.8, h: 0.35 };
+}
+
+function graphicShape(frameEl: Element, geometry: DeckGeometry): Shape {
+  const data = descendants(frameEl, "graphicData")[0];
+  const frame =
+    readFrame(frameEl, geometry.slideW, geometry.slideH) ??
+    graphicFrameFallback();
+  const paragraphs = descendants(frameEl, "txBody").flatMap(readParagraphs);
+  if (paragraphs.length) return textShape(paragraphs, frame);
+  return {
+    kind: "placeholder",
+    ...frame,
+    note: graphicLabel(optionalAttr(data, "uri") ?? ""),
+  };
+}
+
+function appendGraphicShapes(
+  doc: Document,
+  shapes: Shape[],
+  geometry: DeckGeometry,
+): void {
+  for (const frameEl of descendants(doc, "graphicFrame")) {
+    shapes.push(graphicShape(frameEl, geometry));
+  }
+}
+
+function notesText(
+  files: Record<string, Uint8Array>,
+  rels: Map<string, string>,
+): string {
+  const path = Array.from(rels.values()).find((value) =>
+    value.includes("notesSlide"),
+  );
+  if (!path) return "";
+  const doc = parseXml(bytesToText(findEntry(files, path)));
+  if (!doc) return "";
+  return descendants(doc, "t")
+    .map((text) => text.textContent)
+    .join(" ")
+    .trim();
+}
+
+function slideText(shapes: Shape[]): string {
+  return shapes
+    .flatMap((shape) => shape.paragraphs ?? [])
+    .map((paragraph) => paragraph.runs.map((run) => run.text).join(""))
+    .join("\n");
+}
+
+function readSlide(
+  files: Record<string, Uint8Array>,
+  path: string,
+  number: number,
+  geometry: DeckGeometry,
+): Slide | null {
+  const doc = parseXml(bytesToText(findEntry(files, path)));
+  if (!doc) return null;
+  const rels = readRels(files, path);
+  const shapes: Shape[] = [];
+  appendTextShapes(doc, shapes, geometry);
+  appendPictures(doc, shapes, geometry, rels, files);
+  appendGraphicShapes(doc, shapes, geometry);
+  return {
+    number,
+    shapes,
+    notes: notesText(files, rels),
+    text: slideText(shapes),
+  };
 }
 
 /**
@@ -234,102 +501,11 @@ export function slideOrder(files: Record<string, Uint8Array>): string[] {
  * a `.pptx` opened as a wall of undifferentiated slide text.
  */
 export function parsePptx(files: Record<string, Uint8Array>): Deck {
-  const presentation = parseXml(bytesToText(findEntry(files, "ppt/presentation.xml")));
-  const sldSz = presentation ? descendants(presentation, "sldSz")[0] : null;
-  const slideW = num(sldSz ? attr(sldSz, "cx") : null) ?? 12_192_000;
-  const slideH = num(sldSz ? attr(sldSz, "cy") : null) ?? 6_858_000;
-  const aspect = slideH > 0 ? slideW / slideH : DEFAULT_ASPECT;
-
+  const geometry = deckGeometry(files);
   const slides: Slide[] = [];
   for (const [i, path] of slideOrder(files).entries()) {
-    const doc = parseXml(bytesToText(findEntry(files, path)));
-    if (!doc) continue;
-    const rels = readRels(files, path);
-    const shapes: Shape[] = [];
-
-    // Text boxes and placeholders.
-    for (const sp of descendants(doc, "sp")) {
-      const txBody = descendants(sp, "txBody")[0];
-      if (!txBody) continue;
-      const paragraphs = readParagraphs(txBody);
-      if (!paragraphs.length) continue;
-      const frame = readFrame(sp, slideW, slideH);
-      shapes.push({
-        kind: "text",
-        // A shape with no geometry of its own inherits it from the layout.
-        // Rather than drop it, stack it down the middle where it is at least
-        // readable and obviously part of the slide.
-        x: frame?.x ?? 0.08,
-        y: frame?.y ?? 0.1 + shapes.length * 0.12,
-        w: frame?.w ?? 0.84,
-        h: frame?.h ?? 0.1,
-        paragraphs,
-      });
-    }
-
-    // Pictures.
-    for (const pic of descendants(doc, "pic")) {
-      const blip = descendants(pic, "blip")[0];
-      const id = blip ? attr(blip, "embed") : null;
-      const target = id ? rels.get(id) : undefined;
-      const frame = readFrame(pic, slideW, slideH) ?? { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
-      if (!target) {
-        shapes.push({ kind: "placeholder", ...frame, note: "picture" });
-        continue;
-      }
-      if (!isRenderableImage(target)) {
-        // EMF/WMF are common in decks and no browser draws them. Saying so
-        // beats a broken-image glyph.
-        shapes.push({
-          kind: "placeholder",
-          ...frame,
-          note: `${target.slice(target.lastIndexOf(".") + 1).toUpperCase()} image`,
-        });
-        continue;
-      }
-      const bytes = findEntry(files, target);
-      if (!bytes) {
-        shapes.push({ kind: "placeholder", ...frame, note: "missing picture" });
-        continue;
-      }
-      shapes.push({ kind: "image", ...frame, src: toDataUrl(bytes, mimeForPath(target)) });
-    }
-
-    // Charts, tables and SmartArt: named, not silently dropped.
-    for (const frameEl of descendants(doc, "graphicFrame")) {
-      const uri = descendants(frameEl, "graphicData")[0];
-      const kindUri = uri ? attr(uri, "uri") ?? "" : "";
-      const label = kindUri.includes("chart")
-        ? "chart"
-        : kindUri.includes("table")
-          ? "table"
-          : kindUri.includes("diagram")
-            ? "diagram"
-            : "object";
-      // A table's cells DO carry readable text — pull it in rather than
-      // reducing a whole comparison table to the word "table".
-      const cells = descendants(frameEl, "txBody").flatMap(readParagraphs);
-      const frame = readFrame(frameEl, slideW, slideH) ?? { x: 0.1, y: 0.5, w: 0.8, h: 0.35 };
-      if (cells.length) shapes.push({ kind: "text", ...frame, paragraphs: cells });
-      else shapes.push({ kind: "placeholder", ...frame, note: label });
-    }
-
-    // Speaker notes live in their own part, linked from the slide's rels.
-    const notesPath = Array.from(rels.values()).find((p) => p.includes("notesSlide"));
-    const notesDoc = notesPath ? parseXml(bytesToText(findEntry(files, notesPath))) : null;
-    const notes = notesDoc
-      ? descendants(notesDoc, "t")
-          .map((t) => t.textContent ?? "")
-          .join(" ")
-          .trim()
-      : "";
-
-    const text = shapes
-      .flatMap((s) => s.paragraphs ?? [])
-      .map((p) => p.runs.map((r) => r.text).join(""))
-      .join("\n");
-
-    slides.push({ number: i + 1, shapes, notes, text });
+    const slide = readSlide(files, path, i + 1, geometry);
+    if (slide) slides.push(slide);
   }
-  return { aspect, slides };
+  return { aspect: geometry.aspect, slides };
 }

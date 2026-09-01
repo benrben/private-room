@@ -100,6 +100,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterable, Optional
 
+from arcelle_sidecar.rec.lanes_system import (
+    SysLane as SysLane,
+    mic_failure_message as mic_failure_message,
+)
+
 from arcelle_sidecar.rec.meta import (
     DIP_LOOKBACK,
     END_FRAMES,
@@ -114,59 +119,6 @@ from arcelle_sidecar.rec.meta import (
     VAD_SUSTAIN,
 )
 from arcelle_sidecar.rec.vad import NeuralVad
-
-# ------------------------------------------------------------------ sys lane
-
-
-class SysLane(Enum):
-    """The Mac's-audio (system) lane's own state, independent of the
-    microphone lane -- what `mic_failure_message` needs to know before it can
-    say something honest about what is (or isn't) still being captured."""
-
-    #: A tap is up and delivering the Mac's audio.
-    RECORDING = "recording"
-    #: Asked for, still coming up. ScreenCaptureKit takes seconds (permission
-    #: round-trip + capture start), and that window is exactly when a first
-    #: run's microphone trouble shows itself.
-    STARTING = "starting"
-    #: Not asked for, or the tap failed.
-    OFF = "off"
-
-
-def mic_failure_message(sys: SysLane, ever_pushed: bool) -> str:
-    """What to say about a microphone that has gone quiet -- port of Rust's
-    `mic_failure_message`, every string copied LITERALLY (this is real
-    user-facing copy, em dashes included).
-
-    THE DEFECT the Rust source's own doc comment records: this used to
-    promise "the Mac's audio keeps recording" unconditionally. With "Include
-    the Mac's audio" unticked -- or the tap refused by macOS -- a dead
-    microphone means NOTHING is being captured, and the banner invited the
-    user to let an empty recording run. The `sys` state is what makes the
-    three-way message honest instead.
-    """
-    lead = "The microphone stopped sending audio" if ever_pushed else "No microphone audio has arrived"
-    # A microphone that never connected at all (no device, blocked in System
-    # Settings) must not be told to "reconnect" -- pausing and resuming
-    # cannot reattach something that was never attached.
-    advice = (
-        "Pause and resume to reconnect the microphone."
-        if ever_pushed
-        else (
-            "Check that a microphone is connected and that Arcelle is allowed to use it "
-            "in System Settings → Privacy & Security → Microphone."
-        )
-    )
-    if sys is SysLane.RECORDING:
-        return f"{lead} — the Mac's audio keeps recording. {advice}"
-    if sys is SysLane.STARTING:
-        return f"{lead} — the Mac's audio is still starting up. {advice}"
-    # SysLane.OFF
-    return (
-        f"{lead}, and the Mac's audio is not being recorded — nothing at all is being "
-        f"captured. {advice} If that cannot be fixed, press Stop."
-    )
-
 
 # ---------------------------------------------------------------- VAD lane
 
@@ -297,28 +249,35 @@ class Lane:
         """Feed 16 kHz samples; returns any phrases that just closed as
         (absolute start sample, audio).
         """
-        closed: list[tuple[int, list[float]]] = []
         self.carry.extend(float(s) for s in samples)
         n = len(self.carry) // FRAME
         if n == 0:
-            return closed
+            return []
         # One Silero pass over all fresh frames (its LSTM wants a run of
         # audio, not isolated 32 ms slices); per-frame probabilities then
         # drive the same state machine the energy gate does.
-        probs = None
-        if self.vad is not None:
-            p = self.vad.probs(self.carry[: n * FRAME])
-            if p is None:
-                self.vad = None  # broke mid-session: energy from here on, permanently
-            else:
-                probs = p
-        for k in range(n):
+        probs = self._fresh_speech_probs(n)
+        return self._process_complete_frames(n, probs)
+
+    def _fresh_speech_probs(self, frame_count: int) -> Optional[list[float]]:
+        if self.vad is None:
+            return None
+        probs = self.vad.probs(self.carry[: frame_count * FRAME])
+        if probs is None:
+            self.vad = None  # broke mid-session: energy from here on, permanently
+        return probs
+
+    def _process_complete_frames(
+        self, frame_count: int, probs: Optional[list[float]]
+    ) -> list[tuple[int, list[float]]]:
+        closed: list[tuple[int, list[float]]] = []
+        for k in range(frame_count):
             chunk = self.carry[k * FRAME : (k + 1) * FRAME]
             prob_k = float(probs[k]) if probs is not None else None
             done = self.frame(chunk, prob_k)
             if done is not None:
                 closed.append(done)
-        del self.carry[: n * FRAME]
+        del self.carry[: frame_count * FRAME]
         return closed
 
     def frame(self, frame: list[float], speech_prob: Optional[float]) -> Optional[tuple[int, list[float]]]:
@@ -328,88 +287,105 @@ class Lane:
         """
         rms = _rms(frame)
         self.level = max(rms, self.level * 0.75)
-        open_ = self.state is not None
-        if speech_prob is not None:
-            # Trained detector, with hysteresis: opening takes real evidence,
-            # staying open takes less, so soft intra-word dips don't chop.
-            voiced = speech_prob >= (VAD_SUSTAIN if open_ else VAD_OPEN)
-        else:
+        voiced = self._is_voiced(rms, speech_prob)
+        self._update_floor(rms, voiced)
+        frame_start = self.pos
+        self.pos += len(frame)
+        if self.state is None:
+            self._frame_while_idle(frame, voiced, frame_start)
+            return None
+        return self._frame_while_active(frame, voiced)
+
+    def _is_voiced(self, rms: float, speech_prob: Optional[float]) -> bool:
+        if speech_prob is None:
             # Energy fallback. The threshold rides the noise floor: a quiet
             # room triggers on soft speech, a fan-heavy one doesn't trigger
             # on the fan. Both knobs sit LOW on purpose -- an absolute RMS
             # floor structurally misses quiet and distant speech, and
             # whisper's own gates catch what noise this lets through.
-            voiced = rms > max(self.floor * 2.0, 0.0015)
-        if not voiced:
-            self.floor = self.floor * 0.98 + rms * 0.02
-            self.floor = max(self.floor, 1e-4)
+            return rms > max(self.floor * 2.0, 0.0015)
+        # Trained detector, with hysteresis: opening takes real evidence,
+        # staying open takes less, so soft intra-word dips don't chop.
+        return speech_prob >= self._vad_threshold()
 
-        frame_start = self.pos
-        self.pos += len(frame)
-
-        finished: Optional[tuple[int, list[float]]] = None
-
+    def _vad_threshold(self) -> float:
         if self.state is None:
-            self.ring.extend(frame)
-            while len(self.ring) > PREROLL:
-                self.ring.popleft()
-            if voiced:
-                self.voiced_run += 1
-                if self.voiced_run >= START_FRAMES:
-                    buf = list(self.ring)
-                    self.ring.clear()
-                    start = (frame_start + len(frame)) - len(buf)
-                    if start < 0:
-                        start = 0
-                    self.state = Active(start=start, buf=buf, silent_frames=0, partial_at=0)
-                    self.voiced_run = 0
-            else:
-                self.voiced_run = 0
-        else:
-            st = self.state
-            st.buf.extend(frame)
-            st.silent_frames = 0 if voiced else st.silent_frames + 1
-            if st.silent_frames >= END_FRAMES:
-                # Trim the silent tail (keep 0.2 s of it as padding).
-                tail_keep = SAMPLE_RATE // 5
-                trim = st.silent_frames * FRAME - tail_keep
-                if trim < 0:
-                    trim = 0
-                keep = len(st.buf) - trim
-                if keep < 0:
-                    keep = 0
-                audio = st.buf[:keep]
-                finished = (st.start, audio)
-                self.state = None
-                self.voiced_run = 0
-            elif len(st.buf) >= MAX_SEGMENT:
-                # Continuous speech reached the window limit: close at the
-                # QUIETEST recent frame -- a between-words dip, not an
-                # arbitrary sample mid-word -- and keep the remainder as the
-                # still-open phrase, so not a syllable is lost.
-                from_ = len(st.buf) - DIP_LOOKBACK
-                if from_ < 0:
-                    from_ = 0
-                best_rms = float("inf")
-                best_cut = len(st.buf)
-                i = from_
-                while i + FRAME <= len(st.buf):
-                    window = st.buf[i : i + FRAME]
-                    r = _rms(window)
-                    if r < best_rms:
-                        best_rms = r
-                        best_cut = i + FRAME // 2
-                    i += FRAME
-                cut = best_cut
-                audio = st.buf[:cut]
-                finished = (st.start, audio)
-                rest = st.buf[cut:]
-                st.start += cut
-                st.partial_at = len(rest)
-                st.buf = rest
-                st.silent_frames = 0
+            return VAD_OPEN
+        return VAD_SUSTAIN
 
-        return finished
+    def _update_floor(self, rms: float, voiced: bool) -> None:
+        if not voiced:
+            self.floor = max(self.floor * 0.98 + rms * 0.02, 1e-4)
+
+    def _frame_while_idle(self, frame: list[float], voiced: bool, frame_start: int) -> None:
+        self._remember_idle_frame(frame)
+        if not voiced:
+            self.voiced_run = 0
+            return
+        self.voiced_run += 1
+        if self.voiced_run >= START_FRAMES:
+            self._open_phrase(frame_start, frame)
+
+    def _remember_idle_frame(self, frame: list[float]) -> None:
+        self.ring.extend(frame)
+        while len(self.ring) > PREROLL:
+            self.ring.popleft()
+
+    def _open_phrase(self, frame_start: int, frame: list[float]) -> None:
+        buf = list(self.ring)
+        self.ring.clear()
+        start = max((frame_start + len(frame)) - len(buf), 0)
+        self.state = Active(start=start, buf=buf, silent_frames=0, partial_at=0)
+        self.voiced_run = 0
+
+    def _frame_while_active(
+        self, frame: list[float], voiced: bool
+    ) -> Optional[tuple[int, list[float]]]:
+        st = self.state
+        st.buf.extend(frame)
+        st.silent_frames = 0 if voiced else st.silent_frames + 1
+        if st.silent_frames >= END_FRAMES:
+            return self._finish_after_silence(st)
+        if len(st.buf) >= MAX_SEGMENT:
+            return self._finish_at_quietest_frame(st)
+        return None
+
+    def _finish_after_silence(self, st: Active) -> tuple[int, list[float]]:
+        # Trim the silent tail (keep 0.2 s of it as padding).
+        trim = max(st.silent_frames * FRAME - SAMPLE_RATE // 5, 0)
+        audio = st.buf[: max(len(st.buf) - trim, 0)]
+        self.state = None
+        self.voiced_run = 0
+        return (st.start, audio)
+
+    def _finish_at_quietest_frame(self, st: Active) -> tuple[int, list[float]]:
+        # Continuous speech reached the window limit: close at the QUIETEST
+        # recent frame -- a between-words dip, not an arbitrary sample
+        # mid-word -- and keep the remainder as the still-open phrase, so not
+        # a syllable is lost.
+        start = st.start
+        cut = self._quietest_frame_midpoint(st.buf)
+        audio = st.buf[:cut]
+        rest = st.buf[cut:]
+        st.start = start + cut
+        st.partial_at = len(rest)
+        st.buf = rest
+        st.silent_frames = 0
+        return (start, audio)
+
+    @staticmethod
+    def _quietest_frame_midpoint(samples: list[float]) -> int:
+        from_ = max(len(samples) - DIP_LOOKBACK, 0)
+        best_rms = float("inf")
+        best_cut = len(samples)
+        i = from_
+        while i + FRAME <= len(samples):
+            rms = _rms(samples[i : i + FRAME])
+            if rms < best_rms:
+                best_rms = rms
+                best_cut = i + FRAME // 2
+            i += FRAME
+        return best_cut
 
     def partial_due(self) -> Optional[tuple[int, list[float]]]:
         """A live partial is due when the open phrase has grown enough since
@@ -515,54 +491,89 @@ class LaneLang:
         drops them first; a final with no detection is no information and
         changes nothing.
         """
-        evidenced = words >= self.MIN_WORDS or dur_cs >= self.MIN_DUR_CS
+        evidenced = self._is_evidenced(words, dur_cs)
         # Only a final substantial enough to DEFEND the lock ends the
         # dead-final streak. Sub-2s scraps used to reset it, which kept a
         # wrong lock alive forever on a stream of short translated
         # fragments. This reset happens REGARDLESS of what follows below --
         # including the early returns just after.
-        if evidenced:
-            self.empty_streak = 0
-        if detected is None:
+        self._reset_empty_streak_for_evidence(evidenced)
+        observation = self._usable_detection(detected, words)
+        if observation is None:
             return
-        heard, prob = detected
-        if words == 0:
-            return
+        heard, prob = observation
 
         if self.lock is None:
-            if evidenced and prob >= self.MIN_LOCK_PROB:
-                self.lock = heard
-                self.dissent = None
-                self.lock_votes = 1
-        elif self.lock == heard:
-            self.dissent = None
-            if evidenced:
-                self.lock_votes += 1
-        else:
-            if evidenced and prob >= self.MIN_SWITCH_PROB:
-                prior = self.dissent
-                self.dissent = None
-                votes = prior[1] + 1 if prior is not None and prior[0] == heard else 1
-                if votes >= self.SWITCH_VOTES:
-                    self.lock = heard
-                    self.dissent = None
-                    self.lock_votes = 1
-                else:
-                    self.dissent = (heard, votes)
-            else:
-                # A weak or unconfident disagreement is no vote -- and it
-                # breaks the run: CONSECUTIVE strong finals are what make a
-                # switch trustworthy.
-                self.dissent = None
-                # But a short final that CONFIDENTLY sounds like another
-                # language is a scrap the lock barely survived -- streak
-                # evidence of a dead lock, same as an empty decode. This
-                # closes the deadlock where every phrase is too short to
-                # vote yet the lane keeps translating them. Gated on `prob`
-                # ALONE, not `evidenced and prob` -- a short-but-confident
-                # final is exactly the case `evidenced` was false for.
-                if prob >= self.MIN_SWITCH_PROB:
-                    self.note_empty_final()
+            self._observe_unlocked(heard, prob, evidenced)
+            return
+        if self.lock == heard:
+            self._observe_agreement(evidenced)
+            return
+        self._observe_disagreement(heard, prob, evidenced)
+
+    def _is_evidenced(self, words: int, dur_cs: int) -> bool:
+        return words >= self.MIN_WORDS or dur_cs >= self.MIN_DUR_CS
+
+    def _reset_empty_streak_for_evidence(self, evidenced: bool) -> None:
+        if evidenced:
+            self.empty_streak = 0
+
+    @staticmethod
+    def _usable_detection(
+        detected: Optional[tuple[str, float]], words: int
+    ) -> Optional[tuple[str, float]]:
+        if detected is None or words == 0:
+            return None
+        return detected
+
+    def _observe_unlocked(self, heard: str, prob: float, evidenced: bool) -> None:
+        if evidenced and prob >= self.MIN_LOCK_PROB:
+            self._lock_to(heard)
+
+    def _observe_agreement(self, evidenced: bool) -> None:
+        self.dissent = None
+        if evidenced:
+            self.lock_votes += 1
+
+    def _observe_disagreement(self, heard: str, prob: float, evidenced: bool) -> None:
+        if evidenced and prob >= self.MIN_SWITCH_PROB:
+            self._record_dissent(heard)
+            return
+        self._discard_weak_dissent(prob)
+
+    def _record_dissent(self, heard: str) -> None:
+        prior = self.dissent
+        self.dissent = None
+        votes = self._dissent_votes(prior, heard)
+        if votes >= self.SWITCH_VOTES:
+            self._lock_to(heard)
+            return
+        self.dissent = (heard, votes)
+
+    @staticmethod
+    def _dissent_votes(prior: Optional[tuple[str, int]], heard: str) -> int:
+        if prior is None or prior[0] != heard:
+            return 1
+        return prior[1] + 1
+
+    def _discard_weak_dissent(self, prob: float) -> None:
+        # A weak or unconfident disagreement is no vote -- and it breaks the
+        # run: CONSECUTIVE strong finals are what make a switch trustworthy.
+        self.dissent = None
+        # But a short final that CONFIDENTLY sounds like another language is
+        # a scrap the lock barely survived -- streak evidence of a dead lock,
+        # same as an empty decode. This closes the deadlock where every
+        # phrase is too short to vote yet the lane keeps translating them.
+        # Gated on `prob` ALONE, not `evidenced and prob` -- a
+        # short-but-confident final is exactly the case `evidenced` was false
+        # for.
+        if prob >= self.MIN_SWITCH_PROB:
+            self.note_empty_final()
+
+    def _lock_to(self, heard: str) -> None:
+        self.lock = heard
+        self.dissent = None
+        self.lock_votes = 1
 
     def retract(self, lang: Optional[str]) -> None:
         """A final that voted turned out to be the other lane's echo:

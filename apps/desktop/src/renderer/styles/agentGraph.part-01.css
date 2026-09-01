@@ -1,0 +1,492 @@
+/* ---------- the live agent graph ----------
+   Hub-and-spoke picture of one chat turn: the Main agent roots the left, every
+   dispatched specialist sits in a column to its right, and children dispatched
+   in the same round share a "N in parallel" band. Sits inline in the streaming
+   assistant bubble, so it stays quiet.
+
+   IT IS A REAL GRAPH. The hand is in the STROKE QUALITY and the node treatment
+   — pen-weight edges with round caps, drawn frames, asymmetric corners — and
+   never in the geometry. Positions are measured from the laid-out DOM and the
+   spokes are exact beziers between them; nothing here nudges, tilts or jitters
+   a node, because a diagram whose nodes move is a diagram nobody can trust.
+   Same rule the room map follows.
+
+   STATUS IS NEVER COLOUR ALONE. Every state also has its own glyph (○ ◐ ✓ ⚠),
+   its own border weight and its own dash, and the node's accessible name spells
+   the word out. The hues are the product-wide marker meanings: blue is active,
+   green complete, red failed, and the pink pen stays reserved for SELECTION —
+   which is what it means everywhere else in the app, and which is why running
+   no longer wears it. Before this pass a running node and a selected node were
+   the same colour.
+
+   Everything resolves through tokens.css, so light and dark are both correct
+   without a second palette and there is no override block at the end. */
+
+.agraph {
+  margin-bottom: 7px;
+  max-width: 100%;
+}
+
+.agraph-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-1);
+}
+/* The caption is composer.css's, shared with the one-agent strip. It is set at
+   10px there; nothing in this product is allowed under 12px, and a two-class
+   selector is what lets that be fixed from here. */
+.agraph-head .agent-strip-caption {
+  font-size: var(--fs-micro);
+  opacity: 1;
+}
+.agraph-summary {
+  font-size: var(--fs-micro);
+  color: var(--faint);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+/* Expand / Close. 24px is the floor for anything clickable — this was a 14px
+   box — and the marker swipe on hover is the app's secondary-button idiom. */
+.agraph-expand {
+  margin-inline-start: auto;
+  min-height: 24px;
+  padding: 2px 9px;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  background-color: transparent;
+  background-image: linear-gradient(
+    98deg,
+    color-mix(in srgb, var(--accent-fill) 32%, transparent) 0%,
+    color-mix(in srgb, var(--accent-fill) 20%, transparent) 62%,
+    color-mix(in srgb, var(--accent-fill) 28%, transparent) 100%
+  );
+  background-repeat: no-repeat;
+  background-position: left center;
+  background-size: 0% 100%;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  transition:
+    background-size var(--dur) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen),
+    color var(--dur-fast) var(--ease-pen);
+}
+.agraph-expand:hover {
+  color: var(--text);
+  background-size: 100% 100%;
+  border-color: var(--sketch);
+}
+
+/* Screen-reader-only running summary. One live region for the whole graph:
+   eight nodes each announcing themselves would be unusable. */
+.agraph-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  margin: 0;
+}
+
+/* ---- canvas: hub | (measured edge layer) | children ---- */
+.agraph-canvas {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 46px;
+  padding: 2px 0;
+  /* Tall enough that a realistic roster (up to ~7 specialists) never needs a
+     nested scrollbar — a scroll region inside a scrolling chat is a trap. The
+     cap only catches pathological turns, and the fade says so. */
+  max-height: 320px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent);
+}
+/* No fade when nothing is clipped — the mask would dim the last row for free. */
+.agraph-canvas:not(.scrolls) {
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+/* The AI column now starts collapsed on reading pages and clamps to a fifth of
+   the grid, so the inline graph has to survive around 180px. The spokes shorten
+   rather than the nodes: an edge can be short and still read as an edge, a node
+   cannot be narrow and still read as a name. `.pane` is the query container
+   (shell.css); container queries have been in WebKit since Safari 16. */
+@container (max-width: 300px) {
+  .agraph-canvas {
+    gap: var(--sp-6);
+  }
+}
+/* The overlay copy: real width, so the instruction can ride its own edge the
+   way a graph should show it. Never used inline — at the chat pane's typical
+   ~290px these labels overlap each other and the nodes. */
+.agraph-canvas.roomy {
+  gap: clamp(120px, 26vw, 300px);
+  max-height: none;
+  padding: var(--sp-4) 0;
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+.agraph-canvas.roomy .agraph-node {
+  padding: 7px 12px;
+}
+.agraph-canvas.roomy .agraph-node-label {
+  font-size: var(--fs-body);
+}
+
+/* ---- expanded overlay ----
+   The veil is the PAPER at 78%, not black: in dark it dims the sheet and in
+   light it washes it out, and in both it reads as the room going quiet behind
+   a window rather than as a scrim borrowed from another product. Same recipe
+   as the prompt window and the ⌘K launcher. */
+.agraph-backdrop {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, var(--page) 78%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 120;
+  padding: var(--sp-6);
+}
+/* A window that occludes, so it is one of the few opaque surfaces in the
+   system — see paper.css section 9. */
+.agraph-modal {
+  width: min(880px, 92vw);
+  max-height: 86vh;
+  background: var(--raised);
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: 14px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow:
+    0 18px 44px var(--shadow),
+    0 3px 10px var(--shadow-lift);
+  animation: nb-float-in var(--dur) var(--ease-pen);
+}
+.agraph-modal-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--line);
+}
+.agraph-modal-title {
+  font-weight: 600;
+  font-size: var(--fs-card);
+  color: var(--text-strong);
+}
+.agraph-modal-head .agraph-expand {
+  margin-inline-start: auto;
+}
+.agraph-modal-body {
+  overflow-y: auto;
+  padding: var(--sp-2) var(--sp-4) var(--sp-4);
+}
+
+/* ---- edges ----
+   Pen strokes, not hairlines: round caps and a consistent 1.6 weight, so the
+   fan reads as one hand of spokes. The DASH is what carries state alongside
+   the colour — solid for done, open dashes for queued, a tight broken line for
+   failed — which survives greyscale and colour blindness both.
+
+   There is deliberately no marching-ants animation on the running spoke any
+   more. Something permanently in motion inside a message the user is trying to
+   read is the one thing this system refuses; the running node keeps the single
+   small spinner, which is the same allowance a busy indicator gets everywhere
+   else in the app. */
+.agraph-edges {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: visible;
+}
+.agraph-edge {
+  fill: none;
+  stroke: var(--rule);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+.agraph-edge.pending {
+  stroke-dasharray: 3 4;
+}
+.agraph-edge.running {
+  stroke: var(--sem-linked);
+  stroke-dasharray: 6 4;
+}
+.agraph-edge.done {
+  stroke: color-mix(in srgb, var(--sem-done) 62%, var(--rule));
+}
+.agraph-edge.failed {
+  stroke: var(--sem-urgent);
+  stroke-dasharray: 2 3;
+}
+
+/* Haloed in the window's own colour so the spokes it rides never cut through
+   the words. `paint-order` draws the stroke first, under the fill. Only ever
+   painted in the expanded overlay, whose surface is --raised. */
+.agraph-edge-label {
+  fill: var(--muted);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.01em;
+  stroke: var(--raised);
+  stroke-width: 4px;
+  stroke-linejoin: round;
+  paint-order: stroke fill;
+}
+
+.agraph-hub {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+.agraph-children {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* ---- a parallel band: the whole point of the feature ----
+   A group of children dispatched in ONE round. The rail + tag say "these are
+   simultaneous" structurally, so the concurrency survives a greyscale print,
+   a colour-blind reader, and the reduced-motion path where nothing pulses.
+
+   The band's wash is INK, not a marker: it is a grouping, not a state, and a
+   pink tint here would have read as "these ones are selected". 4% of warm
+   ivory lightens the charcoal sheet and 4% of charcoal greys the ivory one, so
+   one recipe is right in both themes. */
+.agraph-band {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  position: relative;
+}
+.agraph-band.parallel {
+  padding: 5px 6px 6px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--ink) 4%, transparent);
+}
+.agraph-band-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--fs-micro);
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+.agraph-band-rail {
+  width: 12px;
+  height: 2px;
+  border-radius: 2px 3px 2px 3px / 3px 2px 3px 2px;
+  background: var(--rule-strong);
+}
+
+/* ---- nodes ----
+   A drawn card. Opaque on purpose, and it is the one place in this file that
+   breaks the frames-on-one-sheet rule: the spokes are painted in a layer
+   UNDERNEATH the nodes, so a transparent node would have edges running
+   visibly through its own label. The card has to occlude what passes beneath
+   it, which is exactly the test paper.css sets for an opaque fill.
+
+   The border is --rule-strong, not --rule: every node is a button, and a
+   control boundary owes 3:1 (WCAG 1.4.11) where the pencil rule measures
+   2.55:1 in dark. */
+.agraph-node {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-width: 0;
+  text-align: start;
+  font: inherit;
+  padding: 5px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--rule-strong);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  position: relative;
+  z-index: 1;
+  transition:
+    border-color var(--dur-fast) var(--ease-pen),
+    background-color var(--dur-fast) var(--ease-pen),
+    box-shadow var(--dur-fast) var(--ease-pen);
+  /* New spokes fade+slide in as the roster grows. One pen stroke, once. */
+  animation: agraph-node-in var(--dur-slow) var(--ease-pen) both;
+}
+/* The hub is the root of the drawing, so it takes the full pen. */
+.agraph-node.hub {
+  background: var(--raised);
+  border-color: var(--sketch);
+  border-width: var(--stroke-w);
+  border-radius: var(--radius);
+}
+.agraph-node:hover {
+  border-color: var(--sketch);
+  background: var(--hover);
+}
+.agraph-node:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* Selected reads as circled: the pen on the ring, a wash inside, and a second
+   offset stroke so it looks gone-round-twice rather than merely tinted. */
+.agraph-node.selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent-fill) 14%, var(--surface));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 32%, transparent);
+}
+/* Queued. Dashed, like every provisional boundary in this system — and NOT
+   faded: the old 0.72 opacity dimmed the label as well as the frame, which
+   pushed a node's own name under the contrast floor to say something the
+   dashes and the ○ already say. */
+.agraph-node.pending {
+  border-style: dashed;
+}
+.agraph-node.running {
+  border-color: var(--sem-linked);
+  background: color-mix(in srgb, var(--sem-linked-fill) 12%, var(--surface));
+}
+.agraph-node.done {
+  border-color: color-mix(in srgb, var(--sem-done) 62%, var(--rule-strong));
+}
+.agraph-node.failed {
+  border-color: var(--sem-urgent);
+  border-width: var(--stroke-w);
+}
+@keyframes agraph-node-in {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+}
+
+.agraph-glyph {
+  flex: 0 0 auto;
+  width: 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--fs-meta);
+  color: var(--muted);
+}
+.agraph-node.done .agraph-glyph {
+  color: var(--sem-done);
+}
+.agraph-node.failed .agraph-glyph {
+  color: var(--sem-urgent);
+}
+.agraph-node.running .agraph-glyph {
+  color: var(--sem-linked);
+}
+
+/* The running mark: a rotating arc, so "busy" is legible as motion AND as a
+   distinct shape when motion is off (it falls back to a static ring). */
+.agraph-spin {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in srgb, var(--sem-linked) 30%, transparent);
+  border-top-color: var(--sem-linked);
+  animation: agraph-spin 0.75s linear infinite;
+}
+@keyframes agraph-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.agraph-node-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1 1 auto;
+  gap: 1px;
+}
+.agraph-node-label {
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  color: var(--text-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.agraph-node.pending .agraph-node-label {
+  font-weight: 500;
+  color: var(--text);
+}
+/* The instruction the hub handed this child. Lives in the card rather than on
+   the spoke, where it would be unreadable; the expanded view puts it back
+   on the edge, where there is room for it. */
+.agraph-node-sub {
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.agraph-canvas.roomy .agraph-node-sub {
+  display: none;
+}
+.agraph-elapsed {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- inspector ----
+   A note opened under the diagram, not a floating panel: it sits IN the
+   message, so it stays transparent and earns its identity from a drawn edge. */
+.agraph-inspect {
+  margin-top: var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  padding: var(--sp-2) var(--sp-3);
+  animation: agraph-node-in var(--dur) var(--ease-pen) both;
+}
+.agraph-inspect-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.agraph-inspect-title {
+  font-size: var(--fs-card);
+  font-weight: 600;
+  color: var(--text-strong);
+}
+/* An agent id — technical data, so the mono face, the way every path and
+   identifier in this product is set. */
+.agraph-inspect-id {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  background: var(--hover);
+  border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
+  padding: 1px 5px;
+}
+.agraph-inspect-status {
+  font-size: var(--fs-micro);
+  color: var(--muted);
+}
+.agraph-inspect-status.done {
+  color: var(--sem-done);
+}
+.agraph-inspect-status.failed {
+  color: var(--sem-urgent);
+}
+.agraph-inspect-status.running {
+  color: var(--sem-linked);
+}

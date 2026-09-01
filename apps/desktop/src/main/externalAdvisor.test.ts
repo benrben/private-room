@@ -31,11 +31,11 @@
  */
 
 import { EventEmitter } from "node:events";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createToolEffects, execTool, withRealAdvisorCli, type ExecToolDeps } from "./execTool.js";
 import {
@@ -872,6 +872,115 @@ describe("the production shell and working directory", () => {
     await expect(runExternalCli("codex-cli", [userMsg("hi")], { spawnFn })).rejects.toThrow(
       "Could not start codex-cli: spawn zsh ENOENT"
     );
+  });
+
+  it("reports a synchronously thrown spawn as a CLI startup failure", async () => {
+    const spawnFn: AdvisorSpawnFn = () => {
+      throw new Error("synchronous spawn failure");
+    };
+    await expect(runExternalCli("claude-cli", [userMsg("hi")], { spawnFn })).rejects.toThrow(
+      "Could not start claude-cli: synchronous spawn failure"
+    );
+  });
+
+  it("does not construct a bridge configuration for an unknown engine before rejecting it", async () => {
+    const bridge: AdvisorBridge = {
+      mcpConfigJson: () => {
+        throw new Error("unknown engines must not write bridge config");
+      },
+      mcpUrl: () => {
+        throw new Error("unknown engines must not read bridge URL");
+      },
+      token: "unused",
+    };
+    await expect(runExternalCli("unknown-cli", [userMsg("hi")], { bridge })).rejects.toThrow("Unknown engine");
+  });
+
+  it("treats a synchronous stdin write failure as the child result, not an uncaught error", async () => {
+    const spawnFn: AdvisorSpawnFn = () => {
+      const proc = new FakeProcess();
+      Object.assign(proc.stdin, {
+        end: () => {
+          queueMicrotask(() => {
+            proc.stdout.end(JSON.stringify({ type: "result", result: "write survived" }));
+            proc.stderr.end();
+            proc.emit("close", 0, null);
+          });
+          throw new Error("stdin closed before write");
+        },
+      });
+      return proc;
+    };
+    await expect(runExternalCli("claude-cli", [userMsg("hi")], { spawnFn })).resolves.toMatchObject({
+      text: "write survived",
+    });
+  });
+
+  it("stops a cancel watcher when the child closes synchronously before its first poll", async () => {
+    const spawnFn: AdvisorSpawnFn = () => {
+      const proc = new FakeProcess();
+      Object.assign(proc.stdin, {
+        end: () => {
+          proc.stdout.end(JSON.stringify({ type: "result", result: "closed first" }));
+          proc.stderr.end();
+          proc.emit("close", 0, null);
+        },
+      });
+      return proc;
+    };
+    await expect(
+      runExternalCli("claude-cli", [userMsg("hi")], { spawnFn, cancel: { load: () => false } })
+    ).resolves.toMatchObject({ text: "closed first" });
+  });
+
+  it("ignores a cancellation kill race after the child has already scheduled its close", async () => {
+    const spawnFn: AdvisorSpawnFn = () => {
+      const proc = new FakeProcess();
+      proc.kill = () => {
+        throw new Error("already exited");
+      };
+      queueMicrotask(() => {
+        proc.stdout.end(JSON.stringify({ type: "result", result: "kill race survived" }));
+        proc.stderr.end();
+        proc.emit("close", 0, null);
+      });
+      return proc;
+    };
+    await expect(
+      runExternalCli("claude-cli", [userMsg("hi")], { spawnFn, cancel: { load: () => true } })
+    ).resolves.toMatchObject({ text: "kill race survived" });
+  });
+
+  it("skips a failed attachment write and reports a scratch-directory cleanup failure", async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), "external-advisor-permissions-"));
+    const oldTmpDir = process.env.TMPDIR;
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let stagedDir: string | undefined;
+    process.env.TMPDIR = tmpRoot;
+    const sabotage = {
+      length: TINY_PNG_B64.length,
+      toString: () => {
+        const name = readdirSync(tmpRoot).find((entry) => entry.startsWith("arcelle-cli-"));
+        stagedDir = name === undefined ? undefined : path.join(tmpRoot, name);
+        if (stagedDir !== undefined) chmodSync(stagedDir, 0o500);
+        return TINY_PNG_B64;
+      },
+      valueOf: () => TINY_PNG_B64,
+    } as unknown as string;
+    try {
+      const { spawnFn } = recordingSpawner(
+        JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "ok" } })
+      );
+      await expect(runExternalCli("codex-cli", [userMsg("images", [TINY_PNG_B64, sabotage])], { spawnFn }))
+        .resolves.toMatchObject({ text: "ok" });
+      expect(error).toHaveBeenCalledWith(expect.stringContaining("could NOT remove the cloud-CLI scratch directory"));
+    } finally {
+      error.mockRestore();
+      if (stagedDir !== undefined && existsSync(stagedDir)) chmodSync(stagedDir, 0o700);
+      rmSync(tmpRoot, { recursive: true, force: true });
+      if (oldTmpDir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = oldTmpDir;
+    }
   });
 
   it("survives a child that dies before reading stdin (EPIPE is not an unhandled error event)", async () => {

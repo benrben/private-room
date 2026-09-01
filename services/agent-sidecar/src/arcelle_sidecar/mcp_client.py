@@ -61,6 +61,52 @@ class ToolSpec:
         }
 
 
+def _rpc_body(
+    method: str, request_id: int, params: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Build one JSON-RPC request, omitting parameters when absent."""
+    body: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
+    if params is not None:
+        body["params"] = params
+    return body
+
+
+def _require_rpc_success(response: httpx.Response, method: str) -> None:
+    """Raise this client's established errors for failed HTTP responses."""
+    if response.status_code == 401:
+        raise McpError("room bridge rejected the bearer token")
+    if response.status_code != 200:
+        raise McpError(f"room bridge returned HTTP {response.status_code} for {method}")
+
+
+def _rpc_payload(response: httpx.Response, method: str) -> Any:
+    """Decode the one JSON response required for a JSON-RPC request."""
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise McpError(f"room bridge sent a non-JSON reply to {method}") from exc
+
+
+def _raise_rpc_error(payload: Any) -> None:
+    """Turn a JSON-RPC error envelope into this client's protocol error."""
+    if not isinstance(payload, dict):
+        return
+    error = payload.get("error")
+    if not error:
+        return
+    message = error.get("message") if isinstance(error, dict) else str(error)
+    raise McpError(str(message))
+
+
+def _rpc_result(payload: Any, method: str) -> Any:
+    """Return a JSON-RPC result, rejecting malformed response envelopes."""
+    if not isinstance(payload, dict):
+        raise McpError(f"room bridge sent no result for {method}")
+    if "result" not in payload:
+        raise McpError(f"room bridge sent no result for {method}")
+    return payload["result"]
+
+
 class McpClient:
     """Minimal MCP client: initialize, tools/list, tools/call."""
 
@@ -107,25 +153,12 @@ class McpClient:
 
     async def _rpc(self, method: str, params: dict[str, Any] | None = None) -> Any:
         """One JSON-RPC call. Raises McpError on a protocol failure."""
-        body: dict[str, Any] = {"jsonrpc": "2.0", "id": next(self._ids), "method": method}
-        if params is not None:
-            body["params"] = params
+        body = _rpc_body(method, next(self._ids), params)
         resp = await self.http.post(self.url, json=body, headers=self._headers())
-        if resp.status_code == 401:
-            raise McpError("room bridge rejected the bearer token")
-        if resp.status_code != 200:
-            raise McpError(f"room bridge returned HTTP {resp.status_code} for {method}")
-        try:
-            payload = resp.json()
-        except ValueError as exc:  # pragma: no cover - malformed bridge reply
-            raise McpError(f"room bridge sent a non-JSON reply to {method}") from exc
-        if isinstance(payload, dict) and payload.get("error"):
-            err = payload["error"]
-            msg = err.get("message") if isinstance(err, dict) else str(err)
-            raise McpError(str(msg))
-        if not isinstance(payload, dict) or "result" not in payload:
-            raise McpError(f"room bridge sent no result for {method}")
-        return payload["result"]
+        _require_rpc_success(resp, method)
+        payload = _rpc_payload(resp, method)
+        _raise_rpc_error(payload)
+        return _rpc_result(payload, method)
 
     async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         """Fire a notification (no id). The bridge answers 202 with no body."""
@@ -184,25 +217,7 @@ class McpClient:
         """
         await self.ensure_ready()
         result = await self._rpc("tools/list")
-        raw = result.get("tools", []) if isinstance(result, dict) else []
-        tools: list[ToolSpec] = []
-        for t in raw:
-            if not isinstance(t, dict):
-                continue
-            name = t.get("name")
-            if not isinstance(name, str) or not name:
-                continue
-            schema = t.get("inputSchema")
-            if not isinstance(schema, dict):
-                schema = {"type": "object", "properties": {}}
-            tools.append(
-                ToolSpec(
-                    name=name,
-                    description=str(t.get("description") or ""),
-                    input_schema=schema,
-                )
-            )
-        return tools
+        return _tool_specs(result)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         """Run one tool. A tool failure arrives as ``isError: true``, not an exception."""
@@ -216,23 +231,71 @@ class McpClient:
         return _parse_tool_result(result)
 
 
+def _tool_specs(result: Any) -> list[ToolSpec]:
+    """Translate a tools/list result without letting malformed items leak through."""
+    raw = result.get("tools", []) if isinstance(result, dict) else []
+    tools: list[ToolSpec] = []
+    for tool in raw:
+        spec = _tool_spec(tool)
+        if spec is not None:
+            tools.append(spec)
+    return tools
+
+
+def _tool_spec(tool: Any) -> ToolSpec | None:
+    if not isinstance(tool, dict):
+        return None
+    name = tool.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    schema = tool.get("inputSchema")
+    if not isinstance(schema, dict):
+        schema = {"type": "object", "properties": {}}
+    return ToolSpec(
+        name=name,
+        description=str(tool.get("description") or ""),
+        input_schema=schema,
+    )
+
+
 def _parse_tool_result(result: Any) -> ToolResult:
     if not isinstance(result, dict):
         return ToolResult(text=str(result))
-    is_error = bool(result.get("isError", False))
+    texts, images = _tool_content(result.get("content", []) or [])
+    return ToolResult(
+        text="\n".join(texts),
+        is_error=bool(result.get("isError", False)),
+        images=images,
+    )
+
+
+def _tool_content(content: Any) -> tuple[list[str], list[str]]:
     texts: list[str] = []
     images: list[str] = []
-    for block in result.get("content", []) or []:
+    for block in content:
         if not isinstance(block, dict):
             continue
-        kind = block.get("type")
-        if kind == "text":
-            texts.append(str(block.get("text", "")))
-        elif kind == "image":
-            data = block.get("data")
-            if isinstance(data, str) and data:
-                images.append(data)
-    return ToolResult(text="\n".join(texts), is_error=is_error, images=images)
+        text = _text_content(block)
+        if text is not None:
+            texts.append(text)
+            continue
+        image = _image_content(block)
+        if image is not None:
+            images.append(image)
+    return texts, images
+
+
+def _text_content(block: dict[str, Any]) -> str | None:
+    if block.get("type") != "text":
+        return None
+    return str(block.get("text", ""))
+
+
+def _image_content(block: dict[str, Any]) -> str | None:
+    data = block.get("data")
+    if block.get("type") != "image" or not isinstance(data, str) or not data:
+        return None
+    return data
 
 
 __all__ = ["McpClient", "McpError", "ToolResult", "ToolSpec", "PROTOCOL_VERSION"]

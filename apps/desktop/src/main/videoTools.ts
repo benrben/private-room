@@ -167,344 +167,10 @@ import { mediaKind } from "./peaksTools.js";
 import { clampChars } from "./textClamp.js";
 import { removeQuietly, writePrivate } from "./textUtil.js";
 import type { OpenRoom } from "./turnEngine.js";
+import { MAX_IMPORT_BYTES, NO_ROOM_OPEN, ProbeVideoFn, decodeBase64Strict, frameName, isEmptyMediaMeta, isPng, probeBytes, probeVideoWithFfprobe, runAvconvert, trimmedName, validateSpan } from "./videoConversion.js";
+export { MIN_TRIM_SECS, validateSpan, stampForName, splitName, trimmedName, frameName, describeConvertError, runAvconvert, probeVideoWithFfprobe } from "./videoConversion.js";
+export type { ProbeVideoFn } from "./videoConversion.js";
 
-const execFileAsync = promisify(execFile);
-
-// ------------------------------------------------------------------ constants
-
-/** A clip shorter than this is not a cut, it is a mistake. Ported verbatim
- * from `video.rs`'s `MIN_TRIM_SECS`. */
-export const MIN_TRIM_SECS = 0.1;
-
-/** `commands/files.rs`'s own room-wide file-size ceiling (files.rs has no
- * Electron port yet in this tree — see this module's doc for the OCR/STT
- * lane gap, a different corner of that same unported file). Verbatim value;
- * a future `files.ts` port should absorb this copy rather than the reverse,
- * the same standing `peaksTools.ts` leaves for its own `mediaKind` copy. */
-const MAX_IMPORT_BYTES = 1_000_000_000;
-
-/** `AppState::with_room`'s own refusal, spelled the way every other port in
- * this tree already spells it. */
-const NO_ROOM_OPEN = "No room is open.";
-
-// -------------------------------------------------------------- pure helpers
-
-/** Rust's `{:.1}` fixed-precision float format — one digit after the point.
- * Every value this module formats this way comes from a UI-supplied seconds
- * count or an already-probed duration, never a value near a half-ULP
- * rounding boundary, so `toFixed`'s rounding rule (vs. Rust's) never
- * disagrees for any input either side of this port actually produces. */
-function fmt1(n: number): string {
-  return n.toFixed(1);
-}
-
-/**
- * `[start, end)` must sit somewhere the cut means something. Ported verbatim
- * from `video.rs`'s `validate_span`; throws instead of returning
- * `Result<(f64, f64), String>`, this port's house style.
- *
- * An unknown `duration` (`null`) is NOT a reason to refuse — it only removes
- * the upper bound; a tail that overruns a KNOWN duration is clamped rather
- * than refused (the "drag to the end" case), because the user's intent there
- * is unambiguous.
- */
-export function validateSpan(
-  start: number,
-  end: number,
-  duration: number | null
-): [number, number] {
-  if (!Number.isFinite(start) || !Number.isFinite(end)) {
-    throw new Error("The trim points aren't real numbers.");
-  }
-  if (start < 0) {
-    throw new Error("A trim can't start before the beginning of the video.");
-  }
-  if (end - start < MIN_TRIM_SECS) {
-    throw new Error(
-      `That span is too short to trim — the end has to be at least ${MIN_TRIM_SECS}s after the start.`
-    );
-  }
-  if (duration !== null) {
-    if (start >= duration) {
-      throw new Error(
-        `The trim starts at ${fmt1(start)}s but the video is only ${fmt1(duration)}s long.`
-      );
-    }
-    return [start, Math.min(end, duration)];
-  }
-  return [start, end];
-}
-
-function pad2(n: number): string {
-  return String(n).padStart(2, "0");
-}
-
-/** Seconds → the "1-23" form used inside a file name (colons are legal in a
- * room name but read as a Finder path separator on export). Ported verbatim
- * from `video.rs`'s `stamp_for_name`. */
-export function stampForName(secs: number): string {
-  const s = Math.round(Math.max(secs, 0));
-  if (s >= 3600) {
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
-    return `${h}-${pad2(m)}-${pad2(sec)}`;
-  }
-  const m = Math.floor(s / 60);
-  const sec = s % 60;
-  return `${m}-${pad2(sec)}`;
-}
-
-/**
- * A file name split into (stem, extension), KEEPING the extension's own
- * case. NOT `editMatchExtraction.ts`'s `extensionOf`: that lowercases, and
- * stripping a lowercased suffix off the real name silently fails to match a
- * camera's `IMG_0042.MOV` — the bug this module's own Rust doc comment
- * names by the exact garbled name it used to produce. Ported verbatim from
- * `video.rs`'s `split_name`.
- */
-export function splitName(name: string): [string, string] {
-  const idx = name.lastIndexOf(".");
-  // A leading dot (idx === 0) is not an extension — ".hidden" is the whole
-  // name — and a trailing dot (idx === name.length - 1) leaves no extension
-  // either; `rsplit_once` requires both halves non-empty.
-  if (idx > 0 && idx < name.length - 1) {
-    return [name.slice(0, idx), name.slice(idx + 1)];
-  }
-  return [name, ""];
-}
-
-/** `talk.mp4` + 7.3s-19.0s -> `talk (trim 0-07 to 0-19).mp4`. Ported
- * verbatim from `video.rs`'s `trimmed_name`. */
-export function trimmedName(name: string, start: number, end: number): string {
-  const [stem, ext] = splitName(name);
-  const a = stampForName(start);
-  const b = stampForName(end);
-  return ext === "" ? `${stem} (trim ${a} to ${b})` : `${stem} (trim ${a} to ${b}).${ext}`;
-}
-
-/** `talk.mp4` at 83.4s -> `talk @ 1-23.png`. Ported verbatim from
- * `video.rs`'s `frame_name`. */
-export function frameName(name: string, secs: number): string {
-  const [stem] = splitName(name);
-  return `${stem} @ ${stampForName(secs)}.png`;
-}
-
-/** What went wrong with the cut, said in a sentence. Ported verbatim from
- * `video.rs`'s `describe_convert_error`. */
-export function describeConvertError(err: string): string {
-  if (err.includes("NotFound") || err.includes("No such file or directory")) {
-    return "This Mac has no /usr/bin/avconvert, which is the tool that cuts video here — " +
-      "nothing was trimmed.";
-  }
-  return `The video couldn't be trimmed: ${err}`;
-}
-
-/** `MediaMeta::is_empty()` (`meta == MediaMeta::default()`) — every field
- * independently unknown. Ported verbatim from `media_probe.rs`. */
-function isEmptyMediaMeta(m: MediaMeta): boolean {
-  return (
-    m.durationSecs === null &&
-    m.width === null &&
-    m.height === null &&
-    m.videoCodec === null &&
-    m.frameRate === null &&
-    m.bitrateKbps === null &&
-    m.hasAudio === null &&
-    m.audioCodec === null
-  );
-}
-
-// -------------------------------------------------------------- base64/png
-
-/** `base64::engine::general_purpose::STANDARD.decode` — strict: standard
- * alphabet, canonical padding, no whitespace. A FOURTH local copy of the
- * same strict decoder `chatCmds.ts`/`externalAdvisor.ts`/`skillsCmds.ts`
- * each already carry — see `chatCmds.ts`'s module doc for why Node's own
- * lenient `Buffer.from(s, "base64")` used alone is unsafe here (it never
- * throws, which would turn a corrupt paste into a corrupt file silently
- * written into the room). */
-function decodeBase64Strict(s: string): Buffer | null {
-  if (s.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(s)) {
-    return null;
-  }
-  return Buffer.from(s, "base64");
-}
-
-/** The 8-byte PNG signature. `png.starts_with(b"\x89PNG\r\n\x1a\n")`. */
-const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-
-function isPng(bytes: Buffer): boolean {
-  return bytes.length >= PNG_MAGIC.length && bytes.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC);
-}
-
-// ---------------------------------------------------------- real: avconvert
-
-/** One attempt with one preset. */
-interface AvconvertAttempt {
-  success: boolean;
-  stderrText: string;
-  statusText: string;
-}
-
-function spawnFailureText(err: NodeJS.ErrnoException): string {
-  // Node's spawn-level failure carries a STRING `code` ("ENOENT", …), unlike
-  // a completed-but-nonzero exit (a NUMBER `code`) — see `runOnePreset`. This
-  // mirrors what Rust's own `io::Error` Debug-prints for the same failure
-  // (`Os { code: 2, kind: NotFound, message: "No such file or directory" }`)
-  // closely enough for `describeConvertError`'s substring check to fire.
-  if (err.code === "ENOENT") {
-    return "No such file or directory (os error 2)";
-  }
-  return err.message ?? String(err.code ?? "spawn failed");
-}
-
-/**
- * Run `/usr/bin/avconvert` once with `preset`. Resolves `{success: true}`
- * only on a clean exit (the caller still checks `dst` really exists, exactly
- * as `run_avconvert` does); resolves `{success: false, …}` with whatever
- * stderr/status came back for a completed-but-failed run; THROWS only for a
- * spawn-level failure (the binary itself could not be found/run) — mirroring
- * Rust's `Command::output()`'s own split between "the OS could not even run
- * this" (`io::Error`, the `?` after `.output()`) and "it ran and told us it
- * failed" (`Output` with a non-success `status`).
- */
-async function runOnePreset(
-  preset: string,
-  src: string,
-  dst: string,
-  start: number,
-  dur: number
-): Promise<AvconvertAttempt> {
-  const args = [
-    "-p",
-    preset,
-    "-s",
-    src,
-    "-o",
-    dst,
-    "--start",
-    String(start),
-    "--duration",
-    String(dur),
-    "--replace",
-  ];
-  try {
-    await execFileAsync("/usr/bin/avconvert", args, {
-      encoding: "utf8",
-      maxBuffer: 10 * 1024 * 1024,
-    });
-    return { success: true, stderrText: "", statusText: "exit code: 0" };
-  } catch (e) {
-    const err = e as NodeJS.ErrnoException & {
-      stderr?: string;
-      signal?: NodeJS.Signals | null;
-    };
-    if (typeof err.code === "string") {
-      throw new Error(describeConvertError(spawnFailureText(err)));
-    }
-    const stderrText = typeof err.stderr === "string" ? err.stderr : "";
-    const statusText =
-      typeof err.code === "number"
-        ? `exit code: ${err.code}`
-        : err.signal
-          ? `signal: ${err.signal}`
-          : "unknown exit";
-    return { success: false, stderrText, statusText };
-  }
-}
-
-/**
- * Cut `[start, start+dur)` out of `src` into `dst` with the OS's own
- * converter. `PresetPassthrough` copies the encoded samples (no re-encode,
- * no generation loss); a container it refuses falls back to a real
- * re-encode (`PresetHighestQuality`). Ported verbatim from `video.rs`'s
- * `run_avconvert` — a REAL subprocess port, not a stub; see this module's
- * doc for why.
- *
- * Throws {@link describeConvertError}'s message on failure — including
- * IMMEDIATELY on a spawn-level failure (never tries the second preset),
- * mirroring Rust's own `?` after `.output()`.
- */
-export async function runAvconvert(
-  src: string,
-  dst: string,
-  start: number,
-  dur: number
-): Promise<void> {
-  let last = "";
-  for (const preset of ["PresetPassthrough", "PresetHighestQuality"]) {
-    const attempt = await runOnePreset(preset, src, dst, start, dur);
-    if (attempt.success && fs.existsSync(dst)) {
-      return;
-    }
-    last = clampChars(attempt.stderrText, 300).trim();
-    if (last === "") {
-      last = `${preset} exited with ${attempt.statusText}`;
-    }
-  }
-  throw new Error(describeConvertError(last));
-}
-
-// -------------------------------------------------------- real: media_probe
-
-/** `media_probe::probe_path(path) -> Option<MediaMeta>` — the injectable
- * engine seam. Defaults to {@link probeVideoWithFfprobe}, a REAL read; kept
- * injectable so a future AVFoundation/PyObjC bridge can replace the engine
- * without touching a caller. See this module's doc. */
-export type ProbeVideoFn = (path: string) => Promise<MediaMeta | null>;
-
-/**
- * The REAL default {@link ProbeVideoFn}: `mediaProbe.ts`'s {@link probePath},
- * this migration's full port of `media_probe.rs` over `ffprobe`.
- *
- * Written as a named wrapper rather than passing `probePath` itself, so this
- * file's default never silently acquires `probePath`'s SECOND parameter (its
- * own injectable `ProbeEngine`) — `ProbeVideoFn` is one argument by contract,
- * and a two-argument default would let a caller's stray second argument reach
- * a seam it knows nothing about.
- *
- * `null` for a file no engine could read — including a Mac with no `ffprobe`
- * installed — which is `media_probe.rs`'s own `None`, not a swallowed error.
- */
-export const probeVideoWithFfprobe: ProbeVideoFn = (p) => probePath(p);
-
-/**
- * Stage `bytes` to an owner-only temp file (AVFoundation dispatches on the
- * file EXTENSION as well as the container's own magic, so the temp copy
- * keeps it, and so does `ffprobe`), probe it, and remove the temp file on
- * every exit path — success, `probe` resolving `null`, or `probe` throwing.
- * Ported verbatim from `media_probe.rs`'s `probe_bytes`, with the engine read
- * taken as the injected `probe` (see this module's doc).
- *
- * A rejection from `probe` PROPAGATES. The real default never rejects (it is
- * `Option`-shaped end to end, like Rust's own `probe_bytes`), so this only
- * concerns an INJECTED prober; letting it through rather than folding it into
- * `null` keeps "this engine failed" distinguishable from "this engine looked
- * and found nothing."
- */
-async function probeBytes(
-  bytes: Buffer,
-  ext: string,
-  probe: ProbeVideoFn
-): Promise<MediaMeta | null> {
-  if (bytes.length === 0) {
-    return null;
-  }
-  const stem = randomUUID();
-  const file = path.join(
-    os.tmpdir(),
-    ext === "" ? `arcelle-probe-${stem}` : `arcelle-probe-${stem}.${ext}`
-  );
-  try {
-    if (!writePrivate(file, bytes)) {
-      return null;
-    }
-    return await probe(file);
-  } finally {
-    removeQuietly(file);
-  }
-}
 
 // -------------------------------------------------------------- room access
 
@@ -603,11 +269,20 @@ export interface JobMeta {
  * this type exactly, and a promise-returning function does too. */
 export type EnqueueSttFn = (job: JobMeta) => void;
 
+/** Injectable native conversion boundary used by focused behavior tests. */
+export type ConvertVideoFn = (
+  source: string,
+  destination: string,
+  startSecs: number,
+  durationSecs: number,
+) => Promise<void>;
+
 /** Every optional native/side-effect dependency `video_trim` and
  * `save_video_frame` take, plus `probe_video_meta`'s own — bundled once so
  * {@link registerVideoIpc} can wire all three commands from one deps bag. */
 export interface VideoIpcDeps {
   probe?: ProbeVideoFn;
+  convert?: ConvertVideoFn;
   emit?: EmitFn;
   enqueueStt?: EnqueueSttFn;
 }
@@ -634,12 +309,9 @@ export async function probeVideoMeta(
   probe: ProbeVideoFn = probeVideoWithFfprobe
 ): Promise<MediaMeta | null> {
   const open = requireRoom(room);
-  const cachedJson = getMediaMeta(open.db, id);
-  if (cachedJson !== null) {
-    const cached = parseCachedMediaMeta(cachedJson);
-    if (cached !== null) {
-      return cached;
-    }
+  const cached = cachedMediaMeta(open, id);
+  if (cached !== null) {
+    return cached;
   }
 
   const staged = await takeMediaBytes(room, id);
@@ -647,149 +319,39 @@ export async function probeVideoMeta(
   if (probed === null) {
     return null;
   }
-  const json = JSON.stringify(probed);
+  cacheProbedMediaMeta(room, staged, id, probed);
+  return probed;
+}
+
+function cachedMediaMeta(open: OpenRoom, id: string): MediaMeta | null {
+  const cachedJson = getMediaMeta(open.db, id);
+  return cachedJson === null ? null : parseCachedMediaMeta(cachedJson);
+}
+
+function roomStillMatches(room: RoomSource, staged: StagedVideoBytes, open: OpenRoom | null): boolean {
+  return open !== null && open.path === staged.roomPath && room.roomEpoch() === staged.epoch;
+}
+
+function cacheProbedMediaMeta(
+  room: RoomSource,
+  staged: StagedVideoBytes,
+  id: string,
+  probed: MediaMeta
+): void {
   // Best-effort write-back, matching Rust's `let _ = state.with_room(|room|
   // { if room.path == room_path && state.room_epoch() == epoch { ... } })` —
   // the room may have closed or rolled back while the probe ran.
   try {
     const after = room.currentRoom();
-    if (after !== null && after.path === staged.roomPath && room.roomEpoch() === staged.epoch) {
-      setMediaMeta(after.db, id, json);
+    if (after !== null && roomStillMatches(room, staged, after)) {
+      setMediaMeta(after.db, id, JSON.stringify(probed));
     }
   } catch {
     // Swallowed deliberately — see doc above.
   }
-  return probed;
 }
+import { assertTrimmedClipSize, cachedTrimDuration, enqueueTrimmedVideo, mediaMetaJson, parseCachedMediaMeta, performTrim, requirePinnedTrimRoom, saveTrimmedVideo, trimProbe } from "./videoTrimSupport.js";
 
-/** One field's expected JSON type, per {@link MediaMeta}'s own declared
- * shape. */
-type FieldKind = "number" | "string" | "boolean";
-
-/** A present-and-correctly-typed field reads as its value (`null` counts as
- * present and correct — every `MediaMeta` field is optional); a present
- * field of the WRONG type fails the whole parse, mirroring what
- * `serde_json::from_str::<MediaMeta>` would refuse; an ABSENT field reads as
- * `null`, mirroring serde's own default treatment of a missing `Option<T>`
- * field. */
-function readField(
-  o: Record<string, unknown>,
-  key: string,
-  kind: FieldKind
-): { ok: true; value: number | string | boolean | null } | { ok: false } {
-  if (!(key in o) || o[key] === null || o[key] === undefined) {
-    return { ok: true, value: null };
-  }
-  const v = o[key];
-  if (kind === "number" && typeof v === "number") return { ok: true, value: v };
-  if (kind === "string" && typeof v === "string") return { ok: true, value: v };
-  if (kind === "boolean" && typeof v === "boolean") return { ok: true, value: v };
-  return { ok: false };
-}
-
-/** `serde_json::from_str::<MediaMeta>(&json).ok()` — `null` for malformed
- * JSON, a non-object JSON value, or any field of the wrong declared type. */
-function parseCachedMediaMeta(json: string): MediaMeta | null {
-  let obj: unknown;
-  try {
-    obj = JSON.parse(json);
-  } catch {
-    return null;
-  }
-  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
-    return null;
-  }
-  const o = obj as Record<string, unknown>;
-  const durationSecs = readField(o, "durationSecs", "number");
-  const width = readField(o, "width", "number");
-  const height = readField(o, "height", "number");
-  const videoCodec = readField(o, "videoCodec", "string");
-  const frameRate = readField(o, "frameRate", "number");
-  const bitrateKbps = readField(o, "bitrateKbps", "number");
-  const hasAudio = readField(o, "hasAudio", "boolean");
-  const audioCodec = readField(o, "audioCodec", "string");
-  if (
-    !durationSecs.ok ||
-    !width.ok ||
-    !height.ok ||
-    !videoCodec.ok ||
-    !frameRate.ok ||
-    !bitrateKbps.ok ||
-    !hasAudio.ok ||
-    !audioCodec.ok
-  ) {
-    return null;
-  }
-  return {
-    durationSecs: durationSecs.value as number | null,
-    width: width.value as number | null,
-    height: height.value as number | null,
-    videoCodec: videoCodec.value as string | null,
-    frameRate: frameRate.value as number | null,
-    bitrateKbps: bitrateKbps.value as number | null,
-    hasAudio: hasAudio.value as boolean | null,
-    audioCodec: audioCodec.value as string | null,
-  };
-}
-
-// ------------------------------------------------------------------- trim
-
-/** `run_avconvert` + `media_probe::probe_path` under one temp-file lifetime,
- * exactly `video_trim`'s own `spawn_blocking` closure. Ported verbatim,
- * including the "the source AND the result may not outlive the call as
- * plaintext" guarantee (`finally` removes both on EVERY exit path — a
- * staging failure, a failed cut, a failed read-back, or a thrown `probe`
- * rejection all clean up the same way).
- *
- * DEVIATION, same one `previewTools.ts`/`peaksTools.ts` document for their
- * own injected native seam: Rust's outer `.map_err(|e| format!("The trim
- * could not be started: {e}"))` wraps only a `spawn_blocking` JOIN failure
- * (the blocking task PANICKED) — a layer with no JS analogue. This function's
- * own thrown errors (a staging failure, {@link runAvconvert}'s own message,
- * or a failed read-back) are left UNWRAPPED end to end; {@link videoTrim}
- * does not re-wrap them either. */
-async function performTrim(
-  bytes: Buffer,
-  ext: string,
-  start: number,
-  end: number,
-  probe: ProbeVideoFn
-): Promise<{ clip: Buffer; clipMeta: MediaMeta | null }> {
-  const stamp = randomUUID();
-  const suffix = ext === "" ? "mp4" : ext;
-  const srcPath = path.join(os.tmpdir(), `arcelle-trim-in-${stamp}.${suffix}`);
-  const dstPath = path.join(os.tmpdir(), `arcelle-trim-out-${stamp}.${suffix}`);
-  try {
-    if (!writePrivate(srcPath, bytes)) {
-      throw new Error("The video couldn't be staged: the temp file could not be created.");
-    }
-    // A failed cut propagates straight through — `probe_path`/`fs.read` are
-    // never reached, exactly like Rust's `run_avconvert(...).and_then(...)`.
-    await runAvconvert(srcPath, dstPath, start, end - start);
-
-    // Best-effort, matching Rust's own `Option`-returning `probe_path`:
-    // neither a `null` nor a rejection from an INJECTED prober may fail a
-    // real, successful cut.
-    let clipMeta: MediaMeta | null = null;
-    try {
-      clipMeta = await probe(dstPath);
-    } catch {
-      clipMeta = null;
-    }
-
-    let clip: Buffer;
-    try {
-      clip = await fsp.readFile(dstPath);
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      throw new Error(`The trimmed video couldn't be read back: ${message}`);
-    }
-    return { clip, clipMeta };
-  } finally {
-    removeQuietly(srcPath);
-    removeQuietly(dstPath);
-  }
-}
 
 /**
  * Port of `commands::video_trim`. Cut `[startSecs, endSecs)` out of a video
@@ -808,8 +370,7 @@ export async function videoTrim(
   deps: VideoIpcDeps = {}
 ): Promise<FileMeta> {
   const staged = await takeMediaBytes(room, id);
-  const cachedJson = getMediaMeta(requireRoom(room).db, id);
-  const knownDuration = cachedJson !== null ? parseCachedMediaMeta(cachedJson)?.durationSecs ?? null : null;
+  const knownDuration = cachedTrimDuration(room, id);
   const [start, end] = validateSpan(startSecs, endSecs, knownDuration);
 
   const newName = trimmedName(staged.name, start, end);
@@ -818,54 +379,24 @@ export async function videoTrim(
     staged.ext,
     start,
     end,
-    deps.probe ?? probeVideoWithFfprobe
+    trimProbe(deps),
+    deps.convert ?? runAvconvert,
   );
-
-  if (clip.length === 0) {
-    throw new Error("The trim produced an empty file — nothing was saved.");
-  }
-  if (clip.length > MAX_IMPORT_BYTES) {
-    throw new Error(
-      `The trimmed clip is ${Math.floor(clip.length / (1024 * 1024))} MB — larger than the ` +
-        `${Math.floor(MAX_IMPORT_BYTES / (1024 * 1024))} MB limit for a room file.`
-    );
-  }
-
-  const metaJson =
-    clipMeta !== null && !isEmptyMediaMeta(clipMeta) ? JSON.stringify(clipMeta) : null;
+  assertTrimmedClipSize(clip);
+  const metaJson = mediaMetaJson(clipMeta);
 
   // The room-pin recheck, done BY HAND — see this module's doc's
   // "ROOM-PIN DISCIPLINE" note. Unlike probe_video_meta's cache write-back,
   // this one is NOT best-effort: a mismatch here is a hard refusal, matching
   // Rust's own `return Err(...)` (not a `let _ =`).
-  const open = room.currentRoom();
-  if (open === null || open.path !== staged.roomPath || room.roomEpoch() !== staged.epoch) {
-    throw new Error("The room changed while the video was being trimmed — nothing was saved.");
-  }
-
-  // Several trims of one video are normal; disambiguate.
-  const finalName = availableName(open.db, newName);
-  const file = await createRoomFile(open, finalName, staged.mime, clip, null, "generated");
-  if (metaJson !== null) {
-    setMediaMeta(open.db, file.id, metaJson);
-  }
+  const open = requirePinnedTrimRoom(room, staged);
+  const file = await saveTrimmedVideo(open, staged, newName, clip, metaJson);
 
   emitSafely(deps.emit, "room-files-changed", undefined);
 
   // Best-effort, matching Rust's own internal channel-send error swallowing
   // (`files.rs`'s `enqueue_stt`) — see this module's doc.
-  try {
-    deps.enqueueStt?.({
-      id: file.id,
-      name: file.name,
-      mime: staged.mime,
-      ext: staged.ext,
-      roomPath: staged.roomPath,
-      epoch: staged.epoch,
-    });
-  } catch {
-    // Swallowed deliberately — see doc above.
-  }
+  enqueueTrimmedVideo(deps, file, staged);
 
   return file;
 }
@@ -958,3 +489,5 @@ export function registerVideoIpc(
       saveVideoFrameInRoom(room, args.id, args.pngB64, args.atSecs, deps.emit)
   );
 }
+
+export { MAX_IMPORT_BYTES, StagedVideoBytes, cachedMediaMeta, isEmptyMediaMeta, requireRoom, roomStillMatches };

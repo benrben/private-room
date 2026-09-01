@@ -67,135 +67,25 @@
  * to split first than the shipped app would.
  */
 
+import {
+  argmaxLastTie,
+  asWholeNonNegative,
+  charCount,
+  clamp,
+  divCeil,
+  isAsciiDigit,
+  isWhitespaceChar,
+  rustLines,
+  toAsciiUppercase,
+  trimEndMatches,
+  trimMatches,
+  trimStartMatches,
+} from "./shotsplitText.js";
+
 /** The most shots one script may be cut into. Twenty minutes of finished
  * video at 15 seconds a shot, and eighty paid generations — far past any real
  * episode, low enough that a mistyped number cannot queue a bill. */
 export const MAX_PARTS = 80;
-
-function clamp(n: number, lo: number, hi: number): number {
-  return Math.min(Math.max(n, lo), hi);
-}
-
-/**
- * Rust's `as usize`/`as u32` — a SATURATING, TRUNCATING float-to-integer cast
- * (`NaN` → 0, negatives → 0, fractions truncated toward zero).
- *
- * `split_script(script: &str, parts: usize)` and `parts_for(total_seconds:
- * u32, per_shot: u32)` cannot be handed a `NaN`, a negative or a fraction:
- * Rust's type system already did this cast at the caller (`story.rs`'s
- * `(minutes.max(0.0) * 60.0).round() as u32`). TypeScript's `number` carries
- * all three straight into the body, and each does real damage:
- *
- *   - `splitScript("", NaN)` reached `new Array(NaN)` and threw
- *     `RangeError: Invalid array length` — a CRASH where Rust returns `[""]`.
- *   - `partsFor(NaN, 15)` answered `NaN` instead of Rust's `1`.
- *   - `splitScript(s, 2.7)` produced THREE shots; a `usize` cannot be 2.7.
- *
- * This is reachable, not theoretical: `storyPlanSplit` passes its own
- * `minutes`/`secondsEach` through to both, and Electron's IPC
- * (`structuredClone`) can carry a `NaN` from the renderer where Tauri's JSON
- * argument decoding never could. Doing the cast HERE, at the two entry points
- * whose Rust signatures are integer-typed, is the faithful translation of
- * that signature rather than a new invention.
- */
-function asWholeNonNegative(n: number): number {
-  return Number.isNaN(n) ? 0 : Math.max(0, Math.trunc(n));
-}
-
-/** `usize::div_ceil` for the two call sites below (both non-negative in every
- * real call: `total_seconds`/`per_shot` are u32 in Rust, and this file's own
- * callers never pass negatives). */
-function divCeil(a: number, b: number): number {
-  return Math.floor((a + b - 1) / b);
-}
-
-/** `str.chars().count()` — a Unicode scalar-value count, NOT `string.length`
- * (which counts UTF-16 code units and would over-count anything outside the
- * BMP). */
-function charCount(s: string): number {
-  return Array.from(s).length;
-}
-
-/** `char::is_whitespace` (Unicode White_Space) — see the module doc's
- * "UNICODE FIDELITY" note. */
-function isWhitespaceChar(c: string): boolean {
-  return /\s/u.test(c);
-}
-
-/** `c.is_ascii_digit()`. */
-function isAsciiDigit(c: string): boolean {
-  return c.length === 1 && c >= "0" && c <= "9";
-}
-
-/** `char::to_ascii_uppercase` applied to a whole string, character by
- * character — ASCII letters only, everything else (accents, Hebrew, an em
- * dash) passed through untouched. Deliberately NOT `.toUpperCase()`, which
- * would uppercase far more than Rust's source does. */
-function toAsciiUppercase(s: string): string {
-  return Array.from(s)
-    .map((c) => {
-      const code = c.codePointAt(0)!;
-      return code >= 97 && code <= 122 ? String.fromCharCode(code - 32) : c;
-    })
-    .join("");
-}
-
-/** `str::trim_matches(pred)` — trims from BOTH ends. */
-function trimMatches(s: string, pred: (c: string) => boolean): string {
-  const chars = Array.from(s);
-  let start = 0;
-  let end = chars.length;
-  while (start < end && pred(chars[start]!)) start += 1;
-  while (end > start && pred(chars[end - 1]!)) end -= 1;
-  return chars.slice(start, end).join("");
-}
-
-/** `str::trim_start_matches(pred)` — trims from the START only. */
-function trimStartMatches(s: string, pred: (c: string) => boolean): string {
-  const chars = Array.from(s);
-  let start = 0;
-  while (start < chars.length && pred(chars[start]!)) start += 1;
-  return chars.slice(start).join("");
-}
-
-/** `str::trim_end_matches(pred)` — trims from the END only. */
-function trimEndMatches(s: string, pred: (c: string) => boolean): string {
-  const chars = Array.from(s);
-  let end = chars.length;
-  while (end > 0 && pred(chars[end - 1]!)) end -= 1;
-  return chars.slice(0, end).join("");
-}
-
-/**
- * `str::lines()` — see the module doc's "UNICODE FIDELITY" paragraph for why
- * this is not a plain `.split("\n")`: an empty string has ZERO lines (not
- * one), a trailing `\n` produces no extra empty entry, and each line has any
- * trailing `\r` stripped.
- */
-function rustLines(text: string): string[] {
-  if (text === "") return [];
-  const parts = text.split("\n");
-  if (text.endsWith("\n")) {
-    parts.pop();
-  }
-  return parts.map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
-}
-
-/** The index of the maximum value in `values`, ties won by the LAST index —
- * `Iterator::max_by_key`'s documented tie-break, matched with `>=`. Callers
- * must pass a non-empty array (mirrors the Rust call site's own
- * `.expect("non-empty")`). */
-function argmaxLastTie(values: readonly number[]): number {
-  let bestIndex = 0;
-  let bestValue = -Infinity;
-  for (let i = 0; i < values.length; i += 1) {
-    if (values[i]! >= bestValue) {
-      bestValue = values[i]!;
-      bestIndex = i;
-    }
-  }
-  return bestIndex;
-}
 
 // --------------------------------------------------------------- sentences
 
@@ -204,6 +94,20 @@ function argmaxLastTie(values: readonly number[]): number {
  * beat. */
 function isBoundary(c: string): boolean {
   return c === "." || c === "!" || c === "?" || c === "…" || c === "\n";
+}
+
+function isSentenceTail(c: string): boolean {
+  return isBoundary(c) || c === " " || c === "\t" || c === '"' || c === "”";
+}
+
+function boundaryTail(chars: readonly string[], from: number) {
+  let at = from;
+  let text = "";
+  while (at < chars.length && isSentenceTail(chars[at]!)) {
+    text += chars[at]!;
+    at += 1;
+  }
+  return { at, text };
 }
 
 /**
@@ -217,24 +121,18 @@ export function sentences(text: string): string[] {
   const out: string[] = [];
   let current = "";
   const chars = Array.from(text);
-  let i = 0;
-  while (i < chars.length) {
-    const c = chars[i]!;
+  let at = 0;
+  while (at < chars.length) {
+    const c = chars[at]!;
     current += c;
-    i += 1;
+    at += 1;
     if (!isBoundary(c)) continue;
     // Run on through the rest of a `?!` or `...` cluster and the space after
     // it, so the next sentence starts at a word rather than at a stray space
     // or a second full stop.
-    while (i < chars.length) {
-      const next = chars[i]!;
-      if (isBoundary(next) || next === " " || next === "\t" || next === '"' || next === "”") {
-        current += next;
-        i += 1;
-      } else {
-        break;
-      }
-    }
+    const tail = boundaryTail(chars, at);
+    current += tail.text;
+    at = tail.at;
     out.push(current);
     current = "";
   }
@@ -300,6 +198,85 @@ export function splitWords(text: string, n: number): string[] {
   return out;
 }
 
+function splitDominatingPiece(piece: string, target: number, parts: number) {
+  const length = charCount(piece);
+  const count = divCeil(length, target);
+  return count > 1 && length > target
+    ? splitWords(piece, Math.min(count, parts))
+    : [piece];
+}
+
+function splitDominatingPieces(
+  pieces: string[],
+  target: number,
+  parts: number,
+) {
+  const units: string[] = [];
+  for (const piece of pieces)
+    units.push(...splitDominatingPiece(piece, target, parts));
+  return units;
+}
+
+function growUnitsToCount(units: string[], parts: number) {
+  while (units.length < parts) {
+    const index = argmaxLastTie(units.map((unit) => charCount(unit)));
+    const longest = units[index]!;
+    units.splice(index, 1, ...splitWords(longest, 2));
+  }
+}
+
+function shouldCloseBeforeUnit(
+  current: string,
+  unit: string,
+  used: number,
+  total: number,
+  completed: number,
+  remainingUnits: number,
+  remainingSlots: number,
+  parts: number,
+) {
+  if (current === "" || remainingSlots <= 1) return false;
+  if (remainingUnits === remainingSlots) return true;
+  const boundary = Math.floor((total * (completed + 1)) / parts);
+  const after = used + charCount(unit);
+  return Math.abs(used - boundary) <= Math.abs(after - boundary);
+}
+
+function packUnits(units: string[], total: number, parts: number) {
+  const out: string[] = [];
+  let current = "";
+  let used = 0;
+  for (let index = 0; index < units.length; index += 1) {
+    const unit = units[index]!;
+    if (
+      shouldCloseBeforeUnit(
+        current,
+        unit,
+        used,
+        total,
+        out.length,
+        units.length - index,
+        parts - out.length,
+        parts,
+      )
+    ) {
+      out.push(current);
+      current = "";
+    }
+    current += unit;
+    used += charCount(unit);
+  }
+  return { current, out };
+}
+
+function finishParts(out: string[], current: string, parts: number): string[] {
+  if (current !== "" || out.length < parts) out.push(current);
+  // `packUnits` refuses to close once one slot remains, so it produces at
+  // most `parts - 1` completed pieces; the final push above cannot overflow.
+  while (out.length < parts) out.push("");
+  return out.map((piece) => piece.trim());
+}
+
 /**
  * Cut `script` into exactly `parts` shots. Ported from `split_script`.
  *
@@ -311,87 +288,18 @@ export function splitWords(text: string, n: number): string[] {
 export function splitScript(script: string, partsArg: number): string[] {
   // `parts: usize` in Rust — see {@link asWholeNonNegative}.
   const parts = clamp(asWholeNonNegative(partsArg), 1, MAX_PARTS);
-  if (parts === 1) {
-    return [script.trim()];
-  }
-
+  if (parts === 1) return [script.trim()];
   const pieces = sentences(script);
-  if (pieces.length === 0) {
-    return new Array(parts).fill("");
-  }
-
-  const total = pieces.reduce((sum, p) => sum + charCount(p), 0);
-  const target = Math.max(Math.floor(total / parts), 1);
-
-  // 1. Break up any sentence long enough to dominate a shot on its own.
-  //
-  // Every shot is the SAME number of seconds, so the text in each should be
-  // about the same size. Left whole, a 400-character paragraph took one
-  // 15-second shot while three ten-character lines took the other three —
-  // the same screen time for forty times the content. Sentence integrity is
-  // worth a lot, but not that.
-  const units: string[] = [];
-  for (const piece of pieces) {
-    const length = charCount(piece);
-    const n = divCeil(length, Math.max(target, 1));
-    if (n > 1 && length > target) {
-      units.push(...splitWords(piece, Math.min(n, parts)));
-    } else {
-      units.push(piece);
-    }
-  }
-
-  // 2. Still not enough to go round? Split the LONGEST repeatedly, so one
-  //    enormous paragraph is broken up before a short aside is cut in half.
-  while (units.length < parts) {
-    const index = argmaxLastTie(units.map((p) => charCount(p)));
-    const longest = units[index]!;
-    units.splice(index, 1);
-    const halves = splitWords(longest, 2);
-    units.splice(index, 0, ...halves);
-  }
-
-  // 3. Pack toward the ideal boundaries, choosing for each unit whether
-  //    closing BEFORE it lands nearer the boundary than closing after it.
-  //    Packing greedily "until full" instead overshot every time — a shot
-  //    would close only once it was already past its share, so each one ran
-  //    long and the last took whatever was left.
-  const out: string[] = [];
-  let current = "";
-  let used = 0;
-
-  units.forEach((unit, index) => {
-    const remainingUnits = units.length - index;
-    const remainingSlots = parts - out.length;
-    if (current !== "" && remainingSlots > 1) {
-      // Every remaining unit needs its own shot, or the count fails.
-      const mustClose = remainingUnits === remainingSlots;
-      const boundary = Math.floor((total * (out.length + 1)) / parts);
-      const after = used + charCount(unit);
-      const closingNow = Math.abs(used - boundary);
-      const closingLater = Math.abs(after - boundary);
-      if (mustClose || closingNow <= closingLater) {
-        out.push(current);
-        current = "";
-      }
-    }
-    current += unit;
-    used += charCount(unit);
-  });
-  if (current !== "" || out.length < parts) {
-    out.push(current);
-  }
-  // Belt and braces: the count is the contract the caller builds rows from.
-  while (out.length > parts) {
-    const tail = out.pop() ?? "";
-    if (out.length > 0) {
-      out[out.length - 1] = out[out.length - 1]! + tail;
-    }
-  }
-  while (out.length < parts) {
-    out.push("");
-  }
-  return out.map((p) => p.trim());
+  if (pieces.length === 0) return new Array(parts).fill("");
+  const total = pieces.reduce((sum, piece) => sum + charCount(piece), 0);
+  const units = splitDominatingPieces(
+    pieces,
+    Math.max(Math.floor(total / parts), 1),
+    parts,
+  );
+  growUnitsToCount(units, parts);
+  const packed = packUnits(units, total, parts);
+  return finishParts(packed.out, packed.current, parts);
 }
 
 // ------------------------------------------------------------ script chunks
@@ -404,30 +312,48 @@ export interface Chunk {
 
 /** `12:34` at `i`, as seconds, plus where it ends — or `null`. Ported from
  * `read_clock`. */
-function readClock(chars: readonly string[], i: number): [seconds: number, end: number] | null {
-  let at = i;
-  let minutes = 0;
+function canReadClockDigit(
+  chars: readonly string[],
+  at: number,
+  digits: number,
+) {
+  return at < chars.length && digits < 2 && isAsciiDigit(chars[at]!);
+}
+
+function readClockDigits(chars: readonly string[], from: number) {
+  let at = from;
+  let value = 0;
   let digits = 0;
-  while (at < chars.length && isAsciiDigit(chars[at]!) && digits < 2) {
-    minutes = minutes * 10 + Number(chars[at]);
+  while (canReadClockDigit(chars, at, digits)) {
+    value = value * 10 + Number(chars[at]);
     at += 1;
     digits += 1;
   }
-  if (digits === 0 || at >= chars.length || chars[at] !== ":") {
-    return null;
-  }
-  at += 1;
-  let seconds = 0;
-  let got = 0;
-  while (at < chars.length && isAsciiDigit(chars[at]!) && got < 2) {
-    seconds = seconds * 10 + Number(chars[at]);
-    at += 1;
-    got += 1;
-  }
-  if (got !== 2 || seconds >= 60) {
-    return null;
-  }
-  return [minutes * 60 + seconds, at];
+  return { at, digits, value };
+}
+
+function hasClockMinutes(
+  chars: readonly string[],
+  minute: ReturnType<typeof readClockDigits>,
+) {
+  return (
+    minute.digits > 0 && minute.at < chars.length && chars[minute.at] === ":"
+  );
+}
+
+function validClockSeconds(second: ReturnType<typeof readClockDigits>) {
+  return second.digits === 2 && second.value < 60;
+}
+
+function readClock(
+  chars: readonly string[],
+  i: number,
+): [seconds: number, end: number] | null {
+  const minutes = readClockDigits(chars, i);
+  if (!hasClockMinutes(chars, minutes)) return null;
+  const seconds = readClockDigits(chars, minutes.at + 1);
+  if (!validClockSeconds(seconds)) return null;
+  return [minutes.value * 60 + seconds.value, seconds.at];
 }
 
 /** Is this the dash in `00:00–00:15`? Any of the three people actually
@@ -448,11 +374,18 @@ function isHeading(line: string): boolean {
   if (t === "") {
     return false;
   }
-  if (t.startsWith("#") || Array.from(t).every((c) => c === "-" || c === "=" || c === "*")) {
+  if (
+    t.startsWith("#") ||
+    Array.from(t).every((c) => c === "-" || c === "=" || c === "*")
+  ) {
     return true;
   }
   const bare = trimMatches(t, (c) => c === "*" || c === "#" || c === " ");
-  return bare.startsWith("INT.") || bare.startsWith("EXT.") || bare.startsWith("INT/EXT");
+  return (
+    bare.startsWith("INT.") ||
+    bare.startsWith("EXT.") ||
+    bare.startsWith("INT/EXT")
+  );
 }
 
 /** A closing line about the document rather than a beat in it. Ported from
@@ -462,8 +395,12 @@ function isHeading(line: string): boolean {
  * with "END OF EPISODE 1 — condensed to 5:00 (300 seconds)" — instructions to
  * a reader, sent to a model as though they were something to draw. */
 function isEndMatter(line: string): boolean {
-  const bare = toAsciiUppercase(trimMatches(line, (c) => c === "*" || c === "#" || c === "_" || c === " "));
-  return bare.startsWith("END OF ") || bare === "END" || bare.startsWith("FADE OUT.");
+  const bare = toAsciiUppercase(
+    trimMatches(line, (c) => c === "*" || c === "#" || c === "_" || c === " "),
+  );
+  return (
+    bare.startsWith("END OF ") || bare === "END" || bare.startsWith("FADE OUT.")
+  );
 }
 
 /** Does a marker at `i` START its line? Ported from `starts_line`.
@@ -492,7 +429,7 @@ function clean(text: string): string {
   let out = "";
   for (const line of rustLines(text)) {
     const t = line.trim();
-    if (t === "" || isHeading(t) || isEndMatter(t)) {
+    if (isHeading(t) || t === "" || isEndMatter(t)) {
       continue;
     }
     if (out !== "") {
@@ -501,7 +438,10 @@ function clean(text: string): string {
     out += t;
   }
   const stripped = out.replaceAll("**", "").replaceAll("__", "");
-  return trimStartMatches(stripped, (c) => isRangeDash(c) || isWhitespaceChar(c) || c === ":").trim();
+  return trimStartMatches(
+    stripped,
+    (c) => isRangeDash(c) || isWhitespaceChar(c) || c === ":",
+  ).trim();
 }
 
 /** The heading lines at the end of a region, joined — the scene the NEXT beat
@@ -524,6 +464,81 @@ function trailingHeadings(region: string): string {
   return found.join(" — ");
 }
 
+type Marker = [start: number, end: number, seconds: number];
+type MarkerRead = { marker?: Marker; next: number };
+
+function skipMarkerSpaces(chars: readonly string[], from: number) {
+  let at = from;
+  while (at < chars.length && chars[at] === " ") at += 1;
+  return at;
+}
+
+function readRangeEnd(chars: readonly string[], afterStart: number) {
+  const dash = skipMarkerSpaces(chars, afterStart);
+  if (dash >= chars.length || !isRangeDash(chars[dash]!)) return null;
+  return readClock(chars, skipMarkerSpaces(chars, dash + 1));
+}
+
+function markerPrefix(chars: readonly string[], at: number) {
+  return (
+    isAsciiDigit(chars[at]!) &&
+    !(at > 0 && isAsciiDigit(chars[at - 1]!)) &&
+    startsLine(chars, at)
+  );
+}
+
+function readMarker(chars: readonly string[], at: number): MarkerRead {
+  if (!markerPrefix(chars, at)) return { next: at + 1 };
+  const start = readClock(chars, at);
+  if (!start) return { next: at + 1 };
+  const end = readRangeEnd(chars, start[1]);
+  if (!end) return { next: start[1] };
+  return {
+    marker: [at, end[1], Math.max(end[0] - start[0], 0)],
+    next: end[1],
+  };
+}
+
+function markersIn(chars: readonly string[]): Marker[] {
+  const marks: Marker[] = [];
+  let at = 0;
+  while (at < chars.length) {
+    const read = readMarker(chars, at);
+    if (read.marker) marks.push(read.marker);
+    at = read.next;
+  }
+  return marks;
+}
+
+function markerSlice(chars: readonly string[], from: number, to: number) {
+  return chars.slice(from, to).join("");
+}
+
+function chunkAction(pending: string, region: string) {
+  const prefix = pending === "" ? "" : `${pending}. `;
+  return trimEndMatches(
+    `${prefix}${clean(region)}`.trim(),
+    (c) => c === ".",
+  ).trim();
+}
+
+function chunksFromMarkers(chars: readonly string[], marks: Marker[]): Chunk[] {
+  let pending = trailingHeadings(markerSlice(chars, 0, marks[0]![0]));
+  const out: Chunk[] = [];
+  for (let index = 0; index < marks.length; index += 1) {
+    const [, bodyFrom, seconds] = marks[index]!;
+    const bodyTo =
+      index + 1 < marks.length ? marks[index + 1]![0] : chars.length;
+    const region = markerSlice(chars, bodyFrom, bodyTo);
+    out.push({
+      action: chunkAction(pending, region),
+      seconds: clamp(seconds, 1, 60),
+    });
+    pending = trailingHeadings(region);
+  }
+  return out;
+}
+
 /**
  * Read the chunks a script declared for itself, if it declared any. Ported
  * from `script_chunks`.
@@ -541,86 +556,8 @@ function trailingHeadings(region: string): string {
  */
 export function scriptChunks(script: string): Chunk[] | undefined {
   const chars = Array.from(script);
-  // (where the marker starts, where it ends, its duration)
-  const marks: Array<[start: number, end: number, seconds: number]> = [];
-
-  let i = 0;
-  while (i < chars.length) {
-    if (!isAsciiDigit(chars[i]!)) {
-      i += 1;
-      continue;
-    }
-    // A clock reached from mid-number ("1234:56") is not a timestamp.
-    if (i > 0 && isAsciiDigit(chars[i - 1]!)) {
-      i += 1;
-      continue;
-    }
-    // And a range written mid-sentence is prose about the episode, not a
-    // beat in it.
-    if (!startsLine(chars, i)) {
-      i += 1;
-      continue;
-    }
-    const start = readClock(chars, i);
-    if (start === null) {
-      i += 1;
-      continue;
-    }
-    const [startSeconds, afterStart] = start;
-    let at = afterStart;
-    while (at < chars.length && chars[at] === " ") {
-      at += 1;
-    }
-    if (at >= chars.length || !isRangeDash(chars[at]!)) {
-      i = afterStart;
-      continue;
-    }
-    at += 1;
-    while (at < chars.length && chars[at] === " ") {
-      at += 1;
-    }
-    const end = readClock(chars, at);
-    if (end === null) {
-      i = afterStart;
-      continue;
-    }
-    const [endSeconds, afterEnd] = end;
-    marks.push([i, afterEnd, Math.max(endSeconds - startSeconds, 0)]);
-    i = afterEnd;
-  }
-
-  if (marks.length < 2) {
-    return undefined;
-  }
-
-  const slice = (from: number, to: number): string => chars.slice(from, to).join("");
-
-  // Headings found at the END of one region belong to the NEXT beat: a
-  // screenplay puts the scene line above the action it introduces.
-  let pending = trailingHeadings(slice(0, marks[0]![0]));
-  const out: Chunk[] = [];
-
-  marks.forEach(([, bodyFrom, seconds], index) => {
-    const bodyTo = index + 1 < marks.length ? marks[index + 1]![0] : chars.length;
-    const region = slice(bodyFrom, bodyTo);
-    const carried = trailingHeadings(region);
-
-    let action = "";
-    if (pending !== "") {
-      action += pending;
-      action += ". ";
-    }
-    action += clean(region);
-    pending = carried;
-
-    out.push({
-      action: trimEndMatches(action.trim(), (c) => c === ".").trim(),
-      // A malformed or zero-length range falls back to something usable
-      // rather than refusing the whole script over one typo.
-      seconds: clamp(seconds, 1, 60),
-    });
-  });
-  return out;
+  const marks = markersIn(chars);
+  return marks.length < 2 ? undefined : chunksFromMarkers(chars, marks);
 }
 
 /** How many shots a wanted runtime needs at a given shot length. Ported from

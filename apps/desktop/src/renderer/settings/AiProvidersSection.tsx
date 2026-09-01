@@ -3,6 +3,17 @@ import { confirm as askConfirm } from "../platform";
 import { api, type AiProviderStatus } from "../api";
 import { CheckIcon, CloseIcon } from "../icons";
 
+type ProviderCardProps = {
+  connected: boolean;
+  keyValue: string;
+  busy: boolean;
+  message: string;
+  messageKind: "good" | "error";
+  onKeyChange: (value: string) => void;
+  onConnect: () => void;
+  onDisconnect: () => void;
+};
+
 export default function AiProvidersSection({
   model,
   fallbackModel,
@@ -20,6 +31,7 @@ export default function AiProvidersSection({
   const [message, setMessage] = useState("");
   const [messageKind, setMessageKind] = useState<"good" | "error">("good");
   const openrouter = providers.find((provider) => provider.id === "openrouter");
+  const connected = openrouter?.connected === true;
 
   const refresh = () => api.listAiProviders().then(setProviders).catch(() => setProviders([]));
 
@@ -84,44 +96,16 @@ export default function AiProvidersSection({
         never in the room file. Model catalogs and capabilities are read live from
         the provider.
       </p>
-      <div className={`provider-card${openrouter?.connected ? " connected" : ""}`}>
-        <div className="provider-card-head">
-          <div>
-            <strong>OpenRouter</strong>
-            <div className="settings-hint">Hundreds of models through one OpenAI-compatible API.</div>
-          </div>
-          <span className={`provider-state${openrouter?.connected ? " connected" : ""}`}>
-            {openrouter?.connected ? <><CheckIcon size={12} /> Connected</> : "Not connected"}
-          </span>
-        </div>
-        {openrouter?.connected ? (
-          <button type="button" className="subtle btn-ic" onClick={disconnect} disabled={busy}>
-            <CloseIcon size={14} /> Disconnect
-          </button>
-        ) : (
-          <div className="provider-key-row">
-            <input
-              type="password"
-              autoComplete="off"
-              spellCheck={false}
-              placeholder="OpenRouter API key"
-              aria-label="OpenRouter API key"
-              value={key}
-              disabled={busy}
-              onChange={(event) => setKey(event.target.value)}
-              onKeyDown={(event) => event.key === "Enter" && connect()}
-            />
-            <button type="button" onClick={connect} disabled={busy || !key.trim()}>
-              {busy ? "Checking…" : "Connect"}
-            </button>
-          </div>
-        )}
-        {message && (
-          <div className={`provider-message${messageKind === "good" ? " good" : ""}`}>
-            {message}
-          </div>
-        )}
-      </div>
+      <ProviderCard
+        connected={connected}
+        keyValue={key}
+        busy={busy}
+        message={message}
+        messageKind={messageKind}
+        onKeyChange={setKey}
+        onConnect={connect}
+        onDisconnect={disconnect}
+      />
       {/* What "Connect" actually does, in provider terms. Detail, not a
           consequence — the sentence about where keys are stored is the
           consequence and it stays open above. */}
@@ -134,4 +118,112 @@ export default function AiProvidersSection({
       </details>
     </section>
   );
+}
+
+function ProviderCard({
+  connected,
+  keyValue,
+  busy,
+  message,
+  messageKind,
+  onKeyChange,
+  onConnect,
+  onDisconnect,
+}: ProviderCardProps) {
+  return (
+    <div className={`provider-card${connectedClass(connected)}`}>
+      <ProviderCardHeader connected={connected} />
+      <ProviderConnectionControl
+        connected={connected}
+        keyValue={keyValue}
+        busy={busy}
+        onKeyChange={onKeyChange}
+        onConnect={onConnect}
+        onDisconnect={onDisconnect}
+      />
+      <ProviderMessage message={message} kind={messageKind} />
+    </div>
+  );
+}
+
+function ProviderCardHeader({ connected }: { connected: boolean }) {
+  return (
+    <div className="provider-card-head">
+      <div>
+        <strong>OpenRouter</strong>
+        <div className="settings-hint">Hundreds of models through one OpenAI-compatible API.</div>
+      </div>
+      <span className={`provider-state${connectedClass(connected)}`}>
+        {connected ? <><CheckIcon size={12} /> Connected</> : "Not connected"}
+      </span>
+    </div>
+  );
+}
+
+function ProviderConnectionControl({
+  connected,
+  keyValue,
+  busy,
+  onKeyChange,
+  onConnect,
+  onDisconnect,
+}: Pick<
+  ProviderCardProps,
+  "connected" | "keyValue" | "busy" | "onKeyChange" | "onConnect" | "onDisconnect"
+>) {
+  if (connected) {
+    return (
+      <button type="button" className="subtle btn-ic" onClick={onDisconnect} disabled={busy}>
+        <CloseIcon size={14} /> Disconnect
+      </button>
+    );
+  }
+  return (
+    <ProviderConnectControl
+      keyValue={keyValue}
+      busy={busy}
+      onKeyChange={onKeyChange}
+      onConnect={onConnect}
+    />
+  );
+}
+
+function ProviderConnectControl({
+  keyValue,
+  busy,
+  onKeyChange,
+  onConnect,
+}: Pick<ProviderCardProps, "keyValue" | "busy" | "onKeyChange" | "onConnect">) {
+  const connectDisabled = busy || !keyValue.trim();
+  return (
+    <div className="provider-key-row">
+      <input
+        type="password"
+        autoComplete="off"
+        spellCheck={false}
+        placeholder="OpenRouter API key"
+        aria-label="OpenRouter API key"
+        value={keyValue}
+        disabled={busy}
+        onChange={(event) => onKeyChange(event.target.value)}
+        onKeyDown={(event) => connectOnEnter(event.key, onConnect)}
+      />
+      <button type="button" onClick={onConnect} disabled={connectDisabled}>
+        {busy ? "Checking…" : "Connect"}
+      </button>
+    </div>
+  );
+}
+
+function ProviderMessage({ message, kind }: { message: string; kind: "good" | "error" }) {
+  if (!message) return null;
+  return <div className={`provider-message${kind === "good" ? " good" : ""}`}>{message}</div>;
+}
+
+function connectedClass(connected: boolean): string {
+  return connected ? " connected" : "";
+}
+
+function connectOnEnter(key: string, onConnect: () => void): void {
+  if (key === "Enter") onConnect();
 }

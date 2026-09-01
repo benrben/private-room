@@ -27,14 +27,23 @@
 // builds its OWN plain sandbox object (`sandbox.window = sandbox`, the usual
 // self-reference trick), and attaches only that per-call `document` plus the
 // shims to it, giving each test a truly fresh global.
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { parseHTML } from "linkedom";
 
-const PAGE_SCRIPT_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "page.js");
-const PAGE_SCRIPT_SOURCE = readFileSync(PAGE_SCRIPT_PATH, "utf8");
+// Vitest can execute its transformed test modules from `dist_boot`, where a
+// stale packaged page.js may be present. Resolve from the working tree
+// instead, whether the focused command starts at apps/desktop or repo root.
+const PAGE_SCRIPT_FILES = ["pageCore.js", "pageSnapshot.js", "pageRead.js", "pageActions.js", "page.js"];
+const PAGE_SCRIPT_ROOT = [
+  path.resolve(process.cwd(), "src/main/browser"),
+  path.resolve(process.cwd(), "apps/desktop/src/main/browser"),
+].find((root) => PAGE_SCRIPT_FILES.every((file) => existsSync(path.join(root, file))));
+
+if (!PAGE_SCRIPT_ROOT) throw new Error("Could not locate the working-tree page-script fragments for tests.");
+
+const PAGE_SCRIPT_PATHS = PAGE_SCRIPT_FILES.map((file) => path.join(PAGE_SCRIPT_ROOT, file));
 
 /** The subset of `window.__arcelleBrowse._internals` this harness exercises.
  * Loosely typed (`any`-ish via index signature) — the real contract lives in
@@ -52,11 +61,16 @@ export interface PageScriptInternals {
   regionFor: (el: unknown) => string;
   lowSignal: (elements: unknown[]) => string | null;
   readMarkdown: (mode: string) => string;
+  pageHtml: () => string;
 }
 
 export interface PageScriptHarness {
   document: ReturnType<typeof parseHTML>["document"];
+  location: { href: string; host: string };
+  /** Fresh VM global, exposed so tests can fabricate browser APIs after load. */
+  window: Record<string, unknown>;
   call: (op: string, args?: Record<string, unknown>) => Record<string, unknown>;
+  dispatchKey: (key: string | null, advanceMs?: number) => void;
   internals: PageScriptInternals;
 }
 
@@ -65,7 +79,10 @@ export interface PageScriptHarness {
  * and hand back both the public `call(op, args)` entry point and the
  * `_internals` the script exposes for exactly this kind of test.
  */
-export function loadPageScript(bodyHtml: string, opts: { url?: string } = {}): PageScriptHarness {
+export function loadPageScript(
+  bodyHtml: string,
+  opts: { url?: string; now?: number; globals?: Record<string, unknown> } = {},
+): PageScriptHarness {
   // `parseHTML`'s `window` is deliberately never touched (see the module
   // header) — only its `document` is used, which IS genuinely isolated.
   const { document } = parseHTML("<!doctype html><html><body></body></html>");
@@ -109,7 +126,41 @@ export function loadPageScript(bodyHtml: string, opts: { url?: string } = {}): P
   const sandbox: Record<string, unknown> = {};
   sandbox["window"] = sandbox;
   sandbox["document"] = document;
-  sandbox["location"] = { href: url, host: new URL(url).host };
+  let now = opts.now;
+  const listeners = new Map<string, Array<(event: unknown) => void>>();
+  const dispatchKey = (key: string | null, advanceMs = 0): void => {
+    if (now !== undefined) now += advanceMs;
+    for (const listener of listeners.get("keydown") ?? []) {
+      listener(key === null ? null : { key });
+    }
+  };
+  // Keep the VM's clock aligned with the timer functions supplied below. This
+  // is invisible in normal execution, while a focused test using Vitest's
+  // fake timers can advance both clocks deterministically. A caller that
+  // supplies `now` still gets its explicitly controlled clock.
+  sandbox["Date"] = now === undefined ? Date : { now: () => now };
+  sandbox["addEventListener"] = (type: string, listener: (event: unknown) => void): void => {
+    const handlers = listeners.get(type) ?? [];
+    handlers.push(listener);
+    listeners.set(type, handlers);
+  };
+  const location = { href: url, host: new URL(url).host };
+  sandbox["location"] = location;
+  // Minimal browser navigation primitives. They keep action routing tests in
+  // the real script deterministic without claiming linkedom has a layout or
+  // history implementation; individual tests can replace elementFromPoint
+  // when they need a concrete coordinate target.
+  sandbox["innerHeight"] = 800;
+  sandbox["innerWidth"] = 1_000;
+  sandbox["scrollTo"] = () => {};
+  sandbox["scrollBy"] = () => {};
+  sandbox["history"] = { back: () => {}, forward: () => {} };
+  // The production ticket protocol uses timers for settle/wait polling. Give
+  // the isolated VM the real timer primitives so its asynchronous public path
+  // can be exercised without crossing into a browser runtime.
+  sandbox["setInterval"] = setInterval;
+  sandbox["clearInterval"] = clearInterval;
+  (document as unknown as { elementFromPoint: (x: number, y: number) => unknown }).elementFromPoint = () => null;
   // A fresh `vm` context only gets core ECMAScript intrinsics (Map, Promise,
   // RegExp, WeakRef, ...) — `URL` is a Node/web-platform global, not an
   // ECMAScript one, and is NOT present by default. `readMarkdown`'s link
@@ -125,14 +176,17 @@ export function loadPageScript(bodyHtml: string, opts: { url?: string } = {}): P
   // getSelection: read by `capture`/`info`'s `hasSelection`. No selection
   // API in linkedom; "nothing selected" is the correct, safe default.
   sandbox["getSelection"] = () => "";
+  Object.assign(sandbox, opts.globals);
 
   vm.createContext(sandbox);
-  vm.runInContext(PAGE_SCRIPT_SOURCE, sandbox);
+  for (const scriptPath of PAGE_SCRIPT_PATHS) {
+    vm.runInContext(readFileSync(scriptPath, "utf8"), sandbox, { filename: scriptPath });
+  }
 
   const api = sandbox["__arcelleBrowse"] as {
     call: PageScriptHarness["call"];
     _internals: PageScriptInternals;
   };
 
-  return { document, call: api.call, internals: api._internals };
+  return { document, location, window: sandbox, call: api.call, dispatchKey, internals: api._internals };
 }

@@ -2,6 +2,61 @@ import { useEffect, useRef } from "react";
 import type React from "react";
 import { FOCUSABLE_SELECTOR } from "./types";
 
+function closesForEscape(e: React.KeyboardEvent, onClose: () => void): boolean {
+  if (e.key !== "Escape") return false;
+  e.preventDefault();
+  onClose();
+  return true;
+}
+
+function trapsEmptyModal(
+  els: HTMLElement[],
+  e: React.KeyboardEvent,
+  modal: HTMLDivElement | null,
+): boolean {
+  if (els.length > 0) return false;
+  e.preventDefault();
+  modal?.focus();
+  return true;
+}
+
+function isInsideModal(
+  modal: HTMLDivElement | null,
+  active: HTMLElement | null,
+): boolean {
+  if (!modal || !active) return false;
+  // A focused container (tabIndex=-1) must wrap Shift+Tab, rather than let
+  // native navigation reach the workspace behind the modal.
+  if (active === modal) return false;
+  return modal.contains(active);
+}
+
+function shouldWrapFocus(
+  active: HTMLElement | null,
+  boundary: HTMLElement,
+  inside: boolean,
+): boolean {
+  if (!inside) return true;
+  return active === boundary;
+}
+
+function wrapTabFocus(
+  e: React.KeyboardEvent,
+  els: HTMLElement[],
+  modal: HTMLDivElement | null,
+): void {
+  if (trapsEmptyModal(els, e, modal)) return;
+  const first = els[0];
+  const last = els[els.length - 1];
+  const active = document.activeElement as HTMLElement | null;
+  const inside = isInsideModal(modal, active);
+  const destination = e.shiftKey ? last : first;
+  const boundary = e.shiftKey ? first : last;
+  if (!shouldWrapFocus(active, boundary, inside)) return;
+  e.preventDefault();
+  destination.focus();
+}
+
 /** FOCUS TRAP (audit HIGH): the modal renders over a live workspace whose
  * "Lock" button sits behind it. Without a trap, Tab walks focus out of the
  * modal and a keyboard user could lock the room by accident. We keep Tab /
@@ -40,38 +95,9 @@ export function useFocusTrap(onClose: () => void) {
   }, []);
 
   function onModalKeyDown(e: React.KeyboardEvent) {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      onClose();
-      return;
-    }
+    if (closesForEscape(e, onClose)) return;
     if (e.key !== "Tab") return;
-    const els = focusableEls();
-    if (els.length === 0) {
-      // Nothing focusable inside — keep focus from escaping to the workspace.
-      e.preventDefault();
-      modalRef.current?.focus();
-      return;
-    }
-    const first = els[0];
-    const last = els[els.length - 1];
-    const active = document.activeElement as HTMLElement | null;
-    // Node.contains() is true for the node itself, so a focused container
-    // (tabIndex=-1) would read as "inside" and let native Shift+Tab escape to
-    // the workspace behind the modal. Exclude the container itself.
-    const inside =
-      !!active &&
-      active !== modalRef.current &&
-      !!modalRef.current?.contains(active);
-    if (e.shiftKey) {
-      if (!inside || active === first) {
-        e.preventDefault();
-        last.focus();
-      }
-    } else if (!inside || active === last) {
-      e.preventDefault();
-      first.focus();
-    }
+    wrapTabFocus(e, focusableEls(), modalRef.current);
   }
 
   /** Put focus back inside the trapped subtree.

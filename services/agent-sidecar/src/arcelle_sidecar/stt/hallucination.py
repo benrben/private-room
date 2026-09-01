@@ -30,14 +30,23 @@ def is_junk_segment(text: str) -> bool:
     classic silence hallucinations ("[BLANK_AUDIO]", "(music)", a lone ♪).
     """
     trimmed = text.strip()
-    if not trimmed:
-        return True
-    bracketed = (
-        (trimmed.startswith("[") and trimmed.endswith("]"))
-        or (trimmed.startswith("(") and trimmed.endswith(")"))
-        or (trimmed.startswith("*") and trimmed.endswith("*"))
+    return not trimmed or _is_wrapped_junk(trimmed) or _has_no_alphanumeric(trimmed)
+
+
+def _is_wrapped_junk(text: str) -> bool:
+    return (
+        _is_wrapped_by(text, "[", "]")
+        or _is_wrapped_by(text, "(", ")")
+        or _is_wrapped_by(text, "*", "*")
     )
-    return bracketed or all(not c.isalnum() for c in trimmed)
+
+
+def _is_wrapped_by(text: str, opening: str, closing: str) -> bool:
+    return text.startswith(opening) and text.endswith(closing)
+
+
+def _has_no_alphanumeric(text: str) -> bool:
+    return all(not character.isalnum() for character in text)
 
 
 def _trim_non_alnum(s: str) -> str:
@@ -142,20 +151,34 @@ def merge_token_words(
     """
     words: list[list] = []  # each entry: [bytearray, t0, t1]
     for raw_bytes, t0, t1 in pieces:
-        remaining = raw_bytes
-        while remaining.endswith(b"\n"):
-            remaining = remaining[:-1]
-        # The space check looks at the ORIGINAL piece's first byte, not the
-        # newline-trimmed `remaining` — matches Rust's `bytes.first()` (the
-        # untrimmed slice), which only differs from `remaining` when the
-        # piece was newline(s) only, in which case neither is a space anyway.
-        starts_new_word = raw_bytes[:1] == b" " or not words
-        if starts_new_word:
-            words.append([bytearray(remaining), t0, t1])
-        else:
-            last = words[-1]
-            last[0].extend(remaining)
-            last[2] = t1
+        _append_token_piece(words, raw_bytes, t0, t1)
+    return _decoded_token_words(words)
+
+
+def _append_token_piece(words: list[list], raw_bytes: bytes, t0: int, t1: int) -> None:
+    remaining = _without_trailing_newlines(raw_bytes)
+    if _starts_new_token_word(raw_bytes, words):
+        words.append([bytearray(remaining), t0, t1])
+        return
+    last = words[-1]
+    last[0].extend(remaining)
+    last[2] = t1
+
+
+def _without_trailing_newlines(raw_bytes: bytes) -> bytes:
+    remaining = raw_bytes
+    while remaining.endswith(b"\n"):
+        remaining = remaining[:-1]
+    return remaining
+
+
+def _starts_new_token_word(raw_bytes: bytes, words: list[list]) -> bool:
+    # Check the ORIGINAL bytes, not the newline-trimmed version. This mirrors
+    # Rust's `bytes.first()` for newline-only pieces too.
+    return raw_bytes[:1] == b" " or not words
+
+
+def _decoded_token_words(words: list[list]) -> list[tuple[str, int, int]]:
 
     result: list[tuple[str, int, int]] = []
     for buf, t0, t1 in words:

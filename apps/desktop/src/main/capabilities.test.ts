@@ -114,6 +114,14 @@ describe("ported from capabilities.rs", () => {
     }
   });
 
+  it("keeps a recognized external engine ahead of a cloud-looking submodel suffix", () => {
+    // Engine selection is based on the external prefix. A provider slug can
+    // legitimately contain `:cloud`; only an Ollama tag uses that suffix to
+    // select the relay transport.
+    expect(engineIdOf("openrouter::vendor/model:cloud")).toBe("openrouter");
+    expect(declaredFor("openrouter::vendor/model:cloud")).toBe(OPENROUTER);
+  });
+
   /** THE CONVERSION THIS PACKET EXISTS FOR: "can it stream?" is a declared
    * field, not a name sniff. Since 2026-08-27 every engine streams — the CLIs
    * through their NDJSON envelopes (token deltas for Claude/Antigravity, one

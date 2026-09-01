@@ -37,6 +37,15 @@ import json
 from typing import Any
 
 from . import llm
+from .chat_docs_cast import (
+    CAST_SCHEMA,
+    CAST_SHEET_SYSTEM,
+    CAST_MAX as CAST_MAX,
+    CAST_WINDOW_CHARS as CAST_WINDOW_CHARS,
+    CAST_WINDOW_OVERLAP as CAST_WINDOW_OVERLAP,
+    cast_windows,
+    merge_cast,
+)
 from .config import KEEP_ALIVE_WARM
 from .messages import Message, system_message, user_message
 from .model_text import prime_schema, recover_json, strip_think_spans
@@ -65,80 +74,55 @@ DOC_SYS = (
 #: The value a field gets when the document does not contain it (cmd_extract).
 NOT_FOUND = "(not found)"
 
-#: story.rs — reading a character sheet into a cast.
-#:
-#: Replaced a hand-written parser that matched headings and labels. It read a
-#: tidy sheet correctly and mangled a real one, which is the usual fate of a
-#: heuristic meeting a document a person actually wrote: nested lists, tables,
-#: numbered items, an appearance split over three bullets under a sub-heading.
-#:
-#: The two rules that matter are the two a model gets wrong. **Do not invent
-#: anyone** — an added character is believed, and ends up in shots. And
-#: `description` is for a PICTURE MODEL: it goes verbatim into every prompt
-#: that person appears in, so "brave and loyal" is worse than useless there
-#: while "tall, grey wool coat, cropped hair" is the whole job.
-CAST_SHEET_SYSTEM = (
-    "You read a document and list the CHARACTERS it describes.\n"
-    "Rules:\n"
-    "1. Only people the document actually describes. Never invent a character, "
-    "and never turn a place, a chapter heading, a section title, an episode "
-    "name or a list label into one. If the document describes no characters, "
-    "return an empty list.\n"
-    "2. `name` is what they are called, nothing else — no title line, no "
-    "numbering, no markdown, no colon.\n"
-    "3. `description` is ONLY what they LOOK like — build, age, hair, clothing, "
-    "distinguishing marks. It is fed straight to an image model, so personality, "
-    "role and history do not belong in it. Gather the appearance from wherever "
-    "it appears in their entry, including lists and tables. If the document "
-    "never says what they look like, use an empty string rather than guessing.\n"
-    "4. `story` is who they are: role, history, what they want, how they speak. "
-    "Empty string if the document does not say.\n"
-    "5. Copy the document's own wording. Do not embellish, translate or "
-    "summarise into your own phrasing.\n"
-    "6. Keep the document's language."
-)
-
-#: One person as the sheet reader returns them.
-CAST_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "cast": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "description": {"type": "string"},
-                    "story": {"type": "string"},
-                },
-                "required": ["name", "description", "story"],
-            },
-        }
-    },
-    "required": ["cast"],
-}
-
-#: How much document goes into one call.
-#:
-#: Windowed rather than clamped, and the difference is the whole point: a clamp
-#: reads the first N characters and silently reports the rest as "no characters
-#: found", which is exactly the `#minutes` failure — a confident answer about
-#: the part it happened to see. Every window is read and the results merged.
-CAST_WINDOW_CHARS = 12_000
-#: Carried between windows so a person split across a boundary is still whole
-#: in one of them.
-CAST_WINDOW_OVERLAP = 1_200
-#: A ceiling on one import, mirroring the Rust. A document that yields more
-#: than this is being misread, and importing sixty people nobody asked for is
-#: worse than importing none.
-CAST_MAX = 40
-
 # --- Rust helper reproductions ----------------------------------------------
 
 
 #: docs_html.rs parse_string_list strips these from the START of a fallback line
 #: (ASCII digits plus these list markers). A ``str.lstrip`` char set.
 _LINE_MARKERS = "0123456789-*.) "
+
+
+def _json_string_items(cleaned: str) -> list[str]:
+    start = cleaned.find("[")
+    if start == -1:
+        return []
+    try:
+        value, _ = json.JSONDecoder().raw_decode(cleaned[start:])
+    except ValueError:
+        return []
+    return _string_entries(value)
+
+
+def _string_entries(values: list[Any]) -> list[str]:
+    entries: list[str] = []
+    for value in values:
+        if isinstance(value, str):
+            entries.append(value)
+    return entries
+
+
+def _fallback_string_items(cleaned: str) -> list[str]:
+    entries: list[str] = []
+    for line in cleaned.splitlines():
+        item = line.strip().lstrip(_LINE_MARKERS).strip()
+        if item and len(item.encode("utf-8")) < 80:
+            entries.append(item)
+    return entries
+
+
+def _unique_trimmed_items(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        trimmed = item.strip()
+        if not trimmed:
+            continue
+        key = trimmed.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(trimmed)
+    return out
 
 
 def parse_string_list(raw: str) -> list[str]:
@@ -150,34 +134,10 @@ def parse_string_list(raw: str) -> list[str]:
     so a 20-item list must not quietly become the first 12 files.
     """
     cleaned = strip_think_spans(raw)
-    items: list[str] = []
-    start = cleaned.find("[")
-    if start != -1:
-        try:
-            value, _ = json.JSONDecoder().raw_decode(cleaned[start:])
-        except ValueError:
-            value = None
-        if isinstance(value, list):
-            for v in value:
-                if isinstance(v, str):
-                    items.append(v)
+    items = _json_string_items(cleaned)
     if not items:
-        for line in cleaned.splitlines():
-            t = line.strip().lstrip(_LINE_MARKERS).strip()
-            if t and len(t.encode("utf-8")) < 80:
-                items.append(t)
-    seen: set[str] = set()
-    out: list[str] = []
-    for s in items:
-        s = s.strip()
-        if not s:
-            continue
-        low = s.lower()
-        if low in seen:
-            continue
-        seen.add(low)
-        out.append(s)
-    return out
+        items = _fallback_string_items(cleaned)
+    return _unique_trimmed_items(items)
 
 
 def value_str(parsed: Any, key: str) -> str:
@@ -384,73 +344,57 @@ async def generate_doc(
     )
 
 
-def cast_windows(document: str) -> list[str]:
-    """Cut a document into overlapping windows, on paragraph breaks where it can.
-
-    Splitting mid-sentence would hand a window half a character's appearance
-    and nothing to attach it to, so a boundary is nudged back to the last blank
-    line in the tail of the window when there is one.
-    """
-    text = document.strip()
-    if len(text) <= CAST_WINDOW_CHARS:
-        return [text] if text else []
-    windows: list[str] = []
-    start = 0
-    while start < len(text):
-        end = min(start + CAST_WINDOW_CHARS, len(text))
-        if end < len(text):
-            # Look for a paragraph break in the last fifth of the window.
-            floor = end - CAST_WINDOW_CHARS // 5
-            brk = text.rfind("\n\n", max(start, floor), end)
-            if brk > start:
-                end = brk
-        windows.append(text[start:end].strip())
-        if end >= len(text):
-            break
-        start = max(end - CAST_WINDOW_OVERLAP, start + 1)
-    return [w for w in windows if w]
-
-
-def merge_cast(found: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Fold the windows' answers into one cast, first mention wins the name.
-
-    The overlap means a person can come back twice; the same person described
-    in two places should be ONE entry with both halves, not two heroes with the
-    same name who each know half of themselves. Matched case-insensitively
-    because a sheet writes "MIRA" in a heading and "Mira" in the prose.
-    """
-    merged: list[dict[str, str]] = []
-    seen: dict[str, int] = {}
-    for person in found:
-        name = (person.get("name") or "").strip()
-        if not name:
-            continue
-        key = name.casefold()
-        description = (person.get("description") or "").strip()
-        story = (person.get("story") or "").strip()
-        if key in seen:
-            at = merged[seen[key]]
-            # Only ADD what is missing. Overwriting would let a later, thinner
-            # window erase a full description from an earlier one.
-            for field, value in (("description", description), ("story", story)):
-                if not value:
-                    continue
-                if not at[field]:
-                    at[field] = value
-                elif value.casefold() not in at[field].casefold():
-                    at[field] = f"{at[field]} {value}".strip()
-            continue
-        if len(merged) >= CAST_MAX:
-            continue
-        seen[key] = len(merged)
-        merged.append({"name": name, "description": description, "story": story})
-    return merged
-
-
 def _is_fatal(code: str) -> bool:
     """A hard engine failure is about the ENGINE, never the document (the same
     test as file_pass.py / rec_read.py)."""
     return code == "OLLAMA_DOWN" or code.startswith("MODEL_MISSING")
+
+
+def _cast_messages(window: str) -> list[Message]:
+    return [
+        system_message(CAST_SHEET_SYSTEM),
+        user_message(f"Document:\n{window}"),
+    ]
+
+
+def _cast_people(reply: str) -> list[dict[str, str]] | None:
+    parsed = json.loads(reply.strip())
+    if not isinstance(parsed, dict):
+        return None
+    people = parsed.get("cast")
+    if not isinstance(people, list):
+        return None
+    return [person for person in people if isinstance(person, dict)]
+
+
+async def _read_cast_window(
+    model: str,
+    base_url: str,
+    window: str,
+    *,
+    temperature: float,
+    keep_alive: str,
+    privacy: dict[str, Any] | None,
+    provider: Any | None,
+) -> list[dict[str, str]] | None:
+    try:
+        reply = await _structured(
+            model,
+            base_url,
+            _cast_messages(window),
+            CAST_SCHEMA,
+            temperature=temperature,
+            keep_alive=keep_alive,
+            privacy=privacy,
+            provider=provider,
+        )
+        return _cast_people(reply)
+    except llm.LlmError as exc:
+        if _is_fatal(exc.code):
+            raise
+    except (ValueError, TypeError):
+        pass
+    return None
 
 
 async def extract_cast(
@@ -481,41 +425,19 @@ async def extract_cast(
     found: list[dict[str, str]] = []
     failures = 0
     for window in windows:
-        messages = [
-            system_message(CAST_SHEET_SYSTEM),
-            user_message(f"Document:\n{window}"),
-        ]
-        try:
-            reply = await _structured(
-                model,
-                base_url,
-                messages,
-                CAST_SCHEMA,
-                temperature=temperature,
-                keep_alive=keep_alive,
-                privacy=privacy,
-                provider=provider,
-            )
-            parsed = json.loads(reply.strip())
-        except llm.LlmError as exc:
-            # A dead daemon or an unpulled model is not this document's fault,
-            # and it will be every window's answer — counting it as a window
-            # that "was not usable" ends in a message blaming the file, with
-            # the sentinel the Rust gateway rebuilds OLLAMA_DOWN /
-            # MODEL_MISSING:<model> from (and the UI's "start Ollama" offer)
-            # thrown away.
-            if _is_fatal(exc.code):
-                raise
+        people = await _read_cast_window(
+            model,
+            base_url,
+            window,
+            temperature=temperature,
+            keep_alive=keep_alive,
+            privacy=privacy,
+            provider=provider,
+        )
+        if people is None:
             failures += 1
             continue
-        except (ValueError, TypeError):
-            failures += 1
-            continue
-        people = parsed.get("cast") if isinstance(parsed, dict) else None
-        if isinstance(people, list):
-            found.extend(p for p in people if isinstance(p, dict))
-        else:
-            failures += 1
+        found.extend(people)
     if failures == len(windows):
         raise llm.LlmError(
             "ENGINE_ERROR",

@@ -144,19 +144,28 @@
  */
 
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
-import { execFile } from "node:child_process";
-import { promises as fs } from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { promisify } from "node:util";
 import type Database from "better-sqlite3-multiple-ciphers";
 import type { AudioPeaks } from "../shared/apiTypes.js";
 import type { OpenRoom } from "./turnEngine.js";
 import { readRoomFile } from "./workspace/roomContent.js";
 import { getFileFull, getFileMeta } from "./db-host/files.js";
 import { extensionOf } from "./editMatchExtraction.js";
-import { decodeWav, SAMPLE_RATE } from "./recFormat.js";
-import { findFfmpeg } from "./mediaProbe.js";
+import {
+  decodeAudioBytes,
+  type DecodeToPcmFn,
+} from "./peaksDecode.js";
+
+export {
+  DECODE_NON_WAV_NOT_IMPLEMENTED,
+  decodeAudioBytes,
+  decodeAudioBytesWith,
+  transcodeWithMacOs,
+  transcodeWithMacOsUsing,
+  type DecodedPcm,
+  type DecodeToPcmFn,
+  type MacOsTranscodeDeps,
+  type TranscodeToWav,
+} from "./peaksDecode.js";
 
 export type { AudioPeaks };
 
@@ -204,32 +213,31 @@ export function envelope(samples: ArrayLike<number>, buckets: number): number[] 
   // times MAX_BUCKETS (8000) ≈ 1.4e12 — no BigInt needed, unlike Rust's u64
   // widening (which exists only because `usize` is 32-bit on some targets).
   for (let b = 0; b < buckets; b++) {
-    const start = Math.floor((b * len) / buckets);
-    let end = Math.floor(((b + 1) * len) / buckets);
-    end = Math.max(end, start + 1);
-    end = Math.min(end, len);
-    let peak = 0;
-    for (let i = start; i < end; i++) {
-      const a = Math.abs(samples[i] ?? 0);
-      if (a > peak) {
-        peak = a;
-      }
-    }
-    out[b] = Math.min(peak, 1);
+    out[b] = bucketPeak(samples, len, buckets, b);
   }
+  return normalizeEnvelope(out);
+}
+
+function bucketPeak(samples: ArrayLike<number>, len: number, buckets: number, bucket: number): number {
+  const start = Math.floor((bucket * len) / buckets);
+  const end = Math.min(Math.max(Math.floor(((bucket + 1) * len) / buckets), start + 1), len);
+  let peak = 0;
+  for (let i = start; i < end; i++) {
+    peak = Math.max(peak, Math.abs(samples[i] ?? 0));
+  }
+  return Math.min(peak, 1);
+}
+
+function normalizeEnvelope(out: number[]): number[] {
   // Normalize to the loudest moment so a quietly-recorded meeting still
   // fills the lane. A silent file stays silent rather than being amplified
   // into noise.
-  let loudest = 0;
-  for (const v of out) {
-    if (v > loudest) {
-      loudest = v;
-    }
+  const loudest = Math.max(0, ...out);
+  if (loudest <= NOISE_FLOOR) {
+    return out;
   }
-  if (loudest > NOISE_FLOOR) {
-    for (let i = 0; i < out.length; i++) {
-      out[i] = (out[i] as number) / loudest;
-    }
+  for (let i = 0; i < out.length; i++) {
+    out[i] = (out[i] as number) / loudest;
   }
   return out;
 }
@@ -391,190 +399,6 @@ export function mediaKind(mime: string, ext: string): MediaKind | null {
   return null;
 }
 
-// -------------------------------------------------------------------- decode
-
-/** `stt::decode_bytes_to_pcm`'s eventual return shape, widened to carry the
- * sample rate alongside the samples — see this module's doc's "RUST-FIDELITY
- * DEVIATION" note for why `duration` cannot safely assume 16 kHz the way the
- * Rust source's own (always-afconvert-resampled) callers can. */
-export interface DecodedPcm {
-  samples: ArrayLike<number>;
-  sampleRate: number;
-}
-
-/** `stt::decode_bytes_to_pcm(bytes, ext, kind)`'s seam — injectable so a
- * future real afconvert/avconvert port can replace {@link decodeAudioBytes}
- * without changing {@link audioPeaks}'s own signature, the same
- * threaded-seam convention `jobDownload.ts`'s `DownloadToTempFn` and
- * `previewTools.ts`'s `PreviewRenderFn` already use for an unported
- * dependency. */
-export type DecodeToPcmFn = (bytes: Buffer, ext: string, kind: MediaKind) => Promise<DecodedPcm>;
-
-export type TranscodeToWav = (source: string, wav: string, kind: MediaKind, tempDir: string) => Promise<void>;
-
-const execFileAsync = promisify(execFile);
-
-type ConverterExec = (command: string, args: readonly string[]) => Promise<void>;
-
-export interface MacOsTranscodeDeps {
-  exec?: ConverterExec;
-  findFfmpeg?: () => string | null;
-}
-
-const executeConverter: ConverterExec = async (command, args) => {
-  await execFileAsync(command, [...args], { maxBuffer: 1024 * 1024 });
-};
-
-function processError(prefix: string, error: unknown): Error {
-  const row = typeof error === "object" && error !== null ? error as { code?: unknown; stderr?: unknown; message?: unknown } : {};
-  if (row.code === "ENOENT") {
-    return new Error(`${prefix} failed to start: ${typeof row.message === "string" ? row.message : String(error)}`);
-  }
-  const stderr = typeof row.stderr === "string" ? row.stderr : Buffer.isBuffer(row.stderr) ? row.stderr.toString("utf8") : "";
-  return new Error(`${prefix}: ${stderr.slice(0, 200)}`);
-}
-
-export async function transcodeWithMacOsUsing(
-  source: string,
-  wav: string,
-  kind: MediaKind,
-  tempDir: string,
-  deps: MacOsTranscodeDeps = {},
-): Promise<void> {
-  const run = deps.exec ?? executeConverter;
-  let audioSource = source;
-  const m4a = path.join(tempDir, "audio.m4a");
-  if (kind === "video") {
-    try {
-      await run("/usr/bin/avconvert", ["-p", "PresetAppleM4A", "-s", source, "-o", m4a]);
-      await fs.chmod(m4a, 0o600).catch(() => undefined);
-      audioSource = m4a;
-    } catch (error) {
-      // AVFoundation does not demux every Matroska/AAC combination Chromium
-      // can play. Use an owner-installed ffmpeg as a decoder fallback; it is
-      // never bundled or downloaded by this path.
-      const ffmpeg = (deps.findFfmpeg ?? findFfmpeg)();
-      if (ffmpeg === null) throw processError("no readable audio track", error);
-      try {
-        await run(ffmpeg, [
-          "-nostdin", "-v", "error", "-y", "-i", source,
-          "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
-          "-c:a", "pcm_s16le", wav,
-        ]);
-        await fs.chmod(wav, 0o600).catch(() => undefined);
-        return;
-      } catch (fallbackError) {
-        throw processError("no readable audio track", fallbackError);
-      }
-    }
-  }
-  try {
-    await run("/usr/bin/afconvert", ["-f", "WAVE", "-d", "LEI16@16000", audioSource, wav]);
-    await fs.chmod(wav, 0o600).catch(() => undefined);
-  } catch (error) {
-    throw processError("audio decode failed", error);
-  }
-}
-
-export const transcodeWithMacOs: TranscodeToWav = (source, wav, kind, tempDir) =>
-  transcodeWithMacOsUsing(source, wav, kind, tempDir);
-
-/** The labelled reason {@link decodeAudioBytes} falls back to for anything
- * that isn't WAV bytes. Exported so a caller or a test can recognize it
- * without hand-copying the string. */
-export const DECODE_NON_WAV_NOT_IMPLEMENTED =
-  "NOT_IMPLEMENTED: stt::decode_bytes_to_pcm (the afconvert/avconvert OS-converter " +
-  "shell-out that turns any audio or video container into 16 kHz mono PCM, " +
-  "src-tauri/src/stt.rs) has no Electron port yet — that is stt.rs's own subsystem, " +
-  "with real subprocess and private-tempfile machinery of its own, not a helper this " +
-  "file can reasonably inline. WAV bytes decode for real, via recFormat.ts's " +
-  "already-ported decodeWav (this room's own recordings, and any plain imported " +
-  ".wav); every other container reaches this labelled refusal rather than a " +
-  "fabricated waveform.";
-
-/** `decodeWav`'s own thrown message for bytes that aren't RIFF/WAVE-shaped at
- * all — matched by STRING, not by extension/mime, so a `.wav`-named file
- * that isn't really one still gets a real parse error and any container that
- * happens to actually BE a WAV still decodes. */
-const NOT_A_WAV_FILE = "not a WAV file";
-
-/**
- * The WAV header's OWN declared sample rate, read from its "fmt " chunk.
- *
- * Deliberately NOT reusing `recFormat.ts`'s `decodeWav`, which intentionally
- * discards this same field (see this module's "RUST-FIDELITY DEVIATION"
- * note: that parser only ever sees bytes ALREADY guaranteed 16 kHz, either
- * this app's own recordings or `afconvert`'s own output, so it never needed
- * to read it). {@link decodeAudioBytes} skips that resample guarantee
- * entirely, so it reads the rate for itself here rather than assume one.
- * Same RIFF chunk walk `decodeWav` uses, reading `nSamplesPerSec` (fmt body
- * offset 4) instead of `nChannels` (fmt body offset 2). Returns `null` (the
- * caller falls back to {@link SAMPLE_RATE}) for anything shorter than a
- * minimal WAV header or missing a readable "fmt " chunk — never throws, so a
- * file `decodeWav` can still parse (it needs no complete "fmt " chunk of its
- * own past the channel count) never fails here first.
- */
-function wavSampleRate(bytes: Buffer): number | null {
-  if (bytes.length < 44) {
-    return null;
-  }
-  let pos = 12;
-  while (pos + 8 <= bytes.length) {
-    const id = bytes.toString("ascii", pos, pos + 4);
-    const size = bytes.readUInt32LE(pos + 4);
-    const body = pos + 8;
-    if (id === "fmt " && body + 8 <= bytes.length) {
-      return bytes.readUInt32LE(body + 4);
-    }
-    if (id === "data") {
-      break; // a well-formed WAV always has "fmt " before "data"
-    }
-    pos = body + size + (size & 1);
-  }
-  return null;
-}
-
-/**
- * The default {@link DecodeToPcmFn}: a real decode for WAV bytes, an honest
- * refusal for everything else. See this module's doc for the full reasoning.
- */
-export async function decodeAudioBytesWith(
-  bytes: Buffer,
-  ext: string,
-  kind: MediaKind,
-  transcode: TranscodeToWav,
-): Promise<DecodedPcm> {
-  let samples: Float32Array;
-  try {
-    samples = decodeWav(bytes);
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    if (message === NOT_A_WAV_FILE) {
-      const safeExt = /^[a-z0-9]{1,10}$/iu.test(ext) ? ext : "bin";
-      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "arcelle-peaks-"));
-      const source = path.join(tempDir, `source.${safeExt}`);
-      const wav = path.join(tempDir, "decoded.wav");
-      try {
-        await fs.writeFile(source, bytes, { mode: 0o600, flag: "wx" });
-        await transcode(source, wav, kind, tempDir);
-        samples = decodeWav(await fs.readFile(wav));
-        return { samples, sampleRate: SAMPLE_RATE };
-      } finally {
-        await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
-      }
-    }
-    // A real WAV that fails to parse for some other reason (no data chunk,
-    // truncated bytes) is a genuine decode failure — keep decodeWav's own
-    // words rather than reinterpreting them, the same philosophy
-    // `describeDecodeError` states out loud for its own passthrough case.
-    throw e instanceof Error ? e : new Error(message);
-  }
-  return { samples, sampleRate: wavSampleRate(bytes) ?? SAMPLE_RATE };
-}
-
-export const decodeAudioBytes: DecodeToPcmFn = (bytes, ext, kind) =>
-  decodeAudioBytesWith(bytes, ext, kind, transcodeWithMacOs);
-
 // -------------------------------------------------------------- room access
 
 /** The slice of the (not-yet-ported) `AppState` this command needs:
@@ -590,7 +414,7 @@ export interface RoomSource {
  * `previewTools.ts` already spell it. */
 const NO_ROOM_OPEN = "No room is open.";
 
-function openDb(room: RoomSource): Database.Database {
+export function openDb(room: RoomSource): Database.Database {
   const open = room.currentRoom();
   if (open === null) {
     throw new Error(NO_ROOM_OPEN);
@@ -603,6 +427,93 @@ function errMessage(e: unknown): string {
 }
 
 // ------------------------------------------------------------- audio_peaks
+
+interface PeakWork {
+  buckets: number;
+  key: string;
+  hit: AudioPeaks | undefined;
+}
+
+interface PeakFile {
+  name: string;
+  mime: string;
+  bytes: Buffer;
+}
+
+function peakWork(
+  db: Database.Database,
+  cache: PeakCache,
+  id: string,
+  bucketsArg: number | null | undefined,
+): PeakWork {
+  const buckets = clampBuckets(bucketsArg);
+  const size = getFileMeta(db, id).sizeBytes;
+  const key = cacheKey(id, buckets, size);
+  return { buckets, key, hit: cache.map.get(key) };
+}
+
+function legacyPeakFile(db: Database.Database, id: string): PeakFile {
+  const [name, mimeRaw, bytesRaw] = getFileFull(db, id);
+  return { name, mime: mimeRaw ?? "", bytes: bytesRaw ?? Buffer.alloc(0) };
+}
+
+async function roomPeakFile(room: OpenRoom, id: string): Promise<PeakFile> {
+  const file = await readRoomFile({ db: room.db, path: room.path }, id);
+  return {
+    name: file.name,
+    mime: file.mimeType ?? "",
+    bytes: file.bytes ?? Buffer.alloc(0),
+  };
+}
+
+function peakDecodeInput(file: PeakFile): { bytes: Buffer; ext: string; kind: MediaKind } {
+  if (file.bytes.length === 0) {
+    throw new Error("This file has no audio to draw.");
+  }
+  const ext = extensionOf(file.name);
+  const kind = mediaKind(file.mime, ext);
+  if (kind === null) {
+    throw new Error("This file is not audio or video.");
+  }
+  return { bytes: file.bytes, ext, kind };
+}
+
+function computedPeaks(samples: ArrayLike<number>, sampleRate: number, buckets: number): AudioPeaks {
+  const duration = sampleRate > 0 ? samples.length / sampleRate : 0;
+  const peaks = envelope(samples, buckets);
+  return { peaks, duration, silent: isSilent(peaks) };
+}
+
+async function decodePeaks(
+  file: PeakFile,
+  buckets: number,
+  decode: DecodeToPcmFn,
+): Promise<AudioPeaks> {
+  const { bytes, ext, kind } = peakDecodeInput(file);
+  try {
+    const { samples, sampleRate } = await decode(bytes, ext, kind);
+    return computedPeaks(samples, sampleRate, buckets);
+  } catch (error) {
+    throw new Error(describeDecodeError(errMessage(error)));
+  }
+}
+
+function cacheComputedPeaks(cache: PeakCache, key: string, computed: AudioPeaks): AudioPeaks {
+  if (cache.map.size >= MAX_CACHED) {
+    cache.map.clear();
+  }
+  cache.map.set(key, clonePeaks(computed));
+  return computed;
+}
+
+async function computeAndCachePeaks(
+  cache: PeakCache,
+  work: PeakWork,
+  file: PeakFile,
+  decode: DecodeToPcmFn,
+): Promise<AudioPeaks> {
+  return cacheComputedPeaks(cache, work.key, await decodePeaks(file, work.buckets, decode));
+}
 
 /**
  * Port of `commands::audio_peaks`. Takes the room's ALREADY-UNWRAPPED
@@ -621,50 +532,13 @@ export async function audioPeaks(
   bucketsArg: number | null | undefined,
   decode: DecodeToPcmFn = decodeAudioBytes
 ): Promise<AudioPeaks> {
-  const buckets = clampBuckets(bucketsArg);
-
   // The stored length FIRST, and without the bytes: it is what tells a
   // cached envelope apart from one of audio that has since been rewritten
   // (see `cacheKey`'s own doc), and it means a cache HIT never has to read —
   // let alone decrypt — the file's (possibly huge) blob at all.
-  const size = getFileMeta(db, id).sizeBytes;
-  const key = cacheKey(id, buckets, size);
-  const hit = cache.map.get(key);
-  if (hit !== undefined) {
-    return clonePeaks(hit);
-  }
-
-  const [name, mimeRaw, bytesRaw] = getFileFull(db, id);
-  const mime = mimeRaw ?? "";
-  const bytes = bytesRaw ?? Buffer.alloc(0);
-  if (bytes.length === 0) {
-    throw new Error("This file has no audio to draw.");
-  }
-  const ext = extensionOf(name);
-  const kind = mediaKind(mime, ext);
-  if (kind === null) {
-    throw new Error("This file is not audio or video.");
-  }
-
-  let computed: AudioPeaks;
-  try {
-    const { samples, sampleRate } = await decode(bytes, ext, kind);
-    // `decode_bytes_to_pcm` always returns mono 16 kHz in Rust, which is
-    // where its duration comes from; this port's WAV fast path reads the
-    // real declared rate instead — see this module's "RUST-FIDELITY
-    // DEVIATION" note.
-    const duration = sampleRate > 0 ? samples.length / sampleRate : 0;
-    const peaks = envelope(samples, buckets);
-    computed = { peaks, duration, silent: isSilent(peaks) };
-  } catch (e) {
-    throw new Error(describeDecodeError(errMessage(e)));
-  }
-
-  if (cache.map.size >= MAX_CACHED) {
-    cache.map.clear();
-  }
-  cache.map.set(key, clonePeaks(computed));
-  return computed;
+  const work = peakWork(db, cache, id, bucketsArg);
+  if (work.hit !== undefined) return clonePeaks(work.hit);
+  return computeAndCachePeaks(cache, work, legacyPeakFile(db, id), decode);
 }
 
 /** Hybrid-room entry point: metadata stays in SQLCipher, while workspace
@@ -677,31 +551,9 @@ export async function audioPeaksForRoom(
   bucketsArg: number | null | undefined,
   decode: DecodeToPcmFn = decodeAudioBytes,
 ): Promise<AudioPeaks> {
-  const buckets = clampBuckets(bucketsArg);
-  const size = getFileMeta(room.db, id).sizeBytes;
-  const key = cacheKey(id, buckets, size);
-  const hit = cache.map.get(key);
-  if (hit !== undefined) return clonePeaks(hit);
-
-  const file = await readRoomFile({ db: room.db, path: room.path }, id);
-  const bytes = file.bytes ?? Buffer.alloc(0);
-  if (bytes.length === 0) throw new Error("This file has no audio to draw.");
-  const ext = extensionOf(file.name);
-  const kind = mediaKind(file.mimeType ?? "", ext);
-  if (kind === null) throw new Error("This file is not audio or video.");
-
-  let computed: AudioPeaks;
-  try {
-    const { samples, sampleRate } = await decode(bytes, ext, kind);
-    const duration = sampleRate > 0 ? samples.length / sampleRate : 0;
-    const peaks = envelope(samples, buckets);
-    computed = { peaks, duration, silent: isSilent(peaks) };
-  } catch (e) {
-    throw new Error(describeDecodeError(errMessage(e)));
-  }
-  if (cache.map.size >= MAX_CACHED) cache.map.clear();
-  cache.map.set(key, clonePeaks(computed));
-  return computed;
+  const work = peakWork(room.db, cache, id, bucketsArg);
+  if (work.hit !== undefined) return clonePeaks(work.hit);
+  return computeAndCachePeaks(cache, work, await roomPeakFile(room, id), decode);
 }
 
 /**

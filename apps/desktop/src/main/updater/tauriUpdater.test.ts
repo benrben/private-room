@@ -259,6 +259,15 @@ describe("downloadAndVerify", () => {
     );
     expect(httpErr.code).toBe("http_error");
   });
+
+  it("reports a payload network failure with its own error type", async () => {
+    const offline: FetchLike = async () => {
+      throw new Error("ECONNRESET");
+    };
+    const error = await rejectsWith<UpdateDownloadError>(downloadAndVerify(offline, entry, fixture.pubkeyB64));
+    expect(error.code).toBe("network_error");
+    expect(error.message).toContain("ECONNRESET");
+  });
 });
 
 // ------------------------------------------------------- security invariant

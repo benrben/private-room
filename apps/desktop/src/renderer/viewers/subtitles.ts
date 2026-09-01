@@ -67,50 +67,98 @@ export function shortStamp(ms: number): string {
  * the cue's own id, its positioning settings, and the `WEBVTT` header,
  * `NOTE`/`STYLE`/`REGION` blocks between cues — and all of it is carried on the
  * cues so a save can put the file back together as it was. */
+type ParsedCue = Omit<Cue, "index" | "before" | "after">;
+
+interface ParseState {
+  cues: Cue[];
+  stray: string[];
+}
+
+interface CuePreamble {
+  at: number;
+  id?: string;
+}
+
+function cueLines(block: string): string[] {
+  return block.split("\n").filter((line) => line.trim() !== "");
+}
+
+function isMetadataBlock(lines: string[]): boolean {
+  return /^WEBVTT/i.test(lines[0]) || /^(NOTE|STYLE|REGION)\b/i.test(lines[0]);
+}
+
+function cuePreamble(lines: string[]): CuePreamble | undefined {
+  if (lines[0].includes("-->")) return { at: 0 };
+  if (!lines[1]) return undefined;
+  return { at: 1, id: lines[0].trim() };
+}
+
+function parseTiming(
+  timingLine: string,
+): Pick<ParsedCue, "startMs" | "endMs" | "settings"> | undefined {
+  const [rawStart = "", rawEnd = ""] = timingLine.split("-->");
+  const startMs = parseStamp(rawStart);
+  // A WebVTT timing line can carry settings after the end stamp
+  // ("... --> 00:02.000 line:90%"), so only the first token is the time.
+  const tail = rawEnd.trim().split(/\s+/);
+  const endMs = parseStamp(tail[0]);
+  if (startMs == null || endMs == null) return undefined;
+  const settings = tail.slice(1).join(" ");
+  return settings ? { startMs, endMs, settings } : { startMs, endMs };
+}
+
+function parseCue(lines: string[]): ParsedCue | undefined {
+  const preamble = cuePreamble(lines);
+  if (!preamble) return undefined;
+  const timingLine = lines[preamble.at];
+  if (!timingLine.includes("-->")) return undefined;
+  const timing = parseTiming(timingLine);
+  if (!timing) return undefined;
+  // A timed block with no words is still a cue. Dropping it deleted the
+  // timecode of every line the editor cleared, and renumbered the rest.
+  const text = lines.slice(preamble.at + 1).join("\n").trim();
+  return preamble.id ? { ...timing, id: preamble.id, text } : { ...timing, text };
+}
+
+function indexedCue(parsed: ParsedCue, index: number): Cue {
+  const { id, settings, startMs, endMs, text } = parsed;
+  const cue: Cue = { index, startMs, endMs, text };
+  if (id) cue.id = id;
+  if (settings) cue.settings = settings;
+  return cue;
+}
+
+function publishCue(state: ParseState, parsed: ParsedCue): void {
+  const cue = indexedCue(parsed, state.cues.length + 1);
+  if (state.stray.length) {
+    cue.before = state.stray;
+    state.stray = [];
+  }
+  state.cues.push(cue);
+}
+
+function consumeBlock(state: ParseState, block: string): void {
+  const lines = cueLines(block);
+  if (!lines.length) return;
+  if (isMetadataBlock(lines)) {
+    state.stray.push(lines.join("\n"));
+    return;
+  }
+  const parsed = parseCue(lines);
+  if (parsed) publishCue(state, parsed);
+}
+
+function finishMetadata(state: ParseState): void {
+  if (state.stray.length && state.cues.length) state.cues[state.cues.length - 1].after = state.stray;
+}
+
 export function parseCues(raw: string): Cue[] {
-  const cues: Cue[] = [];
-  // Blocks seen since the last cue: not speech, but part of the file.
-  let stray: string[] = [];
+  const state: ParseState = { cues: [], stray: [] };
   // Both dialects separate cues with a blank line; \r\n is normalized first so
   // a Windows-authored file doesn't leave a stray \r on every line of text.
-  const blocks = raw.replace(/\r\n?/g, "\n").split(/\n{2,}/);
-  for (const block of blocks) {
-    const lines = block.split("\n").filter((l) => l.trim() !== "");
-    if (lines.length === 0) continue;
-    if (/^WEBVTT/i.test(lines[0]) || /^(NOTE|STYLE|REGION)\b/i.test(lines[0])) {
-      stray.push(lines.join("\n"));
-      continue;
-    }
-    // A leading bare number is SRT's cue index; WebVTT may use a cue id here.
-    let at = 0;
-    let id: string | undefined;
-    if (!lines[at].includes("-->")) {
-      id = lines[at].trim();
-      at++;
-    }
-    if (at >= lines.length || !lines[at].includes("-->")) continue;
-    const [rawStart, rawEnd] = lines[at].split("-->");
-    const startMs = parseStamp(rawStart ?? "");
-    // A WebVTT timing line can carry settings after the end stamp
-    // ("... --> 00:02.000 line:90%"), so only the first token is the time.
-    const tail = (rawEnd ?? "").trim().split(/\s+/);
-    const endMs = parseStamp(tail[0] ?? "");
-    if (startMs == null || endMs == null) continue;
-    const settings = tail.slice(1).join(" ");
-    // A timed block with no words is still a cue. Dropping it deleted the
-    // timecode of every line the editor cleared, and renumbered the rest.
-    const text = lines.slice(at + 1).join("\n").trim();
-    const cue: Cue = { index: cues.length + 1, startMs, endMs, text };
-    if (id) cue.id = id;
-    if (settings) cue.settings = settings;
-    if (stray.length) {
-      cue.before = stray;
-      stray = [];
-    }
-    cues.push(cue);
-  }
-  if (stray.length && cues.length) cues[cues.length - 1].after = stray;
-  return cues;
+  raw.replace(/\r\n?/g, "\n").split(/\n{2,}/).forEach((block) => consumeBlock(state, block));
+  finishMetadata(state);
+  return state.cues;
 }
 
 /** Serialize back to SRT. Round-trips `parseCues`, so the subtitle editor can

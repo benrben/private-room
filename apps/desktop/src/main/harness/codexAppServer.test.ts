@@ -172,6 +172,82 @@ function completingTurnChild(
   return child as unknown as ChildProcessWithoutNullStreams;
 }
 
+interface InteractiveTurnServer {
+  child: ChildProcessWithoutNullStreams;
+  requests: Array<Record<string, unknown>>;
+  send(message: Record<string, unknown>): void;
+  sendRaw(line: string): void;
+}
+
+function interactiveTurnServer(): InteractiveTurnServer {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const requests: Array<Record<string, unknown>> = [];
+  const child = Object.assign(new EventEmitter(), {
+    stdin,
+    stdout,
+    stderr,
+    pid: 987_656,
+    kill: () => {
+      queueMicrotask(() => child.emit("exit", null, "SIGTERM"));
+      return true;
+    },
+  });
+  const send = (message: Record<string, unknown>): void => {
+    stdout.write(`${JSON.stringify(message)}\n`);
+  };
+  const sendRaw = (line: string): void => {
+    stdout.write(`${line}\n`);
+  };
+  stdin.on("data", (chunk) => {
+    for (const line of chunk.toString().split("\n").filter(Boolean)) {
+      const message = JSON.parse(line) as Record<string, unknown>;
+      requests.push(message);
+      if (typeof message.method !== "string" || message.id === undefined) continue;
+      if (message.method === "initialize") queueMicrotask(() => send({ id: message.id, result: { userAgent: "fake" } }));
+      if (message.method === "thread/start") queueMicrotask(() => send({ id: message.id, result: { thread: { id: "thread-1" } } }));
+      if (message.method === "turn/start") queueMicrotask(() => send({ id: message.id, result: { turn: { id: "turn-1" } } }));
+    }
+  });
+  stdin.on("finish", () => queueMicrotask(() => child.emit("exit", 0, null)));
+  return { child: child as unknown as ChildProcessWithoutNullStreams, requests, send, sendRaw };
+}
+
+async function waitForRequest(server: InteractiveTurnServer, method: string): Promise<Record<string, unknown>> {
+  for (let attempts = 0; attempts < 50; attempts += 1) {
+    const request = server.requests.find((candidate) => candidate.method === method);
+    if (request !== undefined) return request;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`Timed out waiting for ${method}.`);
+}
+
+async function startInteractiveTurn(runId: string): Promise<{ server: InteractiveTurnServer; run: Awaited<ReturnType<CodexAppServerRuntime["startTurn"]>> }> {
+  const fixture = await codexHomeFixture();
+  const server = interactiveTurnServer();
+  const runtime = new CodexAppServerRuntime("codex", (() => server.child) as never, 100, fixture.sourceHome);
+  const run = await runtime.startTurn({
+    runId,
+    roomId: "room-1",
+    provider: "codex",
+    model: "test-model",
+    workspacePath: fixture.workspacePath,
+    runtimePath: fixture.runtimePath,
+    privacyMode: "cloud-direct",
+    writeEnabled: false,
+    exposureVerified: true,
+  }, { text: "Exercise the app-server protocol." });
+  await waitForRequest(server, "turn/start");
+  return { server, run };
+}
+
+async function collectEvents(events: AsyncIterable<unknown>): Promise<unknown[]> {
+  const collected: unknown[] = [];
+  for await (const event of events) collected.push(event);
+  return collected;
+}
+
 describe("Codex app-server compatibility probe", () => {
   it("creates a private runtime home with only auth and config", async () => {
     const fixture = await codexHomeFixture();
@@ -218,6 +294,7 @@ exit 2`);
     const writes: string[] = [];
     const kills: NodeJS.Signals[] = [];
     const child = probeChild("initialize", writes, kills);
+    child.stdout.write("fabricated non-protocol diagnostic\n");
     const spawn = ((_options: unknown, args: string[], spawnOptions: { env?: NodeJS.ProcessEnv }) => {
       expect(args).toEqual(["app-server", "--listen", "stdio://"]);
       expect(spawnOptions.env?.CODEX_HOME).toBe(expectedRuntimeHome);
@@ -230,6 +307,75 @@ exit 2`);
     expect(writes[0]).not.toContain("/workspace/SECRET-room");
     expect(writes[0]).not.toContain("SECRET /Users/person/private-room");
     expect(kills).toContain("SIGTERM");
+  });
+
+  it("fails closed when the initialize request cannot be written", async () => {
+    const fixture = await codexHomeFixture();
+    const child = probeChild("hang", [], []);
+    child.stdin.write = (() => { throw new Error("fabricated stdin refusal"); }) as typeof child.stdin.write;
+    const runtime = new CodexAppServerRuntime(
+      "codex",
+      (() => child) as never,
+      10,
+      fixture.sourceHome,
+    );
+    await expect(runtime.verifyExposure(fixture.workspacePath, fixture.runtimePath, false)).resolves.toBe(false);
+  });
+
+  it("fails closed when the sandboxed exposure process cannot spawn", async () => {
+    const fixture = await codexHomeFixture();
+    const runtime = new CodexAppServerRuntime(
+      "codex",
+      (() => { throw new Error("fabricated spawn refusal"); }) as never,
+      10,
+      fixture.sourceHome,
+    );
+    await expect(runtime.verifyExposure(fixture.workspacePath, fixture.runtimePath, false)).resolves.toBe(false);
+  });
+
+  it("refuses an unverified turn before allocating its protocol process", async () => {
+    const spawn = (() => { throw new Error("must not spawn"); }) as never;
+    const runtime = new CodexAppServerRuntime("codex", spawn);
+    await expect(runtime.startTurn({
+      runId: "unverified",
+      roomId: "room-1",
+      provider: "codex",
+      model: "test-model",
+      workspacePath: "/workspace",
+      runtimePath: "/runtime",
+      privacyMode: "cloud-direct",
+      writeEnabled: false,
+      exposureVerified: false,
+    }, { text: "must not run" })).rejects.toThrow("refused an unverified workspace exposure");
+  });
+
+  it("stops the Room MCP bridge when turn process setup fails", async () => {
+    const fixture = await codexHomeFixture();
+    let stopped = 0;
+    const runtime = new CodexAppServerRuntime(
+      "codex",
+      (() => { throw new Error("fabricated turn spawn refusal"); }) as never,
+      10,
+      fixture.sourceHome,
+      async () => ({
+        url: "http://127.0.0.1:1/mcp",
+        token: "fabricated",
+        instructions: "Fabricated Room MCP",
+        stop: async () => { stopped += 1; },
+      }),
+    );
+    await expect(runtime.startTurn({
+      runId: "spawn-failure",
+      roomId: "room-1",
+      provider: "codex",
+      model: "test-model",
+      workspacePath: fixture.workspacePath,
+      runtimePath: fixture.runtimePath,
+      privacyMode: "cloud-direct",
+      writeEnabled: false,
+      exposureVerified: true,
+    }, { text: "must fail" })).rejects.toThrow("fabricated turn spawn refusal");
+    expect(stopped).toBe(1);
   });
 
   it.each(["exit", "hang"] as const)("fails closed when app-server %s before initialization", async (behavior) => {
@@ -393,6 +539,102 @@ exit 2`);
     });
   });
 
+  it("routes approvals, collaboration, notifications, and generic requests through the app-server protocol", async () => {
+    const { server, run } = await startInteractiveTurn("run-protocol");
+    server.send({ id: "command", method: "item/commandExecution/requestApproval", params: { reason: "Run review" } });
+    server.send({ id: "file", method: "item/fileChange/requestApproval", params: { command: "Write notes" } });
+    server.send({ id: "permissions", method: "item/permissions/requestApproval", params: { permissions: { fileSystem: "write" } } });
+    server.send({
+      id: "room-mcp",
+      method: "mcpServer/elicitation/request",
+      params: {
+        serverName: "room",
+        mode: "form",
+        message: "Approve the Room tool.",
+        _meta: { codex_approval_kind: "mcp_tool_call", persist: ["session"] },
+      },
+    });
+    server.send({ id: "generic", method: "mcpServer/elicitation/request", params: { serverName: "other", mode: "form" } });
+    server.send({ method: "item/agentMessage/delta", params: { delta: "hello" } });
+    server.send({
+      method: "item/started",
+      params: { item: { type: "collab_agent_tool_call", id: "tool-1", tool: "delegate", receiver_thread_ids: ["agent-1"] } },
+    });
+    server.send({
+      method: "item/completed",
+      params: {
+        item: {
+          type: "collab_agent_tool_call",
+          id: "tool-1",
+          status: "failed",
+          error: { message: "not found" },
+          agents_states: { "agent-state": { status: "pending" } },
+        },
+      },
+    });
+    server.send({
+      method: "item/completed",
+      params: { item: { type: "collab_agent_tool_call", status: "failed", new_thread_id: "agent-fallback" } },
+    });
+    server.send({ method: "turn/diff/updated", params: { diff: "updated plan" } });
+    server.send({ method: "thread/tokenUsage/updated", params: { usage: { inputTokens: 12, outputTokens: "unknown" } } });
+    server.send({ method: "error" });
+    server.send({ method: "unknown/notification" });
+    server.send({ id: "unknown-response", result: "ignored" });
+    server.sendRaw("not a protocol message");
+
+    await run.approve("command", "allow-once");
+    await run.approve("file", "deny");
+    await run.approve("permissions", "allow-run");
+    await run.approve("room-mcp", "allow-run");
+    await expect(run.approve("expired", "deny")).rejects.toThrow("no longer active");
+
+    server.send({ method: "turn/completed", params: { turn: { status: "completed" } } });
+    const events = await collectEvents(run.events);
+    expect(events).toEqual(expect.arrayContaining([
+      { type: "approval_requested", runId: "run-protocol", requestId: "command", tool: "shell", detail: "Run review" },
+      { type: "approval_requested", runId: "run-protocol", requestId: "file", tool: "file_change", detail: "Write notes" },
+      { type: "approval_requested", runId: "run-protocol", requestId: "permissions", tool: "permissions", detail: "Codex requests permission for this protected operation." },
+      { type: "approval_requested", runId: "run-protocol", requestId: "room-mcp", tool: "room_mcp", detail: "Approve the Room tool." },
+      { type: "text_delta", runId: "run-protocol", text: "hello" },
+      { type: "agent_started", runId: "run-protocol", agentId: "agent-1", label: "delegate" },
+      { type: "tool_started", runId: "run-protocol", tool: "collabAgentToolCall", toolId: "tool-1" },
+      { type: "agent_completed", runId: "run-protocol", agentId: "agent-state" },
+      { type: "agent_completed", runId: "run-protocol", agentId: "agent-fallback" },
+      { type: "plan_updated", runId: "run-protocol", text: "updated plan" },
+      { type: "usage_updated", runId: "run-protocol", inputTokens: 12, outputTokens: undefined },
+      { type: "run_completed", runId: "run-protocol", status: "completed" },
+    ]));
+    const replies = server.requests.filter((request) => request.method === undefined && request.id !== undefined);
+    expect(replies).toEqual(expect.arrayContaining([
+      { id: "generic", result: { action: "decline", content: null } },
+      { id: "command", result: { decision: "accept" } },
+      { id: "file", result: { decision: "decline" } },
+      { id: "permissions", result: { permissions: { fileSystem: "write" }, scope: "session", strictAutoReview: false } },
+      { id: "room-mcp", result: { action: "accept", content: null, _meta: { persist: "session" } } },
+    ]));
+  });
+
+  it.each([
+    ["interrupted", { type: "run_completed", runId: "run-interrupted", status: "cancelled" }],
+    ["failed", { type: "run_failed", runId: "run-failed" }],
+  ] as const)("maps a %s turn completion to the matching terminal event", async (status, expected) => {
+    const { server, run } = await startInteractiveTurn(`run-${status}`);
+    server.send({ method: "turn/completed", params: { turn: { status } } });
+    await expect(collectEvents(run.events)).resolves.toEqual(expect.arrayContaining([expect.objectContaining(expected)]));
+  });
+
+  it("falls back to process termination when an interrupt RPC returns an error", async () => {
+    const { server, run } = await startInteractiveTurn("run-interrupt-error");
+    const cancellation = run.cancel();
+    const interrupt = await waitForRequest(server, "turn/interrupt");
+    server.send({ id: interrupt.id, error: { message: "cannot interrupt" } });
+    await cancellation;
+    await expect(collectEvents(run.events)).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "run_failed", runId: "run-interrupt-error" }),
+    ]));
+  });
+
   it.runIf(installedCodex && nativeWorkspaceSandboxSupported())(
     "initializes the installed app-server with isolated mutable state",
     async () => {
@@ -429,5 +671,14 @@ exit 2`);
     expect(compatibility.compatible).toBe(false);
     expect(compatibility.missingMethods).toContain("turn/interrupt");
     expect(compatibility.missingMethods).toContain("item/completed");
+  });
+
+  it("fails closed when one generated schema file is incomplete JSON", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-codex-schema-fixture-"));
+    roots.push(root);
+    await writeFile(path.join(root, "protocol.json"), '{"method":"thread/start"', "utf8");
+    const compatibility = await inspectCodexSchemaDirectory(root);
+    expect(compatibility).toMatchObject({ compatible: false, files: 0 });
+    expect(compatibility.missingMethods).toContain("thread/start");
   });
 });

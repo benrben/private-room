@@ -727,6 +727,15 @@ describe("menuSync", () => {
     menuSync(menu as unknown as ElectronMenu, aState());
     expect(menu.getMenuItemById(NEW_ID)!.enabled).toBe(false);
   });
+
+  it("leaves an unexpected checkbox row unchanged when no checked payload exists for it", () => {
+    const menu = new FakeMenu();
+    menu.set(NEW_ID, { type: "checkbox", checked: true, enabled: false });
+
+    menuSync(menu as unknown as ElectronMenu, aState());
+
+    expect(menu.getMenuItemById(NEW_ID)).toMatchObject({ checked: true, enabled: false });
+  });
 });
 
 // Section-id constants are exercised implicitly by every `rowsOf(...)` call

@@ -115,18 +115,37 @@ function isDefaultProvenance(p: Provenance): boolean {
  * port has no module-private-but-sibling-visible concept, and that call site is
  * a later batch's to wire up.
  */
+function copyProvenanceJsonString(
+  out: Record<string, unknown>,
+  key: "runId" | "agent" | "tool",
+  value: string | undefined,
+): void {
+  if (value !== undefined) {
+    out[key] = value;
+  }
+}
+
+function copyProvenanceJsonSources(out: Record<string, unknown>, sourceFileIds: string[] | undefined): void {
+  if (sourceFileIds === undefined || sourceFileIds.length === 0) {
+    return;
+  }
+  out.sourceFileIds = sourceFileIds;
+}
+
+function provenanceJsonRecord(p: Provenance): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  copyProvenanceJsonString(out, "runId", p.runId);
+  copyProvenanceJsonString(out, "agent", p.agent);
+  copyProvenanceJsonString(out, "tool", p.tool);
+  copyProvenanceJsonSources(out, p.sourceFileIds);
+  return out;
+}
+
 export function provenanceToJson(p: Provenance): string | null {
   if (isDefaultProvenance(p)) {
     return null;
   }
-  const out: Record<string, unknown> = {};
-  if (p.runId !== undefined) out.runId = p.runId;
-  if (p.agent !== undefined) out.agent = p.agent;
-  if (p.tool !== undefined) out.tool = p.tool;
-  if (p.sourceFileIds !== undefined && p.sourceFileIds.length > 0) {
-    out.sourceFileIds = p.sourceFileIds;
-  }
-  return JSON.stringify(out);
+  return JSON.stringify(provenanceJsonRecord(p));
 }
 
 /** One optional string field, serde-style: absent and JSON `null` both read as
@@ -135,6 +154,62 @@ export function provenanceToJson(p: Provenance): string | null {
 function optString(v: unknown): string | undefined | false {
   if (v === undefined || v === null) return undefined;
   return typeof v === "string" ? v : false;
+}
+
+function parsedProvenanceRecord(json: string): Record<string, unknown> | null {
+  try {
+    const raw: unknown = JSON.parse(json);
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      return null;
+    }
+    return raw as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function hasOnlyOptionalStrings(values: readonly (string | undefined | false)[]): boolean {
+  return values.every((value) => value !== false);
+}
+
+function copyProvenanceString(
+  fields: Provenance,
+  key: "runId" | "agent" | "tool",
+  value: string | undefined | false
+): void {
+  if (typeof value === "string") {
+    fields[key] = value;
+  }
+}
+
+function provenanceStringFields(raw: Record<string, unknown>): Provenance | null {
+  const values = [optString(raw.runId), optString(raw.agent), optString(raw.tool)] as const;
+  if (!hasOnlyOptionalStrings(values)) {
+    return null;
+  }
+  const fields: Provenance = {};
+  copyProvenanceString(fields, "runId", values[0]);
+  copyProvenanceString(fields, "agent", values[1]);
+  copyProvenanceString(fields, "tool", values[2]);
+  return fields;
+}
+
+function provenanceSourceFileIds(raw: Record<string, unknown>): string[] | undefined | null {
+  const sourceFileIds = raw.sourceFileIds;
+  if (sourceFileIds === undefined || sourceFileIds === null) {
+    return undefined;
+  }
+  if (!Array.isArray(sourceFileIds) || sourceFileIds.some((value) => typeof value !== "string")) {
+    return null;
+  }
+  return sourceFileIds as string[];
+}
+
+function provenanceWithSources(fields: Provenance, sourceFileIds: string[] | undefined): Provenance {
+  if (sourceFileIds === undefined) {
+    return fields;
+  }
+  return { ...fields, sourceFileIds };
 }
 
 /**
@@ -159,35 +234,19 @@ function optString(v: unknown): string | undefined | false {
  * files recorded" is what both spellings mean.
  */
 export function provenanceFromJson(json: string): Provenance | null {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(json);
-  } catch {
+  const raw = parsedProvenanceRecord(json);
+  if (raw === null) {
     return null;
   }
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+  const fields = provenanceStringFields(raw);
+  if (fields === null) {
     return null;
   }
-  const o = raw as Record<string, unknown>;
-  const runId = optString(o.runId);
-  const agent = optString(o.agent);
-  const tool = optString(o.tool);
-  if (runId === false || agent === false || tool === false) {
+  const sourceFileIds = provenanceSourceFileIds(raw);
+  if (sourceFileIds === null) {
     return null;
   }
-  let sourceFileIds: string[] | undefined;
-  if (o.sourceFileIds !== undefined && o.sourceFileIds !== null) {
-    if (!Array.isArray(o.sourceFileIds) || o.sourceFileIds.some((x) => typeof x !== "string")) {
-      return null;
-    }
-    sourceFileIds = o.sourceFileIds as string[];
-  }
-  const out: Provenance = {};
-  if (runId !== undefined) out.runId = runId;
-  if (agent !== undefined) out.agent = agent;
-  if (tool !== undefined) out.tool = tool;
-  if (sourceFileIds !== undefined) out.sourceFileIds = sourceFileIds;
-  return out;
+  return provenanceWithSources(fields, sourceFileIds);
 }
 
 // ---------------------------------------------------- ART-1: staged artifacts

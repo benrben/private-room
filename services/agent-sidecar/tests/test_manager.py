@@ -798,6 +798,23 @@ def test_sibling_ties_fall_to_the_domain_default() -> None:
     assert resolve_worker("ask_connector_agent", "handle it") == "connectors.use"
 
 
+def test_navigation_intent_prefers_the_reachable_browser_worker() -> None:
+    """A destination is browser work even when a search hint is more specific."""
+    assert (
+        resolve_worker("ask_web_agent", "go to Google and search for new tax rules")
+        == "chat.browse"
+    )
+    search_only = set(ALL_REGISTRY_TOOLS) - set(get_agent("chat.browse").tools)
+    assert (
+        resolve_worker(
+            "ask_web_agent",
+            "go to Google and search for new tax rules",
+            served_names=search_only,
+        )
+        == "chat.web"
+    )
+
+
 def test_hebrew_instructions_resolve_too() -> None:
     assert resolve_worker("ask_jobs_agent", "סכם את כל הספר") == "jobs.run"
     assert resolve_worker("ask_jobs_agent", "תזמן תהליך כל בוקר") == "jobs.workflows"

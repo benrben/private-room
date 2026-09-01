@@ -173,3 +173,37 @@ def test_uc_count_is_clamped_to_16() -> None:
     # instead of stopping after the 16 placeholder 'x' characters.
     doc = "{\\rtf1\\ansi\\ansicpg1252\\uc20\\u65" + ("x" * 16) + "REAL\\par}"
     assert rtf.extract_rtf(doc) == "AREAL\n"
+
+
+def test_malformed_numeric_escapes_are_ignored_without_losing_prose() -> None:
+    # The Rust parser accepts only its target integer grammar. Invalid
+    # parameters reset `ansicpg`, or contribute no Unicode character, while
+    # leaving the following literal prose available to the main walk.
+    assert rtf.extract_rtf(r"{\rtf1\ansicpg-1 A\'e8B}") == "AèB"
+    assert rtf.extract_rtf(r"{\rtf1\uc0\u12-34Z}") == "Z"
+    assert rtf.extract_rtf(r"{\rtf1\uc0\u\~Z}") == "Z"
+
+
+def test_fallback_escapes_each_consume_one_character() -> None:
+    # A fallback hex escape, control word, non-alphabetic escape, and a
+    # trailing escape all represent exactly one ANSI fallback character.
+    assert rtf.extract_rtf(r"{\rtf1\u65\'e8Z}") == "AZ"
+    assert rtf.extract_rtf(r"{\rtf1\u65\foo1 Z}") == "AZ"
+    assert rtf.extract_rtf(r"{\rtf1\u65\~Z}") == "AZ"
+    assert rtf.extract_rtf("{\\rtf1\\u65\\") == "A"
+
+
+def test_incomplete_escapes_and_raw_newlines_do_not_add_text() -> None:
+    assert rtf.extract_rtf("{\\rtf1 A\\'") == "A"
+    assert rtf.extract_rtf("{\\rtf1 A\\") == "A"
+    assert rtf.extract_rtf("{\\rtf1 A\nB}") == "AB"
+
+
+def test_escaped_symbol_in_skipped_group_remains_skipped() -> None:
+    assert rtf.extract_rtf(r"{\rtf1{\fonttbl\~}A}") == "A"
+
+
+def test_invalid_unicode_scalars_are_not_emitted() -> None:
+    assert rtf.extract_rtf(r"{\rtf1\uc0\u1114112Z}") == "Z"
+    assert rtf._rtf_u_char(-1) is None
+    assert rtf._rtf_u_char(0xD800) is None

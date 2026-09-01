@@ -34,6 +34,22 @@ export function iWorkPreviewEntry(names: readonly string[]): string | null {
   }) ?? null;
 }
 
+function validPdfPreview(bytes: Buffer): boolean {
+  const header = bytes.toString("ascii", 0, Math.min(bytes.length, 8));
+  const tail = bytes.toString("latin1", Math.max(0, bytes.length - 2048));
+  return /^%PDF-\d\.\d/.test(header) && tail.includes("%%EOF");
+}
+
+function pdfPreview(bytes: Buffer, entryName: string): IWorkPreview {
+  return { bytes, entryName, extension: ".pdf", mimeType: "application/pdf" };
+}
+
+function jpegPreview(bytes: Buffer, entryName: string): IWorkPreview | null {
+  const jpeg = extractRawPreview(bytes, 1);
+  if (jpeg === null || jpeg.offset !== 0 || jpeg.bytes.length !== bytes.length) return null;
+  return { bytes, entryName, extension: ".jpg", mimeType: "image/jpeg" };
+}
+
 /** Recover and validate the preferred embedded preview; malformed input is null. */
 export function extractIWorkPreview(bytes: Uint8Array): IWorkPreview | null {
   const entryName = iWorkPreviewEntry(zipEntryNames(bytes));
@@ -42,14 +58,9 @@ export function extractIWorkPreview(bytes: Uint8Array): IWorkPreview | null {
   if (preview === undefined) return null;
   const lower = asciiLower(entryName);
   if (lower.endsWith(".pdf")) {
-    const header = preview.toString("ascii", 0, Math.min(preview.length, 8));
-    const tail = preview.toString("latin1", Math.max(0, preview.length - 2048));
-    if (!/^%PDF-\d\.\d/.test(header) || !tail.includes("%%EOF")) return null;
-    return { bytes: preview, entryName, extension: ".pdf", mimeType: "application/pdf" };
+    return validPdfPreview(preview) ? pdfPreview(preview, entryName) : null;
   }
   // iWork owns the preview and may legitimately embed a compact thumbnail.
   // The 1000px quality floor belongs only to camera-RAW extraction.
-  const jpeg = extractRawPreview(preview, 1);
-  if (jpeg === null || jpeg.offset !== 0 || jpeg.bytes.length !== preview.length) return null;
-  return { bytes: preview, entryName, extension: ".jpg", mimeType: "image/jpeg" };
+  return jpegPreview(preview, entryName);
 }

@@ -258,6 +258,19 @@ def test_recognize_groups_ambiguous_top_two_gets_no_name() -> None:
     assert out == [None]
 
 
+def test_recognize_groups_nan_runner_does_not_create_an_ambiguity() -> None:
+    """Keep the original strict ``<`` ambiguity rule for non-finite input."""
+    centroid = neural_print(E0, voiced_frames=200)
+    non_finite = E0.copy()
+    non_finite[0] = np.nan
+    known = [
+        rec.KnownVoice(name="Zed", vec=vec_at_cos(0.85)),
+        rec.KnownVoice(name="Unknown", vec=non_finite),
+    ]
+
+    assert rec.recognize_groups([centroid], known, blocked=[]) == ["Zed"]
+
+
 def test_recognize_groups_below_known_same_never_assigned() -> None:
     centroid = neural_print(E0, voiced_frames=200)
     known = [rec.KnownVoice(name="Low", vec=vec_at_cos(0.70))]  # < KNOWN_SAME (0.72)

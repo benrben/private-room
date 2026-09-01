@@ -127,6 +127,13 @@ def test_measure_lufs_scales_linearly_with_gain() -> None:
     assert abs(delta - 6.02) < 0.2
 
 
+def test_measure_lufs_returns_absolute_gate_floor_for_long_silence() -> None:
+    # A full gating window of silence must take the absolute-gate path rather
+    # than the shorter-fragment fallback, and it cannot attempt a relative gate.
+    fs = 24_000
+    assert tts.measure_lufs([0.0] * fs, fs) == -70.0
+
+
 # --- the defaults are the product voice spec --------------------------------
 
 
@@ -382,6 +389,23 @@ async def test_an_all_empty_script_is_an_error_not_a_silent_file(
         await tts.synthesize_podcast([{"text": "  "}, {"text": ""}])
     with pytest.raises(tts.TtsError):
         await tts.synthesize_podcast([])
+
+
+@pytest.mark.asyncio
+async def test_podcast_rejects_a_decode_at_the_wrong_sample_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_mp3(_text: str, _voice: str, _rate: str, _pitch: str) -> bytes:
+        return b"mp3"
+
+    def wrong_rate(_mp3: bytes, _sample_rate: int | None = None) -> bytes:
+        return sine_wav(seconds=0.1, fs=16_000)
+
+    monkeypatch.setattr(tts, "synthesize_mp3", fake_mp3)
+    monkeypatch.setattr(tts, "mp3_to_wav", wrong_rate)
+
+    with pytest.raises(tts.TtsError, match="decoded at 16000 Hz"):
+        await tts.synthesize_podcast([{"text": "One."}])
 
 
 def test_splitting_cuts_between_sentences_and_keeps_the_terminator() -> None:

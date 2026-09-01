@@ -95,9 +95,17 @@ def test_resample_matches_scalar_reference_on_non_dividing_lengths(n_in, from_ra
     np.testing.assert_allclose(vectorized, reference, rtol=0, atol=1e-6)
 
 
-def test_decode_wav_garbage_bytes_raises_not_a_wav_file():
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"garbage",
+        b"NOPE" + b"\x00" * 4 + b"WAVE" + b"\x00" * 32,
+        b"RIFF" + b"\x00" * 4 + b"NOPE" + b"\x00" * 32,
+    ],
+)
+def test_decode_wav_garbage_bytes_raises_not_a_wav_file(data: bytes):
     with pytest.raises(ValueError, match="not a WAV file"):
-        decode_wav(b"garbage")
+        decode_wav(data)
 
 
 def test_decode_wav_no_data_chunk_raises_and_skips_an_odd_sized_chunk():
@@ -150,3 +158,9 @@ def test_decode_wav_averages_multiple_channels():
     for (l, r), got in zip(frames, out):
         expected = (l + r) / 2.0 / 32768.0
         assert abs(float(got) - expected) < 1e-6
+
+
+def test_decode_wav_empty_data_chunk_is_an_empty_float32_array():
+    out = decode_wav(encode_wav(np.array([], dtype=np.float32)))
+    assert out.dtype == np.float32
+    assert out.size == 0

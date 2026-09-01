@@ -1,0 +1,497 @@
+
+
+/* A timestamp the room recorded, so the sans. It stays at --fs-meta, the
+   metadata floor — it was raised off --fs-micro when this was set in the hand,
+   and 13px is the floor whatever face is carrying it. */
+.history-time {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--text-dim);
+}
+
+/* Idea 11 — the side-by-side compare modal. */
+.compare-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-8);
+  background: rgba(0, 0, 0, 0.55);
+}
+/* A modal occludes the room, so it is opaque and drawn on --raised — the
+   floating-surface recipe from paper.css section 9. The shadow is themed:
+   a literal 40%-black bloom is invisible on ivory paper. */
+.compare-modal {
+  display: flex;
+  flex-direction: column;
+  width: min(1200px, 96vw);
+  height: min(80vh, 900px);
+  background: var(--raised);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-lg);
+  box-shadow:
+    0 24px 60px var(--shadow),
+    0 3px 10px var(--shadow-lift);
+  overflow: hidden;
+}
+.compare-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--border);
+}
+.compare-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.compare-name {
+  font-size: var(--fs-body);
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.compare-sub {
+  font-size: var(--fs-micro);
+  color: var(--text-dim);
+}
+.compare-head-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-shrink: 0;
+}
+.compare-confirm {
+  display: inline-flex;
+  gap: 6px;
+}
+.compare-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.compare-diff-host {
+  flex: 1;
+  min-height: 0;
+}
+.compare-empty {
+  margin: auto;
+  color: var(--text-dim);
+  font-size: var(--fs-body);
+}
+.compare-plain {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--border);
+}
+.compare-pane {
+  margin: 0;
+  padding: var(--sp-3) 14px;
+  overflow: auto;
+  background: var(--panel);
+  color: var(--text);
+  font-size: var(--fs-meta);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.compare-pane-label {
+  position: sticky;
+  top: -12px;
+  margin: -12px -14px 8px;
+  padding: 6px 14px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+/* It floats over the diff, so it is opaque on purpose. */
+.compare-rtl-hint {
+  position: absolute;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 5px 12px;
+  background: var(--raised);
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px 999px 999px 999px / 14px 12px 14px 12px;
+  font-size: var(--fs-micro);
+  color: var(--text-dim);
+  box-shadow: 0 6px 18px var(--shadow-lift);
+  pointer-events: none;
+}
+
+/* ADD-3 — inline "Delete? ✓ ✕" confirm affordance. */
+.confirm-del {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.confirm-q {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 0 var(--sp-1);
+}
+
+.chip-btn.confirm-yes {
+  color: var(--ok);
+  opacity: 1;
+}
+
+.chip-btn.confirm-yes:hover {
+  background: color-mix(in srgb, var(--mk-green) 15%, transparent);
+}
+
+.chip-btn.confirm-no {
+  opacity: 1;
+}
+
+.viewer-empty {
+  margin: auto;
+  max-width: 440px;
+  padding: var(--sp-6);
+  text-align: center;
+  color: var(--text-dim);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* The pink radial glow that used to sit behind this icon is gone, for two
+   reasons. It was a GLOW, which the notebook does not have anywhere. And it
+   was drawn as a `z-index: -1` pseudo-element — the exact construction that
+   renders in Chrome and vanishes in WKWebView the moment any ancestor grows
+   a background, which is what the app actually ships on. */
+.viewer-empty-icon {
+  line-height: 0;
+  margin-bottom: 20px;
+  position: relative;
+}
+.viewer-empty-icon svg {
+  width: 200px;
+  height: auto;
+}
+
+.viewer-empty-title {
+  font-size: var(--fs-section);
+  font-family: var(--display);
+  font-weight: 600;
+  color: var(--text-strong);
+  margin: 0 0 10px;
+  letter-spacing: -0.01em;
+}
+
+/* An empty state is an INSTRUCTION, and instructions are never set small. */
+.viewer-empty-sub {
+  font-size: var(--fs-lead);
+  line-height: var(--lh-body);
+  max-width: 42ch;
+  margin: 0 0 22px;
+}
+.viewer-empty-sub strong {
+  color: var(--text);
+}
+
+.viewer-empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: center;
+  margin-bottom: 26px;
+}
+/* The empty state's actions, on paper.css's secondary-button recipe: a drawn
+   outline over the sheet with a marker swash that wipes in from the left on
+   hover, rather than a filled grey box. The swash is the element's own
+   background-image growing from 0% width, so the label can never end up
+   underneath it. --rule-strong is the border because a control boundary owes
+   3:1 and --sketch-at-rest did not survive being dropped on --panel-2. */
+.qa-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  padding: 9px 15px;
+  font-size: var(--fs-meta);
+  color: var(--text);
+  background-color: transparent;
+  background-image: linear-gradient(
+    98deg,
+    color-mix(in srgb, var(--accent-fill) 34%, transparent) 0%,
+    color-mix(in srgb, var(--accent-fill) 22%, transparent) 62%,
+    color-mix(in srgb, var(--accent-fill) 30%, transparent) 100%
+  );
+  background-repeat: no-repeat;
+  background-position: left center;
+  background-size: 0% 100%;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  transition:
+    background-size var(--dur) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen),
+    transform var(--dur-fast) var(--ease-pen);
+}
+.qa-btn svg {
+  flex-shrink: 0;
+  color: var(--text-dim);
+}
+.qa-btn:hover:not(:disabled) {
+  background-size: 100% 100%;
+  border-color: var(--sketch);
+}
+/* Pressed against the paper. */
+.qa-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+/* Filled ink, no swash: a solid fill with a marker wash on top of it is mud,
+   and the pink pen stays reserved for selection so a primary action never
+   reads as "selected". */
+.qa-btn.primary {
+  background-color: var(--btn-ink);
+  background-image: none;
+  border-color: var(--btn-ink);
+  color: var(--btn-ink-text);
+  font-weight: 600;
+}
+.qa-btn.primary svg {
+  color: var(--btn-ink-text);
+}
+.qa-btn.primary:hover:not(:disabled) {
+  background-color: color-mix(in srgb, var(--btn-ink) 86%, var(--accent));
+  border-color: color-mix(in srgb, var(--btn-ink) 86%, var(--accent));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .qa-btn {
+    transition: none;
+  }
+  .qa-btn:active:not(:disabled) {
+    transform: none;
+  }
+}
+
+/* A note pinned under the actions: a drawn card on the sheet, not a filled
+   panel — the grid keeps running through it. */
+.viewer-empty-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  text-align: left;
+  max-width: 44ch;
+  padding: 13px 15px;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--text-dim);
+}
+.viewer-empty-note svg {
+  flex-shrink: 0;
+  margin-top: 1px;
+  color: var(--accent-2);
+}
+.viewer-empty-note strong {
+  color: var(--text);
+}
+
+.viewer-status {
+  color: var(--text-dim);
+  font-size: var(--fs-micro);
+  padding: 6px 0;
+}
+
+
+/* Wave 1b (idea 10): the AI wrote the open file while the user's editor
+   buffer was dirty — the reload is parked behind this choice banner. */
+/* "Needs review" is yellow across the whole product, and the word in the
+   banner carries the meaning — the marker only reinforces it. The stroke down
+   the leading edge is paper.css's category edge, which is why this no longer
+   needs a pink wash it had no claim to. */
+.stale-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: var(--sp-2) 14px;
+  border-bottom: 1px solid var(--line);
+  box-shadow: inset 3px 0 0 var(--sem-pending-fill);
+  background: color-mix(in srgb, var(--sem-pending-fill) 12%, transparent);
+  font-size: var(--fs-meta);
+  color: var(--text);
+}
+
+.stale-banner-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* ---------- PRIV-1: the reader's cloud view ---------- */
+.cloudview {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.cloudview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: var(--sp-2) 14px 0;
+}
+/* Both badges are paper.css's taped label: the WORD carries the state and the
+   marker only reinforces it, so the text is --ink over a 34% wash rather than
+   the hue's own ink on a wash of the same hue — the one combination in this
+   palette that lands under 4.5:1. */
+.cloudview-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 2px var(--sp-2);
+  color: var(--ink);
+  border-radius: 2px 3px 2px 4px / 4px 2px 3px 2px;
+}
+.cloudview-badge.protected {
+  background: color-mix(in srgb, var(--sem-pending-fill) 34%, transparent);
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--sem-pending-fill) 46%, transparent);
+}
+.cloudview-badge.danger {
+  background: color-mix(in srgb, var(--sem-urgent-fill) 34%, transparent);
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--sem-urgent-fill) 46%, transparent);
+}
+.cloudview-size {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+.cloudview-ribbon {
+  padding: var(--sp-2) 14px;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+}
+.cloudview-raw .cloudview-ribbon {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--mk-red) 10%, transparent);
+}
+/* Door OFF: the sensitive spans aren't blacked out — they're exposed. Show
+   them as a red-underlined warning instead of a solid blackout chip. */
+.cloudview-mark.exposed {
+  background: transparent;
+  color: var(--danger);
+  border-radius: 0;
+  padding: 0;
+  font-family: inherit;
+  font-size: inherit;
+  text-decoration: underline wavy var(--danger);
+}
+/* The file's own words, exactly as a cloud model would receive them. Kept in
+   the interface face, not mono: this is the user's prose, and it may be
+   Hebrew, CJK or Turkish — --sans is the only stack in the app with the
+   per-glyph fallbacks those need.
+
+   Two classes because this is a <pre> and `.viewer-body pre` above is (0,1,1);
+   a single class would lose and the face would silently stay monospace. */
+.cloudview .cloudview-text {
+  flex: 1;
+  overflow: auto;
+  margin: 0;
+  padding: 14px var(--sp-4);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--sans);
+}
+.cloudview-mark {
+  background: var(--text);
+  color: var(--panel);
+  border-radius: 4px 2px 5px 3px / 3px 5px 2px 4px;
+  padding: 0 5px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11.5px;
+}
+.cloudview-empty {
+  padding: var(--sp-6);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+}
+.viewer-actions .cloudview-on {
+  color: var(--accent);
+}
+
+/* "Quote in chat" — the affordance that turns a text selection into something
+   the room can act on.
+
+   `position: fixed` against the viewport, because the coordinates come from
+   `Range.getBoundingClientRect()`, which is viewport-relative. Nothing
+   recomputes them as the page moves — the button is dismissed on scroll and
+   resize instead, which is the honest behaviour for a control that should
+   appear exactly when it is wanted. The translate centres it on the selection
+   and lifts it clear of the text.
+
+   No animation. This system allows no constant movement, and a control that
+   appears exactly when it is wanted needs none to be noticed. */
+.quote-selection-btn {
+  position: fixed;
+  z-index: 40;
+  transform: translate(-50%, calc(-100% - var(--sp-2)));
+  padding: 3px var(--sp-2);
+  font-size: var(--fs-meta);
+  line-height: 1.5;
+  color: var(--ink);
+  background: var(--raised);
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 2px 8px var(--shadow-lift);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.quote-selection-btn:hover {
+  border-color: var(--accent);
+}
+
+/* "Opening…" — a file's bytes are on their way.
+
+   An overlay rather than a replacement for the pane's contents: what is
+   already on screen stays readable, and a failed open cannot unmount the page
+   underneath it. Fixed like the quote button and for the same reason — it is
+   pinned to the pane, not to the document that is scrolling inside it. */
+.viewer-opening {
+  position: absolute;
+  top: var(--sp-3);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  padding: 3px var(--sp-3);
+  font-size: var(--fs-meta);
+  color: var(--text-dim);
+  background: var(--raised);
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 2px 8px var(--shadow-lift);
+  pointer-events: none;
+}

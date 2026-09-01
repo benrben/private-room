@@ -59,6 +59,8 @@ from arcelle_sidecar.rec.meta import (
     PREROLL,
     SAMPLE_RATE,
     START_FRAMES,
+    VAD_OPEN,
+    VAD_SUSTAIN,
 )
 
 # ------------------------------------------------------------------ helpers
@@ -373,6 +375,24 @@ def test_start_frames_hysteresis_never_opens_on_a_brief_voiced_dip() -> None:
         closed = lane.push(pattern)
         assert closed == []
         assert lane.state is None, "voiced_run must never reach START_FRAMES"
+
+
+def test_vad_probabilities_use_the_open_then_sustain_thresholds() -> None:
+    """The trained-VAD path uses the stricter threshold while idle, then the
+    sustain threshold after opening; the energy in these silent frames must
+    not influence either decision."""
+    lane = bare_lane(0)
+
+    assert lane.frame(frame_of(0.0), VAD_OPEN - 0.01) is None
+    assert lane.state is None
+    for _ in range(START_FRAMES):
+        assert lane.frame(frame_of(0.0), VAD_OPEN) is None
+    assert isinstance(lane.state, Active)
+
+    assert lane.frame(frame_of(0.0), VAD_SUSTAIN) is None
+    assert lane.state.silent_frames == 0
+    assert lane.frame(frame_of(0.0), VAD_SUSTAIN - 0.01) is None
+    assert lane.state.silent_frames == 1
 
 
 def test_end_frames_hysteresis_a_brief_dip_does_not_close_the_phrase() -> None:

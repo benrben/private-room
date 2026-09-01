@@ -49,6 +49,7 @@ import type Database from "better-sqlite3-multiple-ciphers";
 import { randomUUID } from "node:crypto";
 import { executeOne, queryOne, queryOpt, queryRows, type Row } from "./util.js";
 import { finishWorkflowRunByJob } from "./workflows.js";
+import { workIdentity } from "./jobIdentity.js";
 import * as obs from "../obs.js";
 
 /** A job row as the UI and runner see it. `plan` and `state` are opaque JSON
@@ -162,80 +163,6 @@ function createJobInner(
 }
 
 // ------------------------------------------------------- duplicate Activity rows
-
-/** The unit separator (0x1F) `work_identity` joins its parts with — the exact
- * character the Rust source's `\u{1f}` writes. Not printable, so it can never
- * collide with real kind/title/plan text. */
-const UNIT_SEP = "\u001f";
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-/**
- * Canonical JSON: object keys sorted alphabetically, recursively.
- *
- * Rust's `serde_json::Value` (this crate does not enable `preserve_order`)
- * stores object fields in a `BTreeMap`, so its `Display` — what
- * {@link workIdentity}'s fallback branch embeds via `format!("{plan}")` — is
- * always alphabetical by key, regardless of insertion order. `JSON.stringify`
- * preserves INSERTION order instead, which would let two plans carrying the
- * same fields written in a different order (by two different call sites) read
- * as two distinct "units of work" here where Rust reads them as one — the exact
- * Activity pile-up `retireSupersededParked` exists to prevent. This makes the
- * two agree.
- *
- * `undefined` is dropped from objects and rendered as `null` inside arrays,
- * matching `JSON.stringify`, so a plan built with an explicitly-undefined field
- * hashes the same as one that simply omits it.
- */
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) {
-    return `[${value.map((v) => (v === undefined ? "null" : canonicalJson(v))).join(",")}]`;
-  }
-  if (isRecord(value)) {
-    const parts: string[] = [];
-    for (const k of Object.keys(value).sort()) {
-      const v = value[k];
-      if (v === undefined || typeof v === "function" || typeof v === "symbol") {
-        continue; // JSON.stringify drops these keys entirely
-      }
-      parts.push(`${JSON.stringify(k)}:${canonicalJson(v)}`);
-    }
-    return `{${parts.join(",")}}`;
-  }
-  return JSON.stringify(value) ?? "null";
-}
-
-/**
- * The identity two job rows share when they are the SAME unit of work, so a
- * second parked copy is a pile-up rather than a second thing to resume.
- *
- * Derived from the paths that could mint one. A workflow's in-flight guard only
- * counts `running`/`queued` rows, so every trigger that met a parked attempt
- * added another row for the same workflow — and its plan is NOT identical
- * (`trigger` and `prev_run_at` move between runs), so only the workflow id
- * identifies them. The auto-index job is the second pile-up source and misses
- * plan equality the same way (its plan carries the missing-file set that run
- * snapshotted, so no two are ever identical), while a manual "Room summary"
- * (`auto: false`) is deliberately NOT folded in — it is a thing the user asked
- * for by name. Everything else (file passes, studio jobs, downloads) is
- * identified by kind + title + the immutable plan: the plan is the whole
- * definition of what a resume would do, so two rows carrying the same one
- * cannot be told apart by running them.
- */
-function workIdentity(kind: string, title: string, plan: unknown): string {
-  if (kind === "workflow" && isRecord(plan)) {
-    const wf = plan["workflow_id"];
-    if (typeof wf === "string" && wf !== "") {
-      return `workflow${UNIT_SEP}${wf}`;
-    }
-  }
-  if (kind === "deep_summary" && isRecord(plan) && plan["auto"] === true) {
-    return `deep_summary${UNIT_SEP}auto`;
-  }
-  return `${kind}${UNIT_SEP}${title}${UNIT_SEP}${canonicalJson(plan)}`;
-}
 
 /** Every PARKED top-level job row, oldest first, paired with its identity.
  * Parked = the Activity group with nothing driving it, where the only offer is

@@ -98,6 +98,28 @@ export interface CaptureAndSaveDeps {
   emitFilesChanged(): void;
 }
 
+interface CapturedPage {
+  title: string;
+  url: string;
+  text: string;
+  html: string;
+  clipped: boolean;
+}
+
+type ExtractedPage = ReturnType<typeof readPage> | null;
+
+interface SavedMarkdown {
+  mdName: string;
+  name: string;
+}
+
+type CaptureStore = (
+  name: string,
+  mime: string,
+  bytes: Buffer,
+  text: string | null,
+) => Promise<{ id: string; name: string }>;
+
 /**
  * Capture the live page (or the user's selection) and save it into the room.
  * ONE code path, shared by the agent's `browse_save` tool and the toolbar's
@@ -107,27 +129,55 @@ export async function captureAndSave(
   deps: CaptureAndSaveDeps,
   what: "page" | "selection",
 ): Promise<string> {
-  const v = (await deps.browser.call("capture", { what })) as Record<string, unknown>;
-  const title = typeof v.title === "string" ? v.title : "";
-  const url = typeof v.url === "string" ? v.url : "";
-  const text = typeof v.text === "string" ? v.text : "";
-  const html = typeof v.html === "string" ? v.html : "";
-  // `capture` clips the live DOM at 4 MB of markup (and the text at 800 KB)
-  // and says so. Nothing used to read that flag, which was survivable while
-  // the HTML twin was only a fidelity copy — but the ARTICLE is now parsed out
-  // of exactly that clipped markup, so on a huge page the reader gets a body
-  // that stops partway under a sentence calling it "the readable article". A
-  // page we could not capture whole has to say so.
-  const clipped = v.truncated === true;
-  if (text.trim() === "" && html.trim() === "") {
+  const captured = await capturePage(deps.browser, what);
+  const extracted = extractPage(what, captured.html, captured.url);
+  const meta = capturedMeta(extracted, captured.title, captured.url);
+  const names = await saveCapturedFiles(deps, what, captured, extracted, meta);
+  announceSavedCapture(deps, captured.url, names);
+  return savedReply(what, extracted?.article != null, captured.clipped, names, meta);
+}
+
+async function capturePage(browser: SaveCaptureBrowser, what: "page" | "selection"): Promise<CapturedPage> {
+  const value = (await browser.call("capture", { what })) as Record<string, unknown>;
+  const captured = capturedPage(value);
+  requireCapturedContent(captured);
+  return captured;
+}
+
+function capturedPage(value: Record<string, unknown>): CapturedPage {
+  return {
+    title: capturedString(value.title),
+    url: capturedString(value.url),
+    text: capturedString(value.text),
+    html: capturedString(value.html),
+    // `capture` clips the live DOM at 4 MB of markup (and the text at 800 KB)
+    // and says so. Nothing used to read that flag, which was survivable while
+    // the HTML twin was only a fidelity copy — but the ARTICLE is now parsed out
+    // of exactly that clipped markup, so on a huge page the reader gets a body
+    // that stops partway under a sentence calling it "the readable article". A
+    // page we could not capture whole has to say so.
+    clipped: value.truncated === true,
+  };
+}
+
+function capturedString(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function requireCapturedContent(captured: CapturedPage): void {
+  if (captured.text.trim() === "" && captured.html.trim() === "") {
     throw new Error("The page returned nothing to save — it may still be loading.");
   }
+}
 
-  // A selection is the user's own excerpt, and `capture` sends no markup for
-  // one — so there is no article to extract and no metadata to read.
-  const extracted = what === "page" && html.trim() !== "" ? readPage(html, url) : null;
+/** A selection is the user's own excerpt, so it must not borrow page metadata. */
+function extractPage(what: "page" | "selection", html: string, url: string): ExtractedPage {
+  if (what !== "page" || html.trim() === "") return null;
+  return readPage(html, url);
+}
 
-  const meta: PageMeta = {
+function capturedMeta(extracted: ExtractedPage, title: string, url: string): PageMeta {
+  return {
     ...(extracted?.meta ?? {}),
     // `document.title` is the page's own title; keep it when the extractor
     // found nothing better, and never fall back to the URL here — the URL is a
@@ -136,21 +186,33 @@ export async function captureAndSave(
     sourceUrl: nonEmpty(url),
     capturedAt: nowIso(),
   };
+}
 
+async function saveCapturedFiles(
+  deps: CaptureAndSaveDeps,
+  what: "page" | "selection",
+  captured: CapturedPage,
+  extracted: ExtractedPage,
+  meta: PageMeta,
+): Promise<string[]> {
+  const store = captureStore(deps, captured.url);
+  const markdown = await saveMarkdownCopy(deps.db, store, what, captured, extracted, meta);
+  const twinName = await saveHtmlTwin(
+    deps.db,
+    store,
+    what,
+    markdown.mdName,
+    captured.html,
+    captured.url,
+    extracted,
+    meta,
+  );
+  return savedNames(markdown.name, twinName);
+}
+
+function captureStore(deps: CaptureAndSaveDeps, url: string): CaptureStore {
   const { db } = deps;
-  const saved = currentDate(db);
-  const displayTitle = meta.title ?? url;
-  const baseTitle = what === "selection" ? `${displayTitle} (selection)` : displayTitle;
-  // Saving the same page twice (a news front page revisited an hour later is
-  // the common case) produced a second "Google News.md" sitting beside the
-  // first, with no date, domain or run to tell them apart. Resolve the free
-  // name BEFORE the twin is derived from it, so the pair stays name-matched.
-  const mdName = availableName(db, linkFileName(baseTitle, url));
-  // No article: the page's own text, whole. Worse than an article and never
-  // dressed up as one — see the reply this builds below.
-  const body = extracted?.article ? extracted.article.markdown : text;
-  const content = markdownPage(displayTitle, meta, saved, body);
-  const store = async (name: string, mime: string, bytes: Buffer, text: string | null) => {
+  return async (name, mime, bytes, text) => {
     if (deps.workspace === undefined) {
       return insertFileFromUrl(db, name, mime, bytes, text, "web", url);
     }
@@ -160,29 +222,60 @@ export async function captureAndSave(
     if (text !== null) setFileExtractedText(db, entry.fileId, text);
     return getFileMeta(db, entry.fileId);
   };
+}
+
+async function saveMarkdownCopy(
+  db: Database.Database,
+  store: CaptureStore,
+  what: "page" | "selection",
+  captured: CapturedPage,
+  extracted: ExtractedPage,
+  meta: PageMeta,
+): Promise<SavedMarkdown> {
+  const saved = currentDate(db);
+  const displayTitle = meta.title ?? captured.url;
+  const baseTitle = what === "selection" ? `${displayTitle} (selection)` : displayTitle;
+  // Saving the same page twice (a news front page revisited an hour later is
+  // the common case) produced a second "Google News.md" sitting beside the
+  // first, with no date, domain or run to tell them apart. Resolve the free
+  // name BEFORE the twin is derived from it, so the pair stays name-matched.
+  const mdName = availableName(db, linkFileName(baseTitle, captured.url));
+  // No article: the page's own text, whole. Worse than an article and never
+  // dressed up as one — see the reply this builds below.
+  const body = extracted?.article ? extracted.article.markdown : captured.text;
+  const content = markdownPage(displayTitle, meta, saved, body);
   const md = await store(mdName, "text/markdown", Buffer.from(content, "utf8"), content);
   writeWebMeta(db, md.id, meta);
-  const names = [md.name];
+  return { mdName, name: md.name };
+}
 
-  if (what === "page" && html.trim() !== "") {
-    const htmlName = availableName(db, `${stripMdSuffix(mdName)}.html`);
-    const doc = extracted?.article
-      ? articleDocument(displayTitle, meta, extracted.article.html)
-      : // Nothing was extractable, so the capture itself is all there is — kept
-        // verbatim rather than replaced by a prettier lie.
-        html;
-    const twin = await store(
-      htmlName,
-      "text/html",
-      Buffer.from(doc, "utf8"),
-      // No chunks of its own: the Markdown copy carries the search text, and
-      // indexing both would find the same page twice.
-      null,
-    );
-    writeWebMeta(db, twin.id, meta);
-    names.push(twin.name);
-  }
+async function saveHtmlTwin(
+  db: Database.Database,
+  store: CaptureStore,
+  what: "page" | "selection",
+  mdName: string,
+  html: string,
+  url: string,
+  extracted: ExtractedPage,
+  meta: PageMeta,
+): Promise<string | undefined> {
+  if (what !== "page" || html.trim() === "") return undefined;
+  const htmlName = availableName(db, `${stripMdSuffix(mdName)}.html`);
+  const doc = extracted?.article
+    ? articleDocument(meta.title ?? url, meta, extracted.article.html)
+    : // Nothing was extractable, so the capture itself is all there is — kept
+      // verbatim rather than replaced by a prettier lie.
+      html;
+  const twin = await store(htmlName, "text/html", Buffer.from(doc, "utf8"), null);
+  writeWebMeta(db, twin.id, meta);
+  return twin.name;
+}
 
+function savedNames(markdownName: string, twinName: string | undefined): string[] {
+  return twinName === undefined ? [markdownName] : [markdownName, twinName];
+}
+
+function announceSavedCapture(deps: CaptureAndSaveDeps, url: string, names: readonly string[]): void {
   // Every other web import starts these two after the file lands; this one
   // started neither, so a page saved from the browser was searchable
   // immediately, had no AI description, and sat outside the privacy scan until
@@ -191,8 +284,6 @@ export async function captureAndSave(
   deps.schedulePrivacyScan();
   deps.browser.journal("save", url, `Saved ${names.join(" and ")}`);
   deps.emitFilesChanged();
-
-  return savedReply(what, extracted?.article != null, clipped, names, meta);
 }
 
 /** `chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")` — second resolution,
@@ -265,32 +356,37 @@ export function savedReply(
   names: readonly string[],
   meta: PageMeta,
 ): string {
-  const subject =
-    what === "selection"
-      ? "the selected text"
-      : hasArticle
-        ? "the readable article"
-        : "this page's text (it has no article to extract)";
-  let files: string;
-  if (names.length === 2) {
-    files = `"${names[0]}" (searchable) and "${names[1]}" (formatted)`;
-  } else if (names.length === 1) {
-    files = `"${names[0]}"`;
-  } else {
-    files = "the room";
-  }
-  let out = `Saved ${subject} as ${files}.`;
-  const kept: string[] = [];
-  if (meta.siteName) kept.push(meta.siteName);
-  if (meta.byline) kept.push(`by ${meta.byline}`);
-  if (meta.published) kept.push(`published ${meta.published}`);
-  if (kept.length > 0) {
-    out += ` Kept from the page: ${kept.join(" · ")}.`;
+  let out = `Saved ${savedSubject(what, hasArticle)} as ${savedFiles(names)}.`;
+  const kept = savedMetadata(meta);
+  if (kept !== "") {
+    out += ` Kept from the page: ${kept}.`;
   }
   if (clipped) {
     out += " The page was too big to capture whole, so this copy stops partway through it.";
   }
   return out;
+}
+
+function savedSubject(what: string, hasArticle: boolean): string {
+  if (what === "selection") {
+    return "the selected text";
+  }
+  return hasArticle ? "the readable article" : "this page's text (it has no article to extract)";
+}
+
+function savedFiles(names: readonly string[]): string {
+  if (names.length === 2) {
+    return `"${names[0]}" (searchable) and "${names[1]}" (formatted)`;
+  }
+  return names.length === 1 ? `"${names[0]}"` : "the room";
+}
+
+function savedMetadata(meta: PageMeta): string {
+  const kept: string[] = [];
+  if (meta.siteName) kept.push(meta.siteName);
+  if (meta.byline) kept.push(`by ${meta.byline}`);
+  if (meta.published) kept.push(`published ${meta.published}`);
+  return kept.join(" · ");
 }
 
 /**
@@ -339,20 +435,8 @@ export function markdownPage(
  */
 export function articleDocument(title: string, meta: PageMeta, articleHtml: string): string {
   let body = docHero(meta.siteName ?? "", title, meta.excerpt ? htmlEscape(meta.excerpt) : "");
-  const chips: string[] = [];
-  if (meta.byline) chips.push(`By ${meta.byline}`);
-  if (meta.published) chips.push(`Published ${meta.published}`);
-  if (meta.modified) chips.push(`Updated ${meta.modified}`);
-  if (meta.capturedAt) chips.push(`Saved ${meta.capturedAt}`);
-  if (chips.length > 0) {
-    body += `<div class="chips">${chips
-      .map((c) => `<span class="chip">${htmlEscape(c)}</span>`)
-      .join("")}</div>\n`;
-  }
-  if (meta.sourceUrl) {
-    const escaped = htmlEscape(meta.sourceUrl);
-    body += `<p class="note">Source: <a href="${escaped}">${escaped}</a></p>\n`;
-  }
+  body += articleChips(meta);
+  body += articleSourceNote(meta.sourceUrl);
   body += "<hr>\n";
   body += articleHtml;
   // The page's declared language, honoured. The shell is `<html lang="en">`
@@ -361,11 +445,37 @@ export function articleDocument(title: string, meta: PageMeta, articleHtml: stri
   // still opened left-to-right with its punctuation on the wrong side. The
   // direction is derived only from a language the page ACTUALLY declared; a
   // page that declared none is left exactly as it was rather than guessed at.
-  if (meta.lang) {
-    const dir = isRtlLang(meta.lang) ? ' dir="rtl"' : "";
-    body = `<div lang="${htmlEscape(meta.lang)}"${dir}>\n${body}</div>\n`;
+  return htmlDocument(title, articleLanguageWrapper(meta.lang, body));
+}
+
+function articleChips(meta: PageMeta): string {
+  const labels: Array<[string, string | undefined]> = [
+    ["By", meta.byline],
+    ["Published", meta.published],
+    ["Updated", meta.modified],
+    ["Saved", meta.capturedAt],
+  ];
+  const chips = labels
+    .filter(([, value]) => Boolean(value))
+    .map(([label, value]) => `<span class="chip">${htmlEscape(`${label} ${value}`)}</span>`)
+    .join("");
+  return chips === "" ? "" : `<div class="chips">${chips}</div>\n`;
+}
+
+function articleSourceNote(sourceUrl: string | undefined): string {
+  if (!sourceUrl) {
+    return "";
   }
-  return htmlDocument(title, body);
+  const escaped = htmlEscape(sourceUrl);
+  return `<p class="note">Source: <a href="${escaped}">${escaped}</a></p>\n`;
+}
+
+function articleLanguageWrapper(lang: string | undefined, body: string): string {
+  if (!lang) {
+    return body;
+  }
+  const dir = isRtlLang(lang) ? ' dir="rtl"' : "";
+  return `<div lang="${htmlEscape(lang)}"${dir}>\n${body}</div>\n`;
 }
 
 /** True for the scripts that read right to left, matched on the language
@@ -396,11 +506,6 @@ function htmlEscape(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
-function isFullHtmlDoc(s: string): boolean {
-  const low = s.trimStart().toLowerCase();
-  return low.startsWith("<!doctype") || low.startsWith("<html");
-}
-
 const PLACEHOLDER_DOC_STYLE = `
 body{margin:0;background:#f4f1e8;color:#20221f;font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 .doc{max-width:46rem;margin:0 auto;padding:2.5rem 1.25rem 3rem}
@@ -419,9 +524,6 @@ hr{border:0;border-top:1px solid #c8c6ba;margin:1.5rem 0}
 `;
 
 function htmlDocument(title: string, body: string): string {
-  if (isFullHtmlDoc(body)) {
-    return body;
-  }
   return (
     `<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n` +
     `<meta name="viewport" content="width=device-width, initial-scale=1">\n` +

@@ -129,22 +129,35 @@ def identity_print(prints: list[VoicePrint]) -> VoicePrint | None:
     mean (the exact 1e-6 norm floor the Rust source uses): a vector that
     defines nothing is not a saved voice.
     """
-    strong = [p for p in prints if is_neural(p.vec) and p.is_strong()]
+    strong = _strong_identity_prints(prints)
     if not strong:
         return None
-    dim = int(np.asarray(strong[0].vec).shape[0])
-    frames = sum(p.voiced_frames for p in strong)
+    frames = _identity_frames(strong)
     if frames < MIN_IDENTITY_FRAMES:
         return None
+    vector = _identity_vector(strong)
+    if vector is None:
+        return None
+    return VoicePrint(vec=vector, voiced_frames=frames)
 
+
+def _strong_identity_prints(prints: list[VoicePrint]) -> list[VoicePrint]:
+    return [print_ for print_ in prints if is_neural(print_.vec) and print_.is_strong()]
+
+
+def _identity_frames(prints: list[VoicePrint]) -> int:
+    return sum(print_.voiced_frames for print_ in prints)
+
+
+def _identity_vector(prints: list[VoicePrint]) -> np.ndarray | None:
+    dim = int(np.asarray(prints[0].vec).shape[0])
     mean = np.zeros(dim, dtype=np.float64)
-    for p in strong:
-        mean += np.asarray(p.vec, dtype=np.float64)
+    for print_ in prints:
+        mean += np.asarray(print_.vec, dtype=np.float64)
     norm = float(np.sqrt(np.sum(mean * mean)))
     if norm < 1e-6:
         return None  # prints that cancel out define nothing
-    mean = mean / norm
-    return VoicePrint(vec=mean.astype(np.float32), voiced_frames=frames)
+    return (mean / norm).astype(np.float32)
 
 
 def raw_similarity(a: VoicePrint, b: VoicePrint) -> float | None:
@@ -184,6 +197,83 @@ def vetoed(c: VoicePrint, k: KnownVoice, sim: float) -> bool:
     return False
 
 
+def _recognizable_centroid(centroid: VoicePrint | None) -> bool:
+    """Whether a group has an identity-print we may compare."""
+    return centroid is not None and is_neural(centroid.vec)
+
+
+def _comparable_known(k: KnownVoice, c_vec: np.ndarray) -> bool:
+    """Whether a saved voice shares the centroid's neural geometry."""
+    return len(k.vec) == len(c_vec) and is_neural(k.vec)
+
+
+def _eligible_known(k: KnownVoice, c_vec: np.ndarray, blocked: list[str]) -> bool:
+    """Whether a saved voice is available to this group."""
+    return _comparable_known(k, c_vec) and k.name not in blocked
+
+
+def _accepted_similarity(c: VoicePrint, k: KnownVoice, c_vec: np.ndarray) -> float | None:
+    """Return a trusted match score, or no score for this saved voice."""
+    sim = cosine(c_vec, np.asarray(k.vec))
+    if sim < KNOWN_SAME:
+        return None
+    if vetoed(c, k, sim):
+        return None
+    return sim
+
+
+def _scored_candidates(
+    c: VoicePrint,
+    known: list[KnownVoice],
+    blocked: list[str],
+) -> list[tuple[float, int]]:
+    """Rank every saved voice this group can safely claim."""
+    c_vec = np.asarray(c.vec)
+    scored: list[tuple[float, int]] = []
+    for i, k in enumerate(known):
+        if not _eligible_known(k, c_vec, blocked):
+            continue
+        sim = _accepted_similarity(c, k, c_vec)
+        if sim is not None:
+            scored.append((sim, i))
+    scored.sort(key=lambda t: -t[0])
+    return scored
+
+
+def _is_ambiguous_candidate(scored: list[tuple[float, int]]) -> bool:
+    """Whether the top two saved voices leave the identity unanswered."""
+    return len(scored) > 1 and (scored[0][0] - scored[1][0]) < KNOWN_MARGIN
+
+
+def _recognition_pair(
+    group: int,
+    centroid: VoicePrint | None,
+    known: list[KnownVoice],
+    blocked: list[str],
+) -> tuple[float, int, int] | None:
+    """Return this group's unambiguous best saved-voice match."""
+    if not _recognizable_centroid(centroid):
+        return None
+    scored = _scored_candidates(centroid, known, blocked)
+    if not scored or _is_ambiguous_candidate(scored):
+        return None
+    sim, best = scored[0]
+    return sim, group, best
+
+
+def _claim_pair(
+    out: list[str | None],
+    used: set[int],
+    known: list[KnownVoice],
+    pair: tuple[float, int, int],
+) -> None:
+    """Put an available saved voice on its highest-scoring group."""
+    _sim, group, known_index = pair
+    if out[group] is None and known_index not in used:
+        used.add(known_index)
+        out[group] = known[known_index].name
+
+
 def recognize_groups(
     centroids: list[VoicePrint | None],
     known: list[KnownVoice],
@@ -206,39 +296,13 @@ def recognize_groups(
     """
     out: list[str | None] = [None] * len(centroids)
     pairs: list[tuple[float, int, int]] = []
-
-    for g, centroid in enumerate(centroids):
-        if centroid is None or not is_neural(centroid.vec):
-            continue
-        c = centroid
-        c_vec = np.asarray(c.vec)
-
-        scored: list[tuple[float, int]] = []
-        for i, k in enumerate(known):
-            if len(k.vec) != len(c_vec) or not is_neural(k.vec):
-                continue
-            if k.name in blocked:
-                continue
-            sim = cosine(c_vec, np.asarray(k.vec))
-            if sim < KNOWN_SAME:
-                continue
-            if vetoed(c, k, sim):
-                continue
-            scored.append((sim, i))
-        scored.sort(key=lambda t: -t[0])
-
-        if not scored:
-            continue
-        sim, best = scored[0]
-        if len(scored) > 1 and (sim - scored[1][0]) < KNOWN_MARGIN:
-            continue  # two people it could be -- so it is neither
-        pairs.append((sim, g, best))
+    for group, centroid in enumerate(centroids):
+        pair = _recognition_pair(group, centroid, known, blocked)
+        if pair is not None:
+            pairs.append(pair)
 
     pairs.sort(key=lambda t: -t[0])
     used: set[int] = set()
-    for _sim, g, k in pairs:
-        if out[g] is None:
-            if k not in used:
-                used.add(k)
-                out[g] = known[k].name
+    for pair in pairs:
+        _claim_pair(out, used, known, pair)
     return out

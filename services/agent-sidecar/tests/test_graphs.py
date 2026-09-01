@@ -19,6 +19,8 @@ from arcelle_sidecar.graphs import (
     WRITE_TOOLS,
     build_agent_graph,
     graph_for,
+    route_action,
+    route_after_probe,
     route_after_react_prepare,
     template_for,
 )
@@ -66,6 +68,46 @@ def test_every_registered_agent_compiles_to_a_graph() -> None:
 def test_react_prepare_runs_only_graph_synthesized_calls_before_the_model() -> None:
     assert route_after_react_prepare({"calls": []}) == "call_model"  # type: ignore[arg-type]
     assert route_after_react_prepare({"calls": [object()]}) == "execute_tools"  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("agent_id", "question", "served", "expected"),
+    [
+        (
+            "creator.studio",
+            "Make flashcards from these notes",
+            [
+                "search_room",
+                "open_file",
+                "studio_flashcards",
+                "studio_mindmap",
+                "generate_podcast_script",
+                "web_search",
+            ],
+            ("studio_flashcards", ["search_room", "open_file", "studio_flashcards"]),
+        ),
+        ("creator.studio", "Make a flashcard diagram", ["studio_flashcards", "studio_mindmap"], None),
+        ("creator.studio", "Make something useful", ["studio_flashcards"], None),
+        ("creator.studio", "Make flashcards", ["search_room", "studio_mindmap"], None),
+        ("files.read", "Read this document", ["open_file"], None),
+    ],
+)
+async def test_route_action_only_narrows_for_one_served_positive_winner(
+    agent_id: str,
+    question: str,
+    served: list[str],
+    expected: tuple[str, list[str]] | None,
+) -> None:
+    """The rule router abstains unless its selected verb is safely available."""
+    tools = [{"type": "function", "function": {"name": name}} for name in served]
+    result = await route_action({"agent_id": agent_id, "question": question, "tools": tools})
+
+    if expected is None:
+        assert result == {}
+        return
+    target, offered = expected
+    assert result["routed"] == target
+    assert [tool["function"]["name"] for tool in result["tools"]] == offered
 
 
 def test_agents_sharing_a_template_share_one_compiled_graph() -> None:
@@ -433,12 +475,63 @@ def test_referent_names_reads_each_write_tools_real_argument_shape() -> None:
     ) == []
 
 
+def test_referent_names_fail_open_for_malformed_shapes_and_receipts() -> None:
+    """A ledger extractor must never turn an unusual successful reply into a loop error."""
+    from arcelle_sidecar.graph import _referent_names
+
+    malformed_receipt = 'ARCELLE_ARTIFACT_RECEIPT {"fileId":}'
+    assert _referent_names("studio_mindmap", {}, malformed_receipt) == []
+
+    invalid_fields = (
+        "ARCELLE_ARTIFACT_RECEIPT "
+        '{"fileId":0,"name":0,"sha256":0,"size":"unknown"}'
+    )
+    assert _referent_names("generate_podcast_script", {}, invalid_fields) == []
+
+    assert _referent_names("draw", {"name": "sketch.canvas"}) == ["sketch.canvas"]
+    assert _referent_names("edit_files", {"edits": "  "}) == []
+    assert _referent_names(
+        "edit_files", {"edits": ["  outline.md  ", None, {"name": ""}]}
+    ) == ["outline.md"]
+    assert _referent_names("rename_file", {"name": "kept-name.md"}) == ["kept-name.md"]
+    assert _referent_names("run_mcp_tool", {"tool": "mail.send"}) == ["mail.send"]
+    assert _referent_names("run_mcp_tool", {}) == ["a connector tool"]
+
+
 def _studio_receipt(name: str = "deck.html") -> str:
     return (
         f'Saved "{name}".\nARCELLE_ARTIFACT_RECEIPT '
         f'{{"fileId":"file-1","name":"{name}","size":12,"sha256":"'
         + "a" * 64
         + '"}'
+    )
+
+
+def test_a_studio_readback_must_follow_a_commit_for_a_produced_artifact() -> None:
+    """Only an ``open_file`` after the latest Studio commit is evidence."""
+    from arcelle_sidecar.graphs import _opened_produced_artifact
+
+    commit = {"name": "studio_flashcards", "arguments": {"name": "deck.html"}}
+    produced = {"produced": ["studio_flashcards: deck.html"]}
+
+    assert not _opened_produced_artifact({})  # type: ignore[arg-type]
+    assert not _opened_produced_artifact(
+        {
+            **produced,
+            "tool_events": [{"name": "open_file", "arguments": {"name": "deck.html"}}],
+        }  # type: ignore[arg-type]
+    )
+    assert not _opened_produced_artifact(
+        {
+            **produced,
+            "tool_events": [commit, {"name": "search_room", "arguments": {}}],
+        }  # type: ignore[arg-type]
+    )
+    assert _opened_produced_artifact(
+        {
+            **produced,
+            "tool_events": [commit, {"name": "open_file", "arguments": {"name": "deck.html"}}],
+        }  # type: ignore[arg-type]
     )
 
 
@@ -939,6 +1032,85 @@ async def test_the_web_chain_cannot_be_skipped_by_declining_a_stage() -> None:
     assert ran.index("web_search") < ran.index("fetch_page")
 
 
+async def test_stage_catalog_restores_its_full_box_and_reoffers_only_a_missing_verb() -> None:
+    """Staging must not lose a verb, a spill reader, or the bounded retry rule."""
+    from arcelle_sidecar.graphs import STAGE_MISSED_NOTE, stage_catalog
+
+    box = specs(["web_search", "fetch_page", "search_room"])
+    tool_dicts = [tool.to_ollama() for tool in box]
+    first_stage = await stage_catalog(  # type: ignore[arg-type]
+        {
+            "agent_id": "chat.web",
+            "stage": 0,
+            "tools": tool_dicts,
+            "spills": ["res_1"],
+        }
+    )
+    assert [tool["function"]["name"] for tool in first_stage["tools"]] == [
+        "web_search",
+        "search_room",
+        "read_result",
+    ]
+    assert first_stage["full_tools"] == tool_dicts
+
+    absent_stage = await stage_catalog(  # type: ignore[arg-type]
+        {
+            "agent_id": "chat.web",
+            "stage": 1,
+            "full_tools": [tool_dicts[0], tool_dicts[2]],
+        }
+    )
+    assert absent_stage == {
+        "stage": 2,
+        "full_tools": [tool_dicts[0], tool_dicts[2]],
+    }
+
+    answered_chain = await stage_catalog(  # type: ignore[arg-type]
+        {
+            "agent_id": "chat.web",
+            "stage": 2,
+            "full_tools": tool_dicts,
+            "attempted": {"web_search", "fetch_page"},
+        }
+    )
+    assert answered_chain == {"full_tools": tool_dicts}
+
+    missed_unavailable = await stage_catalog(  # type: ignore[arg-type]
+        {
+            "agent_id": "chat.web",
+            "stage": 2,
+            "full_tools": [tool_dicts[1], tool_dicts[2]],
+            "attempted": {"fetch_page"},
+        }
+    )
+    assert missed_unavailable == {
+        "full_tools": [tool_dicts[1], tool_dicts[2]],
+        "stage_retried": True,
+    }
+
+    missed_available = await stage_catalog(  # type: ignore[arg-type]
+        {
+            "agent_id": "chat.web",
+            "stage": 2,
+            "full_tools": tool_dicts,
+            "attempted": {"web_search"},
+            "corrections": [
+                "keep this ground-truth correction",
+                STAGE_MISSED_NOTE.format(tool="web_search"),
+            ],
+        }
+    )
+    assert [tool["function"]["name"] for tool in missed_available["tools"]] == [
+        "fetch_page",
+        "search_room",
+    ]
+    assert missed_available["corrections"] == [
+        "keep this ground-truth correction",
+        STAGE_MISSED_NOTE.format(tool="fetch_page"),
+    ]
+    assert missed_available["stage_retried"] is True
+
+
 def test_chain_stage_routes_a_declined_stage_back_to_the_chain() -> None:
     """Structural guard for the above — the behavioural test could be satisfied
     by a model script that simply never declines."""
@@ -1304,6 +1476,43 @@ async def test_the_write_gate_survives_an_inherited_baton() -> None:
 # --- probe_gate_act: the transcribe agent can finally do its job --------------
 
 
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        ({"cancelled": True}, "synthesize"),
+        (
+            {
+                "agent_id": "media.transcribe",
+                "messages": [{"role": "tool", "content": "Speech model is not installed."}],
+            },
+            "blocked",
+        ),
+        (
+            {
+                "agent_id": "media.transcribe",
+                "messages": [
+                    {"role": "tool", "content": "Speech model is not installed."},
+                    {"role": "tool", "content": "Speech model ready."},
+                ],
+            },
+            "call_model",
+        ),
+        (
+            {
+                "agent_id": "media.transcribe",
+                "messages": [{"role": "user", "content": "not installed"}],
+            },
+            "call_model",
+        ),
+    ],
+)
+def test_route_after_probe_uses_cancellation_and_latest_tool_result(
+    state: dict[str, object], expected: str
+) -> None:
+    """Only cancellation or the newest probe tool result chooses this edge."""
+    assert route_after_probe(state) == expected  # type: ignore[arg-type]
+
+
 async def test_the_transcribe_agent_reaches_its_action_verb() -> None:
     """THE bug this shape exists for.
 
@@ -1452,6 +1661,32 @@ async def test_an_unrecognised_probe_result_fails_open() -> None:
         make_request("re-transcribe a.mp4"), chat, mcp, agent_id="media.transcribe"
     )
     assert "retranscribe_file" in [c[0] for c in out.mcp.calls]
+
+
+async def test_probe_obeys_its_navigation_precondition_and_search_result_guard() -> None:
+    """A browser snapshot needs an opened page, not merely an attempted search."""
+    from arcelle_sidecar.graphs import probe
+
+    tools = [{"function": {"name": "browse_snapshot"}}]
+    base = {"agent_id": "chat.browse", "tools": tools, "seen": set()}
+
+    assert await probe({**base, "attempted": set()}) == {}  # type: ignore[arg-type]
+
+    ready = await probe(
+        {**base, "attempted": {"browse_open"}, "messages": []}  # type: ignore[arg-type]
+    )
+    assert [call.name for call in ready["calls"]] == ["browse_snapshot"]
+
+    search_result = await probe(
+        {
+            **base,
+            "attempted": {"browse_open"},
+            "messages": [
+                {"role": "tool", "content": "Searched the room's own engines."}
+            ],
+        }  # type: ignore[arg-type]
+    )
+    assert search_result == {}
 
 
 @pytest.mark.parametrize(
@@ -1638,6 +1873,53 @@ async def test_a_clean_run_spends_no_repair_round() -> None:
     )
     assert len(out.chat.seen_messages) == 2
     assert "1715" in out.final
+
+
+@pytest.mark.parametrize(
+    ("events", "repair_needed"),
+    [
+        ([], True),
+        (
+            [
+                {"name": "save_workflow", "arguments": {"name": "Morning"}},
+                {"name": "list_workflows", "arguments": {}, "result": "Morning"},
+                {
+                    "name": "test_workflow",
+                    "arguments": {"name_or_id": "Evening"},
+                    "result": "VALIDATED: yes",
+                },
+            ],
+            True,
+        ),
+        (
+            [
+                {"name": "save_workflow", "arguments": {"name": "Morning"}},
+                {
+                    "name": "test_workflow",
+                    "arguments": {"name_or_id": "Morning"},
+                    "result": "VALIDATED: yes",
+                },
+            ],
+            False,
+        ),
+    ],
+)
+async def test_workflow_receipts_must_name_the_latest_mutation(
+    events: list[dict[str, object]], repair_needed: bool
+) -> None:
+    """A valid receipt is both later than and tied to the workflow it checks."""
+    from arcelle_sidecar.graphs import check_result
+
+    result = await check_result(
+        {
+            "agent_id": "jobs.workflows",
+            "attempted": {"save_workflow"},
+            "tool_events": events,
+            "tools": [{"function": {"name": "test_workflow"}}],
+        }
+    )
+
+    assert result["repair_needed"] is repair_needed
 
 
 def test_no_graph_node_writes_a_state_key_the_schema_would_drop() -> None:
@@ -1891,10 +2173,10 @@ def test_the_main_prompt_does_not_teach_the_agent_to_deny_its_specialists() -> N
 # --- the catalog rebuilds a spilled result has to survive ---------------------
 
 
-def test_every_node_that_rebuilds_the_catalog_keeps_the_spill_reader() -> None:
+def test_every_catalog_builder_keeps_the_spill_reader() -> None:
     """`read_result` is minted mid-round by `execute_tools`, so it is in no
-    agent's box and in nothing the bridge serves (`results.py`). Any node that
-    returns a `tools` key rebuilds the catalog from a box — and would retire the
+    agent's box and in nothing the bridge serves (`results.py`). Any catalog
+    builder that returns a `tools` key rebuilds from a box — and would retire the
     reader unless it goes through `graphs.narrowed`.
 
     Pinned as the SET of such nodes rather than as behaviour: a new narrowing
@@ -1923,7 +2205,11 @@ def test_every_node_that_rebuilds_the_catalog_keeps_the_spill_reader() -> None:
         and returned_catalogs(fn)
     }
 
-    assert set(rebuilders) == {"stage_catalog", "route_action"}, (
+    assert set(rebuilders) == {
+        "_completed_stage_catalog",
+        "_next_stage_catalog",
+        "route_action",
+    }, (
         "a node started rebuilding the catalog — route its `tools` value through "
         f"`narrowed(state, …)` and add it here: {sorted(rebuilders)}"
     )

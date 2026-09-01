@@ -176,6 +176,16 @@ describe("missingRequiredArg", () => {
       "new_text is required"
     );
   });
+
+  it("treats a malformed required list as unavailable validation instead of throwing or partly enforcing it", () => {
+    const schemas = builtinParamSchemas();
+    schemas.set("malformed_required", { required: ["name", 4] });
+    try {
+      expect(missingRequiredArg("malformed_required", { name: "present" })).toBeNull();
+    } finally {
+      resetBuiltinParamSchemasCacheForTests();
+    }
+  });
 });
 
 describe("slimSchema", () => {
@@ -253,6 +263,18 @@ describe("slimSchema", () => {
     slimSchema(schema); // slim again, as a fresh mcp_routes() build would each turn
     expect(schema.description).toBe(firstPassDesc);
     expect((schema.enum as string[]).length).toBe(SCHEMA_ENUM_MAX);
+  });
+
+  it("preserves a previously recorded enum total when a connector sends an already-slimmed schema", () => {
+    const schema: Record<string, unknown> = {
+      type: "string",
+      enum: ["only-visible-value"],
+      description: `Pick one (showing ${SCHEMA_ENUM_MAX} of 99 allowed values — ask the user if you need one that is not listed)`,
+    };
+    slimSchema(schema);
+    expect(schema.description).toBe(
+      `Pick one (showing ${SCHEMA_ENUM_MAX} of 99 allowed values — ask the user if you need one that is not listed)`
+    );
   });
 
   it("descends into properties/items but does not mistake a connector's OWN field named 'title'/'properties' for a keyword", () => {

@@ -1020,6 +1020,15 @@ describe("clampTestReport", () => {
       expect(body.slice(i, i + 2)).toBe("🌅");
     }
   });
+
+  it("backs up to the preceding scalar boundary when the next character crosses the byte cap", () => {
+    const report = `${"x".repeat(5999)}€more`;
+    const clamped = clampTestReport(report);
+    const body = clamped.slice(0, clamped.length - "…\n(report truncated)".length);
+    expect(body).toBe("x".repeat(5999));
+    expect(Buffer.byteLength(body, "utf8")).toBe(5999);
+    expect(body).not.toContain("�");
+  });
 });
 
 // ============================================================================

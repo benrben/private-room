@@ -186,10 +186,20 @@ def test_boxes_from_items_drops_degenerate_and_malformed() -> None:
     items = [
         {"bbox_2d": [10, 10, 10, 90], "label": "zero-width"},  # c-a < 0.001 -> drop
         {"bbox_2d": [1, 2, 3], "label": "short"},  # not 4 coords -> drop
+        {"bbox_2d": [1, True, 3, 4], "label": "boolean"},  # bool is not a JSON number
         {"label": "no-coords"},  # no box key -> drop
         "not-a-dict",  # non-object -> drop
     ]
     assert vision.boxes_from_items(items, 100.0, 100.0) == []
+
+
+def test_boxes_from_items_supports_box_alias_and_reorders_before_clamping() -> None:
+    # ``box`` uses the normal x-first 0-1000 convention. Reordering has to happen
+    # before clamping or a completely reversed out-of-range box would be discarded.
+    items = [{"box": [1100, 1200, -200, -100], "label": "reverse"}]
+    assert vision.boxes_from_items(items, 100.0, 100.0) == [
+        {"label": "reverse", "x1": 0.0, "y1": 0.0, "x2": 1.0, "y2": 1.0}
+    ]
 
 
 # --- the shared recover_json / strip_think_spans (model_text) ----------------

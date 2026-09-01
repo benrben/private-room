@@ -9,6 +9,14 @@
 import { describe, expect, it } from "vitest";
 import { buildZip, crc32, parseZip, readZipEntryBytes, readZipEntryText, zipEntryNames } from "./editMatchZip.js";
 
+function centralDirectoryOffset(zip: Buffer): number {
+  return zip.readUInt32LE(zip.length - 6);
+}
+
+function localHeaderOffset(zip: Buffer): number {
+  return zip.readUInt32LE(centralDirectoryOffset(zip) + 42);
+}
+
 describe("editMatchZip", () => {
   it("round-trips a single stored entry", () => {
     const zip = buildZip([{ name: "hello.txt", data: Buffer.from("hello world"), store: true }]);
@@ -66,6 +74,34 @@ describe("editMatchZip", () => {
     const zip = buildZip([{ name: "a.txt", data: Buffer.from("A") }]);
     expect(() => parseZip(zip.subarray(0, zip.length - 5))).toThrow();
     expect(() => parseZip(Buffer.from("short"))).toThrow();
+  });
+
+  it("REGRESSION: central metadata guards retain their exact error categories", () => {
+    const source = buildZip([{ name: "guarded.txt", data: Buffer.from("content"), store: true }]);
+    const central = centralDirectoryOffset(source);
+
+    const badCentral = Buffer.from(source);
+    badCentral.writeUInt32LE(0, central);
+    expect(() => parseZip(badCentral)).toThrow("Malformed zip central directory.");
+
+    const zip64 = Buffer.from(source);
+    zip64.writeUInt32LE(0xffffffff, central + 20);
+    expect(() => parseZip(zip64)).toThrow("This zip archive uses zip64 extensions, which this reader does not support.");
+
+    const badLocal = Buffer.from(source);
+    badLocal.writeUInt32LE(0, localHeaderOffset(badLocal));
+    expect(() => parseZip(badLocal)).toThrow('Malformed zip local header for entry "guarded.txt".');
+
+    const truncated = Buffer.from(source);
+    truncated.writeUInt32LE(0xfffffffe, central + 20);
+    expect(() => parseZip(truncated)).toThrow('Truncated zip entry "guarded.txt".');
+  });
+
+  it("REGRESSION: an unsupported compression method stays an absent readable entry", () => {
+    const source = buildZip([{ name: "method.txt", data: Buffer.from("content"), store: true }]);
+    const unsupported = Buffer.from(source);
+    unsupported.writeUInt16LE(99, centralDirectoryOffset(unsupported) + 10);
+    expect(readZipEntryBytes(unsupported, "method.txt")).toBeUndefined();
   });
 
   it("round-trips binary (non-UTF-8-text) bytes exactly", () => {

@@ -41,6 +41,19 @@ describe("parseSpecialists", () => {
       .toEqual([good]);
   });
 
+  it("keeps each valid optional decoration when a sibling decoration is malformed", () => {
+    expect(parseSpecialists([{
+      ...good,
+      capability: "inspect-only",
+      capabilityReason: "   ",
+      localHandoff: true,
+    }])).toEqual([{
+      ...good,
+      capability: "inspect-only",
+      localHandoff: true,
+    }]);
+  });
+
   it("is [] for a non-array payload", () => {
     expect(parseSpecialists(undefined)).toEqual([]);
     expect(parseSpecialists(null)).toEqual([]);
@@ -50,6 +63,10 @@ describe("parseSpecialists", () => {
   it("drops one malformed entry without discarding the rest of the menu", () => {
     const malformed = { key: "broken" }; // missing every other field
     expect(parseSpecialists([good, malformed])).toEqual([good]);
+  });
+
+  it("drops a record with a wrongly typed required field without coercing it", () => {
+    expect(parseSpecialists([{ ...good, tool: 42 }, good])).toEqual([good]);
   });
 
   it("is [] for an empty array (this room really has no specialists)", () => {

@@ -142,6 +142,30 @@ function workflowDeps(
   };
 }
 
+export interface RunScriptFileOps {
+  readonly readRoomFile: typeof readRoomFile;
+  readonly scriptLangOf: typeof scriptLangOf;
+  readonly parseScriptManifest: typeof parseScriptManifest;
+  readonly resolveInterpreter: typeof resolveInterpreter;
+  readonly scriptFingerprint: typeof scriptFingerprint;
+  readonly readScriptApprovals: typeof readScriptApprovals;
+  readonly requestApproval: typeof createScriptApprovalRequester;
+  readonly ensureScriptWorkflow: typeof ensureScriptWorkflow;
+  readonly startWorkflowRun: typeof startWorkflowRun;
+}
+
+const defaultRunScriptFileOps: RunScriptFileOps = {
+  readRoomFile,
+  scriptLangOf,
+  parseScriptManifest,
+  resolveInterpreter,
+  scriptFingerprint,
+  readScriptApprovals,
+  requestApproval: createScriptApprovalRequester,
+  ensureScriptWorkflow,
+  startWorkflowRun,
+};
+
 export async function runScriptFile(
   state: RoomManagerState,
   deps: RoomManagerDeps,
@@ -149,16 +173,27 @@ export async function runScriptFile(
   emit: EventSender,
   fileId: string,
 ): Promise<string> {
+  return runScriptFileWithOps(state, deps, userDataDir, emit, fileId, defaultRunScriptFileOps);
+}
+
+export async function runScriptFileWithOps(
+  state: RoomManagerState,
+  deps: RoomManagerDeps,
+  userDataDir: string,
+  emit: EventSender,
+  fileId: string,
+  ops: RunScriptFileOps,
+): Promise<string> {
   if (!state.room) throw new Error("No room is open.");
-  const file = await readRoomFile({ db: state.room.conn, path: state.room.path }, fileId);
+  const file = await ops.readRoomFile({ db: state.room.conn, path: state.room.path }, fileId);
   const name = file.name;
   const bytes = file.bytes ?? Buffer.alloc(0);
-  if (scriptLangOf(name) === null) throw new Error("Only .py or .js files can be run as scripts.");
-  const manifest = parseScriptManifest(name, bytes.toString("utf8"));
-  const runner = resolveInterpreter(manifest);
-  const sha = scriptFingerprint(bytes);
-  if (!readScriptApprovals(userDataDir).includes(sha)) {
-    const allowed = await createScriptApprovalRequester(state, userDataDir, emit)({
+  if (ops.scriptLangOf(name) === null) throw new Error("Only .py or .js files can be run as scripts.");
+  const manifest = ops.parseScriptManifest(name, bytes.toString("utf8"));
+  const runner = ops.resolveInterpreter(manifest);
+  const sha = ops.scriptFingerprint(bytes);
+  if (!ops.readScriptApprovals(userDataDir).includes(sha)) {
+    const allowed = await ops.requestApproval(state, userDataDir, emit)({
       fileId,
       name,
       sha,
@@ -166,8 +201,32 @@ export async function runScriptFile(
     });
     if (!allowed) throw new Error("This script was not approved to run.");
   }
-  const workflowId = ensureScriptWorkflow(state.room.conn, fileId, name);
-  return startWorkflowRun(workflowDeps(state, deps, userDataDir, emit), workflowId, "manual", null, new Set([sha]));
+  const workflowId = ops.ensureScriptWorkflow(state.room.conn, fileId, name);
+  return ops.startWorkflowRun(
+    workflowDeps(state, deps, userDataDir, emit), workflowId, "manual", null, new Set([sha]),
+  );
+}
+
+export interface ScriptSurfaceIpcOps {
+  readonly listScriptsInRoom: typeof listScriptsInRoom;
+  readonly resolveScriptRun: typeof resolveScriptRun;
+  readonly setScriptScheduleInRoom: typeof setScriptScheduleInRoom;
+  readonly runScriptFile: typeof runScriptFile;
+}
+
+const defaultScriptSurfaceIpcOps: ScriptSurfaceIpcOps = {
+  listScriptsInRoom,
+  resolveScriptRun,
+  setScriptScheduleInRoom,
+  runScriptFile,
+};
+
+function scriptRoom(open: NonNullable<RoomManagerState["room"]>) {
+  return {
+    db: open.conn,
+    path: open.path,
+    ...(open.workspace === undefined ? {} : { workspace: open.workspace }),
+  };
 }
 
 export function registerScriptSurfaceIpc(
@@ -177,34 +236,34 @@ export function registerScriptSurfaceIpc(
   userDataDir: string,
   emit: EventSender,
 ): void {
+  registerScriptSurfaceIpcWithOps(
+    ipcMain, state, deps, userDataDir, emit, defaultScriptSurfaceIpcOps,
+  );
+}
+
+export function registerScriptSurfaceIpcWithOps(
+  ipcMain: Pick<IpcMain, "handle">,
+  state: RoomManagerState,
+  deps: RoomManagerDeps,
+  userDataDir: string,
+  emit: EventSender,
+  ops: ScriptSurfaceIpcOps,
+): void {
   const room = () => {
     if (!state.room) throw new Error("No room is open.");
     return state.room;
   };
   ipcMain.handle("list_scripts", () => {
-    const open = room();
-    return listScriptsInRoom(
-      {
-        db: open.conn,
-        path: open.path,
-        ...(open.workspace === undefined ? {} : { workspace: open.workspace }),
-      },
-      userDataDir,
-    );
+    return ops.listScriptsInRoom(scriptRoom(room()), userDataDir);
   });
   ipcMain.handle("resolve_script_run", (_event: IpcMainInvokeEvent, raw: unknown): void => {
     const args = object(raw);
-    resolveScriptRun(state.scriptPending, String(args.id ?? ""), String(args.decision ?? "deny"));
+    ops.resolveScriptRun(state.scriptPending, String(args.id ?? ""), String(args.decision ?? "deny"));
   });
   ipcMain.handle("set_script_schedule", async (_event: IpcMainInvokeEvent, raw: unknown): Promise<void> => {
     const args = object(raw);
-    const open = room();
-    await setScriptScheduleInRoom(
-      {
-        db: open.conn,
-        path: open.path,
-        ...(open.workspace === undefined ? {} : { workspace: open.workspace }),
-      },
+    await ops.setScriptScheduleInRoom(
+      scriptRoom(room()),
       userDataDir,
       String(args.fileId ?? ""),
       String(args.kind ?? ""),
@@ -214,6 +273,6 @@ export function registerScriptSurfaceIpc(
     emit("workflows-changed", undefined);
   });
   ipcMain.handle("run_script", async (_event: IpcMainInvokeEvent, raw: unknown): Promise<string> => {
-    return runScriptFile(state, deps, userDataDir, emit, String(object(raw).fileId ?? ""));
+    return ops.runScriptFile(state, deps, userDataDir, emit, String(object(raw).fileId ?? ""));
   });
 }

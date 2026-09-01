@@ -208,6 +208,44 @@ def _seconds_of(t: object) -> Optional[float]:
     return None
 
 
+def _positive_seconds(t: object) -> Optional[float]:
+    """A usable CMTime only when it names a strictly positive duration.
+
+    The asset-duration contract is deliberately narrower than `_seconds_of`:
+    a zero-length container does not provide a duration worth displaying.
+    """
+    seconds = _seconds_of(t)
+    return seconds if seconds is not None and seconds > 0.0 else None
+
+
+def _add_video_metadata(meta: MediaMeta, track: object) -> None:
+    """Record the facts supplied by the first video track."""
+    size = _display_size(track)
+    if size is not None:
+        meta.width, meta.height = size
+    meta.video_codec = _track_codec(track)
+    meta.frame_rate = sane_frame_rate(float(track.nominalFrameRate()))
+    bits = float(track.estimatedDataRate())
+    if not math.isfinite(bits):
+        return
+    if bits <= 0.0:
+        return
+    meta.bitrate_kbps = _round_half_away_from_zero(bits / 1000.0)
+
+
+def _metadata_from_tracks(
+    asset: object, video_tracks: object, audio_tracks: object
+) -> Optional[MediaMeta]:
+    """Build metadata after `probe` has established that media exists."""
+    meta = MediaMeta(has_audio=len(audio_tracks) > 0)
+    meta.duration_secs = _positive_seconds(asset.duration())
+    if len(video_tracks) > 0:
+        _add_video_metadata(meta, video_tracks[0])
+    if len(audio_tracks) > 0:
+        meta.audio_codec = _track_codec(audio_tracks[0])
+    return None if meta.is_empty() else meta
+
+
 def probe(path: str) -> Optional[MediaMeta]:
     """The actual AVFoundation probe: open an `AVURLAsset` at the file URL,
     get its video and audio tracks by media type. If BOTH are empty, `None`
@@ -242,34 +280,10 @@ def probe(path: str) -> Optional[MediaMeta]:
 
         video_tracks = asset.tracksWithMediaType_(AVFoundation.AVMediaTypeVideo)
         audio_tracks = asset.tracksWithMediaType_(AVFoundation.AVMediaTypeAudio)
-        if len(video_tracks) == 0 and len(audio_tracks) == 0:
-            return None
-
-        meta = MediaMeta(has_audio=len(audio_tracks) > 0)
-
-        # Duration is a property of the ASSET, not of a track: on a real
-        # clip the video track ran 30.000 s and the audio 29.756 s.
-        d = asset.duration()
-        if bool(d.flags & CM.kCMTimeFlags_Valid) and d.timescale > 0:
-            secs = d.value / d.timescale
-            if math.isfinite(secs) and secs > 0.0:
-                meta.duration_secs = secs
-
-        if len(video_tracks) > 0:
-            track = video_tracks[0]
-            size = _display_size(track)
-            if size is not None:
-                meta.width, meta.height = size
-            meta.video_codec = _track_codec(track)
-            meta.frame_rate = sane_frame_rate(float(track.nominalFrameRate()))
-            bits = float(track.estimatedDataRate())
-            if math.isfinite(bits) and bits > 0.0:
-                meta.bitrate_kbps = _round_half_away_from_zero(bits / 1000.0)
-
-        if len(audio_tracks) > 0:
-            meta.audio_codec = _track_codec(audio_tracks[0])
-
-        return None if meta.is_empty() else meta
+        if len(video_tracks) == 0:
+            if len(audio_tracks) == 0:
+                return None
+        return _metadata_from_tracks(asset, video_tracks, audio_tracks)
 
 
 def probe_path(path: str) -> Optional[MediaMeta]:
@@ -321,6 +335,82 @@ def probe_bytes(data: bytes, ext: str) -> Optional[MediaMeta]:
         _remove(file)
 
 
+def _valid_time(t: object) -> bool:
+    return bool(t.flags & CM.kCMTimeFlags_Valid) and t.timescale > 0
+
+
+def _last_frame_generator(asset: object) -> object:
+    generator = AVFoundation.AVAssetImageGenerator.alloc().initWithAsset_(asset)
+    # A portrait clip stores landscape pixels plus a rotation; without this the
+    # captured frame — and therefore the whole next clip — comes out sideways.
+    generator.setAppliesPreferredTrackTransform_(True)
+    return generator
+
+
+def _video_track_end(asset: object) -> Optional[float]:
+    video_tracks = asset.tracksWithMediaType_(AVFoundation.AVMediaTypeVideo)
+    if len(video_tracks) == 0:
+        return None
+    time_range = video_tracks[0].timeRange()
+    start = _seconds_of(time_range.start)
+    length = _seconds_of(time_range.duration)
+    if start is None or length is None:
+        return None
+    return start + length
+
+
+def _last_frame_end(asset: object, duration: object) -> Optional[float]:
+    video_end = _video_track_end(asset)
+    if video_end is not None:
+        return video_end
+    return _seconds_of(duration)
+
+
+def _last_frame_time(end_secs: float) -> object:
+    at_secs = max(end_secs - 1.0 / 30.0, 0.0)
+    return CM.CMTime(
+        value=_round_half_away_from_zero(at_secs * 600.0),
+        timescale=600,
+        flags=CM.kCMTimeFlags_Valid,
+        epoch=0,
+    )
+
+
+def _zero_time() -> object:
+    return CM.CMTime(value=0, timescale=1, flags=CM.kCMTimeFlags_Valid, epoch=0)
+
+
+def _end_image(generator: object, at: object) -> object | None:
+    zero = _zero_time()
+    generator.setRequestedTimeToleranceBefore_(zero)
+    generator.setRequestedTimeToleranceAfter_(zero)
+    image, _err = generator.copyCGImageAtTime_actualTime_error_(at, None, None)
+    if image is not None:
+        return image
+    # Exactness comes first; for odd containers, relax only how early the
+    # decoder may answer, never how late.
+    any_time = CM.CMTime(
+        value=9_223_372_036_854_775_807,
+        timescale=1,
+        flags=CM.kCMTimeFlags_Valid | CM.kCMTimeFlags_PositiveInfinity,
+        epoch=0,
+    )
+    generator.setRequestedTimeToleranceBefore_(any_time)
+    generator.setRequestedTimeToleranceAfter_(zero)
+    image, _err = generator.copyCGImageAtTime_actualTime_error_(at, None, None)
+    return image
+
+
+def _png_bytes(cg_image: object) -> Optional[bytes]:
+    bitmap = AppKit.NSBitmapImageRep.alloc().initWithCGImage_(cg_image)
+    if bitmap is None:
+        return None
+    encoded = bitmap.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {})
+    if encoded is None:
+        return None
+    return bytes(encoded)
+
+
 def last_frame(path: str) -> Optional[bytes]:
     """The last frame of the clip at `path`, as PNG bytes.
 
@@ -357,69 +447,17 @@ def last_frame(path: str) -> Optional[bytes]:
     with objc.autorelease_pool():
         url = Foundation.NSURL.fileURLWithPath_(path)
         asset = AVFoundation.AVURLAsset.URLAssetWithURL_options_(url, None)
-        d = asset.duration()
-        if not bool(d.flags & CM.kCMTimeFlags_Valid) or d.timescale <= 0:
+        duration = asset.duration()
+        if not _valid_time(duration):
             return None
-
-        generator = AVFoundation.AVAssetImageGenerator.alloc().initWithAsset_(asset)
-        # A portrait clip stores landscape pixels plus a rotation; without
-        # this the captured frame — and therefore the whole next clip —
-        # comes out sideways.
-        generator.setAppliesPreferredTrackTransform_(True)
-
-        video_end_secs: Optional[float] = None
-        video_tracks = asset.tracksWithMediaType_(AVFoundation.AVMediaTypeVideo)
-        if len(video_tracks) > 0:
-            rng = video_tracks[0].timeRange()
-            start = _seconds_of(rng.start)
-            length = _seconds_of(rng.duration)
-            if start is not None and length is not None:
-                video_end_secs = start + length
-        if video_end_secs is None:
-            video_end_secs = _seconds_of(d)
-        if video_end_secs is None:
+        generator = _last_frame_generator(asset)
+        end_secs = _last_frame_end(asset, duration)
+        if end_secs is None:
             return None
-
-        at_secs = max(video_end_secs - 1.0 / 30.0, 0.0)
-        at = CM.CMTime(
-            value=_round_half_away_from_zero(at_secs * 600.0),
-            timescale=600,
-            flags=CM.kCMTimeFlags_Valid,
-            epoch=0,
-        )
-
-        zero = CM.CMTime(value=0, timescale=1, flags=CM.kCMTimeFlags_Valid, epoch=0)
-        generator.setRequestedTimeToleranceBefore_(zero)
-        generator.setRequestedTimeToleranceAfter_(zero)
-
-        cg_image, _err = generator.copyCGImageAtTime_actualTime_error_(at, None, None)
-        if cg_image is None:
-            # The exact request failed. A frame NEAR the end, from the real
-            # clip, still beats no frame at all, so retry with the
-            # tolerance the OS wants before giving up. `i64::MAX` with the
-            # PositiveInfinity flag mirrors the Rust source's `any` CMTime
-            # exactly (the numeric value is irrelevant once that flag is
-            # set, but is kept identical for fidelity).
-            any_time = CM.CMTime(
-                value=9_223_372_036_854_775_807,
-                timescale=1,
-                flags=CM.kCMTimeFlags_Valid | CM.kCMTimeFlags_PositiveInfinity,
-                epoch=0,
-            )
-            generator.setRequestedTimeToleranceBefore_(any_time)
-            generator.setRequestedTimeToleranceAfter_(zero)
-            cg_image, _err = generator.copyCGImageAtTime_actualTime_error_(at, None, None)
-            if cg_image is None:
-                return None
-
-        # CGImage -> PNG, the same way quicklook.py encodes its previews.
-        bitmap = AppKit.NSBitmapImageRep.alloc().initWithCGImage_(cg_image)
-        if bitmap is None:
+        image = _end_image(generator, _last_frame_time(end_secs))
+        if image is None:
             return None
-        encoded = bitmap.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {})
-        if encoded is None:
-            return None
-        return bytes(encoded)
+        return _png_bytes(image)
 
 
 def last_frame_png(data: bytes, ext: str) -> Optional[bytes]:

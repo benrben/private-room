@@ -6,12 +6,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 NATIVE_MODULE="better-sqlite3-multiple-ciphers"
+NATIVE_MODULE_DIR="$(node -p "require('path').dirname(require.resolve('${NATIVE_MODULE}/package.json'))")"
 ELECTRON_VERSION="$(node -p "require('electron/package.json').version")"
 
 restore_node_abi() {
   local exit_code=$?
   echo "[e2e] restoring ${NATIVE_MODULE} for Node"
-  if ! npm run build-release --prefix "../../node_modules/${NATIVE_MODULE}"; then
+  if ! npm run build-release --prefix "$NATIVE_MODULE_DIR"; then
     echo "[e2e] failed to restore ${NATIVE_MODULE} for Node" >&2
     exit 1
   fi

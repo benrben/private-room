@@ -208,26 +208,153 @@ def _share_and_cut(
     """
     if not indices:
         return False
-    fixed = total_chars(messages, reserved_bytes) - sum(
-        byte_len(messages[i].get("content") or "") for i in indices
+    fixed = _fixed_payload_bytes(messages, indices, reserved_bytes)
+    share = _cut_share(budget, fixed, len(indices), floor, only_when_it_fits)
+    if share is None:
+        return False
+    return _cut_messages_to_share(messages, indices, share)
+
+
+def _fixed_payload_bytes(
+    messages: list[Message], indices: list[int], reserved_bytes: int
+) -> int:
+    """Return the cost that cannot be reduced by this sharing pass."""
+    cuttable_content = sum(
+        byte_len(messages[index].get("content") or "") for index in indices
     )
-    share = (budget - fixed) // len(indices)
-    if share < floor:
-        if only_when_it_fits:
-            return False
-        share = floor
+    return total_chars(messages, reserved_bytes) - cuttable_content
+
+
+def _cut_share(
+    budget: int, fixed: int, count: int, floor: int, only_when_it_fits: bool
+) -> int | None:
+    """Choose the equal share, or decline an unhelpful floor-only cut."""
+    share = (budget - fixed) // count
+    if share < floor and only_when_it_fits:
+        return None
+    return max(share, floor)
+
+
+def _cut_content_to_share(message: Message, content: str, share: int) -> str:
+    """Keep the role-appropriate part of ``content`` within ``share`` bytes."""
+    if message.get("role") == "user":
+        return _cut_user(content, share)
+    return _cut_tool(content, str(message.get("tool_name") or "tool"), share)
+
+
+def _cut_message_to_share(message: Message, share: int) -> bool:
+    """Shorten one message when it exceeds its equal allocation."""
+    content = message.get("content") or ""
+    if byte_len(content) <= share:
+        return False
+    message["content"] = _cut_content_to_share(message, content, share)
+    return True
+
+
+def _cut_messages_to_share(
+    messages: list[Message], indices: list[int], share: int
+) -> bool:
+    """Cut every oversized selected message without skipping later results."""
     cut = False
-    for i in indices:
-        m = messages[i]
-        content = m.get("content") or ""
-        if byte_len(content) <= share:
-            continue
-        if m.get("role") == "user":
-            m["content"] = _cut_user(content, share)
-        else:
-            m["content"] = _cut_tool(content, str(m.get("tool_name") or "tool"), share)
-        cut = True
+    for index in indices:
+        cut = _cut_message_to_share(messages[index], share) or cut
     return cut
+
+
+def _fits_window(messages: list[Message], reserved_bytes: int, budget: int) -> bool:
+    """Whether message and reserved payload costs are within ``budget``."""
+    return total_chars(messages, reserved_bytes) <= budget
+
+
+def _older_tool_results(messages: list[Message]) -> list[Message]:
+    """Old, sizable tool results whose full contents have already been used."""
+    keep_from = max(len(messages) - _KEEP_RECENT, 0)
+    return [
+        m
+        for m in messages[1:keep_from]
+        if m.get("role") == "tool" and byte_len(m.get("content") or "") > _MIN_STUB_LEN
+    ]
+
+
+def _trim_old_tool_result(message: Message) -> None:
+    """Replace an old result with its deliberate, role-aware short form."""
+    if _is_report(message):
+        # Never blank a report: leave a head so a four-part answer degrades
+        # to four partial parts instead of silently losing one.
+        content = message.get("content") or ""
+        note = "\n… [report cut here to fit this model's context]"
+        message["content"] = truncate_bytes(content, _REPORT_HEAD) + note
+        return
+    label = message.get("tool_name") or "tool"
+    message["content"] = (
+        f"[{label} result trimmed to fit this model's context — already used above]"
+    )
+
+
+def _trim_old_tool_results(
+    messages: list[Message], reserved_bytes: int, budget: int
+) -> bool:
+    """Trim older room-tool results before reports, stopping as soon as they fit."""
+    trimmed = False
+    # Ordinary room-tool results FIRST, specialist reports LAST.
+    #
+    # The stub note says "already used above", and for a room-tool result that
+    # is true — the assistant turn after it summarised what it found. For a
+    # REPORT it is false twice over: in the hub thread the turn after a report
+    # is the next delegation, and the only turn that consumes reports is the
+    # tool-less synthesis that has not happened yet. Stubbing one deletes a part
+    # of the user's answer while the agent strip still shows that specialist
+    # green. So a report is only trimmed when nothing else is left, and even
+    # then pass 2 keeps its head rather than replacing it wholesale.
+    for message in sorted(_older_tool_results(messages), key=_is_report):
+        if _fits_window(messages, reserved_bytes, budget):
+            return trimmed
+        _trim_old_tool_result(message)
+        trimmed = True
+    return trimmed
+
+
+def _cut_tool_results_to_window(
+    messages: list[Message], reserved_bytes: int, budget: int
+) -> bool:
+    """Share the remaining window among every surviving tool result."""
+    return _share_and_cut(messages, _cuttable(messages, "tool"), budget, reserved_bytes)
+
+
+def _cut_user_turns_to_window(
+    messages: list[Message], reserved_bytes: int, budget: int
+) -> bool:
+    """Reluctantly cut user turns only when their floor can make the fit."""
+    return _share_and_cut(
+        messages,
+        _cuttable(messages, "user", _MIN_USER_KEEP),
+        budget,
+        reserved_bytes,
+        floor=_MIN_USER_KEEP,
+        only_when_it_fits=True,
+    )
+
+
+def _overflowing_window_budget(
+    messages: list[Message], reserved_bytes: int, num_ctx: int | None
+) -> int | None:
+    """Return the local window budget only when this payload exceeds it."""
+    if num_ctx is None:
+        return None
+    budget = window_budget_bytes(num_ctx)
+    return None if _fits_window(messages, reserved_bytes, budget) else budget
+
+
+def _trim_remaining_messages(
+    messages: list[Message], reserved_bytes: int, budget: int, trimmed: bool
+) -> bool:
+    """Run the tool-share and user-share passes after old-result stubbing."""
+    if _fits_window(messages, reserved_bytes, budget):
+        return trimmed
+    trimmed = _cut_tool_results_to_window(messages, reserved_bytes, budget) or trimmed
+    if _fits_window(messages, reserved_bytes, budget):
+        return trimmed
+    return _cut_user_turns_to_window(messages, reserved_bytes, budget) or trimmed
 
 
 def trim_messages_to_window(
@@ -270,75 +397,17 @@ def trim_messages_to_window(
     Every cut leaves a marker, so a short answer is explainable in the
     transcript. The daemon's context-shift leaves nothing.
     """
-    if num_ctx is None:
-        return False
-    budget = window_budget_bytes(num_ctx)
-    if total_chars(messages, reserved_bytes) <= budget:
+    budget = _overflowing_window_budget(messages, reserved_bytes, num_ctx)
+    if budget is None:
         return False
 
-    trimmed = False
-    keep_from = max(len(messages) - _KEEP_RECENT, 0)
-    candidates = [
-        m
-        for m in messages[1:keep_from]
-        if m.get("role") == "tool" and byte_len(m.get("content") or "") > _MIN_STUB_LEN
-    ]
-    # Ordinary room-tool results FIRST, specialist reports LAST.
-    #
-    # The stub note says "already used above", and for a room-tool result that
-    # is true — the assistant turn after it summarised what it found. For a
-    # REPORT it is false twice over: in the hub thread the turn after a report
-    # is the next delegation, and the only turn that consumes reports is the
-    # tool-less synthesis that has not happened yet. Stubbing one deletes a part
-    # of the user's answer while the agent strip still shows that specialist
-    # green. So a report is only trimmed when nothing else is left, and even
-    # then pass 2 keeps its head rather than replacing it wholesale.
-    for m in sorted(candidates, key=lambda x: _is_report(x)):
-        if total_chars(messages, reserved_bytes) <= budget:
-            return trimmed
-        if _is_report(m):
-            # Never blank a report: leave a head so a four-part answer degrades
-            # to four partial parts instead of silently losing one.
-            content = m.get("content") or ""
-            note = "\n… [report cut here to fit this model's context]"
-            m["content"] = truncate_bytes(content, _REPORT_HEAD) + note
-            trimmed = True
-            continue
-        label = m.get("tool_name") or "tool"
-        m["content"] = (
-            f"[{label} result trimmed to fit this model's context — already used above]"
-        )
-        trimmed = True
+    trimmed = _trim_old_tool_results(messages, reserved_bytes, budget)
 
     # Pass 2: share what's left of the budget between the surviving results.
     # Re-checked first: pass 1 stubbing the last candidate can be exactly what
     # made the payload fit, and cutting a result the model has just read when
     # nothing needs cutting is pure loss.
-    if total_chars(messages, reserved_bytes) <= budget:
-        return trimmed
-    if _share_and_cut(messages, _cuttable(messages, "tool"), budget, reserved_bytes):
-        trimmed = True
-
-    # Pass 3: the user's own turns, only if the tool results were not enough —
-    # and only when cutting them can actually make the payload fit. On a small
-    # local window a big inventory-bearing system prompt plus the tool catalog
-    # can exceed the budget between them, and then this pass cannot win: the
-    # request goes out oversized either way, and the only thing the cut achieves
-    # is destroying the question the user just typed. Left whole, the daemon's
-    # own context-shift takes the FRONT of the prompt and the question — which
-    # is composed LAST — survives it.
-    if total_chars(messages, reserved_bytes) <= budget:
-        return trimmed
-    if _share_and_cut(
-        messages,
-        _cuttable(messages, "user", _MIN_USER_KEEP),
-        budget,
-        reserved_bytes,
-        floor=_MIN_USER_KEEP,
-        only_when_it_fits=True,
-    ):
-        trimmed = True
-    return trimmed
+    return _trim_remaining_messages(messages, reserved_bytes, budget, trimmed)
 
 
 def fit_oversized_results(
@@ -375,28 +444,40 @@ def fit_oversized_results(
     anything else here: this runs only when the request would otherwise be
     REJECTED, where a trimmed report beats no answer at all.
     """
-    if budget_bytes is None or not messages:
+    if _already_within_result_budget(messages, budget_bytes, reserved_bytes):
         return messages, False
-    if total_chars(messages, reserved_bytes) <= budget_bytes:
-        return messages, False
+    assert budget_bytes is not None
     out = [dict(m) for m in messages]
     cut = _share_and_cut(out, _cuttable(out, "tool"), budget_bytes, reserved_bytes)
-    if total_chars(out, reserved_bytes) > budget_bytes:
-        # Cut here even when the fit is out of reach — this budget is a fraction
-        # of a stated window, so a smaller request can still be accepted where
-        # the whole one would be rejected — but never below the floor. The
-        # question has to survive the cut it exists to prevent.
-        cut = (
-            _share_and_cut(
-                out,
-                _cuttable(out, "user", _MIN_USER_KEEP),
-                budget_bytes,
-                reserved_bytes,
-                floor=_MIN_USER_KEEP,
-            )
-            or cut
-        )
+    cut = _cut_users_if_needed(out, budget_bytes, reserved_bytes, cut)
     return (out, True) if cut else (messages, False)
+
+
+def _already_within_result_budget(
+    messages: list[Message], budget_bytes: int | None, reserved_bytes: int
+) -> bool:
+    return budget_bytes is None or not messages or total_chars(messages, reserved_bytes) <= budget_bytes
+
+
+def _cut_users_if_needed(
+    messages: list[Message], budget_bytes: int, reserved_bytes: int, cut: bool
+) -> bool:
+    if total_chars(messages, reserved_bytes) <= budget_bytes:
+        return cut
+    # Cut here even when the fit is out of reach — this budget is a fraction
+    # of a stated window, so a smaller request can still be accepted where the
+    # whole one would be rejected — but never below the floor. The question has
+    # to survive the cut it exists to prevent.
+    return (
+        _share_and_cut(
+            messages,
+            _cuttable(messages, "user", _MIN_USER_KEEP),
+            budget_bytes,
+            reserved_bytes,
+            floor=_MIN_USER_KEEP,
+        )
+        or cut
+    )
 
 
 def fit_to_window(

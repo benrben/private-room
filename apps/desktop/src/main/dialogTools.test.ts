@@ -294,6 +294,12 @@ describe("dialogMessage", () => {
       })
     ).toBe("Keep both");
   });
+
+  it("shows unattached when no window is available", async () => {
+    const deps = fakeDeps(undefined, null);
+    await dialogMessage(deps, { message: "Background task finished" });
+    expect(deps.showMessageBox.mock.calls[0]?.length).toBe(1);
+  });
 });
 
 describe("registerDialogIpc", () => {
@@ -328,6 +334,32 @@ describe("registerDialogIpc", () => {
     expect(optionsOf(deps.showMessageBox).buttons).toEqual(["OK"]);
   });
 
+  it("keeps each valid custom button shape across the IPC validation boundary", async () => {
+    const { ipcMain, handlers } = fakeIpcMain();
+    const deps = fakeDeps();
+    registerDialogIpc(ipcMain, deps);
+    const message = handlers.get("dialog_message")!;
+
+    await message(fakeEvent, { message: "three", buttons: { yes: "Ship", no: "Hold", cancel: "Later" } });
+    await message(fakeEvent, { message: "two", buttons: { ok: "Replace", cancel: "Keep" } });
+    await message(fakeEvent, { message: "one", buttons: { ok: "Continue" } });
+
+    expect(optionsOf(deps.showMessageBox, 0).buttons).toEqual(["Ship", "Hold", "Later"]);
+    expect(optionsOf(deps.showMessageBox, 1).buttons).toEqual(["Replace", "Keep"]);
+    expect(optionsOf(deps.showMessageBox, 2).buttons).toEqual(["Continue"]);
+  });
+
+  it("keeps valid preset button names across the IPC validation boundary", async () => {
+    const { ipcMain, handlers } = fakeIpcMain();
+    const deps = fakeDeps({ message: { response: 2, checkboxChecked: false } });
+    registerDialogIpc(ipcMain, deps);
+    await expect(handlers.get("dialog_message")!(fakeEvent, {
+      message: "Proceed?",
+      buttons: "YesNoCancel",
+    })).resolves.toBe("Cancel");
+    expect(optionsOf(deps.showMessageBox).buttons).toEqual(["Yes", "No", "Cancel"]);
+  });
+
   it("a wrong-shaped filter entry is dropped rather than handed to a native panel", async () => {
     const { ipcMain, handlers } = fakeIpcMain();
     const deps = fakeDeps();
@@ -336,6 +368,16 @@ describe("registerDialogIpc", () => {
       filters: [{ name: "Good", extensions: ["png", 7] }, { name: "No extensions" }, "nonsense"],
     });
     expect(optionsOf(deps.showOpenDialog).filters).toEqual([{ name: "Good", extensions: ["png"] }]);
+  });
+
+  it("drops the filters field entirely when every renderer-supplied filter is malformed", async () => {
+    const { ipcMain, handlers } = fakeIpcMain();
+    const deps = fakeDeps();
+    registerDialogIpc(ipcMain, deps);
+    await handlers.get("dialog_open")!(fakeEvent, {
+      filters: [{ name: 7, extensions: ["png"] }, { name: "Missing", extensions: "png" }, null],
+    });
+    expect(optionsOf(deps.showOpenDialog).filters).toBeUndefined();
   });
 
   it("preserves the room picker flag and native guidance across the IPC validation boundary", async () => {

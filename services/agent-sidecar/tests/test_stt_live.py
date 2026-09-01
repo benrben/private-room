@@ -580,6 +580,30 @@ def test_lang_detect_failure_is_best_effort_none(
     assert out.detected is None
 
 
+def test_lang_detect_unknown_language_is_best_effort_none(
+    fake_model: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A detector id without a language string is another no-vote, not an error."""
+    seg = _FakeSegment(
+        text=b" hi",
+        t0=0,
+        t1=50,
+        tokens=[_FakeToken(id=1, raw=b" hi", p=0.9, plog=-0.05, t0=0, t1=50)],
+    )
+    _install_fake_pw(
+        monkeypatch,
+        [seg],
+        decoded_lang_id=0,
+        lang_map={0: "en"},
+        detect_id=2,
+        detect_prob=0.7,
+    )
+
+    out = live.transcribe_segments("/fake/sniff-unknown-language.bin", np.zeros(4000), 0, live.Sniff())
+
+    assert out.detected is None
+
+
 def test_lang_detect_exception_is_swallowed(
     fake_model: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -665,6 +689,45 @@ def test_words_exclude_special_tokens_from_mean_p_and_merge(
     assert got.words == [("Hello", 305, 315), ("world", 315, 325)]
     # mean_p is the arithmetic mean over the two NON-special tokens only.
     assert got.mean_p == pytest.approx((0.9 + 0.8) / 2)
+
+
+def test_unscored_segment_keeps_zero_confidence_without_querying_silence(
+    fake_model: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A segment containing only control tokens cannot contribute a silence vote."""
+    seg = _FakeSegment(
+        text=b" hello",
+        t0=0,
+        t1=50,
+        tokens=[_FakeToken(id=1, raw=b"[_BEG_]", p=0.9, plog=-0.1, t0=0, t1=0)],
+    )
+    _install_fake_pw(monkeypatch, [seg])
+    monkeypatch.setattr(
+        live,
+        "_segment_no_speech_prob",
+        lambda _ctx, _index: pytest.fail("unscored segments must not query no-speech probability"),
+    )
+
+    out = live.transcribe_segments("/fake/no-scored-tokens.bin", np.zeros(4000), 0, live.Auto())
+
+    assert out.segs == [live.SegOut(t0=0, t1=50, text="hello", words=[], lang="en", mean_p=0.0)]
+
+
+def test_decode_failure_releases_the_context_and_checks_it_back(
+    fake_model: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed native decode leaves the shared context usable by the next caller."""
+    _install_fake_pw(monkeypatch, [])
+    monkeypatch.setattr(live._pw, "whisper_full", lambda *_args: 1)
+    path = "/fake/decode-failure.bin"
+
+    with pytest.raises(RuntimeError, match="transcription failed"):
+        live.transcribe_segments(path, np.zeros(4000), 0, live.Auto())
+
+    assert engine._cache is not None
+    assert engine._cache.refs == 0
+    assert engine._cache.decode_lock.acquire(blocking=False)
+    engine._cache.decode_lock.release()
 
 
 # --------------------------------------------------------------------- (1) real say roundtrip

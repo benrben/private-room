@@ -29,9 +29,11 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
+import { createServer } from "node:net";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RecentRoom } from "../shared/apiTypes.js";
@@ -180,6 +182,15 @@ describe("readRecent", () => {
     expect(readRecent(dir)).toEqual([]);
   });
 
+  it("rejects an entry whose optional missing flag is not a boolean", () => {
+    const dir = freshDir();
+    writeFileSync(
+      path.join(dir, "recent.json"),
+      JSON.stringify([{ name: "x", path: "/x", missing: "no" }])
+    );
+    expect(readRecent(dir)).toEqual([]);
+  });
+
   it("applies defaults for absent optional fields (missing:false, openedAt:null)", () => {
     const dir = freshDir();
     writeFileSync(path.join(dir, "recent.json"), JSON.stringify([{ name: "x", path: "/x" }]));
@@ -274,6 +285,20 @@ describe("writeRecent", () => {
     const notADir = path.join(dir, "actually-a-file");
     writeFileSync(notADir, "x");
     expect(() => writeRecent(notADir, [])).toThrow(/app data folder/);
+  });
+
+  it("keeps a rename failure distinct from a temporary-file write failure", () => {
+    const dir = freshDir();
+    mkdirSync(recentFilePath(dir));
+
+    expect(() => writeRecent(dir, [mk("/a")])).toThrow(/Could not save the recent-rooms list/);
+  });
+
+  it("wraps a temporary recent-file write failure before attempting the rename", () => {
+    const dir = freshDir();
+    mkdirSync(`${recentFilePath(dir)}.tmp`);
+
+    expect(() => writeRecent(dir, [mk("/a")])).toThrow(/Could not write the recent-rooms list/);
   });
 });
 
@@ -401,6 +426,81 @@ describe("trashRoom", () => {
     ).rejects.toThrow(/Close the room/i);
     expect(trashItem).not.toHaveBeenCalled();
   });
+
+  it("refuses incomplete, missing, and symlinked targets before OS Trash", async () => {
+    const dir = freshDir();
+    const trashItem = vi.fn(async () => {});
+    const legacy = path.join(dir, "legacy.roomai");
+    const link = path.join(dir, "linked.roomai");
+    writeFileSync(legacy, "legacy room");
+    symlinkSync(legacy, link);
+
+    await expect(trashRoom(dir, "relative.roomai", { trashItem })).rejects.toThrow(
+      "A complete room path is required.",
+    );
+    await expect(trashRoom(dir, path.join(dir, "gone.roomai"), { trashItem })).rejects.toThrow(
+      "The room is not at that location.",
+    );
+    await expect(trashRoom(dir, link, { trashItem })).rejects.toThrow(
+      "A symbolic link cannot be moved as an Arcelle room.",
+    );
+    expect(trashItem).not.toHaveBeenCalled();
+  });
+
+  it("keeps the recent entry until OS Trash accepts a legacy room file", async () => {
+    const dir = freshDir();
+    const legacy = path.join(dir, "Archive.ROOMAI");
+    writeFileSync(legacy, "legacy room");
+    writeRecent(dir, [mk(legacy)]);
+    const trashItem = vi.fn(async () => {
+      expect(readRecent(dir)).toEqual([mk(legacy)]);
+    });
+
+    await trashRoom(dir, legacy, { trashItem });
+
+    expect(trashItem).toHaveBeenCalledWith(path.resolve(legacy));
+    expect(readRecent(dir)).toEqual([]);
+  });
+
+  it("does not remove a recent entry when OS Trash rejects the move", async () => {
+    const dir = freshDir();
+    const legacy = path.join(dir, "Archive.arcelle");
+    writeFileSync(legacy, "legacy room");
+    writeRecent(dir, [mk(legacy)]);
+
+    await expect(
+      trashRoom(dir, legacy, { trashItem: vi.fn(async () => { throw new Error("trash failed"); }) }),
+    ).rejects.toThrow("trash failed");
+    expect(readRecent(dir)).toEqual([mk(legacy)]);
+  });
+
+  it("refuses filesystem nodes that are neither workspaces nor legacy files", async () => {
+    const dir = freshDir();
+    // macOS caps Unix-domain socket paths. `dir` can be a deeply nested
+    // quality-loop fixture path, so keep the socket itself deliberately short.
+    const socketDir = mkdtempSync(path.join(os.tmpdir(), "rt-"));
+    const socketPath = path.join(socketDir, "s");
+    const server = createServer();
+    let listening = false;
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(socketPath, () => {
+          listening = true;
+          resolve();
+        });
+      });
+      await expect(trashRoom(dir, socketPath, { trashItem: vi.fn(async () => {}) })).rejects.toThrow(
+        "Only an Arcelle workspace or legacy room file can be moved to Trash.",
+      );
+    } finally {
+      if (listening) {
+        await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      }
+      rmSync(socketDir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ------------------------------------------------------------- registerRecentIpc
@@ -435,5 +535,24 @@ describe("registerRecentIpc", () => {
     writeRecent(dir, [mk("/x")]);
     await handlers.get("clear_recent")!(null);
     expect(readRecent(dir)).toEqual([]);
+
+    const legacy = path.join(dir, "through-ipc.arcelle");
+    writeFileSync(legacy, "legacy room");
+    writeRecent(dir, [mk(legacy)]);
+    await handlers.get("trash_room")!(null, { path: legacy });
+    expect(readRecent(dir)).toEqual([]);
+  });
+
+  it("reports when the optional OS Trash integration is unavailable", () => {
+    const dir = freshDir();
+    const handlers = new Map<string, (event: unknown, ...args: unknown[]) => unknown>();
+    registerRecentIpc(
+      { handle: (channel, handler) => handlers.set(channel, handler as (event: unknown, ...args: unknown[]) => unknown) },
+      dir,
+    );
+
+    expect(() => handlers.get("trash_room")!(null, { path: "/a.roomai" })).toThrow(
+      "Moving rooms to Trash is unavailable.",
+    );
   });
 });

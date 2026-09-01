@@ -23,7 +23,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { resetBaseUrlOverrideForTests, resolvedBaseUrl } from "./engineRouting.js";
 import { createRoom } from "./db-host/open.js";
@@ -47,8 +47,25 @@ import {
   frontPage,
   frontPageOf,
   frontPageSuggestions,
+  registerFrontPageIpc,
   type FrontPageSuggestionsDeps,
 } from "./moonshotFrontPage.js";
+
+describe("front-page IPC registration", () => {
+  it("serves both empty front-page views while no room is open", async () => {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>();
+    registerFrontPageIpc(
+      { handle: (channel: string, handler: (...args: unknown[]) => unknown) => {
+        handlers.set(channel, handler);
+      } } as never,
+      { currentRoom: () => null },
+    );
+
+    expect(handlers.get("front_page")!({})).toMatchObject({ fileCount: 0 });
+    await expect(handlers.get("front_page_suggestions")!({})).resolves.toEqual([]);
+    expect([...handlers.keys()]).toEqual(["front_page", "front_page_suggestions"]);
+  });
+});
 
 let tmpDir: string;
 

@@ -47,6 +47,15 @@ describe("parseDelim / serializeDelim", () => {
   it("a CR or LF inside a quoted field is data, not a row end", () => {
     expect(parseDelim('a,"line1\nline2"\n', ",")).toEqual([["a", "line1\nline2"]]);
   });
+
+  it("keeps an empty final field when the source has no final row terminator", () => {
+    // A bare trailing delimiter is a real editable cell, not a formatting
+    // artifact. Losing it shifts later A1 writes left by one column.
+    expect(parseDelim("name,note\nalice,", ",")).toEqual([
+      ["name", "note"],
+      ["alice", ""],
+    ]);
+  });
 });
 
 describe("guessSep / delimStyle", () => {
@@ -69,6 +78,11 @@ describe("guessSep / delimStyle", () => {
     expect(delimStyle("a,b\r\n1,2\r\n")).toEqual({ newline: "\r\n", trailingNewline: true });
     expect(delimStyle("a,b\n1,2")).toEqual({ newline: "\n", trailingNewline: false });
     expect(delimStyle("")).toEqual({ newline: "\n", trailingNewline: true });
+  });
+
+  it("ignores quoted line breaks and samples separator evidence only from the first kilobyte", () => {
+    expect(delimStyle('"line one\r\nline two",note\rvalue,next')).toEqual({ newline: "\r", trailingNewline: false });
+    expect(guessSep(`${"x".repeat(1024)};;;;`)).toBe(",");
   });
 });
 
@@ -101,6 +115,10 @@ describe("setCellInBytes (csv/tsv)", () => {
     // The grid's row 1 is the file's SECOND line, and the header is written
     // back verbatim so the addresses stay lined up.
     expect(setCell("t.csv", "sep=;\r\na;b\r\n1;2\r\n", "B2", "9").text).toBe("sep=;\r\na;b\r\n1;9\r\n");
+  });
+
+  it("keeps a one-character `sep=` header terminator verbatim", () => {
+    expect(setCell("t.csv", "sep=;\ra;b\r1;2\r", "B2", "9").text).toBe("sep=;\ra;b\r1;9\r");
   });
 
   it("extends a short row/grid to reach a cell past the current bounds", () => {

@@ -2,7 +2,7 @@
   "name": "arcelle",
   "private": true,
   "license": "UNLICENSED",
-  "version": "0.26.11",
+  "version": "0.26.12",
   "type": "module",
   "workspaces": [
     "apps/desktop"
@@ -22,6 +22,7 @@
     "test:electron": "npm run test:electron:unit && npm run test:electron:real",
     "test:electron:unit": "npm run test:unit --workspace @arcelle/desktop",
     "test:electron:real": "npm run test:electron-real --workspace @arcelle/desktop",
+    "test:coverage": "npm run test:unit --workspace @arcelle/desktop -- --coverage --coverage.reporter=lcov",
     "test:packaging": "npm run test:packaging --workspace @arcelle/desktop",
     "test:page": "node --test \"tests/contract/*.test.mjs\"",
     "test:mock": "node tests/support/check-mock-coverage.mjs --bridge=electron",
@@ -45,5 +46,6 @@
     "monaco-editor": {
       "dompurify": "3.4.14"
     }
-  }
+  },
+  "packageManager": "pnpm@11.22.0+sha512.1ff870c4c6133dfd88fb2afc46dd13d47f09c9794b438c6fdb47ca98caf3bc16381ee0be93a091b8e3824cf01f889f46d7d9e20910fb0be1ab0fb5baa80dd621"
 }

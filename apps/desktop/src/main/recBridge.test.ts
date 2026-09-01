@@ -14,7 +14,13 @@
  */
 
 import { createCipheriv, randomBytes, randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
@@ -22,7 +28,12 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { createRoom } from "./db-host/open.js";
-import { getFileBytes, getFileExtractedText, getFileName, insertFile } from "./db-host/files.js";
+import {
+  getFileBytes,
+  getFileExtractedText,
+  getFileName,
+  insertFile,
+} from "./db-host/files.js";
 import { getRecMeta, setRecMeta } from "./db-host/recordings.js";
 import { enrollVoice, knownVoices, savedVoices } from "./db-host/voices.js";
 import {
@@ -58,6 +69,7 @@ import {
   recDeleteRange,
   recDeleteRangeHybrid,
   recExportClean,
+  recExportCleanHybrid,
   recGet,
   recHighlightAdd,
   recHostWsUrl,
@@ -112,23 +124,37 @@ function freshRoom(): Database.Database {
   return createRoom(roomPath, "correct horse battery staple", "Test Room");
 }
 
-function makeCtx(db: Database.Database | null, overrides: Partial<RecBridgeDeps> = {}): RecBridgeCtx {
+function makeCtx(
+  db: Database.Database | null,
+  overrides: Partial<RecBridgeDeps> = {},
+): RecBridgeCtx {
   return createRecBridgeCtx({
-    currentRoom: (): OpenRoom | null => (db === null ? null : { db, path: roomPath }),
+    currentRoom: (): OpenRoom | null =>
+      db === null ? null : { db, path: roomPath },
     resolveSttModel: () => "/models/whisper.bin",
     spoolDir: () => tmpDir,
-    sessionWsUrl: async (fileId) => `ws://127.0.0.1/rec/session?token=test&fileId=${fileId}`,
+    sessionWsUrl: async (fileId) =>
+      `ws://127.0.0.1/rec/session?token=test&fileId=${fileId}`,
     ...overrides,
   });
 }
 
 function fakePost(
-  handlers: Record<string, (body: unknown) => { status: number; json: unknown }>
-): ((path: string, body: unknown) => Promise<{ status: number; json: unknown }>) & {
+  handlers: Record<
+    string,
+    (body: unknown) => { status: number; json: unknown }
+  >,
+): ((
+  path: string,
+  body: unknown,
+) => Promise<{ status: number; json: unknown }>) & {
   calls: Array<{ path: string; body: Record<string, unknown> }>;
 } {
   const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
-  const fn = async (p: string, body: unknown): Promise<{ status: number; json: unknown }> => {
+  const fn = async (
+    p: string,
+    body: unknown,
+  ): Promise<{ status: number; json: unknown }> => {
     calls.push({ path: p, body: body as Record<string, unknown> });
     const handler = handlers[p];
     if (handler === undefined) {
@@ -139,7 +165,10 @@ function fakePost(
   return Object.assign(fn, { calls });
 }
 
-function ok(json: Record<string, unknown> = {}): { status: number; json: unknown } {
+function ok(json: Record<string, unknown> = {}): {
+  status: number;
+  json: unknown;
+} {
   return { status: 200, json: { ok: true, ...json } };
 }
 
@@ -159,8 +188,19 @@ function fakeHostWs(): HostWsLike & { sent: string[]; closed: boolean } {
   return ws;
 }
 
-function addRecording(db: Database.Database, name: string, meta: RecMeta): string {
-  const file = insertFile(db, name, "audio/wav", encodeWav(new Float32Array(0)), "(live recording)\n", "recording");
+function addRecording(
+  db: Database.Database,
+  name: string,
+  meta: RecMeta,
+): string {
+  const file = insertFile(
+    db,
+    name,
+    "audio/wav",
+    encodeWav(new Float32Array(0)),
+    "(live recording)\n",
+    "recording",
+  );
   setRecMeta(db, file.id, JSON.stringify(meta));
   return file.id;
 }
@@ -202,12 +242,17 @@ async function listenOn(handler: http.RequestListener): Promise<string> {
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 }
 
-async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+async function readJsonBody(
+  req: http.IncomingMessage,
+): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
     chunks.push(chunk as Buffer);
   }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<
+    string,
+    unknown
+  >;
 }
 
 // ============================================================ meta parsing
@@ -215,16 +260,30 @@ async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, u
 describe("parseRecMeta", () => {
   it("no row is not damage; a damaged row is, and never a silent empty transcript", () => {
     expect(parseRecMeta(null).durationCs).toBe(0);
-    expect(parseRecMeta('{"durationCs":900,"segments":[],"cuts":[]}').durationCs).toBe(900);
+    expect(
+      parseRecMeta('{"durationCs":900,"segments":[],"cuts":[]}').durationCs,
+    ).toBe(900);
 
     // Rust's own `unreadable_meta_is_an_error_not_an_empty_transcript` cases.
-    for (const damaged of ["", "{", "not json at all", '{"durationCs":"soon"}']) {
+    for (const damaged of [
+      "",
+      "{",
+      "not json at all",
+      '{"durationCs":"soon"}',
+    ]) {
       expect(() => parseRecMeta(damaged)).toThrowError(/can't be read/);
     }
     // …and the shapes a bare `JSON.parse(x) as RecMeta` would wave through into
     // a TypeError three frames later. `durationCs`/`segments`/`cuts` carry no
     // `#[serde(default)]` in Rust, so serde refuses these too.
-    for (const damaged of ["null", "123", '"a string"', "[]", '{"foo":1}', '{"durationCs":1,"segments":{}}']) {
+    for (const damaged of [
+      "null",
+      "123",
+      '"a string"',
+      "[]",
+      '{"foo":1}',
+      '{"durationCs":1,"segments":{}}',
+    ]) {
       expect(() => parseRecMeta(damaged)).toThrowError(/can't be read/);
     }
     expect(() => parseRecMeta("{")).toThrowError(/History/); // must say how to get it back
@@ -236,8 +295,12 @@ describe("parseRecMeta", () => {
   });
 
   it("coerceRecMeta accepts the already-parsed object /rec/edit_meta answers with", () => {
-    expect(coerceRecMeta({ durationCs: 42, segments: [], cuts: [] }).durationCs).toBe(42);
-    expect(() => coerceRecMeta({ segments: [], cuts: [] })).toThrowError(/durationCs/);
+    expect(
+      coerceRecMeta({ durationCs: 42, segments: [], cuts: [] }).durationCs,
+    ).toBe(42);
+    expect(() => coerceRecMeta({ segments: [], cuts: [] })).toThrowError(
+      /durationCs/,
+    );
   });
 });
 
@@ -251,7 +314,14 @@ describe("control POSTs (real HTTP server)", () => {
       void readJsonBody(req).then((body) => {
         seen = body;
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, fileId: body.fileId, spoolKey: "a2V5", spoolPath: "/tmp/x.spool" }));
+        res.end(
+          JSON.stringify({
+            ok: true,
+            fileId: body.fileId,
+            spoolKey: "a2V5",
+            spoolPath: "/tmp/x.spool",
+          }),
+        );
       });
     });
     const ctx = makeCtx(db, {
@@ -273,7 +343,7 @@ describe("control POSTs (real HTTP server)", () => {
         "modelPath",
         "spoolDir",
         "systemAudio",
-      ].sort()
+      ].sort(),
     );
     expect(seen.modelPath).toBe("/models/whisper.bin");
     expect(seen.systemAudio).toBe(true);
@@ -290,18 +360,43 @@ describe("control POSTs (real HTTP server)", () => {
     const db = freshRoom();
     const base = await listenOn((_req, res) => {
       res.writeHead(409, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "A recording is already in progress.", code: "REC_ALREADY_LIVE" }));
+      res.end(
+        JSON.stringify({
+          error: "A recording is already in progress.",
+          code: "REC_ALREADY_LIVE",
+        }),
+      );
     });
-    const ctx = makeCtx(db, { sidecarPost: (p, body) => sidecarPostAt(base, p, body) });
-    await expect(recStart(db, ctx, { systemAudio: false })).rejects.toMatchObject({
+    const ctx = makeCtx(db, {
+      sidecarPost: (p, body) => sidecarPostAt(base, p, body),
+    });
+    await expect(
+      recStart(db, ctx, { systemAudio: false }),
+    ).rejects.toMatchObject({
       code: "REC_ALREADY_LIVE",
       message: "A recording is already in progress.",
     });
   });
 
+  it("treats a non-JSON control response as null and gives it stable fallback diagnostics", async () => {
+    const base = await listenOn((_req, res) => {
+      res.writeHead(503, { "content-type": "text/plain" });
+      res.end("temporarily unavailable");
+    });
+    await expect(sidecarPostAt(base, "/rec/pause", {})).resolves.toEqual({ status: 503, json: null });
+
+    const ctx = makeCtx(null, { sidecarPost: (p, body) => sidecarPostAt(base, p, body) });
+    ctx.state.liveFileId = "live-file";
+    await expect(recPause(ctx)).rejects.toMatchObject({
+      name: "RecControlError",
+      code: "REC_CONTROL_FAILED",
+      message: "The room's engine could not complete this request (HTTP 503).",
+    });
+  });
+
   it("recHostWsUrl carries the token and file id on the query string, ws-scheme", () => {
     expect(recHostWsUrl("http://127.0.0.1:8123", "f 1", "tok/en")).toBe(
-      "ws://127.0.0.1:8123/rec/host?token=tok%2Fen&fileId=f%201"
+      "ws://127.0.0.1:8123/rec/host?token=tok%2Fen&fileId=f%201",
     );
   });
 });
@@ -311,7 +406,9 @@ describe("control POSTs (real HTTP server)", () => {
 describe("recStart", () => {
   it("creates a fresh recording file, tracks the live session, and attaches the host WS", async () => {
     const db = freshRoom();
-    const post = fakePost({ "/rec/start": () => ok({ spoolKey: "a2V5", spoolPath: "/tmp/f.spool" }) });
+    const post = fakePost({
+      "/rec/start": () => ok({ spoolKey: "a2V5", spoolPath: "/tmp/f.spool" }),
+    });
     const ws = fakeHostWs();
     let notified = 0;
     const ctx = makeCtx(db, {
@@ -323,7 +420,9 @@ describe("recStart", () => {
     });
 
     const started = await recStart(db, ctx, { systemAudio: false });
-    expect(started.name).toMatch(/^Recording \d{4}-\d{2}-\d{2} \d{2}\.\d{2}\.wav$/);
+    expect(started.name).toMatch(
+      /^Recording \d{4}-\d{2}-\d{2} \d{2}\.\d{2}\.wav$/,
+    );
     expect(started.meta).toEqual(defaultRecMeta());
     expect(getFileName(db, started.fileId)).toBe(started.name);
     expect(getRecMeta(db, started.fileId)).not.toBeNull();
@@ -337,56 +436,89 @@ describe("recStart", () => {
   });
 
   it("names a fresh recording from the local wall clock, Rust's strftime format", () => {
-    expect(recordingStamp(new Date(2026, 7, 22, 9, 4))).toBe("2026-08-22 09.04");
+    expect(recordingStamp(new Date(2026, 7, 22, 9, 4))).toBe(
+      "2026-08-22 09.04",
+    );
   });
 
   it("refuses with no resolved STT model, and never inserts a file for it", async () => {
     const db = freshRoom();
     const ctx = makeCtx(db, { resolveSttModel: () => null });
-    await expect(recStart(db, ctx, { systemAudio: false })).rejects.toThrowError("STT_MODEL_MISSING");
-    expect(db.prepare("SELECT COUNT(*) FROM files").pluck().get() as number).toBe(0);
+    await expect(
+      recStart(db, ctx, { systemAudio: false }),
+    ).rejects.toThrowError("STT_MODEL_MISSING");
+    expect(
+      db.prepare("SELECT COUNT(*) FROM files").pluck().get() as number,
+    ).toBe(0);
   });
 
   it("refuses a second start, and says something followable while the last one is SAVING", async () => {
     const db = freshRoom();
     const ctx = makeCtx(db, {
-      sidecarPost: fakePost({ "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }) }),
+      sidecarPost: fakePost({
+        "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }),
+      }),
       connectHostWs: () => fakeHostWs(),
     });
     const started = await recStart(db, ctx, { systemAudio: false });
-    await expect(recStart(db, ctx, { systemAudio: false })).rejects.toThrowError(
-      `A recording is already running (file ${started.fileId}). Stop it first.`
+    await expect(
+      recStart(db, ctx, { systemAudio: false }),
+    ).rejects.toThrowError(
+      `A recording is already running (file ${started.fileId}). Stop it first.`,
     );
     // "Stop it first" is an instruction nobody can follow once the engine is
     // saving, so that state gets its own sentence.
     ctx.state.liveStatus = "saving";
-    await expect(recStart(db, ctx, { systemAudio: false })).rejects.toThrowError(/still being saved/);
+    await expect(
+      recStart(db, ctx, { systemAudio: false }),
+    ).rejects.toThrowError(/still being saved/);
   });
 
   it("rolls the fresh row back when the sidecar refuses to start", async () => {
     const db = freshRoom();
     const ctx = makeCtx(db, {
       sidecarPost: fakePost({
-        "/rec/start": () => ({ status: 409, json: { error: "busy", code: "REC_ALREADY_LIVE" } }),
+        "/rec/start": () => ({
+          status: 409,
+          json: { error: "busy", code: "REC_ALREADY_LIVE" },
+        }),
       }),
     });
-    await expect(recStart(db, ctx, { systemAudio: false })).rejects.toBeInstanceOf(RecControlError);
+    await expect(
+      recStart(db, ctx, { systemAudio: false }),
+    ).rejects.toBeInstanceOf(RecControlError);
     // Nothing will ever reference that row — an empty "Recording ….wav" left in
     // the room is a file the user has to notice and delete by hand.
-    expect(db.prepare("SELECT COUNT(*) FROM files").pluck().get() as number).toBe(0);
+    expect(
+      db.prepare("SELECT COUNT(*) FROM files").pluck().get() as number,
+    ).toBe(0);
     expect(ctx.state.liveFileId).toBeNull();
   });
 
   it("resumes an existing file: rescues checkpoints, decodes base samples, sends the stored meta", async () => {
     const db = freshRoom();
-    const meta: RecMeta = { ...defaultRecMeta(), durationCs: 250, segments: [phrase([word("hi", 0, 50)])] };
+    const meta: RecMeta = {
+      ...defaultRecMeta(),
+      durationCs: 250,
+      segments: [phrase([word("hi", 0, 50)])],
+    };
     const id = addRecording(db, "board meeting.wav", meta);
     const stored = encodeWav(Float32Array.from([0.25, 0.5, -0.25]));
-    db.prepare("UPDATE files SET original_bytes = ? WHERE id = ?").run(stored, id);
-    db.prepare("INSERT INTO rec_chunks(file_id, seq, pcm) VALUES (?, 1, ?)").run(id, Buffer.from([0, 0x40]));
+    db.prepare("UPDATE files SET original_bytes = ? WHERE id = ?").run(
+      stored,
+      id,
+    );
+    db.prepare(
+      "INSERT INTO rec_chunks(file_id, seq, pcm) VALUES (?, 1, ?)",
+    ).run(id, Buffer.from([0, 0x40]));
 
-    const post = fakePost({ "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }) });
-    const ctx = makeCtx(db, { sidecarPost: post, connectHostWs: () => fakeHostWs() });
+    const post = fakePost({
+      "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }),
+    });
+    const ctx = makeCtx(db, {
+      sidecarPost: post,
+      connectHostWs: () => fakeHostWs(),
+    });
     const started = await recStart(db, ctx, { fileId: id, systemAudio: false });
 
     expect(started.fileId).toBe(id);
@@ -394,11 +526,137 @@ describe("recStart", () => {
     expect(started.meta.durationCs).toBe(250);
     // The checkpoint was spliced in BEFORE the read — resuming without the
     // rescue records over that stretch of the meeting.
-    expect(db.prepare("SELECT COUNT(*) FROM rec_chunks").pluck().get() as number).toBe(0);
+    expect(
+      db.prepare("SELECT COUNT(*) FROM rec_chunks").pluck().get() as number,
+    ).toBe(0);
     const body = post.calls[0]?.body as Record<string, unknown>;
     const sent = Buffer.from(body.baseSamples as string, "base64");
     expect(sent.length).toBe(4 * 4); // three stored samples + the recovered one
     expect((body.meta as RecMeta).durationCs).toBe(250);
+  });
+
+  it("passes configured translation and Ollama settings, and leaves absent spool details null", async () => {
+    const db = freshRoom();
+    const post = fakePost({ "/rec/start": () => ok() });
+    const ctx = makeCtx(db, {
+      sidecarPost: post,
+      connectHostWs: () => fakeHostWs(),
+      diarizeModelPath: () => "/models/titanet.onnx",
+      defaultTranslationModel: () => "qwen-translate",
+      ollamaBaseUrl: () => "http://127.0.0.1:11434",
+    });
+
+    await recStart(db, ctx, { systemAudio: true, liveTranslate: "fr" });
+
+    expect(post.calls[0]?.body).toMatchObject({
+      liveTranslate: "fr",
+      defaultTranslationModel: "qwen-translate",
+      baseUrl: "http://127.0.0.1:11434",
+    });
+    expect(ctx.state.spoolPath).toBeNull();
+    expect(ctx.state.spoolKey).toBeNull();
+  });
+
+  it("creates a recording in a workspace room through the workspace file service", async () => {
+    const db = freshRoom();
+    let createdName = "";
+    const workspace = {
+      createFile: async (name: string): Promise<{ fileId: string }> => {
+        createdName = name;
+        const file = insertFile(
+          db,
+          name,
+          "application/octet-stream",
+          Buffer.alloc(0),
+          "",
+          "recording",
+        );
+        return { fileId: file.id };
+      },
+    } as unknown as NonNullable<OpenRoom["workspace"]>;
+    const ctx = makeCtx(db, {
+      currentRoom: (): OpenRoom => ({ db, path: roomPath, workspace }),
+      sidecarPost: fakePost({ "/rec/start": () => ok() }),
+      connectHostWs: () => fakeHostWs(),
+    });
+
+    const started = await recStart(db, ctx, { systemAudio: false });
+
+    expect(createdName).toBe(started.name);
+    expect(getFileExtractedText(db, started.fileId)).toBe("(live recording)\n");
+    expect(
+      db
+        .prepare("SELECT mime_type FROM files WHERE id = ?")
+        .pluck()
+        .get(started.fileId),
+    ).toBe("audio/wav");
+  });
+
+  it("resumes a workspace recording from its workspace bytes, including silence", async () => {
+    const db = freshRoom();
+    const id = addRecording(db, "workspace.wav", defaultRecMeta());
+    const workspace = {
+      readBuffer: async (): Promise<Buffer> => Buffer.alloc(0),
+    } as unknown as NonNullable<OpenRoom["workspace"]>;
+    const post = fakePost({ "/rec/start": () => ok() });
+    const ctx = makeCtx(db, {
+      currentRoom: (): OpenRoom => ({ db, path: roomPath, workspace }),
+      sidecarPost: post,
+      connectHostWs: () => fakeHostWs(),
+    });
+
+    await recStart(db, ctx, { fileId: id, systemAudio: false });
+
+    expect(post.calls[0]?.body).toMatchObject({
+      fileId: id,
+      baseSamples: null,
+    });
+  });
+
+  it("labels a workspace audio read failure without hiding a non-Error cause", async () => {
+    const db = freshRoom();
+    const id = addRecording(db, "offline.wav", defaultRecMeta());
+    const workspace = {
+      readBuffer: async (): Promise<Buffer> => {
+        throw "workspace unavailable";
+      },
+    } as unknown as NonNullable<OpenRoom["workspace"]>;
+    const ctx = makeCtx(db, {
+      currentRoom: (): OpenRoom => ({ db, path: roomPath, workspace }),
+      sidecarPost: fakePost({ "/rec/start": () => ok() }),
+    });
+
+    await expect(
+      recStart(db, ctx, { fileId: id, systemAudio: false }),
+    ).rejects.toThrowError(
+      "This file can't be continued: workspace unavailable",
+    );
+  });
+
+  it("labels an unrecoverable workspace checkpoint before it reads the recording", async () => {
+    const db = freshRoom();
+    const id = addRecording(db, "interrupted-workspace.wav", defaultRecMeta());
+    db.prepare("UPDATE files SET storage_kind = 'workspace' WHERE id = ?").run(
+      id,
+    );
+    db.prepare(
+      "INSERT INTO rec_chunks(file_id, seq, pcm) VALUES (?, 1, ?)",
+    ).run(id, Buffer.alloc(2));
+    const workspace = {
+      readBuffer: async (): Promise<Buffer> => {
+        throw new Error("workspace locked");
+      },
+    } as unknown as NonNullable<OpenRoom["workspace"]>;
+    const ctx = makeCtx(db, {
+      currentRoom: (): OpenRoom => ({ db, path: roomPath, workspace }),
+      sidecarPost: fakePost({ "/rec/start": () => ok() }),
+    });
+
+    await expect(
+      recStart(db, ctx, { fileId: id, systemAudio: false }),
+    ).rejects.toThrowError(
+      /This recording can't be continued yet\. 1 of 1 interrupted recording\(s\) could not be restored/,
+    );
   });
 
   it("clears an unrecoverable stale spool after restart and retries Resume once", async () => {
@@ -415,22 +673,131 @@ describe("recStart", () => {
           : ok({ spoolKey: "", spoolPath: "" });
       },
     });
-    const ctx = makeCtx(db, { sidecarPost: post, connectHostWs: () => fakeHostWs() });
+    const ctx = makeCtx(db, {
+      sidecarPost: post,
+      connectHostWs: () => fakeHostWs(),
+    });
 
-    await expect(recStart(db, ctx, { fileId: id, systemAudio: false })).resolves.toMatchObject({
+    await expect(
+      recStart(db, ctx, { fileId: id, systemAudio: false }),
+    ).resolves.toMatchObject({
       fileId: id,
     });
     expect(starts).toBe(2);
     expect(existsSync(stale)).toBe(false);
   });
 
+  it("retries a stale-spool resume when the previous spool was already removed", async () => {
+    const db = freshRoom();
+    const id = addRecording(db, "missing-spool.wav", defaultRecMeta());
+    let starts = 0;
+    const post = fakePost({
+      "/rec/start": () => {
+        starts += 1;
+        return starts === 1
+          ? { status: 409, json: { error: "stale", code: "REC_SPOOL_EXISTS" } }
+          : ok();
+      },
+    });
+    const ctx = makeCtx(db, {
+      sidecarPost: post,
+      connectHostWs: () => fakeHostWs(),
+    });
+
+    await expect(
+      recStart(db, ctx, { fileId: id, systemAudio: false }),
+    ).resolves.toMatchObject({ fileId: id });
+    expect(starts).toBe(2);
+  });
+
+  it("rejects an unsafe resumed id before it can unlink an arbitrary spool path", async () => {
+    const db = freshRoom();
+    const inserted = insertFile(
+      db,
+      "unsafe-id.wav",
+      "audio/wav",
+      encodeWav(new Float32Array(0)),
+      "",
+      "recording",
+    );
+    db.prepare("UPDATE files SET id = '.' WHERE id = ?").run(inserted.id);
+    const ctx = makeCtx(db, {
+      sidecarPost: fakePost({
+        "/rec/start": () => ({
+          status: 409,
+          json: { error: "stale", code: "REC_SPOOL_EXISTS" },
+        }),
+      }),
+    });
+
+    await expect(
+      recStart(db, ctx, { fileId: ".", systemAudio: false }),
+    ).rejects.toThrowError("This recording has an invalid file id.");
+  });
+
+  it("keeps a resumed file when sidecar startup fails", async () => {
+    const db = freshRoom();
+    const id = addRecording(db, "keep-on-error.wav", defaultRecMeta());
+    const ctx = makeCtx(db, {
+      sidecarPost: fakePost({
+        "/rec/start": () => ({
+          status: 500,
+          json: { error: "engine down", code: "REC_ENGINE_DOWN" },
+        }),
+      }),
+    });
+
+    await expect(
+      recStart(db, ctx, { fileId: id, systemAudio: false }),
+    ).rejects.toMatchObject({
+      code: "REC_ENGINE_DOWN",
+    });
+    expect(getFileName(db, id)).toBe("keep-on-error.wav");
+  });
+
+  it("preserves the spool cleanup failure when fresh-row cleanup also fails", async () => {
+    const db = freshRoom();
+    db.exec(
+      "CREATE TRIGGER prevent_test_recording_delete BEFORE DELETE ON files BEGIN SELECT RAISE(ABORT, 'keep row'); END;",
+    );
+    const post = fakePost({
+      "/rec/start": (body) => {
+        const fileId = (body as { fileId: string }).fileId;
+        mkdirSync(path.join(tmpDir, `${fileId}.spool`));
+        return {
+          status: 409,
+          json: { error: "stale", code: "REC_SPOOL_EXISTS" },
+        };
+      },
+    });
+    const ctx = makeCtx(db, { sidecarPost: post });
+
+    await expect(
+      recStart(db, ctx, { systemAudio: false }),
+    ).rejects.toThrowError(
+      /previous recording session's temporary spool could not be cleared:/,
+    );
+    expect(
+      db.prepare("SELECT COUNT(*) FROM files").pluck().get() as number,
+    ).toBe(1);
+  });
+
   it("still starts when the voice table cannot be read — a recording that names nobody beats none", async () => {
     const db = freshRoom();
     db.exec("DROP TABLE voice_ids");
-    const post = fakePost({ "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }) });
-    const ctx = makeCtx(db, { sidecarPost: post, connectHostWs: () => fakeHostWs() });
-    await expect(recStart(db, ctx, { systemAudio: false })).resolves.toBeTruthy();
-    expect((post.calls[0]?.body as Record<string, unknown>).knownVoices).toEqual([]);
+    const post = fakePost({
+      "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }),
+    });
+    const ctx = makeCtx(db, {
+      sidecarPost: post,
+      connectHostWs: () => fakeHostWs(),
+    });
+    await expect(
+      recStart(db, ctx, { systemAudio: false }),
+    ).resolves.toBeTruthy();
+    expect(
+      (post.calls[0]?.body as Record<string, unknown>).knownVoices,
+    ).toEqual([]);
   });
 
   it("sends the room's known voices in KnownVoiceIn's own {name, vec, rejects} shape", async () => {
@@ -438,27 +805,42 @@ describe("recStart", () => {
     // Enrolled through the real table, so the shape is whatever the DB layer
     // actually produces rather than a hand-written fixture.
     enrollVoice(db, "Dana", voicePrint(0, 0, 400));
-    const post = fakePost({ "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }) });
-    const ctx = makeCtx(db, { sidecarPost: post, connectHostWs: () => fakeHostWs() });
+    const post = fakePost({
+      "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }),
+    });
+    const ctx = makeCtx(db, {
+      sidecarPost: post,
+      connectHostWs: () => fakeHostWs(),
+    });
     await recStart(db, ctx, { systemAudio: false });
-    const sent = (post.calls[0]?.body as Record<string, unknown>).knownVoices as Array<
-      Record<string, unknown>
-    >;
+    const sent = (post.calls[0]?.body as Record<string, unknown>)
+      .knownVoices as Array<Record<string, unknown>>;
     expect(sent).toHaveLength(1);
-    expect(Object.keys(sent[0] ?? {}).sort()).toEqual(["name", "rejects", "vec"]);
+    expect(Object.keys(sent[0] ?? {}).sort()).toEqual([
+      "name",
+      "rejects",
+      "vec",
+    ]);
     expect((sent[0]?.vec as number[]).length).toBe(192);
   });
 
   it("refuses when no room is open", async () => {
     const db = freshRoom();
-    await expect(recStart(db, makeCtx(null), { systemAudio: false })).rejects.toThrowError("No room is open.");
+    await expect(
+      recStart(db, makeCtx(null), { systemAudio: false }),
+    ).rejects.toThrowError("No room is open.");
   });
 });
 
 // ============================================ pause / resume / stop / status
 
 describe("pause / resume / set_live_* / stop / live status", () => {
-  async function live(db: Database.Database, post = fakePost({ "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }) })): Promise<{
+  async function live(
+    db: Database.Database,
+    post = fakePost({
+      "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }),
+    }),
+  ): Promise<{
     ctx: RecBridgeCtx;
     fileId: string;
     ws: HostWsLike & { sent: string[]; closed: boolean };
@@ -473,8 +855,12 @@ describe("pause / resume / set_live_* / stop / live status", () => {
     const ctx = makeCtx(freshRoom());
     await expect(recPause(ctx)).rejects.toThrowError("No live recording.");
     await expect(recResume(ctx)).rejects.toThrowError("No live recording.");
-    await expect(recSetLiveStt(ctx, true)).rejects.toThrowError("No live recording.");
-    await expect(recSetLiveTranslate(ctx, "es")).rejects.toThrowError("No live recording.");
+    await expect(recSetLiveStt(ctx, true)).rejects.toThrowError(
+      "No live recording.",
+    );
+    await expect(recSetLiveTranslate(ctx, "es")).rejects.toThrowError(
+      "No live recording.",
+    );
     await expect(recStop(ctx)).rejects.toThrowError("No live recording.");
     await expect(recLiveStatus(ctx)).resolves.toBeNull();
   });
@@ -524,7 +910,10 @@ describe("pause / resume / set_live_* / stop / live status", () => {
         calls++;
         return calls === 1
           ? ok({ meta: { ...defaultRecMeta(), durationCs: 700 } })
-          : { status: 502, json: { error: "the disk is full", code: "REC_SAVE_FAILED" } };
+          : {
+              status: 502,
+              json: { error: "the disk is full", code: "REC_SAVE_FAILED" },
+            };
       },
     });
     const first = await live(db, post);
@@ -535,7 +924,9 @@ describe("pause / resume / set_live_* / stop / live status", () => {
     // A failed stop still ends the session slot server-side, so believing a
     // recording is live afterwards would refuse every later start for ever.
     const second = await live(db, post);
-    await expect(recStop(second.ctx)).rejects.toMatchObject({ code: "REC_SAVE_FAILED" });
+    await expect(recStop(second.ctx)).rejects.toMatchObject({
+      code: "REC_SAVE_FAILED",
+    });
     expect(second.ctx.state.liveFileId).toBeNull();
   });
 
@@ -560,7 +951,10 @@ describe("handlePersistRequest", () => {
     reads: Array<readonly [number, number]>;
   }
 
-  function liveSession(payload: Buffer | (() => Buffer), overrides: Partial<RecBridgeDeps> = {}): Live {
+  function liveSession(
+    payload: Buffer | (() => Buffer),
+    overrides: Partial<RecBridgeDeps> = {},
+  ): Live {
     const db = freshRoom();
     const reads: Array<readonly [number, number]> = [];
     const ctx = makeCtx(db, {
@@ -592,7 +986,10 @@ describe("handlePersistRequest", () => {
   }
 
   function chunkCount(db: Database.Database, id: string): number {
-    return db.prepare("SELECT COUNT(*) FROM rec_chunks WHERE file_id = ?").pluck().get(id) as number;
+    return db
+      .prepare("SELECT COUNT(*) FROM rec_chunks WHERE file_id = ?")
+      .pluck()
+      .get(id) as number;
   }
 
   it("checkpoint: appends the decrypted PCM and refreshes text + meta, in one transaction", async () => {
@@ -610,7 +1007,10 @@ describe("handlePersistRequest", () => {
 
   it("checkpoint with no spoolRange appends nothing but still refreshes text + meta", async () => {
     const { db, ctx, fileId, reads } = liveSession(Buffer.alloc(0));
-    expect(await handlePersistRequest(ctx, req({}))).toEqual({ reqId: "r1", ok: true });
+    expect(await handlePersistRequest(ctx, req({}))).toEqual({
+      reqId: "r1",
+      ok: true,
+    });
     expect(reads).toEqual([]);
     expect(chunkCount(db, fileId)).toBe(0);
     expect(getFileExtractedText(db, fileId)).toBe("(live recording)\nhello\n");
@@ -619,8 +1019,13 @@ describe("handlePersistRequest", () => {
   it("full: finalizes the WAV from the spool and then writes the meta, clearing the checkpoints", async () => {
     const wav = encodeWav(Float32Array.from([0.25, 0.5]));
     const { db, ctx, fileId } = liveSession(wav);
-    db.prepare("INSERT INTO rec_chunks(file_id, seq, pcm) VALUES (?, 1, ?)").run(fileId, Buffer.alloc(4));
-    const ack = await handlePersistRequest(ctx, req({ kind: "full", spoolRange: [0, 100], text: "final\n" }));
+    db.prepare(
+      "INSERT INTO rec_chunks(file_id, seq, pcm) VALUES (?, 1, ?)",
+    ).run(fileId, Buffer.alloc(4));
+    const ack = await handlePersistRequest(
+      ctx,
+      req({ kind: "full", spoolRange: [0, 100], text: "final\n" }),
+    );
     expect(ack).toEqual({ reqId: "r1", ok: true });
     expect(getFileBytes(db, fileId)?.equals(wav)).toBe(true);
     expect(getFileExtractedText(db, fileId)).toBe("final\n");
@@ -632,16 +1037,57 @@ describe("handlePersistRequest", () => {
 
   it("full with no spoolRange is a FAILED ack, not an exception past this boundary", async () => {
     const { ctx } = liveSession(Buffer.alloc(0));
-    expect(await handlePersistRequest(ctx, req({ kind: "full" }))).toMatchObject({
+    expect(
+      await handlePersistRequest(ctx, req({ kind: "full" })),
+    ).toMatchObject({
       ok: false,
       reason: "failed",
     });
   });
 
+  it("full with a range but no open spool is a named failed ack", async () => {
+    const { ctx } = liveSession(Buffer.alloc(0));
+    ctx.state.spoolPath = null;
+
+    await expect(handlePersistRequest(ctx, req({ kind: "full", spoolRange: [0, 40] }))).resolves.toMatchObject({
+      ok: false,
+      reason: "failed",
+      message: "No spool file is open for this recording session.",
+    });
+  });
+
+  it("full persists workspace audio through the workspace service before committing metadata", async () => {
+    const wav = encodeWav(Float32Array.from([0.25, -0.25]));
+    const { db, ctx, fileId } = liveSession(wav);
+    db.prepare("UPDATE files SET storage_kind = 'workspace', content_sha256 = ? WHERE id = ?").run("old-sha", fileId);
+    const writes: Array<{ id: string; expected: string | undefined }> = [];
+    const workspace = {
+      writeAtomic: async (id: string, _source: unknown, expected: string | undefined) => {
+        writes.push({ id, expected });
+      },
+    } as unknown as NonNullable<OpenRoom["workspace"]>;
+    ctx.deps.currentRoom = () => ({ db, path: roomPath, workspace });
+
+    await expect(handlePersistRequest(ctx, req({
+      kind: "full",
+      spoolRange: [0, 40],
+      text: "workspace final\n",
+    }))).resolves.toEqual({ reqId: "r1", ok: true });
+
+    expect(writes).toEqual([{ id: fileId, expected: "old-sha" }]);
+    expect(getFileExtractedText(db, fileId)).toBe("workspace final\n");
+    expect(JSON.parse(getRecMeta(db, fileId) as string).durationCs).toBe(300);
+  });
+
   it("transcript: text + meta only, and no spool read at all", async () => {
     const { db, ctx, fileId, reads } = liveSession(Buffer.alloc(0));
     const before = getFileBytes(db, fileId);
-    expect(await handlePersistRequest(ctx, req({ kind: "transcript", spoolRange: [0, 40] }))).toEqual({
+    expect(
+      await handlePersistRequest(
+        ctx,
+        req({ kind: "transcript", spoolRange: [0, 40] }),
+      ),
+    ).toEqual({
       reqId: "r1",
       ok: true,
     });
@@ -661,12 +1107,18 @@ describe("handlePersistRequest", () => {
       reason: "closed",
       message: "The room closed — recording stopped.",
     });
-    expect(getFileExtractedText(noRoom.db, noRoom.fileId)).toBe("(live recording)\n");
+    expect(getFileExtractedText(noRoom.db, noRoom.fileId)).toBe(
+      "(live recording)\n",
+    );
 
     const switched = liveSession(Buffer.alloc(0));
     switched.ctx.state.sessionRoomPath = "/somewhere/else.roomai";
-    expect(await handlePersistRequest(switched.ctx, req({}))).toMatchObject({ reason: "closed" });
-    expect(getFileExtractedText(switched.db, switched.fileId)).toBe("(live recording)\n");
+    expect(await handlePersistRequest(switched.ctx, req({}))).toMatchObject({
+      reason: "closed",
+    });
+    expect(getFileExtractedText(switched.db, switched.fileId)).toBe(
+      "(live recording)\n",
+    );
   });
 
   it('answers "failed", NEVER "closed", for a real write error against the correct open room', async () => {
@@ -676,7 +1128,12 @@ describe("handlePersistRequest", () => {
     const decryptFails = liveSession(() => {
       throw new Error("auth tag mismatch");
     });
-    expect(await handlePersistRequest(decryptFails.ctx, req({ spoolRange: [0, 40] }))).toEqual({
+    expect(
+      await handlePersistRequest(
+        decryptFails.ctx,
+        req({ spoolRange: [0, 40] }),
+      ),
+    ).toEqual({
       reqId: "r1",
       ok: false,
       reason: "failed",
@@ -685,7 +1142,10 @@ describe("handlePersistRequest", () => {
 
     const { db, ctx } = liveSession(Buffer.alloc(0));
     db.exec("DROP TABLE recordings");
-    expect(await handlePersistRequest(ctx, req({}))).toMatchObject({ ok: false, reason: "failed" });
+    expect(await handlePersistRequest(ctx, req({}))).toMatchObject({
+      ok: false,
+      reason: "failed",
+    });
   });
 
   it("a TRANSIENT DB failure is answered so the sidecar RETRIES, and the retry lands", async () => {
@@ -697,7 +1157,10 @@ describe("handlePersistRequest", () => {
     // that never closed.
     const { db, ctx, fileId } = liveSession(Buffer.alloc(0));
     db.pragma("query_only = ON"); // every write fails; nothing else changes
-    const during = await handlePersistRequest(ctx, req({ text: "during the outage\n" }));
+    const during = await handlePersistRequest(
+      ctx,
+      req({ text: "during the outage\n" }),
+    );
     expect(during).toMatchObject({ ok: false, reason: "failed" });
     expect((during as { message: string }).message).toMatch(/readonly/);
     // The room is still open and still THIS session's, so nothing may have been
@@ -707,7 +1170,10 @@ describe("handlePersistRequest", () => {
 
     db.pragma("query_only = OFF");
     expect(
-      await handlePersistRequest(ctx, req({ reqId: "r2", text: "after it cleared\n" }))
+      await handlePersistRequest(
+        ctx,
+        req({ reqId: "r2", text: "after it cleared\n" }),
+      ),
     ).toEqual({ reqId: "r2", ok: true });
     // The retry wrote the whole dirty tail, exactly as the "failed" ack promised.
     expect(getFileExtractedText(db, fileId)).toBe("after it cleared\n");
@@ -715,15 +1181,22 @@ describe("handlePersistRequest", () => {
 
   it("an unknown kind is a failed ack, never a crash", async () => {
     const { ctx } = liveSession(Buffer.alloc(0));
-    const ack = await handlePersistRequest(ctx, req({ kind: "sideways" as PersistRequest["kind"] }));
+    const ack = await handlePersistRequest(
+      ctx,
+      req({ kind: "sideways" as PersistRequest["kind"] }),
+    );
     expect(ack).toMatchObject({ ok: false, reason: "failed" });
-    expect((ack as { message: string }).message).toMatch(/Unknown persist kind/);
+    expect((ack as { message: string }).message).toMatch(
+      /Unknown persist kind/,
+    );
   });
 
   it('a persist arriving with no live session is "closed" — the session it named is over', async () => {
     const { ctx } = liveSession(Buffer.alloc(0));
     ctx.state.liveFileId = null;
-    expect(await handlePersistRequest(ctx, req({}))).toMatchObject({ reason: "closed" });
+    expect(await handlePersistRequest(ctx, req({}))).toMatchObject({
+      reason: "closed",
+    });
   });
 });
 
@@ -746,7 +1219,7 @@ describe("attachHostWs", () => {
         spoolRange: null,
         metaJson: JSON.stringify(defaultRecMeta()),
         text: "words\n",
-      })
+      }),
     );
     await new Promise((r) => setImmediate(r));
     expect(ws.sent).toEqual([JSON.stringify({ reqId: "abc", ok: true })]);
@@ -767,7 +1240,9 @@ describe("attachHostWs", () => {
   it("keeps the session but releases the handle when the socket drops", async () => {
     const db = freshRoom();
     const ctx = makeCtx(db, {
-      sidecarPost: fakePost({ "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }) }),
+      sidecarPost: fakePost({
+        "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }),
+      }),
       connectHostWs: () => ws,
     });
     const ws = fakeHostWs();
@@ -786,7 +1261,11 @@ describe("the spool file", () => {
   function frame(plaintext: Buffer, key: Buffer): Buffer {
     const nonce = randomBytes(12);
     const cipher = createCipheriv("aes-256-gcm", key, nonce);
-    const body = Buffer.concat([cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
+    const body = Buffer.concat([
+      cipher.update(plaintext),
+      cipher.final(),
+      cipher.getAuthTag(),
+    ]);
     const len = Buffer.alloc(4);
     len.writeUInt32LE(nonce.length + body.length, 0);
     return Buffer.concat([len, nonce, body]);
@@ -800,7 +1279,9 @@ describe("the spool file", () => {
 
   it("throws on a wrong key rather than returning garbage", () => {
     const key = randomBytes(32);
-    expect(() => decryptSpoolFrame(frame(Buffer.from("x"), key), randomBytes(32))).toThrow();
+    expect(() =>
+      decryptSpoolFrame(frame(Buffer.from("x"), key), randomBytes(32)),
+    ).toThrow();
   });
 
   it("refuses a range that does not line up with a frame boundary", () => {
@@ -808,8 +1289,15 @@ describe("the spool file", () => {
     const f = frame(Buffer.from("hello"), key);
     // One byte short: the declared length no longer matches what was read, so
     // this fails loudly instead of feeding GCM a shifted window.
-    expect(() => decryptSpoolFrame(f.subarray(0, f.length - 1), key)).toThrowError(/length mismatch/);
-    expect(() => decryptSpoolFrame(Buffer.alloc(2), key)).toThrowError(/length prefix/);
+    expect(() =>
+      decryptSpoolFrame(f.subarray(0, f.length - 1), key),
+    ).toThrowError(/length mismatch/);
+    expect(() => decryptSpoolFrame(Buffer.alloc(2), key)).toThrowError(
+      /length prefix/,
+    );
+    const noNonceOrTag = Buffer.alloc(4);
+    noNonceOrTag.writeUInt32LE(0, 0);
+    expect(() => decryptSpoolFrame(noNonceOrTag, key)).toThrowError(/nonce and an auth tag/);
   });
 
   it("readSpoolFrame reads the exact byte range of the SECOND of two frames", async () => {
@@ -819,8 +1307,13 @@ describe("the spool file", () => {
     const second = frame(Buffer.from("second chunk"), key);
     const spoolPath = path.join(tmpDir, "session.spool");
     writeFileSync(spoolPath, Buffer.concat([first, second]));
-    const range: [number, number] = [first.length, first.length + second.length];
-    expect((await readSpoolFrame(spoolPath, range, key)).toString()).toBe("second chunk");
+    const range: [number, number] = [
+      first.length,
+      first.length + second.length,
+    ];
+    expect((await readSpoolFrame(spoolPath, range, key)).toString()).toBe(
+      "second chunk",
+    );
   });
 
   it("readSpoolFrame refuses a short read rather than decrypting a truncated frame", async () => {
@@ -829,8 +1322,12 @@ describe("the spool file", () => {
     const f = frame(Buffer.from("only frame"), key);
     const spoolPath = path.join(tmpDir, "short.spool");
     writeFileSync(spoolPath, f.subarray(0, f.length - 3)); // a hard-killed sidecar
-    await expect(readSpoolFrame(spoolPath, [0, f.length], key)).rejects.toThrowError(/short/);
-    await expect(readSpoolFrame(spoolPath, [0, 0], key)).rejects.toThrowError(/empty/);
+    await expect(
+      readSpoolFrame(spoolPath, [0, f.length], key),
+    ).rejects.toThrowError(/short/);
+    await expect(readSpoolFrame(spoolPath, [0, 0], key)).rejects.toThrowError(
+      /empty/,
+    );
   });
 });
 
@@ -846,29 +1343,69 @@ describe("edit ops — offline path (direct DB)", () => {
       segments: [phrase([word("hello", 0, 50)], { speaker: "Speaker 1" })],
     });
 
-    let meta = await recNoteAdd(db, ctx, id, 100, "action", "  send the deck  ", " Dana ");
+    let meta = await recNoteAdd(
+      db,
+      ctx,
+      id,
+      100,
+      "action",
+      "  send the deck  ",
+      " Dana ",
+    );
     expect(meta.notes).toHaveLength(1);
-    expect(meta.notes[0]).toMatchObject({ t0: 100, kind: "action", text: "send the deck", who: "Dana", by: "you" });
-    meta = await recNoteSet(db, ctx, id, meta.notes[0]?.id as string, "send the slides");
+    expect(meta.notes[0]).toMatchObject({
+      t0: 100,
+      kind: "action",
+      text: "send the deck",
+      who: "Dana",
+      by: "you",
+    });
+    meta = await recNoteSet(
+      db,
+      ctx,
+      id,
+      meta.notes[0]?.id as string,
+      "send the slides",
+    );
     expect(meta.notes[0]?.text).toBe("send the slides");
 
     meta = await recChapterAdd(db, ctx, id, 200, "Wrap up");
-    meta = await recChapterSet(db, ctx, id, meta.chapters[0]?.id as string, "Closing");
-    expect(meta.chapters[0]).toMatchObject({ t0: 200, title: "Closing", by: "you" });
+    meta = await recChapterSet(
+      db,
+      ctx,
+      id,
+      meta.chapters[0]?.id as string,
+      "Closing",
+    );
+    expect(meta.chapters[0]).toMatchObject({
+      t0: 200,
+      title: "Closing",
+      by: "you",
+    });
 
     meta = await recHighlightAdd(db, ctx, id, 300, 250); // t1 before t0 marks the instant
     expect(meta.highlights[0]).toMatchObject({ t0: 300, t1: 300 });
 
     // Every path refreshes the searchable transcript, so what search and the AI
     // read can never drift from what the screen shows.
-    expect(getFileExtractedText(db, id)).toContain("Action (Dana): send the slides");
+    expect(getFileExtractedText(db, id)).toContain(
+      "Action (Dana): send the slides",
+    );
     expect(recGet(db, id).meta.notes).toHaveLength(1);
 
-    meta = await recItemDelete(db, ctx, id, "note", meta.notes[0]?.id as string);
+    meta = await recItemDelete(
+      db,
+      ctx,
+      id,
+      "note",
+      meta.notes[0]?.id as string,
+    );
     expect(meta.notes).toHaveLength(0);
-    await expect(recItemDelete(db, ctx, id, "chapter", "nope")).rejects.toThrowError(/no longer in this recording/);
     await expect(
-      recItemDelete(db, ctx, id, "sideways" as "note", "x")
+      recItemDelete(db, ctx, id, "chapter", "nope"),
+    ).rejects.toThrowError(/no longer in this recording/);
+    await expect(
+      recItemDelete(db, ctx, id, "sideways" as "note", "x"),
     ).rejects.toThrowError(/Unknown item kind "sideways"/);
   });
 
@@ -879,7 +1416,10 @@ describe("edit ops — offline path (direct DB)", () => {
     // Rust `RecMeta` that refuses to deserialize it at all.
     const db = freshRoom();
     const ctx = makeCtx(db);
-    const id = addRecording(db, "call.wav", { ...defaultRecMeta(), durationCs: 500 });
+    const id = addRecording(db, "call.wav", {
+      ...defaultRecMeta(),
+      durationCs: 500,
+    });
     const meta = await recNoteAdd(db, ctx, id, 0, "URGENT", "look at this");
     expect(meta.notes[0]?.kind).toBe("point");
     expect(getFileExtractedText(db, id)).toContain("Point: look at this");
@@ -888,17 +1428,48 @@ describe("edit ops — offline path (direct DB)", () => {
   it("refuses empty text, an unknown id, and a moment outside the recording", async () => {
     const db = freshRoom();
     const ctx = makeCtx(db);
-    const id = addRecording(db, "call.wav", { ...defaultRecMeta(), durationCs: 500 });
-    await expect(recNoteAdd(db, ctx, id, 0, "point", "   ")).rejects.toThrowError("A note needs some words.");
-    await expect(recChapterAdd(db, ctx, id, 0, "  ")).rejects.toThrowError("A chapter needs a name.");
-    await expect(recNoteAdd(db, ctx, id, 900, "point", "late")).rejects.toThrowError(
-      "That moment is outside this recording."
+    const id = addRecording(db, "call.wav", {
+      ...defaultRecMeta(),
+      durationCs: 500,
+    });
+    await expect(
+      recNoteAdd(db, ctx, id, 0, "point", "   "),
+    ).rejects.toThrowError("A note needs some words.");
+    await expect(recChapterAdd(db, ctx, id, 0, "  ")).rejects.toThrowError(
+      "A chapter needs a name.",
     );
-    await expect(recNoteAdd(db, ctx, id, -1, "point", "early")).rejects.toThrowError(
-      "That moment is outside this recording."
+    await expect(
+      recNoteAdd(db, ctx, id, 900, "point", "late"),
+    ).rejects.toThrowError("That moment is outside this recording.");
+    await expect(
+      recNoteAdd(db, ctx, id, -1, "point", "early"),
+    ).rejects.toThrowError("That moment is outside this recording.");
+    await expect(recNoteSet(db, ctx, id, "nope", "x")).rejects.toThrowError(
+      /no longer in this recording/,
     );
-    await expect(recNoteSet(db, ctx, id, "nope", "x")).rejects.toThrowError(/no longer in this recording/);
-    await expect(recChapterSet(db, ctx, id, "nope", "x")).rejects.toThrowError(/no longer in this recording/);
+    await expect(recChapterSet(db, ctx, id, "nope", "x")).rejects.toThrowError(
+      /no longer in this recording/,
+    );
+    await expect(recNoteSet(db, ctx, id, "nope", "   ")).rejects.toThrowError(
+      "A note needs some words.",
+    );
+    await expect(recChapterSet(db, ctx, id, "nope", "   ")).rejects.toThrowError(
+      "A chapter needs a name.",
+    );
+  });
+
+  it("deletes a stored highlight through the highlight-specific item arm", async () => {
+    const db = freshRoom();
+    const ctx = makeCtx(db);
+    const id = addRecording(db, "call.wav", {
+      ...defaultRecMeta(),
+      durationCs: 500,
+      highlights: [{ id: "highlight-1", t0: 10, t1: 20, by: "you" }],
+    });
+
+    await expect(recItemDelete(db, ctx, id, "highlight", "highlight-1")).resolves.toMatchObject({
+      highlights: [],
+    });
   });
 
   it("caps a pasted note at 400 CODE POINTS, not UTF-16 units", () => {
@@ -907,7 +1478,10 @@ describe("edit ops — offline path (direct DB)", () => {
     return (async (): Promise<void> => {
       const db = freshRoom();
       const ctx = makeCtx(db);
-      const id = addRecording(db, "call.wav", { ...defaultRecMeta(), durationCs: 500 });
+      const id = addRecording(db, "call.wav", {
+        ...defaultRecMeta(),
+        durationCs: 500,
+      });
       const meta = await recNoteAdd(db, ctx, id, 0, "point", "🎧".repeat(500));
       expect([...(meta.notes[0]?.text ?? "")]).toHaveLength(400);
       expect(meta.notes[0]?.text.endsWith("🎧")).toBe(true);
@@ -923,11 +1497,21 @@ describe("edit ops — live path (routed to /rec/edit_meta)", () => {
       "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }),
       "/rec/edit_meta": () => ok({ meta: returned }),
     });
-    const ctx = makeCtx(db, { sidecarPost: post, connectHostWs: () => fakeHostWs() });
+    const ctx = makeCtx(db, {
+      sidecarPost: post,
+      connectHostWs: () => fakeHostWs(),
+    });
     const started = await recStart(db, ctx, { systemAudio: false });
     const before = getRecMeta(db, started.fileId);
 
-    const meta = await recNoteAdd(db, ctx, started.fileId, 900_000, "decision", "we ship Thursday");
+    const meta = await recNoteAdd(
+      db,
+      ctx,
+      started.fileId,
+      900_000,
+      "decision",
+      "we ship Thursday",
+    );
     expect(meta.durationCs).toBe(4200);
     // `Engine::flush` writes the engine's own meta over this row every few
     // phrases, so a direct write here would be erased seconds later in silence.
@@ -953,7 +1537,10 @@ describe("edit ops — live path (routed to /rec/edit_meta)", () => {
       "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }),
       "/rec/edit_meta": () => ok({ meta: defaultRecMeta() }),
     });
-    const ctx = makeCtx(db, { sidecarPost: post, connectHostWs: () => fakeHostWs() });
+    const ctx = makeCtx(db, {
+      sidecarPost: post,
+      connectHostWs: () => fakeHostWs(),
+    });
     const { fileId } = await recStart(db, ctx, { systemAudio: false });
     await recNoteSet(db, ctx, fileId, "n1", "retyped");
     await recChapterAdd(db, ctx, fileId, 10, "Intro");
@@ -977,13 +1564,18 @@ describe("edit ops — live path (routed to /rec/edit_meta)", () => {
         "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }),
         "/rec/edit_meta": () => ({
           status: 400,
-          json: { error: "That moment is outside this recording.", code: "REC_EDIT_META_FAILED" },
+          json: {
+            error: "That moment is outside this recording.",
+            code: "REC_EDIT_META_FAILED",
+          },
         }),
       }),
       connectHostWs: () => fakeHostWs(),
     });
     const { fileId } = await recStart(db, ctx, { systemAudio: false });
-    await expect(recNoteAdd(db, ctx, fileId, 5, "point", "x")).rejects.toMatchObject({
+    await expect(
+      recNoteAdd(db, ctx, fileId, 5, "point", "x"),
+    ).rejects.toMatchObject({
       code: "REC_EDIT_META_FAILED",
       message: "That moment is outside this recording.",
     });
@@ -993,12 +1585,18 @@ describe("edit ops — live path (routed to /rec/edit_meta)", () => {
 // ================================================ speaker naming + enrolment
 
 describe("recSetSpeakerName", () => {
-  function withSpeaker(db: Database.Database, over: Partial<RecMeta> = {}): string {
+  function withSpeaker(
+    db: Database.Database,
+    over: Partial<RecMeta> = {},
+  ): string {
     return addRecording(db, "call.wav", {
       ...defaultRecMeta(),
       durationCs: 1000,
       segments: [
-        phrase([word("hello", 0, 50)], { speaker: "Speaker 1", voice: voicePrint(0, 0, 400) }),
+        phrase([word("hello", 0, 50)], {
+          speaker: "Speaker 1",
+          voice: voicePrint(0, 0, 400),
+        }),
         phrase([word("hi", 60, 90)], { speaker: "Speaker 2" }),
       ],
       ...over,
@@ -1028,14 +1626,16 @@ describe("recSetSpeakerName", () => {
     const db = freshRoom();
     const ctx = makeCtx(db);
     const id = withSpeaker(db);
-    await expect(recSetSpeakerName(db, ctx, id, "  ", "Dana")).rejects.toThrowError("No speaker selected.");
-    await expect(recSetSpeakerName(db, ctx, id, "Speaker 9", "Dana")).rejects.toThrowError(
-      'Nobody in this recording is labelled "Speaker 9".'
-    );
+    await expect(
+      recSetSpeakerName(db, ctx, id, "  ", "Dana"),
+    ).rejects.toThrowError("No speaker selected.");
+    await expect(
+      recSetSpeakerName(db, ctx, id, "Speaker 9", "Dana"),
+    ).rejects.toThrowError('Nobody in this recording is labelled "Speaker 9".');
     const empty = addRecording(db, "silent.wav", defaultRecMeta());
-    await expect(recSetSpeakerName(db, ctx, empty, "Speaker 1", "Dana")).rejects.toThrowError(
-      "That recording has no transcript yet."
-    );
+    await expect(
+      recSetSpeakerName(db, ctx, empty, "Speaker 1", "Dana"),
+    ).rejects.toThrowError("That recording has no transcript yet.");
   });
 
   it("TEACHES the room the voice, reading the {v, f} shape every real segment carries", async () => {
@@ -1057,7 +1657,12 @@ describe("recSetSpeakerName", () => {
     const ctx = makeCtx(db);
     // Strong enough to be labelled, far too thin to recognise anyone by later.
     const id = withSpeaker(db, {
-      segments: [phrase([word("hi", 0, 50)], { speaker: "Speaker 1", voice: voicePrint(0, 0, 80) })],
+      segments: [
+        phrase([word("hi", 0, 50)], {
+          speaker: "Speaker 1",
+          voice: voicePrint(0, 0, 80),
+        }),
+      ],
     });
     await recSetSpeakerName(db, ctx, id, "Speaker 1", "Dana");
     expect(savedVoices(db)).toHaveLength(0);
@@ -1069,7 +1674,12 @@ describe("recSetSpeakerName", () => {
     const id = withSpeaker(db, {
       speakerNames: { "Speaker 1": "Yossi" },
       recognized: ["Yossi"],
-      segments: [phrase([word("hello", 0, 50)], { speaker: "Speaker 1", voice: voicePrint(3, 0, 400) })],
+      segments: [
+        phrase([word("hello", 0, 50)], {
+          speaker: "Speaker 1",
+          voice: voicePrint(3, 0, 400),
+        }),
+      ],
     });
     const meta = await recSetSpeakerName(db, ctx, id, "Speaker 1", "Dana");
     expect(meta.speakerNames).toEqual({ "Speaker 1": "Dana" });
@@ -1079,7 +1689,9 @@ describe("recSetSpeakerName", () => {
     expect(savedVoices(db).map((v) => v.name)).toEqual(["Dana"]);
     // …and the wrong one is told it is not theirs, or the same mistake repeats
     // in every future recording.
-    expect(db.prepare("SELECT name FROM voice_rejects").pluck().all()).toEqual(["Yossi"]);
+    expect(db.prepare("SELECT name FROM voice_rejects").pluck().all()).toEqual([
+      "Yossi",
+    ]);
   });
 
   it("changing your own mind is not a correction — nothing is denied", async () => {
@@ -1089,10 +1701,17 @@ describe("recSetSpeakerName", () => {
     // correcting the app; denying Yossi's own voice would be a fresh error.
     const id = withSpeaker(db, {
       speakerNames: { "Speaker 1": "Yossi" },
-      segments: [phrase([word("hello", 0, 50)], { speaker: "Speaker 1", voice: voicePrint(3, 0, 400) })],
+      segments: [
+        phrase([word("hello", 0, 50)], {
+          speaker: "Speaker 1",
+          voice: voicePrint(3, 0, 400),
+        }),
+      ],
     });
     await recSetSpeakerName(db, ctx, id, "Speaker 1", "Dana");
-    expect(db.prepare("SELECT COUNT(*) FROM voice_rejects").pluck().get() as number).toBe(0);
+    expect(
+      db.prepare("SELECT COUNT(*) FROM voice_rejects").pluck().get() as number,
+    ).toBe(0);
   });
 
   it("CONFIRMING the app's guess denies nobody — least of all the person confirmed", async () => {
@@ -1111,14 +1730,21 @@ describe("recSetSpeakerName", () => {
     const id = withSpeaker(db, {
       speakerNames: { "Speaker 1": "Dana" },
       recognized: ["Dana"], // the app guessed it
-      segments: [phrase([word("hello", 0, 50)], { speaker: "Speaker 1", voice: voicePrint(3, 0, 400) })],
+      segments: [
+        phrase([word("hello", 0, 50)], {
+          speaker: "Speaker 1",
+          voice: voicePrint(3, 0, 400),
+        }),
+      ],
     });
     const meta = await recSetSpeakerName(db, ctx, id, "Speaker 1", "Dana");
     expect(meta.speakerNames).toEqual({ "Speaker 1": "Dana" });
     // Confirmed by the user, so it stops being something the next pass may undo.
     expect(meta.recognized).toEqual([]);
     expect(savedVoices(db).map((v) => v.name)).toEqual(["Dana"]);
-    expect(db.prepare("SELECT COUNT(*) FROM voice_rejects").pluck().get() as number).toBe(0);
+    expect(
+      db.prepare("SELECT COUNT(*) FROM voice_rejects").pluck().get() as number,
+    ).toBe(0);
   });
 
   it("a failed enrolment never fails the rename it was enhancing", async () => {
@@ -1137,23 +1763,42 @@ describe("recSetSpeakerName", () => {
       durationCs: 50,
       speakerNames: { "Speaker 1": "Dana" },
       recognized: [],
-      segments: [phrase([word("hello", 0, 50)], { speaker: "Speaker 1", voice: voicePrint(0, 0, 400) })],
+      segments: [
+        phrase([word("hello", 0, 50)], {
+          speaker: "Speaker 1",
+          voice: voicePrint(0, 0, 400),
+        }),
+      ],
     };
     const post = fakePost({
       "/rec/start": () => ok({ spoolKey: "", spoolPath: "" }),
       "/rec/edit_meta": () => ok({ meta: withName }),
     });
-    const ctx = makeCtx(db, { sidecarPost: post, connectHostWs: () => fakeHostWs() });
+    const ctx = makeCtx(db, {
+      sidecarPost: post,
+      connectHostWs: () => fakeHostWs(),
+    });
     const { fileId } = await recStart(db, ctx, { systemAudio: false });
     // The engine holds the authoritative meta and re-clustered while we watched;
     // the snapshot this process last saw is what says the app had GUESSED here.
-    ctx.state.lastMeta = { ...withName, speakerNames: { "Speaker 1": "Yossi" }, recognized: ["Yossi"] };
+    ctx.state.lastMeta = {
+      ...withName,
+      speakerNames: { "Speaker 1": "Yossi" },
+      recognized: ["Yossi"],
+    };
 
     const meta = await recSetSpeakerName(db, ctx, fileId, "Speaker 1", "Dana");
     expect(meta.speakerNames).toEqual({ "Speaker 1": "Dana" });
-    expect(post.calls[1]?.body).toEqual({ fileId, op: "rename_speaker", label: "Speaker 1", name: "Dana" });
+    expect(post.calls[1]?.body).toEqual({
+      fileId,
+      op: "rename_speaker",
+      label: "Speaker 1",
+      name: "Dana",
+    });
     expect(savedVoices(db).map((v) => v.name)).toEqual(["Dana"]);
-    expect(db.prepare("SELECT name FROM voice_rejects").pluck().all()).toEqual(["Yossi"]);
+    expect(db.prepare("SELECT name FROM voice_rejects").pluck().all()).toEqual([
+      "Yossi",
+    ]);
   });
 });
 
@@ -1165,8 +1810,18 @@ describe("recDeleteRange / recCorrectRange", () => {
       ...defaultRecMeta(),
       durationCs: 1000,
       segments: [
-        phrase([word("keep", 0, 100), word("cut", 100, 200), word("this", 200, 300)]),
-        phrase([], { id: "legacy", t0: 400, t1: 500, text: "legacy line", words: [] }),
+        phrase([
+          word("keep", 0, 100),
+          word("cut", 100, 200),
+          word("this", 200, 300),
+        ]),
+        phrase([], {
+          id: "legacy",
+          t0: 400,
+          t1: 500,
+          text: "legacy line",
+          words: [],
+        }),
       ],
     });
   }
@@ -1176,7 +1831,11 @@ describe("recDeleteRange / recCorrectRange", () => {
     const ctx = makeCtx(db);
     const id = edited(db);
     const meta = recDeleteRange(db, ctx, id, 100, 200);
-    expect(meta.segments[0]?.words.map((w) => w.del === true)).toEqual([false, true, false]);
+    expect(meta.segments[0]?.words.map((w) => w.del === true)).toEqual([
+      false,
+      true,
+      false,
+    ]);
     expect(meta.cuts).toEqual([{ t0: 100, t1: 200 }]);
     expect(getFileExtractedText(db, id)).toContain("keep this");
     expect(getFileExtractedText(db, id)).not.toContain("cut");
@@ -1199,14 +1858,18 @@ describe("recDeleteRange / recCorrectRange", () => {
     recDeleteRange(db, ctx, id, 100, 200);
     recCorrectRange(db, ctx, id, 200, 300, "that");
     const causes = db
-      .prepare("SELECT cause FROM file_versions WHERE file_id = ? ORDER BY rowid")
+      .prepare(
+        "SELECT cause FROM file_versions WHERE file_id = ? ORDER BY rowid",
+      )
       .pluck()
       .all(id);
     expect(causes).toEqual(["Edited transcript", "Corrected transcript"]);
     // The snapshot carries the recording meta too — restoring bytes alone could
     // never bring the old words, speakers or cuts back.
     const snapshot = db
-      .prepare("SELECT rec_meta FROM file_versions WHERE file_id = ? ORDER BY rowid LIMIT 1")
+      .prepare(
+        "SELECT rec_meta FROM file_versions WHERE file_id = ? ORDER BY rowid LIMIT 1",
+      )
       .pluck()
       .get(id) as string;
     expect(JSON.parse(snapshot).cuts).toEqual([]);
@@ -1216,23 +1879,33 @@ describe("recDeleteRange / recCorrectRange", () => {
     const db = freshRoom();
     const ctx = makeCtx(db);
     const id = edited(db);
-    expect(() => recDeleteRange(db, ctx, id, 200, 200)).toThrowError("Nothing selected.");
-    expect(() => recCorrectRange(db, ctx, id, 200, 100, "x")).toThrowError("Nothing selected.");
+    expect(() => recDeleteRange(db, ctx, id, 200, 200)).toThrowError(
+      "Nothing selected.",
+    );
+    expect(() => recCorrectRange(db, ctx, id, 200, 100, "x")).toThrowError(
+      "Nothing selected.",
+    );
     // An empty correction is a DELETE, and delete is a different button with a
     // different consequence. Never guess which was meant.
-    expect(() => recCorrectRange(db, ctx, id, 0, 100, "   ")).toThrowError(/Delete from recording/);
+    expect(() => recCorrectRange(db, ctx, id, 0, 100, "   ")).toThrowError(
+      /Delete from recording/,
+    );
 
     ctx.state.liveFileId = id;
     expect(() => recDeleteRange(db, ctx, id, 0, 100)).toThrowError(
-      "Pause the recording before editing the transcript."
+      "Pause the recording before editing the transcript.",
     );
     expect(() => recCorrectRange(db, ctx, id, 0, 100, "x")).toThrowError(
-      "Pause the recording before editing the transcript."
+      "Pause the recording before editing the transcript.",
     );
   });
 
   it("correctWords retypes one phrase evenly across the span the old words held", () => {
-    const seg = phrase([word("a", 0, 100), word("beeb", 100, 200), word("c", 200, 300)]);
+    const seg = phrase([
+      word("a", 0, 100),
+      word("beeb", 100, 200),
+      word("c", 200, 300),
+    ]);
     expect(correctWords(seg, 100, 200, "bee bee")).toBe(1);
     expect(seg.words.map((w) => [w.w, w.t0, w.t1])).toEqual([
       ["a", 0, 100],
@@ -1245,7 +1918,11 @@ describe("recDeleteRange / recCorrectRange", () => {
   });
 
   it("correctWords leaves no stray words when the correction is shorter, and is a no-op on nothing", () => {
-    const seg = phrase([word("one", 0, 100), word("two", 100, 200), word("three", 200, 300)]);
+    const seg = phrase([
+      word("one", 0, 100),
+      word("two", 100, 200),
+      word("three", 200, 300),
+    ]);
     expect(correctWords(seg, 0, 300, "just this")).toBe(3);
     expect(seg.words.map((w) => w.w)).toEqual(["just", "this"]);
     expect(correctWords(seg, 900, 1000, "nothing here")).toBe(0);
@@ -1256,7 +1933,11 @@ describe("recDeleteRange / recCorrectRange", () => {
     // A deleted word inside the SELECTION but before the first surviving hit is
     // outside [first, last] and keeps its own timings — Rust's own note about
     // "any already marked deleted inside the range's gaps".
-    const leading = phrase([word("gone", 0, 100, true), word("b", 100, 200), word("c", 200, 300)]);
+    const leading = phrase([
+      word("gone", 0, 100, true),
+      word("b", 100, 200),
+      word("c", 200, 300),
+    ]);
     expect(correctWords(leading, 0, 300, "x")).toBe(2);
     expect(leading.words.map((w) => [w.w, w.t0, w.t1])).toEqual([
       ["gone", 0, 100],
@@ -1264,7 +1945,11 @@ describe("recDeleteRange / recCorrectRange", () => {
     ]);
     // One BETWEEN two hits is inside the replaced span and goes with it, since
     // the splice replaces first..=last wholesale.
-    const middle = phrase([word("a", 0, 100), word("gone", 100, 200, true), word("c", 200, 300)]);
+    const middle = phrase([
+      word("a", 0, 100),
+      word("gone", 100, 200, true),
+      word("c", 200, 300),
+    ]);
     expect(correctWords(middle, 0, 300, "x y")).toBe(2);
     expect(middle.words.map((w) => w.w)).toEqual(["x", "y"]);
   });
@@ -1282,9 +1967,17 @@ describe("recDeleteRange / recCorrectRange", () => {
       ],
     });
     // Whose line are the new words? Guessing puts words in somebody's mouth.
-    expect(() => recCorrectRange(db, ctx, id, 0, 200, "x")).toThrowError(/more than one phrase/);
-    expect(() => recCorrectRange(db, ctx, id, 300, 400, "x")).toThrowError(/no word timings/);
-    expect(recCorrectRange(db, ctx, id, 0, 100, "1st").segments[0]?.words.map((w) => w.w)).toEqual(["1st"]);
+    expect(() => recCorrectRange(db, ctx, id, 0, 200, "x")).toThrowError(
+      /more than one phrase/,
+    );
+    expect(() => recCorrectRange(db, ctx, id, 300, 400, "x")).toThrowError(
+      /no word timings/,
+    );
+    expect(
+      recCorrectRange(db, ctx, id, 0, 100, "1st").segments[0]?.words.map(
+        (w) => w.w,
+      ),
+    ).toEqual(["1st"]);
   });
 });
 
@@ -1298,10 +1991,17 @@ describe("reflowAfterCuts", () => {
       recognized: ["Dana"],
       maxSpeakers: 3,
       segments: [
-        phrase([word("keep", 0, 100), word("cut", 100, 200, true), word("this", 200, 300)], {
-          speaker: "Speaker 1",
-          voice: voicePrint(0, 0, 400),
-        }),
+        phrase(
+          [
+            word("keep", 0, 100),
+            word("cut", 100, 200, true),
+            word("this", 200, 300),
+          ],
+          {
+            speaker: "Speaker 1",
+            voice: voicePrint(0, 0, 400),
+          },
+        ),
       ],
     };
     const out = reflowAfterCuts(meta, 16_000); // 1.00 s of spliced audio
@@ -1334,7 +2034,15 @@ describe("reflowAfterCuts", () => {
         { id: "c2", t0: 150, title: "Inside the cut", by: "room" },
         { id: "c3", t0: 250, title: "After", by: "you" },
       ],
-      notes: [{ id: "n1", t0: 150, kind: "point", text: "gone with the words", by: "room" }],
+      notes: [
+        {
+          id: "n1",
+          t0: 150,
+          kind: "point",
+          text: "gone with the words",
+          by: "room",
+        },
+      ],
       highlights: [{ id: "h1", t0: 250, t1: 300, by: "you" }],
     };
     const out = reflowAfterCuts(meta, 16_000);
@@ -1361,7 +2069,11 @@ describe("reflowAfterCuts", () => {
     };
     const out = reflowAfterCuts(meta, 16_000);
     expect(out.segments).toHaveLength(1);
-    expect(out.segments[0]).toMatchObject({ text: "legacy line", t0: 200, t1: 300 });
+    expect(out.segments[0]).toMatchObject({
+      text: "legacy line",
+      t0: 200,
+      t1: 300,
+    });
   });
 });
 
@@ -1377,10 +2089,19 @@ describe("recExportClean", () => {
       ...defaultRecMeta(),
       durationCs: 100,
       cuts: [{ t0: 25, t1: 50 }],
-      segments: [phrase([word("kept", 0, 25), word("cut", 25, 50, true), word("also", 50, 100)])],
+      segments: [
+        phrase([
+          word("kept", 0, 25),
+          word("cut", 25, 50, true),
+          word("also", 50, 100),
+        ]),
+      ],
     };
     const id = addRecording(db, "board meeting.wav", meta);
-    db.prepare("UPDATE files SET original_bytes = ? WHERE id = ?").run(encodeWav(samples), id);
+    db.prepare("UPDATE files SET original_bytes = ? WHERE id = ?").run(
+      encodeWav(samples),
+      id,
+    );
 
     let notified = 0;
     ctx.deps.notifyFilesChanged = (): void => {
@@ -1391,7 +2112,10 @@ describe("recExportClean", () => {
     expect(decodeWav(getFileBytes(db, file.id) as Buffer).length).toBe(12_000);
     const newMeta = parseRecMeta(getRecMeta(db, file.id));
     expect(newMeta.durationCs).toBe(75);
-    expect(newMeta.segments[0]?.words.map((w) => w.w)).toEqual(["kept", "also"]);
+    expect(newMeta.segments[0]?.words.map((w) => w.w)).toEqual([
+      "kept",
+      "also",
+    ]);
     expect(getFileExtractedText(db, file.id)).toContain("kept also");
     expect(notified).toBe(1);
     // The original is untouched.
@@ -1407,6 +2131,73 @@ describe("recExportClean", () => {
     });
     expect(() => recExportClean(db, ctx, id)).toThrowError(/No edits to apply/);
   });
+
+  it("keeps an edited workspace copy beside its source and finalizes its metadata", async () => {
+    const db = freshRoom();
+    const samples = new Float32Array(16_000);
+    const meta: RecMeta = {
+      ...defaultRecMeta(),
+      durationCs: 100,
+      cuts: [{ t0: 25, t1: 50 }],
+      segments: [phrase([word("kept", 0, 25), word("cut", 25, 50, true)])],
+    };
+    const id = addRecording(db, "meeting.wav", meta);
+    const audio = encodeWav(samples);
+    db.prepare("UPDATE files SET relative_path = ? WHERE id = ?").run("calls/meeting.wav", id);
+    const destinations: string[] = [];
+    const workspace = {
+      readBuffer: async (fileId: string) => {
+        expect(fileId).toBe(id);
+        return audio;
+      },
+      createFile: async (name: string, source: AsyncIterable<Buffer>, origin: string) => {
+        destinations.push(name);
+        const chunks: Buffer[] = [];
+        for await (const chunk of source) chunks.push(Buffer.from(chunk));
+        const row = insertFile(
+          db,
+          path.posix.basename(name),
+          "application/octet-stream",
+          Buffer.concat(chunks),
+          null,
+          origin,
+        );
+        return { fileId: row.id };
+      },
+    } as unknown as NonNullable<OpenRoom["workspace"]>;
+    let notified = 0;
+    const ctx = makeCtx(db, {
+      currentRoom: () => ({ db, path: roomPath, workspace }),
+      notifyFilesChanged: () => { notified += 1; },
+    });
+
+    const file = await recExportCleanHybrid(db, ctx, id);
+
+    expect(destinations).toEqual(["calls/meeting (edited).wav"]);
+    expect(file).toMatchObject({ name: "meeting (edited).wav", mimeType: "audio/wav" });
+    expect(parseRecMeta(getRecMeta(db, file.id))).toMatchObject({ durationCs: 75, cuts: [] });
+    expect(getFileExtractedText(db, file.id)).toContain("kept");
+    expect(notified).toBe(1);
+  });
+
+  it("uses a root destination and the existing DB export when no workspace is open", async () => {
+    const db = freshRoom();
+    const meta: RecMeta = {
+      ...defaultRecMeta(),
+      durationCs: 100,
+      cuts: [{ t0: 25, t1: 50 }],
+      segments: [phrase([word("kept", 0, 25), word("cut", 25, 50, true)])],
+    };
+    const id = addRecording(db, "root.wav", meta);
+    db.prepare("UPDATE files SET original_bytes = ? WHERE id = ?").run(
+      encodeWav(new Float32Array(16_000)),
+      id,
+    );
+
+    await expect(recExportCleanHybrid(db, makeCtx(db), id)).resolves.toMatchObject({
+      name: "root (edited).wav",
+    });
+  });
 });
 
 // ================================================================= translate
@@ -1418,7 +2209,9 @@ describe("recTranslate", () => {
       durationCs: 3000,
       speakerNames: { "Speaker 1": "Dana" },
       segments: Array.from({ length: 14 }, (_, i) =>
-        phrase([word(`line${i}`, i * 100, i * 100 + 50)], { speaker: "Speaker 1" })
+        phrase([word(`line${i}`, i * 100, i * 100 + 50)], {
+          speaker: "Speaker 1",
+        }),
       ),
     });
   }
@@ -1430,7 +2223,9 @@ describe("recTranslate", () => {
     const ctx = makeCtx(db, {
       generate: async (prompt) => {
         prompts.push(prompt);
-        const count = Number(/Output exactly (\d+) lines/.exec(prompt)?.[1] ?? 0);
+        const count = Number(
+          /Output exactly (\d+) lines/.exec(prompt)?.[1] ?? 0,
+        );
         return `<think>hmm</think>${Array.from({ length: count }, (_, i) => `translated ${i}`).join("\n")}`;
       },
       onTranslateProgress: (_id, done, total) => progress.push([done, total]),
@@ -1454,7 +2249,12 @@ describe("recTranslate", () => {
     expect(content).not.toContain("came back untranslated");
     // Room map: the name says it came from this recording, but a name is not
     // evidence — renaming either file must not break the link.
-    expect(db.prepare("SELECT derived_from FROM files WHERE id = ?").pluck().get(file.id)).toBe(id);
+    expect(
+      db
+        .prepare("SELECT derived_from FROM files WHERE id = ?")
+        .pluck()
+        .get(file.id),
+    ).toBe(id);
   });
 
   it("OPENS the translated document, the way Rust's own last line does", async () => {
@@ -1488,12 +2288,54 @@ describe("recTranslate", () => {
         throw new Error("no window");
       },
     });
-    await expect(recTranslate(db, ctx, translatable(db), "Spanish")).resolves.toBeTruthy();
+    await expect(
+      recTranslate(db, ctx, translatable(db), "Spanish"),
+    ).resolves.toBeTruthy();
+  });
+
+  it("refuses to save after the source room changes during generation", async () => {
+    const db = freshRoom();
+    let open = true;
+    const ctx = makeCtx(db, {
+      currentRoom: () => open ? { db, path: roomPath } : null,
+      generate: async () => {
+        open = false;
+        return "translated";
+      },
+    });
+
+    await expect(recTranslate(db, ctx, translatable(db), "Spanish")).rejects.toThrowError(
+      "The room was closed or changed before the translated file could be saved.",
+    );
+  });
+
+  it("saves translated Markdown through a workspace and refreshes its encrypted metadata", async () => {
+    const db = freshRoom();
+    const created: string[] = [];
+    const workspace = {
+      createFile: async (name: string, _source: unknown, _origin: string) => {
+        created.push(name);
+        const row = insertFile(db, name, "application/octet-stream", Buffer.alloc(0), null, "generated");
+        return { fileId: row.id };
+      },
+    } as unknown as NonNullable<OpenRoom["workspace"]>;
+    const ctx = makeCtx(db, {
+      currentRoom: () => ({ db, path: roomPath, workspace }),
+      generate: async () => "traducido",
+    });
+
+    const file = await recTranslate(db, ctx, translatable(db), "Spanish");
+
+    expect(created).toEqual(["board meeting — Spanish.md"]);
+    expect(file).toMatchObject({ name: "board meeting — Spanish.md", mimeType: "text/markdown" });
+    expect(getFileExtractedText(db, file.id)).toContain("traducido");
   });
 
   it("keeps the ORIGINAL line for anything the model failed to translate, and says how many", async () => {
     const db = freshRoom();
-    const ctx = makeCtx(db, { generate: async () => "only one line came back" });
+    const ctx = makeCtx(db, {
+      generate: async () => "only one line came back",
+    });
     const id = addRecording(db, "call.wav", {
       ...defaultRecMeta(),
       durationCs: 300,
@@ -1511,7 +2353,9 @@ describe("recTranslate", () => {
   it("GH #24: translates a 45-minute transcript through every batch instead of stopping near minute two", async () => {
     const db = freshRoom();
     const segments = Array.from({ length: 45 }, (_, minute) =>
-      phrase([word(`Hebrew line ${minute + 1}`, minute * 6_000, minute * 6_000 + 100)])
+      phrase([
+        word(`Hebrew line ${minute + 1}`, minute * 6_000, minute * 6_000 + 100),
+      ]),
     );
     const id = addRecording(db, "long-hebrew.wav", {
       ...defaultRecMeta(),
@@ -1537,13 +2381,20 @@ describe("recTranslate", () => {
   it("refuses an empty language, a silent recording, and an unavailable model", async () => {
     const db = freshRoom();
     const id = translatable(db);
-    await expect(recTranslate(db, makeCtx(db, { generate: async () => "" }), id, "  ")).rejects.toThrowError(
-      "Pick a language first."
-    );
-    await expect(recTranslate(db, makeCtx(db), id, "Spanish")).rejects.toThrowError(/Ollama/);
+    await expect(
+      recTranslate(db, makeCtx(db, { generate: async () => "" }), id, "  "),
+    ).rejects.toThrowError("Pick a language first.");
+    await expect(
+      recTranslate(db, makeCtx(db), id, "Spanish"),
+    ).rejects.toThrowError(/Ollama/);
     const silent = addRecording(db, "silent.wav", defaultRecMeta());
     await expect(
-      recTranslate(db, makeCtx(db, { generate: async () => "" }), silent, "Spanish")
+      recTranslate(
+        db,
+        makeCtx(db, { generate: async () => "" }),
+        silent,
+        "Spanish",
+      ),
     ).rejects.toThrowError(/No transcript to translate/);
   });
 
@@ -1559,10 +2410,15 @@ describe("recTranslate", () => {
     });
     const id = translatable(db);
     await expect(recTranslate(db, ctx, id, "Spanish")).rejects.toThrowError(
-      "Stopped — no translated file was saved."
+      "Stopped — no translated file was saved.",
     );
     expect(batches).toBe(1);
-    expect(db.prepare("SELECT COUNT(*) FROM files WHERE name LIKE '%Spanish%'").pluck().get() as number).toBe(0);
+    expect(
+      db
+        .prepare("SELECT COUNT(*) FROM files WHERE name LIKE '%Spanish%'")
+        .pluck()
+        .get() as number,
+    ).toBe(0);
   });
 
   it("the pure batching helpers hold their own contracts", () => {
@@ -1570,14 +2426,22 @@ describe("recTranslate", () => {
       translated: ["x", "y", "c"],
       untranslated: 1,
     });
-    expect(reconcileTranslatedBatch(["a"], "x\ny")).toEqual({ translated: ["x", "y"], untranslated: 0 });
-    expect(buildTranslatePrompt("Hebrew", ["l1", "l2"])).toContain("Output exactly 2 lines");
+    expect(reconcileTranslatedBatch(["a"], "x\ny")).toEqual({
+      translated: ["x", "y"],
+      untranslated: 0,
+    });
+    expect(buildTranslatePrompt("Hebrew", ["l1", "l2"])).toContain(
+      "Output exactly 2 lines",
+    );
     expect(buildTranslatedDocument("call", "Hebrew", ["a", "b"], 0)).toBe(
-      "# call — Hebrew\n\n_Translated on this Mac from the recording's transcript._\n\na\n\nb\n"
+      "# call — Hebrew\n\n_Translated on this Mac from the recording's transcript._\n\na\n\nb\n",
     );
-    expect(translatableLines({ ...defaultRecMeta(), segments: [phrase([word("gone", 0, 50, true)])] })).toEqual(
-      []
-    );
+    expect(
+      translatableLines({
+        ...defaultRecMeta(),
+        segments: [phrase([word("gone", 0, 50, true)])],
+      }),
+    ).toEqual([]);
   });
 });
 
@@ -1587,8 +2451,12 @@ describe("out-of-scope commands", () => {
   it("recPushAudio, recReadStart and recRetranscribe all refuse with an explanation", async () => {
     const db = freshRoom();
     const ctx = makeCtx(db);
-    await expect(recPushAudio(48_000, "AAAA")).rejects.toThrowError(/WS \/rec\/session/);
-    await expect(recReadStart(db, ctx, "x")).rejects.toThrowError(/background AI job/);
+    await expect(recPushAudio(48_000, "AAAA")).rejects.toThrowError(
+      /WS \/rec\/session/,
+    );
+    await expect(recReadStart(db, ctx, "x")).rejects.toThrowError(
+      /background AI job/,
+    );
     // `recRetranscribe` is now only the DEFAULT behind `recIpc.ts`'s
     // `live.retranscribe ?? …` seam, so its refusal must name the real
     // implementation rather than the old (and now false) "no route exists".
@@ -1610,7 +2478,12 @@ describe("the retranscribing guard set (recording_cmds.rs:12-15)", () => {
       sidecarPost: fakePost({
         "/rec/start": (body) => ({
           status: 200,
-          json: { ok: true, fileId: (body as { fileId: string }).fileId, spoolKey: "a2V5", spoolPath: "/tmp/x.spool" },
+          json: {
+            ok: true,
+            fileId: (body as { fileId: string }).fileId,
+            spoolKey: "a2V5",
+            spoolPath: "/tmp/x.spool",
+          },
         }),
       }),
       connectHostWs: () => fakeHostWs(),
@@ -1628,17 +2501,25 @@ describe("the retranscribing guard set (recording_cmds.rs:12-15)", () => {
 
     const refusal = /being re-transcribed/;
     expect(() => recDeleteRange(db, ctx, id, 0, 100)).toThrowError(refusal);
-    expect(() => recCorrectRange(db, ctx, id, 0, 100, "x")).toThrowError(refusal);
+    expect(() => recCorrectRange(db, ctx, id, 0, 100, "x")).toThrowError(
+      refusal,
+    );
     // RESUMING this file appends audio the in-flight rebuild has never seen,
     // so every timestamp past the join would be wrong.
-    await expect(recStart(db, ctx, { fileId: id, systemAudio: false })).rejects.toThrowError(refusal);
+    await expect(
+      recStart(db, ctx, { fileId: id, systemAudio: false }),
+    ).rejects.toThrowError(refusal);
     // …but a BRAND-NEW recording shares nothing with it and must still start.
-    await expect(recStart(db, ctx, { systemAudio: false })).resolves.toMatchObject({ name: expect.any(String) });
+    await expect(
+      recStart(db, ctx, { systemAudio: false }),
+    ).resolves.toMatchObject({ name: expect.any(String) });
 
     endRetranscribe(id);
     ctx.state.liveFileId = null;
     expect(isRetranscribing(id)).toBe(false);
-    expect(recDeleteRange(db, ctx, id, 0, 100).cuts).toEqual([{ t0: 0, t1: 100 }]);
+    expect(recDeleteRange(db, ctx, id, 0, 100).cuts).toEqual([
+      { t0: 0, t1: 100 },
+    ]);
   });
 
   it("refuses a workspace-room edit BEFORE it spends a History version on it", async () => {
@@ -1667,17 +2548,93 @@ describe("the retranscribing guard set (recording_cmds.rs:12-15)", () => {
 
     expect(beginRetranscribe(id)).toBe(true);
     try {
-      await expect(recDeleteRangeHybrid(db, ctx, id, 0, 100)).rejects.toThrowError(/being re-transcribed/);
-      await expect(recCorrectRangeHybrid(db, ctx, id, 0, 100, "x")).rejects.toThrowError(/being re-transcribed/);
+      await expect(
+        recDeleteRangeHybrid(db, ctx, id, 0, 100),
+      ).rejects.toThrowError(/being re-transcribed/);
+      await expect(
+        recCorrectRangeHybrid(db, ctx, id, 0, 100, "x"),
+      ).rejects.toThrowError(/being re-transcribed/);
       expect(snapshots).toBe(0);
     } finally {
       endRetranscribe(id);
     }
     // Released, the same call snapshots and edits as it always did.
-    await expect(recDeleteRangeHybrid(db, ctx, id, 0, 100)).resolves.toMatchObject({
+    await expect(
+      recDeleteRangeHybrid(db, ctx, id, 0, 100),
+    ).resolves.toMatchObject({
       cuts: [{ t0: 0, t1: 100 }],
     });
     expect(snapshots).toBe(1);
+  });
+
+  it("falls back to the DB correction path when the matching room has no workspace", async () => {
+    const db = freshRoom();
+    const id = addRecording(db, "call.wav", {
+      ...defaultRecMeta(),
+      durationCs: 1000,
+      segments: [phrase([word("before", 0, 100)])],
+    });
+    const ctx = makeCtx(db);
+
+    await expect(recCorrectRangeHybrid(db, ctx, id, 0, 100, "after")).resolves.toMatchObject({
+      segments: [expect.objectContaining({ words: [expect.objectContaining({ w: "after" })] })],
+    });
+  });
+
+  it("snapshots a workspace transcript before applying a hybrid correction", async () => {
+    const db = freshRoom();
+    const id = addRecording(db, "call.wav", {
+      ...defaultRecMeta(),
+      durationCs: 1000,
+      segments: [phrase([word("before", 0, 100)])],
+    });
+    const snapshots: Array<[string, string]> = [];
+    const ctx = makeCtx(db, {
+      currentRoom: () => ({
+        db,
+        path: roomPath,
+        workspace: {
+          snapshotVersion: async (fileId: string, cause: string) => {
+            snapshots.push([fileId, cause]);
+            return "version-id";
+          },
+        } as unknown as NonNullable<OpenRoom["workspace"]>,
+      }),
+    });
+
+    await expect(recCorrectRangeHybrid(db, ctx, id, 0, 100, "after")).resolves.toMatchObject({
+      segments: [expect.objectContaining({ words: [expect.objectContaining({ w: "after" })] })],
+    });
+    expect(snapshots).toEqual([[id, "Corrected transcript"]]);
+  });
+
+  it("keeps a direct workspace transcript correction when best-effort history snapshotting fails", async () => {
+    const db = freshRoom();
+    const id = addRecording(db, "call.wav", {
+      ...defaultRecMeta(),
+      durationCs: 1000,
+      segments: [phrase([word("before", 0, 100)])],
+    });
+    let snapshots = 0;
+    const ctx = makeCtx(db, {
+      currentRoom: () => ({
+        db,
+        path: roomPath,
+        workspace: {
+          snapshotVersion: async () => {
+            snapshots += 1;
+            throw new Error("fabricated snapshot failure");
+          },
+        } as unknown as NonNullable<OpenRoom["workspace"]>,
+      }),
+    });
+
+    expect(recCorrectRange(db, ctx, id, 0, 100, "after")).toMatchObject({
+      segments: [expect.objectContaining({ words: [expect.objectContaining({ w: "after" })] })],
+    });
+    await Promise.resolve();
+    expect(snapshots).toBe(1);
+    expect(getFileExtractedText(db, id)).toContain("after");
   });
 
   it("endRetranscribe is idempotent, so a doubly-released claim cannot wedge a file", () => {

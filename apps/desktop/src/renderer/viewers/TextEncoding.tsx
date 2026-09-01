@@ -69,6 +69,32 @@ const IDLE: EncodingState = {
   picker: null,
 };
 
+function isReDecodable(content: FileContent): boolean {
+  if (!RE_DECODABLE_KINDS.has(content.kind)) return false;
+  return content.kind !== "email" || !content.name.toLocaleLowerCase().endsWith(".msg");
+}
+
+function payloadChanged(pinned: { id: string; payload: string }, fileId: string, payload: string): boolean {
+  return pinned.id !== fileId || pinned.payload !== payload;
+}
+
+function encodingState(
+  decoded: DecodedFileText | null,
+  chosen: string | null,
+  error: string,
+  pick: (name: string) => void,
+): EncodingState {
+  return {
+    // Only substitute text once a re-read has actually landed; before that the
+    // viewer shows what `get_file_content` decoded, which is the same reading.
+    text: decoded ? decoded.text : null,
+    key: chosen ?? "auto",
+    decoded,
+    alert: <EncodingAlert decoded={decoded} error={error} />,
+    picker: <EncodingPicker decoded={decoded} chosen={chosen} onPick={pick} />,
+  };
+}
+
 /**
  * Track (and let the user change) how the open file's bytes are being decoded.
  *
@@ -81,9 +107,7 @@ export function useTextEncoding(fileId: string, content: FileContent): EncodingS
   // its MAPI strings from the original bytes with msgreader. Asking the raw
   // text decoder to inspect that binary container produces a UTF-8 byte
   // warning even while the selected MSG parser has rendered the body cleanly.
-  const applies = RE_DECODABLE_KINDS.has(content.kind) && !(
-    content.kind === "email" && content.name.toLocaleLowerCase().endsWith(".msg")
-  );
+  const applies = isReDecodable(content);
   const [chosen, setChosen] = useState<string | null>(null);
   const [decoded, setDecoded] = useState<DecodedFileText | null>(null);
   const [error, setError] = useState("");
@@ -101,7 +125,7 @@ export function useTextEncoding(fileId: string, content: FileContent): EncodingS
   // with the reset values — an effect would fire a doomed request first.
   const payload = content.text ?? "";
   const [pinned, setPinned] = useState({ id: fileId, payload });
-  if (pinned.id !== fileId || pinned.payload !== payload) {
+  if (payloadChanged(pinned, fileId, payload)) {
     setPinned({ id: fileId, payload });
     setChosen(null);
     setDecoded(null);
@@ -140,15 +164,7 @@ export function useTextEncoding(fileId: string, content: FileContent): EncodingS
   }, []);
 
   if (!applies) return IDLE;
-  return {
-    // Only substitute text once a re-read has actually landed; before that the
-    // viewer shows what `get_file_content` decoded, which is the same reading.
-    text: decoded ? decoded.text : null,
-    key: chosen ?? "auto",
-    decoded,
-    alert: <EncodingAlert decoded={decoded} error={error} />,
-    picker: <EncodingPicker decoded={decoded} chosen={chosen} onPick={pick} />,
-  };
+  return encodingState(decoded, chosen, error, pick);
 }
 
 /** The value of the picker's first row — "let the app decide", which is not an

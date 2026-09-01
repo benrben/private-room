@@ -295,6 +295,26 @@ async def test_map_empty_reply_falls_back_to_raw_window_text(monkeypatch: pytest
     assert len(fake.calls) == 1  # parsed fine, no retry
 
 
+async def test_map_merge_fallback_keeps_a_byte_safe_raw_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The merge fallback is the user-visible reading when the model produced a
+    # valid but empty reply. It must retain only whole UTF-8 characters at the
+    # same byte cap as ordinary merge notes.
+    window = "x" * (file_pass.PASS_NOTES_MAX - 1) + "é"
+    set_replies(monkeypatch, json.dumps({"notes": " ", "thread": "ignored"}))
+
+    art = await file_pass.run_map(
+        model="m", base_url="http://h:1", mode="merge", file_name="f", instruction="i",
+        part=0, total=1, start=0, end=len(window.encode()), text_len=len(window.encode()),
+        thread="carried", window_text=window,
+    )
+
+    assert art == {
+        "result": "x" * (file_pass.PASS_NOTES_MAX - 1),
+        "thread": "carried",
+        "skipped": False,
+    }
+
+
 # --- section (sectioned compose) --------------------------------------------
 
 

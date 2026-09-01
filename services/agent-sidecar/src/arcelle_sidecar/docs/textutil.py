@@ -170,36 +170,52 @@ def convert(name: str, data: bytes, to: str) -> str | None:
     if not can_read(ext):
         return None
 
+    src, dst = _conversion_paths(ext, to)
+
+    try:
+        return _convert_private_bytes(src, dst, data, to)
+    finally:
+        _remove(src)
+        _remove(dst)
+
+
+def _conversion_paths(ext: str, to: str) -> tuple[str, str]:
     stem = uuid.uuid4()
     tmp_dir = tempfile.gettempdir()
     src = os.path.join(tmp_dir, f"arcelle-tu-{stem}.{ext}")
     dst = os.path.join(tmp_dir, f"arcelle-tu-{stem}.{to}")
+    return src, dst
 
+
+def _convert_private_bytes(src: str, dst: str, data: bytes, to: str) -> str | None:
+    if not _write_private(src, data):
+        return None
+    if not _run_textutil(src, dst, to):
+        return None
+    return _read_textutil_output(dst)
+
+
+def _run_textutil(src: str, dst: str, to: str) -> bool:
     try:
-        if not _write_private(src, data):
-            return None
-        try:
-            proc = subprocess.run(
-                ["/usr/bin/textutil", "-convert", to, "-output", dst, src],
-                capture_output=True,
-            )
-        except OSError:
-            # The converter failed to even start -- same "no text" outcome
-            # as a non-zero exit, mirroring the Rust `Ok(o) if o.status.
-            # success() => ..., _ => None` match, which folds a `Command`
-            # spawn error into the same `None` as a bad exit status.
-            return None
-        if proc.returncode != 0:
-            return None
-        try:
-            with open(dst, encoding="utf-8") as fh:
-                out = fh.read()
-        except (OSError, UnicodeDecodeError):
-            return None
-        return out if out.strip() else None
-    finally:
-        _remove(src)
-        _remove(dst)
+        proc = subprocess.run(
+            ["/usr/bin/textutil", "-convert", to, "-output", dst, src],
+            capture_output=True,
+        )
+    except OSError:
+        # The converter failed to even start -- same "no text" outcome as a
+        # non-zero exit, mirroring Rust's `Ok(o) if o.status.success() =>
+        # ..., _ => None` match.
+        return False
+    return proc.returncode == 0
+
+
+def _read_textutil_output(dst: str) -> str | None:
+    try:
+        with open(dst, encoding="utf-8") as fh:
+            out = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return out if out.strip() else None
 
 
 def resolve_field_codes(text: str, as_html: bool) -> str:
@@ -218,58 +234,53 @@ def resolve_field_codes(text: str, as_html: bool) -> str:
     """
     out: list[str] = []
     rest = text
-    while True:
-        at = rest.find("HYPERLINK")
-        if at == -1:
-            break
+    while (at := rest.find("HYPERLINK")) != -1:
         before = rest[:at]
         after = rest[at + len("HYPERLINK") :]
-
-        # The target is the first quoted string after the keyword.
-        q1 = after.find('"')
-        if q1 == -1:
-            out.append(before)
-            out.append("HYPERLINK")
-            rest = after
-            continue
-        q2rel = after[q1 + 1 :].find('"')
-        if q2rel == -1:
+        field = _field_target_and_tail(after)
+        if field is None:
             out.append(before)
             out.append("HYPERLINK")
             rest = after
             continue
 
-        # Only treat it as a field if what sits between the keyword and the
-        # quote looks like the rest of a field instruction -- otherwise the
-        # word "HYPERLINK" is just a word someone wrote. Everything Word
-        # puts there before the target is a SWITCH, and every switch starts
-        # with a backslash (`\l`, `\o`), so a bare word in that gap means
-        # the next quote belongs to a later sentence and swallowing it
-        # would delete every word in between.
-        gap = after[:q1]
-        # Byte length, to match the Rust `gap.len()` exactly -- see module
-        # docstring for why a character count is not equivalent.
-        if len(gap.encode("utf-8")) > _MAX_FIELD_GAP or not all(
-            tok.startswith("\\") for tok in gap.split()
-        ):
-            out.append(before)
-            out.append("HYPERLINK")
-            rest = after
-            continue
-
-        target = after[q1 + 1 : q1 + 1 + q2rel]
+        target, rest = field
         out.append(before)
-        # Trailing whitespace before the field belongs to the prose, not
-        # the link.
-        if as_html and _looks_like_url(target):
-            out.append(f'<a href="{_escape_attr(target)}">{_escape_text(target)}</a>')
-        elif not as_html:
-            out.append(target)
-        else:
-            out.append(_escape_text(target))
-        rest = after[q1 + 1 + q2rel + 1 :]
+        out.append(_render_field_target(target, as_html))
     out.append(rest)
     return "".join(out)
+
+
+def _field_target_and_tail(after: str) -> tuple[str, str] | None:
+    """Return a recognized field's target and following text, if present."""
+    q1 = after.find('"')
+    if q1 == -1:
+        return None
+    q2rel = after[q1 + 1 :].find('"')
+    if q2rel == -1:
+        return None
+    gap = after[:q1]
+    if not _is_field_gap(gap):
+        return None
+    target = after[q1 + 1 : q1 + 1 + q2rel]
+    tail = after[q1 + 1 + q2rel + 1 :]
+    return target, tail
+
+
+def _is_field_gap(gap: str) -> bool:
+    """Whether text before a target quote can only be field switches."""
+    return len(gap.encode("utf-8")) <= _MAX_FIELD_GAP and all(
+        token.startswith("\\") for token in gap.split()
+    )
+
+
+def _render_field_target(target: str, as_html: bool) -> str:
+    """Render a resolved field target in text or safe HTML form."""
+    if not as_html:
+        return target
+    if _looks_like_url(target):
+        return f'<a href="{_escape_attr(target)}">{_escape_text(target)}</a>'
+    return _escape_text(target)
 
 
 def _looks_like_url(s: str) -> bool:

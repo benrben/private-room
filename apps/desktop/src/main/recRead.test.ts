@@ -585,6 +585,12 @@ describe("coerceReadArtifact", () => {
     expect([chapters, notes, highlights].every((l) => l.length === 0)).toBe(true);
   });
 
+  it("drops primitive highlight and note entries without inventing turn zero", () => {
+    const a = coerceReadArtifact({ highlights: [null, "bad", 7], notes: [null, "bad", 7] });
+    expect(a.highlights).toEqual([]);
+    expect(a.notes).toEqual([]);
+  });
+
   it("a highlight's missing `until` is 0 (Rust's serde default) and `mergeFindings` reads that as 'the turn itself'", () => {
     const a = coerceReadArtifact({ highlights: [{ turn: 5 }] });
     expect(a.highlights).toEqual([{ turn: 5, until: 0 }]);
@@ -895,6 +901,29 @@ describe("sidecarJsonCancellableAt", () => {
     const tornError = (torn as { error: { code: string; error: string; status: number } }).error;
     expect(tornError.code).toBe("ENGINE_ERROR");
     expect(isFatal(sidecarErrorSentinel(tornError, "m"))).toBe(false);
+  });
+
+  it("recognizes refused direct, caused, and aggregate fetch failures without contacting a sidecar", async () => {
+    const refusedDirect = Object.assign(new Error("direct refusal"), { code: "ECONNREFUSED" });
+    const refusedCause = Object.assign(new Error("outer failure"), {
+      cause: Object.assign(new Error("inner refusal"), { code: "ECONNREFUSED" }),
+    });
+    const refusedAggregate = Object.assign(new Error("all resolved addresses refused"), {
+      errors: [{ code: "ECONNREFUSED" }],
+    });
+    const originalFetch = globalThis.fetch;
+
+    try {
+      for (const failure of [refusedDirect, refusedCause, refusedAggregate]) {
+        globalThis.fetch = vi.fn().mockRejectedValue(failure) as unknown as typeof fetch;
+        await expect(sidecarJsonCancellableAt("http://sidecar.test", "/rec_read_map", {}, new CancelFlag())).resolves.toEqual({
+          kind: "error",
+          error: { code: "OLLAMA_DOWN", error: failure.message, status: 0 },
+        });
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   /** The cancel poll must not become a latency tax: a response that arrives in
@@ -1372,6 +1401,42 @@ describe("executeReadStep — publish", () => {
     room.db.close();
   });
 
+  it("ignores a malformed persisted window artifact rather than crashing publish", async () => {
+    const room = freshRoom();
+    const list = turns(2);
+    const fileId = addRecording(room.db, "standup.wav", metaOf(segmentsFor(list)));
+    const jobId = createJob(room.db, "rec_read", "Reading", {}, 2);
+    putJobArtifact(room.db, jobId, 0, "{malformed");
+    const { rooms } = fakeRooms({ db: room.db, path: "room-a" });
+
+    const result = await executeReadStep(
+      { rooms }, jobId, "room-a", planFor(fileId, list, [[0, 2]]), "m", list, publishStep(1), NEVER_CANCELLED,
+    );
+
+    expect(result.ok).toBe(true);
+    const written = JSON.parse(getRecMeta(room.db, fileId) as string) as RecMeta;
+    expect(written.readOf).toBeTruthy();
+    room.db.close();
+  });
+
+  it("reports malformed recording metadata as a publish error", async () => {
+    const room = freshRoom();
+    const list = turns(1);
+    const fileId = addRecording(room.db, "standup.wav", metaOf(segmentsFor(list)));
+    const jobId = createJob(room.db, "rec_read", "Reading", {}, 1);
+    putJobArtifact(room.db, jobId, 0, JSON.stringify(artifact()));
+    setRecMeta(room.db, fileId, "{malformed");
+    const { rooms } = fakeRooms({ db: room.db, path: "room-a" });
+
+    const result = await executeReadStep(
+      { rooms }, jobId, "room-a", planFor(fileId, list, [[0, 1]]), "m", list, publishStep(1), NEVER_CANCELLED,
+    );
+
+    expect(result.ok).toBe(false);
+    expect((result as { error: string }).error.length).toBeGreaterThan(0);
+    room.db.close();
+  });
+
   it("logs (once) when SOME windows were skipped, naming counts not content", async () => {
     const room = freshRoom();
     const list = turns(2);
@@ -1774,6 +1839,21 @@ describe("recReadRowStarter (resume)", () => {
       kind: "error",
       message: "The recording this read belongs to is no longer in the room.",
     });
+    room.db.close();
+  });
+
+  it("returns the malformed current transcript's error instead of starting a fabricated engine call", async () => {
+    const room = freshRoom();
+    const list = turns(1);
+    const fileId = addRecording(room.db, "standup.wav", metaOf(segmentsFor(list)));
+    const plan = planFor(fileId, list, [[0, 1]]);
+    const jobId = createJob(room.db, "rec_read", "Reading", plan, 2);
+    setRecMeta(room.db, fileId, "not a recording transcript");
+    const { deps } = queueDepsFor(room.db, room.path);
+    const result = await recReadRowStarter(extraDeps())(deps, getJob(room.db, jobId), room.path, new CancelFlag());
+
+    expect(result.kind).toBe("error");
+    expect((result as { message: string }).message).not.toBe("");
     room.db.close();
   });
 

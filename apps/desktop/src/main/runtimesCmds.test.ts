@@ -36,7 +36,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   cachedPathPrefix as scriptRunCachedPathPrefix,
@@ -82,7 +82,10 @@ import type { HttpResponseLike, SpawnedProcess, SpawnFn } from "./ytdlp.js";
  * `HttpResponseLike` that streams fixed bytes, split into `chunkSize`-byte
  * pieces so multi-chunk progress accounting is exercised, not just a single
  * `read()`. */
-function fakeFetchOk(bytes: Uint8Array, opts: { chunkSize?: number; contentLength?: number } = {}): RuntimeFetchLike {
+function fakeFetchOk(
+  bytes: Uint8Array,
+  opts: { chunkSize?: number; contentLength?: number } = {},
+): RuntimeFetchLike {
   const chunkSize = opts.chunkSize ?? (bytes.length || 1);
   const chunks: Uint8Array[] = [];
   for (let i = 0; i < bytes.length; i += chunkSize) {
@@ -135,6 +138,7 @@ function mkTempDir(prefix = "runtimes-test-"): string {
 }
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   resetPathPrefixCellForTests();
   setScriptRunCachedPathPrefix("");
   for (const dir of tmpDirs.splice(0)) {
@@ -157,7 +161,13 @@ function buildFixtureTarGz(files: ReadonlyArray<[string, string]>): Uint8Array {
     writeFileSync(full, contents);
   }
   const tarPath = path.join(workDir, "out.tar.gz");
-  execFileSync("/usr/bin/tar", ["-czf", tarPath, "-C", workDir, "payload-1.0.0"]);
+  execFileSync("/usr/bin/tar", [
+    "-czf",
+    tarPath,
+    "-C",
+    workDir,
+    "payload-1.0.0",
+  ]);
   return new Uint8Array(readFileSync(tarPath));
 }
 
@@ -223,13 +233,13 @@ describe("runtimeAsset", () => {
   it("builds the pinned uv URL/digest for each known arch", () => {
     const arm = runtimeAsset("uv", "arm64");
     expect(arm.url).toBe(
-      `https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-aarch64-apple-darwin.tar.gz`
+      `https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-aarch64-apple-darwin.tar.gz`,
     );
     expect(arm.sha256).toBe(UV_SHA256_AARCH64);
 
     const x64 = runtimeAsset("uv", "x64");
     expect(x64.url).toBe(
-      `https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-apple-darwin.tar.gz`
+      `https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-apple-darwin.tar.gz`,
     );
     expect(x64.sha256).toBe(UV_SHA256_X86_64);
   });
@@ -237,13 +247,13 @@ describe("runtimeAsset", () => {
   it("builds the pinned node URL/digest for each known arch", () => {
     const arm = runtimeAsset("node", "arm64");
     expect(arm.url).toBe(
-      `https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-darwin-arm64.tar.gz`
+      `https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-darwin-arm64.tar.gz`,
     );
     expect(arm.sha256).toBe(NODE_SHA256_ARM64);
 
     const x64 = runtimeAsset("node", "x64");
     expect(x64.url).toBe(
-      `https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-darwin-x64.tar.gz`
+      `https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-darwin-x64.tar.gz`,
     );
     expect(x64.sha256).toBe(NODE_SHA256_X64);
   });
@@ -252,7 +262,9 @@ describe("runtimeAsset", () => {
     // Mirrors runtimes.rs's own `asset_urls_are_platform_correct`: check shape,
     // not a specific arch string, since CI/dev machines differ.
     const uv = runtimeAsset("uv");
-    expect(uv.url.startsWith("https://github.com/astral-sh/uv/releases/download/")).toBe(true);
+    expect(
+      uv.url.startsWith("https://github.com/astral-sh/uv/releases/download/"),
+    ).toBe(true);
     expect(uv.url.endsWith("-apple-darwin.tar.gz")).toBe(true);
     const node = runtimeAsset("node");
     expect(node.url).toContain("nodejs.org/dist/");
@@ -261,8 +273,12 @@ describe("runtimeAsset", () => {
   });
 
   it("throws naming the unsupported chip rather than returning a guessed asset", () => {
-    expect(() => runtimeAsset("uv", "riscv64")).toThrow("no uv build for riscv64");
-    expect(() => runtimeAsset("node", "riscv64")).toThrow("no node build for riscv64");
+    expect(() => runtimeAsset("uv", "riscv64")).toThrow(
+      "no uv build for riscv64",
+    );
+    expect(() => runtimeAsset("node", "riscv64")).toThrow(
+      "no node build for riscv64",
+    );
   });
 
   it("every pinned download is version-locked (never /latest/) and carries a real 64-hex digest", () => {
@@ -271,7 +287,9 @@ describe("runtimeAsset", () => {
       for (const arch of ["arm64", "x64"]) {
         const a = runtimeAsset(kind, arch);
         expect(a.url).not.toContain("/latest/");
-        expect(a.url.includes(UV_VERSION) || a.url.includes(NODE_VERSION)).toBe(true);
+        expect(a.url.includes(UV_VERSION) || a.url.includes(NODE_VERSION)).toBe(
+          true,
+        );
         expect(a.sha256).toHaveLength(64);
         expect(/^[0-9a-f]+$/i.test(a.sha256)).toBe(true);
       }
@@ -287,11 +305,16 @@ describe("checksumRefusal", () => {
   it("passes a matching digest, case-insensitively, and refuses by name otherwise", () => {
     // Mirrors runtimes.rs's own `a_download_that_hashes_wrong_is_refused_by_name`.
     const empty = sha256Hex(new Uint8Array(0));
-    expect(empty).toBe("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    expect(empty).toBe(
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    );
 
     expect(checksumRefusal("uv", empty, empty)).toBeNull();
     // Case is not a difference: checksum files are published both ways.
     expect(checksumRefusal("uv", empty.toUpperCase(), empty)).toBeNull();
+    // This is ASCII folding, not Unicode case folding: inputs outside a hex
+    // digest must never become equal merely because another locale folds them.
+    expect(checksumRefusal("uv", "Å", "å")).not.toBeNull();
 
     const why = checksumRefusal("node", empty, "00");
     expect(why).not.toBeNull();
@@ -332,8 +355,12 @@ describe("filesystem layout", () => {
 
   it("installDir nests one directory per kind under the runtimes root", () => {
     const appDataDir = mkTempDir();
-    expect(installDir(appDataDir, "uv")).toBe(path.join(appDataDir, "runtimes", "uv"));
-    expect(installDir(appDataDir, "node")).toBe(path.join(appDataDir, "runtimes", "node"));
+    expect(installDir(appDataDir, "uv")).toBe(
+      path.join(appDataDir, "runtimes", "uv"),
+    );
+    expect(installDir(appDataDir, "node")).toBe(
+      path.join(appDataDir, "runtimes", "node"),
+    );
   });
 
   it("isInstalled is false until the marker file exists, and survives a missing dir", () => {
@@ -345,6 +372,14 @@ describe("filesystem layout", () => {
     expect(isInstalled(appDataDir, "uv")).toBe(true);
     // Node still isn't.
     expect(isInstalled(appDataDir, "node")).toBe(false);
+  });
+
+  it("reports not installed when the filesystem probe itself fails", () => {
+    const appDataDir = mkTempDir();
+    const exists = vi.fn(() => { throw new Error("volume unavailable"); });
+
+    expect(isInstalled(appDataDir, "uv", exists)).toBe(false);
+    expect(exists).toHaveBeenCalledOnce();
   });
 
   it("pathPrefix is empty when nothing is installed, and colon-joins uv-then-node when both are", () => {
@@ -361,7 +396,9 @@ describe("filesystem layout", () => {
     mkdirSync(path.join(nodeDir, "bin"), { recursive: true });
     writeFileSync(path.join(nodeDir, "bin", "node"), "x");
     // Node's bin/ subdir is what goes on PATH, and uv precedes node.
-    expect(pathPrefix(appDataDir)).toBe(`${uvDir}:${path.join(nodeDir, "bin")}`);
+    expect(pathPrefix(appDataDir)).toBe(
+      `${uvDir}:${path.join(nodeDir, "bin")}`,
+    );
   });
 });
 
@@ -401,8 +438,15 @@ describe("statusFor", () => {
     const appDataDir = mkTempDir();
     const shellDir = mkTempDir("runtimes-shell-");
     writeFileSync(path.join(shellDir, "uvx"), "x");
-    const status = await statusFor(appDataDir, "uvx", { resolveLoginPath: async () => shellDir });
-    expect(status).toEqual({ available: true, kind: null, provisionable: false, note: "" });
+    const status = await statusFor(appDataDir, "uvx", {
+      resolveLoginPath: async () => shellDir,
+    });
+    expect(status).toEqual({
+      available: true,
+      kind: null,
+      provisionable: false,
+      note: "",
+    });
   });
 
   it("reports available when a DOWNLOADED runtime satisfies it, even off the login PATH", async () => {
@@ -411,13 +455,17 @@ describe("statusFor", () => {
     mkdirSync(uvDir, { recursive: true });
     writeFileSync(path.join(uvDir, "uv"), "x");
     writeFileSync(path.join(uvDir, "uvx"), "x");
-    const status = await statusFor(appDataDir, "uvx", { resolveLoginPath: async () => "/nope" });
+    const status = await statusFor(appDataDir, "uvx", {
+      resolveLoginPath: async () => "/nope",
+    });
     expect(status.available).toBe(true);
   });
 
   it("reports provisionable with the download note when the command maps to a fetchable runtime", async () => {
     const appDataDir = mkTempDir();
-    const status = await statusFor(appDataDir, "npx", { resolveLoginPath: async () => "/nope" });
+    const status = await statusFor(appDataDir, "npx", {
+      resolveLoginPath: async () => "/nope",
+    });
     expect(status).toEqual({
       available: false,
       kind: "node",
@@ -428,7 +476,9 @@ describe("statusFor", () => {
 
   it("reports NOT provisionable, with the honest note, for a command the app can't fetch (e.g. docker)", async () => {
     const appDataDir = mkTempDir();
-    const status = await statusFor(appDataDir, "docker", { resolveLoginPath: async () => "/nope" });
+    const status = await statusFor(appDataDir, "docker", {
+      resolveLoginPath: async () => "/nope",
+    });
     expect(status.available).toBe(false);
     expect(status.kind).toBeNull();
     expect(status.provisionable).toBe(false);
@@ -438,13 +488,18 @@ describe("statusFor", () => {
 
   it("mcpRuntimeForCommand is a thin pass-through to statusFor", async () => {
     const appDataDir = mkTempDir();
-    const status = await mcpRuntimeForCommand(appDataDir, "npx", { resolveLoginPath: async () => "/nope" });
+    const status = await mcpRuntimeForCommand(appDataDir, "npx", {
+      resolveLoginPath: async () => "/nope",
+    });
     expect(status.kind).toBe("node");
   });
 
   it("with no deps override, resolves against the REAL login shell (no network) without hanging", async () => {
     const appDataDir = mkTempDir();
-    const status = await mcpRuntimeForCommand(appDataDir, "definitely-not-a-real-binary-xyz");
+    const status = await mcpRuntimeForCommand(
+      appDataDir,
+      "definitely-not-a-real-binary-xyz",
+    );
     expect(status.available).toBe(false);
     expect(status.provisionable).toBe(false);
   });
@@ -479,20 +534,34 @@ describe("provisionRuntime", () => {
     const digest = sha256Hex(bytes);
     const events: Array<[string, unknown]> = [];
 
+    const fetchFn = vi.fn(fakeFetchOk(bytes, { chunkSize: 37 }));
+    vi.stubGlobal("fetch", fetchFn);
     const deps: ProvisionDeps = {
-      fetchFn: fakeFetchOk(bytes, { chunkSize: 37 }),
-      assetOverride: () => ({ url: "https://fixture.invalid/uv.tar.gz", sha256: digest }),
+      assetOverride: () => ({
+        url: "https://fixture.invalid/uv.tar.gz",
+        sha256: digest,
+      }),
       emit: (event, payload) => events.push([event, payload]),
     };
     await provisionRuntime(appDataDir, "uv", deps);
 
+    expect(fetchFn).toHaveBeenCalledWith("https://fixture.invalid/uv.tar.gz", {
+      headers: { "User-Agent": "Arcelle-Electron/runtimes" },
+    });
+
     expect(isInstalled(appDataDir, "uv")).toBe(true);
     const uvDir = installDir(appDataDir, "uv");
     // --strip-components=1 stripped the fixture's "payload-1.0.0" wrapper.
-    expect(readFileSync(path.join(uvDir, "uv"), "utf8")).toBe("#!/bin/sh\necho fake-uv\n");
-    expect(readFileSync(path.join(uvDir, "extra", "readme.txt"), "utf8")).toBe("hello");
+    expect(readFileSync(path.join(uvDir, "uv"), "utf8")).toBe(
+      "#!/bin/sh\necho fake-uv\n",
+    );
+    expect(readFileSync(path.join(uvDir, "extra", "readme.txt"), "utf8")).toBe(
+      "hello",
+    );
     // The temp download is cleaned up.
-    expect(existsSync(path.join(appDataDir, "runtimes", "uv.download"))).toBe(false);
+    expect(existsSync(path.join(appDataDir, "runtimes", "uv.download"))).toBe(
+      false,
+    );
 
     // Progress: at least one "download" phase, one "extract", one "done", all
     // tagged with the right kind, and "done" reports a positive total.
@@ -501,8 +570,13 @@ describe("provisionRuntime", () => {
     expect(phases).toContain("extract");
     expect(phases[phases.length - 1]).toBe("done");
     expect(events.every(([e]) => e === "runtime-progress")).toBe(true);
-    expect(events.every(([, p]) => (p as { kind: string }).kind === "uv")).toBe(true);
-    const done = events[events.length - 1]?.[1] as { got: number; total: number };
+    expect(events.every(([, p]) => (p as { kind: string }).kind === "uv")).toBe(
+      true,
+    );
+    const done = events[events.length - 1]?.[1] as {
+      got: number;
+      total: number;
+    };
     expect(done.got).toBeGreaterThan(0);
     expect(done.total).toBeGreaterThan(0);
   });
@@ -515,12 +589,58 @@ describe("provisionRuntime", () => {
     await expect(
       provisionRuntime(appDataDir, "uv", {
         fetchFn: fakeFetchOk(bytes),
-        assetOverride: () => ({ url: "https://fixture.invalid/uv.tar.gz", sha256: wrongDigest }),
-      })
+        assetOverride: () => ({
+          url: "https://fixture.invalid/uv.tar.gz",
+          sha256: wrongDigest,
+        }),
+      }),
     ).rejects.toThrow(/is not the one this app expects/);
 
-    expect(existsSync(path.join(appDataDir, "runtimes", "uv.download"))).toBe(false);
+    expect(existsSync(path.join(appDataDir, "runtimes", "uv.download"))).toBe(
+      false,
+    );
     expect(existsSync(installDir(appDataDir, "uv"))).toBe(false);
+  });
+
+  it("keeps the checksum refusal when best-effort temp cleanup itself fails", async () => {
+    const appDataDir = mkTempDir();
+    const bytes = buildFixtureTarGz([["uv", "x"]]);
+    const tempPath = path.join(appDataDir, "runtimes", "uv.download");
+    const unlinkFn = vi.fn(async () => { throw new Error("cleanup denied"); });
+
+    await expect(provisionRuntime(appDataDir, "uv", {
+      fetchFn: fakeFetchOk(bytes),
+      assetOverride: () => ({
+        url: "https://fixture.invalid/uv.tar.gz",
+        sha256: sha256Hex(new Uint8Array([9, 9, 9])),
+      }),
+      unlinkFn,
+    })).rejects.toThrow(/is not the one this app expects/);
+
+    expect(unlinkFn).toHaveBeenCalledWith(tempPath);
+    expect(existsSync(tempPath)).toBe(true);
+  });
+
+  it("continues extraction when best-effort stale-directory cleanup fails", async () => {
+    const appDataDir = mkTempDir();
+    const uvDir = installDir(appDataDir, "uv");
+    mkdirSync(uvDir, { recursive: true });
+    writeFileSync(path.join(uvDir, "stale.txt"), "preserved by simulated cleanup refusal");
+    const bytes = buildFixtureTarGz([["uv", "fresh"]]);
+    const rmdirFn = vi.fn(async () => { throw new Error("cleanup denied"); });
+
+    await provisionRuntime(appDataDir, "uv", {
+      fetchFn: fakeFetchOk(bytes),
+      assetOverride: () => ({
+        url: "https://fixture.invalid/uv.tar.gz",
+        sha256: sha256Hex(bytes),
+      }),
+      rmdirFn,
+    });
+
+    expect(rmdirFn).toHaveBeenCalledWith(uvDir, { recursive: true, force: true });
+    expect(readFileSync(path.join(uvDir, "uv"), "utf8")).toBe("fresh");
+    expect(readFileSync(path.join(uvDir, "stale.txt"), "utf8")).toContain("cleanup refusal");
   });
 
   it("a real non-zero tar exit (garbage archive) is refused, and the empty install dir is removed", async () => {
@@ -531,8 +651,11 @@ describe("provisionRuntime", () => {
     await expect(
       provisionRuntime(appDataDir, "node", {
         fetchFn: fakeFetchOk(bytes),
-        assetOverride: () => ({ url: "https://fixture.invalid/node.tar.gz", sha256: digest }),
-      })
+        assetOverride: () => ({
+          url: "https://fixture.invalid/node.tar.gz",
+          sha256: digest,
+        }),
+      }),
     ).rejects.toThrow(/could not unpack the Node\.js runtime/);
 
     expect(existsSync(installDir(appDataDir, "node"))).toBe(false);
@@ -547,8 +670,11 @@ describe("provisionRuntime", () => {
     await expect(
       provisionRuntime(appDataDir, "node", {
         fetchFn: fakeFetchOk(bytes),
-        assetOverride: () => ({ url: "https://fixture.invalid/node.tar.gz", sha256: digest }),
-      })
+        assetOverride: () => ({
+          url: "https://fixture.invalid/node.tar.gz",
+          sha256: digest,
+        }),
+      }),
     ).rejects.toThrow(/didn't unpack as expected/);
 
     expect(existsSync(installDir(appDataDir, "node"))).toBe(false);
@@ -566,16 +692,21 @@ describe("provisionRuntime", () => {
     await expect(
       provisionRuntime(appDataDir, "uv", {
         fetchFn: fakeFetchOk(bytes),
-        assetOverride: () => ({ url: "https://fixture.invalid/uv.tar.gz", sha256: digest }),
+        assetOverride: () => ({
+          url: "https://fixture.invalid/uv.tar.gz",
+          sha256: digest,
+        }),
         spawnFn,
-      })
+      }),
     ).rejects.toThrow(/could not run tar/);
 
     // Neither cleaned up — the freshly-created (empty) dir and the temp
     // download both survive a spawn failure, exactly as Rust's `?` leaves
     // them before its own `remove_file` line is ever reached.
     expect(existsSync(installDir(appDataDir, "uv"))).toBe(true);
-    expect(existsSync(path.join(appDataDir, "runtimes", "uv.download"))).toBe(true);
+    expect(existsSync(path.join(appDataDir, "runtimes", "uv.download"))).toBe(
+      true,
+    );
   });
 
   it("also reports a tar spawn failure delivered via an async 'error' event, not just a synchronous throw", async () => {
@@ -592,9 +723,12 @@ describe("provisionRuntime", () => {
     await expect(
       provisionRuntime(appDataDir, "uv", {
         fetchFn: fakeFetchOk(bytes),
-        assetOverride: () => ({ url: "https://fixture.invalid/uv.tar.gz", sha256: digest }),
+        assetOverride: () => ({
+          url: "https://fixture.invalid/uv.tar.gz",
+          sha256: digest,
+        }),
         spawnFn,
-      })
+      }),
     ).rejects.toThrow(/could not run tar: EACCES/);
   });
 
@@ -609,7 +743,10 @@ describe("provisionRuntime", () => {
     const appDataDir = mkTempDir();
     const uvDir = installDir(appDataDir, "uv");
     mkdirSync(path.join(uvDir, "leftover"), { recursive: true });
-    writeFileSync(path.join(uvDir, "leftover", "half-written.bin"), "from a crashed run");
+    writeFileSync(
+      path.join(uvDir, "leftover", "half-written.bin"),
+      "from a crashed run",
+    );
     writeFileSync(path.join(uvDir, "stale-uv-0.9"), "an older release's file");
     // Deliberately NOT the marker file, so `isInstalled` is still false and
     // the idempotent short-circuit does not hide the behavior under test.
@@ -618,11 +755,16 @@ describe("provisionRuntime", () => {
     const bytes = buildFixtureTarGz([["uv", "#!/bin/sh\necho fresh\n"]]);
     await provisionRuntime(appDataDir, "uv", {
       fetchFn: fakeFetchOk(bytes),
-      assetOverride: () => ({ url: "https://fixture.invalid/uv.tar.gz", sha256: sha256Hex(bytes) }),
+      assetOverride: () => ({
+        url: "https://fixture.invalid/uv.tar.gz",
+        sha256: sha256Hex(bytes),
+      }),
     });
 
     expect(isInstalled(appDataDir, "uv")).toBe(true);
-    expect(readFileSync(path.join(uvDir, "uv"), "utf8")).toBe("#!/bin/sh\necho fresh\n");
+    expect(readFileSync(path.join(uvDir, "uv"), "utf8")).toBe(
+      "#!/bin/sh\necho fresh\n",
+    );
     expect(existsSync(path.join(uvDir, "leftover"))).toBe(false);
     expect(existsSync(path.join(uvDir, "stale-uv-0.9"))).toBe(false);
   });
@@ -639,12 +781,18 @@ describe("provisionRuntime", () => {
     // a file that was never tampered with.
     const appDataDir = mkTempDir();
     const root = runtimesRoot(appDataDir);
-    writeFileSync(path.join(root, "uv.download"), "GARBAGE FROM AN INTERRUPTED RUN".repeat(500));
+    writeFileSync(
+      path.join(root, "uv.download"),
+      "GARBAGE FROM AN INTERRUPTED RUN".repeat(500),
+    );
 
     const bytes = buildFixtureTarGz([["uv", "x"]]);
     await provisionRuntime(appDataDir, "uv", {
       fetchFn: fakeFetchOk(bytes, { chunkSize: 13 }),
-      assetOverride: () => ({ url: "https://fixture.invalid/uv.tar.gz", sha256: sha256Hex(bytes) }),
+      assetOverride: () => ({
+        url: "https://fixture.invalid/uv.tar.gz",
+        sha256: sha256Hex(bytes),
+      }),
     });
 
     expect(isInstalled(appDataDir, "uv")).toBe(true);
@@ -666,14 +814,19 @@ describe("provisionRuntime", () => {
     const appDataDir = mkTempDir();
     // A DIRECTORY where the temp download file goes -> a real EISDIR from the
     // real fs, no mocking of `fs` itself.
-    mkdirSync(path.join(runtimesRoot(appDataDir), "uv.download"), { recursive: true });
+    mkdirSync(path.join(runtimesRoot(appDataDir), "uv.download"), {
+      recursive: true,
+    });
 
     const bytes = buildFixtureTarGz([["uv", "x"]]);
     await expect(
       provisionRuntime(appDataDir, "uv", {
         fetchFn: fakeFetchOk(bytes),
-        assetOverride: () => ({ url: "https://fixture.invalid/uv.tar.gz", sha256: sha256Hex(bytes) }),
-      })
+        assetOverride: () => ({
+          url: "https://fixture.invalid/uv.tar.gz",
+          sha256: sha256Hex(bytes),
+        }),
+      }),
     ).rejects.toThrow(/could not write the download: /);
   });
 
@@ -686,7 +839,7 @@ describe("provisionRuntime", () => {
       body: null,
     });
     await expect(
-      provisionRuntime(appDataDir, "uv", { fetchFn })
+      provisionRuntime(appDataDir, "uv", { fetchFn }),
     ).rejects.toThrow(/returned HTTP 503/);
     expect(existsSync(installDir(appDataDir, "uv"))).toBe(false);
   });
@@ -697,8 +850,61 @@ describe("provisionRuntime", () => {
       throw new Error("getaddrinfo ENOTFOUND");
     };
     await expect(
-      provisionRuntime(appDataDir, "uv", { fetchFn, assetOverride: () => ({ url: "https://fixture.invalid/x", sha256: "0".repeat(64) }) })
-    ).rejects.toThrow(/could not reach https:\/\/fixture\.invalid\/x: getaddrinfo ENOTFOUND/);
+      provisionRuntime(appDataDir, "uv", {
+        fetchFn,
+        assetOverride: () => ({
+          url: "https://fixture.invalid/x",
+          sha256: "0".repeat(64),
+        }),
+      }),
+    ).rejects.toThrow(
+      /could not reach https:\/\/fixture\.invalid\/x: getaddrinfo ENOTFOUND/,
+    );
+  });
+
+  it("keeps provisioning when the best-effort progress sender throws", async () => {
+    const appDataDir = mkTempDir();
+    const bytes = buildFixtureTarGz([["uv", "x"]]);
+    await provisionRuntime(appDataDir, "uv", {
+      fetchFn: fakeFetchOk(bytes),
+      assetOverride: () => ({
+        url: "https://fixture.invalid/uv.tar.gz",
+        sha256: sha256Hex(bytes),
+      }),
+      emit: () => {
+        throw new Error("renderer closed");
+      },
+    });
+
+    expect(isInstalled(appDataDir, "uv")).toBe(true);
+  });
+
+  it("reports an interrupted response reader after closing its partial download", async () => {
+    const appDataDir = mkTempDir();
+    const fetchFn: RuntimeFetchLike = async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      body: {
+        getReader: () => ({
+          read: async () => Promise.reject(new Error("connection reset")),
+        }),
+      },
+    });
+
+    await expect(
+      provisionRuntime(appDataDir, "uv", {
+        fetchFn,
+        assetOverride: () => ({
+          url: "https://fixture.invalid/uv.tar.gz",
+          sha256: "0".repeat(64),
+        }),
+      }),
+    ).rejects.toThrow("download interrupted: connection reset");
+    expect(existsSync(path.join(appDataDir, "runtimes", "uv.download"))).toBe(
+      true,
+    );
+    expect(existsSync(installDir(appDataDir, "uv"))).toBe(false);
   });
 
   it("passes the real, pinned asset by default (no assetOverride) — the fetch sees the real GitHub/nodejs.org URL", async () => {
@@ -706,9 +912,16 @@ describe("provisionRuntime", () => {
     let seenUrl: string | null = null;
     const fetchFn: RuntimeFetchLike = async (url) => {
       seenUrl = url;
-      return { ok: false, status: 404, headers: { get: () => null }, body: null };
+      return {
+        ok: false,
+        status: 404,
+        headers: { get: () => null },
+        body: null,
+      };
     };
-    await expect(provisionRuntime(appDataDir, "node", { fetchFn })).rejects.toThrow();
+    await expect(
+      provisionRuntime(appDataDir, "node", { fetchFn }),
+    ).rejects.toThrow();
     expect(seenUrl).toContain("nodejs.org/dist/");
   });
 });
@@ -720,7 +933,9 @@ describe("provisionRuntime", () => {
 describe("mcpProvisionRuntime", () => {
   it("rejects an unknown runtime kind by name, without touching the filesystem", async () => {
     const appDataDir = mkTempDir();
-    await expect(mcpProvisionRuntime(appDataDir, "python")).rejects.toThrow('unknown runtime "python"');
+    await expect(mcpProvisionRuntime(appDataDir, "python")).rejects.toThrow(
+      'unknown runtime "python"',
+    );
     expect(existsSync(path.join(appDataDir, "runtimes"))).toBe(false);
   });
 
@@ -732,7 +947,10 @@ describe("mcpProvisionRuntime", () => {
     expect(cachedPathPrefix()).toBe("");
     await mcpProvisionRuntime(appDataDir, "uv", {
       fetchFn: fakeFetchOk(bytes),
-      assetOverride: () => ({ url: "https://fixture.invalid/uv.tar.gz", sha256: digest }),
+      assetOverride: () => ({
+        url: "https://fixture.invalid/uv.tar.gz",
+        sha256: digest,
+      }),
     });
     const uvDir = installDir(appDataDir, "uv");
     expect(cachedPathPrefix()).toBe(uvDir);
@@ -750,16 +968,26 @@ describe("registerRuntimesIpc", () => {
     call: (channel: string, ...args: unknown[]) => Promise<unknown>;
     channels: string[];
   } {
-    const handlers = new Map<string, (event: unknown, ...args: unknown[]) => unknown>();
+    const handlers = new Map<
+      string,
+      (event: unknown, ...args: unknown[]) => unknown
+    >();
     return {
       ipcMain: {
-        handle: (channel: string, fn: (event: never, ...args: never[]) => unknown) => {
-          handlers.set(channel, fn as unknown as (event: unknown, ...args: unknown[]) => unknown);
+        handle: (
+          channel: string,
+          fn: (event: never, ...args: never[]) => unknown,
+        ) => {
+          handlers.set(
+            channel,
+            fn as unknown as (event: unknown, ...args: unknown[]) => unknown,
+          );
         },
       } as unknown as Pick<import("electron").IpcMain, "handle">,
       call: async (channel, ...args) => {
         const fn = handlers.get(channel);
-        if (fn === undefined) throw new Error(`no handler registered for ${channel}`);
+        if (fn === undefined)
+          throw new Error(`no handler registered for ${channel}`);
         return fn(undefined, ...args);
       },
       channels: [...handlers.keys()],
@@ -785,9 +1013,9 @@ describe("registerRuntimesIpc", () => {
     expect(status.available).toBe(false);
     expect(status.provisionable).toBe(false);
 
-    await expect(call("mcp_provision_runtime", { kind: "not-a-kind" })).rejects.toThrow(
-      'unknown runtime "not-a-kind"'
-    );
+    await expect(
+      call("mcp_provision_runtime", { kind: "not-a-kind" }),
+    ).rejects.toThrow('unknown runtime "not-a-kind"');
   });
 
   it("threads the supplied emit through to mcp_provision_runtime — proven via the idempotent short-circuit (no network reachable from this test)", async () => {
@@ -805,7 +1033,9 @@ describe("registerRuntimesIpc", () => {
 
     const events: unknown[] = [];
     const { ipcMain, call } = fakeIpcMain();
-    registerRuntimesIpc(ipcMain, appDataDir, (event, payload) => events.push([event, payload]));
+    registerRuntimesIpc(ipcMain, appDataDir, (event, payload) =>
+      events.push([event, payload]),
+    );
     await call("mcp_provision_runtime", { kind: "uv" });
     expect(events).toEqual([]);
     // The publish-after-install step still ran (refreshPathPrefix), so the

@@ -35,6 +35,7 @@
  */
 
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import type { Stats } from "node:fs";
 import { lstat, stat } from "node:fs/promises";
 import path from "node:path";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
@@ -78,13 +79,24 @@ interface RecentRoomJson {
  * `Vec<T>` deserialization.
  */
 function isRecentRoomJson(x: unknown): x is RecentRoomJson {
-  if (typeof x !== "object" || x === null) {
-    return false;
-  }
-  const o = x as Record<string, unknown>;
-  if (typeof o.name !== "string" || typeof o.path !== "string") {
-    return false;
-  }
+  const room = recentRoomRecord(x);
+  return room !== null && hasRequiredRecentFields(room) && hasValidRecentOptionals(room);
+}
+
+function recentRoomRecord(x: unknown): Record<string, unknown> | null {
+  if (typeof x !== "object" || x === null) return null;
+  return x as Record<string, unknown>;
+}
+
+function hasRequiredRecentFields(room: Record<string, unknown>): boolean {
+  return typeof room.name === "string" && typeof room.path === "string";
+}
+
+function hasValidRecentOptionals(room: Record<string, unknown>): boolean {
+  return hasValidOpenedAt(room) && hasValidMissing(room);
+}
+
+function hasValidOpenedAt(room: Record<string, unknown>): boolean {
   // `openedAt` is Rust's `Option<i64>`: an INTEGER or nothing. `typeof
   // === "number"` alone is not that check — `1.5` and `1e400` (which
   // `JSON.parse` yields as `Infinity`) both pass it while serde refuses them,
@@ -93,13 +105,12 @@ function isRecentRoomJson(x: unknown): x is RecentRoomJson {
   // `null` on the very next `writeRecent`, silently rewriting a timestamp
   // nobody asked it to touch. `Number.isInteger` is the same guard
   // `windowGeometry.ts` uses for its own integer-typed fields.
-  if ("openedAt" in o && o.openedAt !== null && !Number.isInteger(o.openedAt)) {
-    return false;
-  }
-  if ("missing" in o && typeof o.missing !== "boolean") {
-    return false;
-  }
-  return true;
+  if (!("openedAt" in room) || room.openedAt === null) return true;
+  return Number.isInteger(room.openedAt);
+}
+
+function hasValidMissing(room: Record<string, unknown>): boolean {
+  return !("missing" in room) || typeof room.missing === "boolean";
 }
 
 /** Applies the two fields' Rust-side `#[serde(default)]` — `openedAt` absent
@@ -325,6 +336,8 @@ export interface RecentTrashDeps {
   currentRoomPath?: () => string | null;
 }
 
+const LEGACY_ROOM_EXTENSIONS = new Set([".arcelle", ".roomai"]);
+
 /**
  * Move one complete room to the operating-system Trash. This deliberately
  * accepts only a valid workspace root or a legacy room-file extension: the
@@ -336,39 +349,56 @@ export async function trashRoom(
   roomPath: string,
   deps: RecentTrashDeps,
 ): Promise<void> {
-  if (typeof roomPath !== "string" || roomPath.trim() === "" || !path.isAbsolute(roomPath)) {
+  const target = resolveTrashTarget(roomPath);
+  refuseOpenRoom(target, deps);
+  const info = await readTrashTarget(target);
+  validateTrashTarget(target, info);
+
+  await deps.trashItem(target);
+  removeRecent(userDataDir, roomPath);
+}
+
+function resolveTrashTarget(roomPath: string): string {
+  if (!isCompleteRoomPath(roomPath)) {
     throw new Error("A complete room path is required.");
   }
+  return path.resolve(roomPath);
+}
 
-  const target = path.resolve(roomPath);
+function isCompleteRoomPath(roomPath: unknown): roomPath is string {
+  return typeof roomPath === "string" && roomPath.trim() !== "" && path.isAbsolute(roomPath);
+}
+
+function refuseOpenRoom(target: string, deps: RecentTrashDeps): void {
   const openPath = deps.currentRoomPath?.();
   if (openPath && path.resolve(openPath) === target) {
     throw new Error("Close the room before moving it to Trash.");
   }
+}
 
-  let info;
+async function readTrashTarget(target: string): Promise<Stats> {
   try {
-    info = await lstat(target);
+    return await lstat(target);
   } catch {
     throw new Error("The room is not at that location.");
   }
+}
+
+function validateTrashTarget(target: string, info: Stats): void {
   if (info.isSymbolicLink()) {
     throw new Error("A symbolic link cannot be moved as an Arcelle room.");
   }
   if (info.isDirectory()) {
     // Reads and validates `.arcelle/room.json`; throws for an arbitrary folder.
     readWorkspaceMarker(target);
-  } else if (info.isFile()) {
-    const extension = path.extname(target).toLocaleLowerCase("en-US");
-    if (extension !== ".arcelle" && extension !== ".roomai") {
-      throw new Error("Only an Arcelle workspace or legacy room file can be moved to Trash.");
-    }
-  } else {
-    throw new Error("Only an Arcelle workspace or legacy room file can be moved to Trash.");
+    return;
   }
+  if (isLegacyRoomFile(target, info)) return;
+  throw new Error("Only an Arcelle workspace or legacy room file can be moved to Trash.");
+}
 
-  await deps.trashItem(target);
-  removeRecent(userDataDir, roomPath);
+function isLegacyRoomFile(target: string, info: Stats): boolean {
+  return info.isFile() && LEGACY_ROOM_EXTENSIONS.has(path.extname(target).toLocaleLowerCase("en-US"));
 }
 
 /**

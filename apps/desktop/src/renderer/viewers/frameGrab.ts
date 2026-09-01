@@ -161,6 +161,82 @@ export type GrabbedFrame =
   | { imageB64: string; width: number; height: number; atSeconds: number; sha256: string }
   | { error: string };
 
+function createFrameVideo(): HTMLVideoElement {
+  const video = document.createElement("video");
+  video.muted = true;
+  video.preload = "auto";
+  video.setAttribute("playsinline", "");
+  // Paired with the roommedia:// handler's Access-Control-Allow-Origin: *.
+  video.crossOrigin = "anonymous";
+  // Off-screen but in the document — WKWebView won't load detached media.
+  video.style.position = "fixed";
+  video.style.left = "-10000px";
+  video.style.width = "1px";
+  video.style.height = "1px";
+  return video;
+}
+
+function attachFrameSource(video: HTMLVideoElement, token: string, mime: string): void {
+  const source = document.createElement("source");
+  source.src = `roommedia://localhost/${token}`;
+  if (mime) source.type = mime;
+  video.appendChild(source);
+  document.body.appendChild(video);
+  video.load();
+}
+
+async function videoLoadError(video: HTMLVideoElement): Promise<string | undefined> {
+  const loaded = await mediaEvent(video, "loadedmetadata", 8000);
+  if (loaded !== "ok") return mediaLoadFailure(loaded);
+  if (!video.videoWidth || !video.videoHeight) return "That file has no video track.";
+  return undefined;
+}
+
+function frameTime(duration: number, seconds: number): number {
+  return Number.isFinite(duration)
+    ? Math.min(Math.max(0, seconds), duration)
+    : Math.max(0, seconds);
+}
+
+async function seekError(video: HTMLVideoElement, atSeconds: number): Promise<string | undefined> {
+  const seeked = await mediaEvent(video, "seeked", 8000);
+  // HAVE_CURRENT_DATA: even if "seeked" got lost, a decodable frame is up.
+  if (seeked !== "ok" && video.readyState < 2) {
+    return `Couldn't seek that video to ${atSeconds.toFixed(1)}s.`;
+  }
+  return undefined;
+}
+
+function presentationError(
+  result: Exclude<Awaited<ReturnType<typeof presentedFrame>>, { status: "presented" }>,
+): string {
+  if (result.status === "invalid-timestamp") {
+    return "That video presented a frame without a verifiable media timestamp, so no pixels were attached.";
+  }
+  return "That video did not present the requested frame before the frame-grab timeout.";
+}
+
+async function capturePresentedFrame(
+  video: HTMLVideoElement,
+  maxWidth: number,
+  atSeconds: number,
+): Promise<GrabbedFrame> {
+  try {
+    const png = drawToPng(video, video.videoWidth, video.videoHeight, maxWidth);
+    return {
+      imageB64: png.imageB64,
+      width: png.width,
+      height: png.height,
+      atSeconds,
+      // Hash the exact PNG attached to the model. The Electron host verifies
+      // this receipt again before accepting the frame into tool provenance.
+      sha256: await frameSha256(png.imageB64),
+    };
+  } catch {
+    return { error: "That video's frames couldn't be exported to an image." };
+  }
+}
+
 /** SHA-256 of the decoded frame bytes, not of their base64 spelling. Exported
  * so the renderer contract can be pinned without constructing a video DOM. */
 export async function frameSha256(imageB64: string): Promise<string> {
@@ -190,77 +266,27 @@ export async function grabFrame(
 ): Promise<GrabbedFrame> {
   if (!token) return { error: "There is no media stream to grab a frame from." };
 
-  const video = document.createElement("video");
-  video.muted = true;
-  video.preload = "auto";
-  video.setAttribute("playsinline", "");
-  // Paired with the roommedia:// handler's Access-Control-Allow-Origin: *.
-  video.crossOrigin = "anonymous";
-  // Off-screen but in the document — WKWebView won't load detached media.
-  video.style.position = "fixed";
-  video.style.left = "-10000px";
-  video.style.width = "1px";
-  video.style.height = "1px";
+  const video = createFrameVideo();
 
   try {
-    const source = document.createElement("source");
-    source.src = `roommedia://localhost/${token}`;
-    if (mime) source.type = mime;
-    video.appendChild(source);
-    document.body.appendChild(video);
-    video.load();
+    attachFrameSource(video, token, mime);
 
-    const loaded = await mediaEvent(video, "loadedmetadata", 8000);
-    if (loaded !== "ok") {
-      return { error: mediaLoadFailure(loaded) };
-    }
-    if (!video.videoWidth || !video.videoHeight) {
-      return { error: "That file has no video track." };
-    }
+    const loadError = await videoLoadError(video);
+    if (loadError) return { error: loadError };
 
-    const duration = video.duration;
-    const t = Number.isFinite(duration)
-      ? Math.min(Math.max(0, seconds), duration)
-      : Math.max(0, seconds);
-    video.currentTime = t;
-    const seeked = await mediaEvent(video, "seeked", 8000);
-    // HAVE_CURRENT_DATA: even if "seeked" got lost, a decodable frame is up.
-    if (seeked !== "ok" && video.readyState < 2) {
-      return { error: `Couldn't seek that video to ${t.toFixed(1)}s.` };
-    }
+    const atSeconds = frameTime(video.duration, seconds);
+    video.currentTime = atSeconds;
+    const failedSeek = await seekError(video, atSeconds);
+    if (failedSeek) return { error: failedSeek };
     // WKWebView fires "seeked" before the decoder has PAINTED the new frame —
     // drawing immediately captures a black canvas (the model then honestly
     // reports "a completely black screen").
     const presented = await presentedFrame(video, 2500);
-    if (presented.status === "invalid-timestamp") {
-      return {
-        error: "That video presented a frame without a verifiable media timestamp, so no pixels were attached.",
-      };
-    }
-    if (presented.status !== "presented") {
-      return {
-        error: "That video did not present the requested frame before the frame-grab timeout.",
-      };
-    }
-
-    try {
-      const png = drawToPng(video, video.videoWidth, video.videoHeight, maxWidth);
-      return {
-        imageB64: png.imageB64,
-        width: png.width,
-        height: png.height,
-        // The time actually PRESENTED, not the one asked for. A request past
-        // the end clamps to `duration`, and `presentedFrame`'s play/pause nudge
-        // advances the pipeline — so the two can differ, and a caption that
-        // asserted the requested time either way would be quietly wrong.
-        atSeconds: presented.mediaTime,
-        // Hash the exact PNG attached to the model. The Electron host verifies
-        // this receipt again before accepting the frame into tool provenance.
-        sha256: await frameSha256(png.imageB64),
-      };
-    } catch {
-      return { error: "That video's frames couldn't be exported to an image." };
-    }
+    if (presented.status !== "presented") return { error: presentationError(presented) };
+    // The time actually PRESENTED, not the one asked for. A request past the
+    // end clamps to `duration`, and the play/pause nudge can advance the
+    // pipeline, so the two can differ.
+    return capturePresentedFrame(video, maxWidth, presented.mediaTime);
   } finally {
     video.remove();
   }

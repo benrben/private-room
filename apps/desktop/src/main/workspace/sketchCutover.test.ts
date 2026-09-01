@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createToolEffects, execTool } from "../execTool.js";
 import {
   createSketch,
+  createSketchInRoom,
   execReadDrawingInRoom,
   exportSketchPngInRoom,
   exportSketchSvgInRoom,
@@ -31,8 +32,16 @@ describe("workspace drawing cutover", () => {
     const root = path.join(temporary, "Room");
     const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Room");
     const workspace = new WorkspaceService(db, root);
-    const room = { db, path: root, workspace };
+      const room = { db, path: root, workspace };
     try {
+      const manual = await createSketchInRoom(room, "Manual sketch");
+      expect(JSON.parse(await readFile(path.join(root, manual.name), "utf8"))).toMatchObject({
+        elements: [],
+      });
+      expect(listPublicFiles(db)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: manual.id, libraryVisibility: "sectionOnly" }),
+      ]));
+
       const outcome = await execTool(
         "draw",
         { name: "Flow", script: 'rect 10 10 100 80 blue "Start"' },

@@ -1,0 +1,500 @@
+
+.page-close {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--faint);
+  opacity: 0;
+}
+.page-row:hover .page-close,
+.page-row:focus-within .page-close,
+.page-row.is-current .page-close {
+  opacity: 1;
+}
+.page-close:hover {
+  color: var(--text-strong);
+  background: var(--hover);
+}
+/* Visible focus, always: the close button is reachable by Tab from the row. */
+.page-close:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.page-row.is-dragging {
+  opacity: 0.5;
+}
+
+/* ----- "Section only" / "In Library", on the object's own toolbar ----- */
+
+.library-chip-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+/* Quiet by design: this is a STATUS, and a loud badge beside a document title
+   competes with the title. It earns attention by being the exception — only
+   objects made inside a destination carry one at all. */
+.library-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  white-space: nowrap;
+}
+.library-chip.is-linked {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.library-chip.is-linked:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.library-chip-btn {
+  font-size: var(--fs-micro);
+}
+.library-chip-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 60;
+  min-width: 250px;
+  max-width: 300px;
+}
+.library-chip-q {
+  margin: 0;
+  padding: var(--sp-3);
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  line-height: 1.45;
+}
+.library-chip-q strong {
+  color: var(--text-strong);
+  font-size: var(--fs-meta);
+}
+.library-chip-actions {
+  padding: 0 var(--sp-3) var(--sp-3);
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+/* ----- center pane chrome ----- */
+
+/* The trail is SECONDARY, which is a matter of weight and colour rather than
+   of size: at 11px it was secondary by being hard to read. It runs at the
+   metadata rung, the room and folder steps sit in the secondary ink, and only
+   the thing you are actually looking at takes full ink. */
+.editor-breadcrumb-bar {
+  min-height: 32px;
+  flex: 0 0 auto;
+  padding: 2px var(--sp-2) 2px 14px;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 5px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  flex-wrap: wrap;
+  /* The room/folder trail, not the document (P0-3). */
+  user-select: none;
+}
+.editor-breadcrumb {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.editor-breadcrumb strong {
+  color: var(--muted);
+  font-weight: 400;
+}
+.editor-breadcrumb .crumb-title {
+  color: var(--text-strong);
+  font-weight: 500;
+}
+/* "← Private browser": the way back to the place this file is showing over.
+   It is deliberately NOT a step in the trail — a room document opened from the
+   browser does not live in the browser — so it is drawn as its own small
+   sketched control, set apart from the crumbs by its outline. Only appears
+   when the place and the document's context differ, which for the file areas
+   is never. */
+.crumb-back {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-height: 22px;
+  margin-left: var(--sp-1);
+  padding: 2px 9px 2px 6px;
+  border: 1px solid var(--line);
+  /* The same uneven pen-drawn radius the other small paper controls use. */
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen);
+}
+.crumb-back:hover {
+  color: var(--text-strong);
+  border-color: var(--rule-strong);
+}
+@media (prefers-reduced-motion: reduce) {
+  .crumb-back {
+    transition: none;
+  }
+}
+
+/* The generated one-liner under the breadcrumb (P1-4 left no title of its own
+   in .viewer-head for this to sit under — see ViewerPane.tsx's
+   `fileDescription`). Metadata rung, quieter than the breadcrumb above it:
+   this is a hint about the file, not a heading. Truncates hard to one line;
+   the full sentence is the strip's own tooltip. Only rendered when the file
+   has one, so most rows never pay for this space at all. */
+.viewer-file-description {
+  flex: 0 0 auto;
+  padding: 3px 14px 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  font-style: italic;
+  border-bottom: 1px solid var(--line-soft);
+  user-select: none;
+}
+
+/* Container-query adaptations: tight panes shed metadata, not actions. */
+@container (max-width: 260px) {
+  .source-meta,
+  .count-badge,
+  .area-nav-state {
+    display: none;
+  }
+  .pane-heading {
+    font-size: var(--fs-micro);
+  }
+}
+@container (max-width: 390px) {
+  .local-mini span,
+  .assistant-tab > span,
+  .context-label-prefix {
+    display: none;
+  }
+}
+
+/* ----- narrow window: one pane at a time, switched from the rail ----- */
+
+@media (max-width: 920px) {
+  .pr-topbar {
+    grid-template-columns: 38px minmax(120px, 0.6fr) minmax(180px, 1fr) auto;
+  }
+  .privacy-badge span {
+    display: none;
+  }
+  .privacy-badge {
+    width: 28px;
+    justify-content: center;
+    padding: 0;
+  }
+}
+@media (max-width: 670px) {
+  .room-identity {
+    display: none;
+  }
+  .pr-topbar {
+    grid-template-columns: 38px minmax(120px, 1fr) auto;
+  }
+  .command-wrap {
+    grid-column: 2;
+    padding-inline: var(--sp-2);
+  }
+  .top-actions {
+    grid-column: 3;
+  }
+  .command-button kbd {
+    display: none;
+  }
+  .status-left .status-item:not(:first-child) {
+    display: none;
+  }
+}
+
+/* ----- integration: legacy panes inside the new grid ----- */
+
+/* Quick-action shortcut pills (pinned workflows / global scripts): the same
+   quiet chrome as every other top-bar control. */
+.qa-pill {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xs);
+  font-size: var(--fs-meta);
+  line-height: 1;
+}
+.qa-pill:hover {
+  color: var(--text);
+  background: var(--hover);
+  border-color: var(--line);
+}
+.pop-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
+  padding: 7px 10px;
+  font-size: var(--fs-meta);
+  color: var(--text);
+  white-space: nowrap;
+}
+.pop-menu-item:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.pane-center .viewer {
+  flex: 1;
+  min-height: 0;
+  background: transparent;
+}
+.pane-ai .chat {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  width: auto;
+  max-width: none;
+  display: flex;
+  flex-direction: column;
+  border-left: 0;
+  background: transparent;
+}
+
+/* Toasts live at the shell level now — bottom-right, above the status bar. */
+.toast-stack {
+  position: fixed;
+  right: 14px;
+  bottom: 34px;
+  left: auto;
+  top: auto;
+  z-index: 70;
+}
+
+/* The import strip (kept from the old sidebar). */
+.import-strip {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: var(--sp-2) 10px 0;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: var(--panel-2);
+  font-size: var(--fs-micro);
+  color: var(--muted);
+}
+.import-strip-count {
+  color: var(--text);
+  font-weight: 500;
+}
+.import-strip-name {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--faint);
+}
+
+/* ----- Studio tab -----
+
+   Drawn in aiPane.css, scoped to `.pane-ai`. Only the scroll box is left here:
+   that sheet restates every other rule this band used to carry. */
+
+.studio-tab-view {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* Center-pane content header: quiet toolbar over the document. */
+.viewer-head {
+  min-height: 42px;
+  flex: 0 0 auto;
+  padding: var(--sp-1) 10px var(--sp-1) 14px;
+  gap: 6px;
+  border-bottom: 1px solid var(--line-soft);
+  background: transparent;
+  flex-wrap: wrap;
+  /* Toolbar, not the document (P0-3). The rename field inside it is still an
+     <input>, which base.css opts back into `text`. */
+  user-select: none;
+}
+.viewer-title {
+  font-weight: 500;
+  font-size: var(--fs-meta);
+  color: var(--text-strong);
+}
+.viewer-actions {
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
+.viewer-actions .subtle {
+  font-size: var(--fs-micro);
+  padding: 4px 7px;
+  border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
+}
+.viewer-actions .subtle:hover {
+  background: var(--hover);
+}
+
+/* Reading measure + display serif for rendered documents. */
+.md-body {
+  max-width: 72ch;
+  font-size: 14.5px;
+  line-height: 1.7;
+}
+.md-body > h1:first-child {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: clamp(26px, 3cqw, 36px);
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  color: var(--text-strong);
+  line-height: 1.18;
+}
+
+/* Compact, calm library file rows. */
+.file-row {
+  border-radius: var(--radius-xs);
+  min-height: 33px;
+}
+.file-row.selected {
+  background: var(--selected);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* Settings modal: wider, grouped nav by intent. */
+.settings {
+  width: min(720px, 94vw);
+  border-radius: var(--radius-lg);
+  background: var(--panel-2);
+}
+.settings-nav-group {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 10px;
+}
+.settings-nav-heading {
+  padding: 6px 10px 3px;
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.075em;
+}
+.settings-nav {
+  flex: 0 0 158px;
+}
+.settings-nav-item {
+  font-size: var(--fs-meta);
+  padding: 5px 10px;
+  border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
+  color: var(--muted);
+  background: none;
+  border: 0;
+  text-align: left;
+}
+.settings-nav-item:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+
+/* Command palette panel refinements. */
+.search-panel {
+  width: min(600px, 92vw);
+  background: var(--panel-2);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 22px 70px var(--shadow);
+}
+/* The launcher's own "expand into a full-page-equivalent view" (P1-2): once a
+   real query has real results, the panel grows to fit the filter strip and
+   the richer rows (find.css) instead of staying the width of a plain command
+   list. Set here, not in find.css, because .search-panel's base size is
+   already this file's — a second file setting the same property on the same
+   selector would just be the next cascade fight waiting to happen. */
+.search-panel.is-expanded {
+  width: min(880px, 94vw);
+  max-height: 82vh;
+}
+.search-input {
+  padding: 13px 15px;
+  font-size: var(--fs-body);
+}
+.search-result {
+  border-radius: var(--radius-xs);
+  padding: 7px 10px;
+}
+.search-result.sel {
+  background: var(--selected);
+}
+.search-result:disabled {
+  opacity: 0.5;
+}
+.search-result.action .search-result-title {
+  font-weight: 500;
+}
+.search-overlay {
+  background: color-mix(in srgb, var(--page) 62%, transparent);
+  backdrop-filter: blur(1.5px);
+}
+
+/* ----- Activity tab -----
+
+   The tab is drawn in aiPane.css, scoped to `.pane-ai` so it wins the tie with
+   this sheet, which loads last. What is left here is what that file does not
+   restate: the scroll box, and the fill's geometry — the fill is a <span>, so
+   without these three it has no box to fill at all. */
+
+.activity-view {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.activity-progress span {
+  display: block;
+  height: 100%;
+  width: 0;
+}
+.activity-progress span.indeterminate {
+  width: 40%;
+  animation: activity-indeterminate 1.2s ease-in-out infinite alternate;
+}
+@keyframes activity-indeterminate {
+  from {
+    margin-left: 0;
+  }
+  to {
+    margin-left: 60%;
+  }
+}

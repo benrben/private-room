@@ -133,26 +133,40 @@ export function offeredScopes(subject: ScopeSubject): BrowserScope[] {
 /** The control's words for one scope. Attached files still beat the room, and
  * are still counted the way they always were. */
 export function scopeLabel(scope: BrowserScope, subject: ScopeSubject): string {
-  if (scope === "page") return "this page";
-  if (scope === "selection") return "the selected passage";
-  if (scope === "sketch") {
-    // Named, because "this drawing" beside a Sketches list of nine is not an
-    // answer to which one. Attachments are not dropped by picking a drawing,
-    // so they are not hidden either.
-    const named = subject.sketch ? `“${subject.sketch.name}”` : "this drawing";
-    return subject.attachments === 0
-      ? named
-      : `${named} + ${subject.attachments} attached`;
-  }
-  if (scope === "objects") {
-    const n = subject.sketch?.selection.length ?? 0;
-    return n === 1 ? "the selected object" : `the ${n} selected objects`;
-  }
-  if (subject.attachments === 0) return "the whole room";
-  return `${subject.attachments} attached source${subject.attachments === 1 ? "" : "s"}`;
+  const fixed = fixedScopeLabel(scope);
+  if (fixed) return fixed;
+  if (scope === "sketch") return sketchScopeLabel(subject);
+  if (scope === "objects") return selectedObjectsLabel(subject);
+  return roomScopeLabel(subject.attachments);
 }
 
-function placeholderOf(scope: BrowserScope, subject: ScopeSubject): string {
+function fixedScopeLabel(scope: BrowserScope): string | null {
+  if (scope === "page") return "this page";
+  if (scope === "selection") return "the selected passage";
+  return null;
+}
+
+function sketchScopeLabel(subject: ScopeSubject): string {
+  // Named, because "this drawing" beside a Sketches list of nine is not an
+  // answer to which one. Attachments are not dropped by picking a drawing,
+  // so they are not hidden either.
+  const named = subject.sketch ? `“${subject.sketch.name}”` : "this drawing";
+  return subject.attachments === 0
+    ? named
+    : `${named} + ${subject.attachments} attached`;
+}
+
+function selectedObjectsLabel(subject: ScopeSubject): string {
+  const count = subject.sketch?.selection.length ?? 0;
+  return count === 1 ? "the selected object" : `the ${count} selected objects`;
+}
+
+function roomScopeLabel(attachments: number): string {
+  if (attachments === 0) return "the whole room";
+  return `${attachments} attached source${attachments === 1 ? "" : "s"}`;
+}
+
+export function placeholderOf(scope: BrowserScope, subject: ScopeSubject): string {
   if (scope === "page") return "Ask about this page…";
   if (scope === "selection") return "Ask about the selected passage…";
   if (scope === "sketch") {
@@ -197,17 +211,38 @@ export function chatScope(
   chosen: BrowserScope | null,
 ): ChatScope {
   const available = offeredScopes(subject);
-  const scope = chosen && available.includes(chosen) ? chosen : available[0];
+  const scope = chosenScope(available, chosen);
   return {
     available,
     scope,
     label: scopeLabel(scope, subject),
     placeholder: placeholderOf(scope, subject),
-    sendsPageText: scope === "page" || scope === "selection",
-    fileIds: scope === "sketch" && subject.sketch ? [subject.sketch.fileId] : [],
-    preamble:
-      scope === "objects" && subject.sketch ? selectedObjectsBlock(subject.sketch) : "",
+    sendsPageText: scopeSendsPageText(scope),
+    fileIds: scopeFileIds(scope, subject.sketch),
+    preamble: scopePreamble(scope, subject.sketch),
   };
+}
+
+function chosenScope(
+  available: readonly BrowserScope[],
+  chosen: BrowserScope | null,
+): BrowserScope {
+  if (chosen && available.includes(chosen)) return chosen;
+  return available[0];
+}
+
+function scopeSendsPageText(scope: BrowserScope): boolean {
+  return scope === "page" || scope === "selection";
+}
+
+function scopeFileIds(scope: BrowserScope, sketch: OpenSketch | null): readonly string[] {
+  if (scope !== "sketch" || sketch === null) return [];
+  return [sketch.fileId];
+}
+
+function scopePreamble(scope: BrowserScope, sketch: OpenSketch | null): string {
+  if (scope !== "objects" || sketch === null) return "";
+  return selectedObjectsBlock(sketch);
 }
 
 /** What the strip and the composer say when there is no browser and no drawing
@@ -252,20 +287,34 @@ export function pageContext(got: {
   text?: string;
   total?: number;
 }): PageContext | null {
-  const text = (got.text ?? "").trim();
+  const text = trimmedPageField(got.text);
   if (!text) return null;
-  const kept = text.length > MAX_PAGE_CHARS ? text.slice(0, MAX_PAGE_CHARS) : text;
+  const kept = clippedPageText(text);
   // The page script cuts long documents too, and reports the whole document's
   // length in `total`. Its shortfall and ours are the same thing to a reader —
   // page they were told about and did not get — so they are counted together
   // rather than reported as two separate cuts.
-  const whole = Math.max(got.total ?? 0, text.length);
+  const whole = Math.max(numberOrZero(got.total), text.length);
   return {
-    title: (got.title ?? "").trim(),
-    url: (got.url ?? "").trim(),
+    title: trimmedPageField(got.title),
+    url: trimmedPageField(got.url),
     text: kept,
     omitted: Math.max(0, whole - kept.length),
   };
+}
+
+function trimmedPageField(value: string | null | undefined): string {
+  if (value === undefined || value === null) return "";
+  return value.trim();
+}
+
+function clippedPageText(text: string): string {
+  return text.length > MAX_PAGE_CHARS ? text.slice(0, MAX_PAGE_CHARS) : text;
+}
+
+function numberOrZero(value: number | null | undefined): number {
+  if (value === undefined || value === null) return 0;
+  return value;
 }
 
 /**

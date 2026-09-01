@@ -1,0 +1,90 @@
+
+/* An actual page out of the notebook: a pencil margin rule and feint lines.
+   Both are backgrounds on the element itself — no pseudo-element, no negative
+   z-index (the trick that renders in Chrome and vanishes in WebKit), nothing
+   hit-testable, nothing in the accessibility tree.
+
+   The rules repeat every 26px and the copy's line-height is set to exactly
+   26px, so the text sits on the ruling and stays on it however long it wraps
+   instead of drifting a pixel per line. The margin rule is drawn in --rule —
+   a pencil, not the red of a school exercise book, which in this product
+   would read as "urgent". */
+.mem-sheet {
+  position: relative;
+  padding: 19px var(--sp-4) var(--sp-4) 56px;
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-radius: var(--radius);
+  background-image:
+    linear-gradient(
+      90deg,
+      transparent 0 40px,
+      color-mix(in srgb, var(--rule) 70%, transparent) 40px 41px,
+      transparent 41px
+    ),
+    repeating-linear-gradient(
+      to bottom,
+      transparent 0 25px,
+      var(--line-soft) 25px 26px
+    );
+  background-repeat: no-repeat, repeat;
+  /* Explicit lengths rather than `left 19px`: a keyword-plus-length pair is
+     valid two-value syntax, but it is one token away from the three-value
+     edge-offset syntax and reads ambiguously. `0 19px` cannot be misread, and
+     the 19px is the same as the block's own padding-top so the first rule
+     lands under the first line rather than through it. */
+  background-position:
+    0 0,
+    0 19px;
+}
+.mem-sheet-copy {
+  margin: 0 0 var(--sp-4);
+  max-width: 54ch;
+  color: var(--text);
+  font-size: var(--fs-body);
+  /* Locked to the ruling pitch above. */
+  line-height: 26px;
+}
+.mem-sheet-copy strong {
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  font-weight: 500;
+}
+
+@container mem-page (max-width: 520px) {
+  .mem-masthead {
+    flex-direction: column;
+    gap: var(--sp-4);
+  }
+  .mem-stamp {
+    padding-top: 0;
+  }
+  /* The action column folds under the memory rather than crushing it. Not on
+     a card mid-edit, which has its own three-track layout. */
+  .mem-card:not(.is-editing) {
+    grid-template-columns: 18px minmax(0, 1fr);
+  }
+  .mem-card:not(.is-editing) .mem-actions {
+    grid-row: auto;
+    grid-column: 2;
+  }
+  .mem-card.is-editing {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .mem-card.is-editing .memory-cat-select,
+  .mem-card.is-editing .mem-actions {
+    grid-column: 1;
+  }
+}
+
+/* ==========================================================================
+   4. MOTION
+   The lift, press and swash transitions both pages borrow are already covered
+   by paper.css's reduced-motion block; these are the two of our own.
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  .sk-card-ico,
+  .sk-res-row {
+    transition: none;
+  }
+}

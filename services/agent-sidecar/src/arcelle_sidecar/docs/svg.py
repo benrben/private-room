@@ -46,6 +46,8 @@ rather than re-finding it byte by byte.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 from arcelle_sidecar.docs.xml_utils import decode_basic_entities
 
 # Bound on how much text this reader contributes to the index -- same value
@@ -102,6 +104,15 @@ def _push_capped(out: list[str], s: str, total_len: list[int]) -> None:
     total_len[0] += len(trimmed.encode("utf-8"))
 
 
+def _tag_depth_after(c: str, depth: int) -> int | None:
+    """Return the new tag depth for an angle bracket, or `None` for text."""
+    if c == "<":
+        return depth + 1
+    if c == ">":
+        return depth - 1 if depth > 0 else depth
+    return None
+
+
 def _strip_inner_tags(s: str) -> str:
     """Drop any tags inside an element body, keeping the characters between
     them, then entity-decode what remains.
@@ -109,14 +120,61 @@ def _strip_inner_tags(s: str) -> str:
     out: list[str] = []
     depth = 0
     for c in s:
-        if c == "<":
-            depth += 1
-        elif c == ">":
-            if depth > 0:
-                depth -= 1
-        elif depth == 0:
+        updated_depth = _tag_depth_after(c, depth)
+        if updated_depth is not None:
+            depth = updated_depth
+            continue
+        if depth == 0:
             out.append(c)
     return decode_basic_entities("".join(out))
+
+
+def _has_tag_name_boundary(lower: str, after_name: int) -> bool:
+    if after_name >= len(lower):
+        return False
+    boundary = lower[after_name]
+    return boundary.isspace() or boundary in (">", "/")
+
+
+def _find_element_start(lower: str, element: str, from_idx: int) -> int | None:
+    """Find the next opening tag whose name is not only a longer-name prefix."""
+    open_tag = _ascii_lower(f"<{element}")
+    while True:
+        start = lower.find(open_tag, from_idx)
+        if start == -1:
+            return None
+        after_name = start + len(open_tag)
+        if _has_tag_name_boundary(lower, after_name):
+            return start
+        from_idx = after_name
+
+
+def _element_body_bounds(lower: str, element: str, start: int) -> tuple[int, int] | None:
+    """Return the content offsets of a complete text-bearing SVG element."""
+    body_rel = lower.find(">", start)
+    if body_rel == -1:
+        return None
+    body_at = body_rel + 1
+    end = lower.find(_ascii_lower(f"</{element}>"), body_at)
+    if end == -1:
+        return None
+    return body_at, end
+
+
+def _element_bodies(raw: str, lower: str, element: str) -> Iterator[str]:
+    """Yield complete bodies for one SVG text-bearing element name."""
+    from_idx = 0
+    close_length = len(f"</{element}>")
+    while True:
+        start = _find_element_start(lower, element, from_idx)
+        if start is None:
+            return
+        bounds = _element_body_bounds(lower, element, start)
+        if bounds is None:
+            return
+        body_at, end = bounds
+        yield raw[body_at:end]
+        from_idx = end + close_length
 
 
 def extract_svg(raw: str) -> str | None:
@@ -127,37 +185,10 @@ def extract_svg(raw: str) -> str | None:
     total_len = [0]
     lower = _ascii_lower(raw)
     for element in _TEXT_ELEMENTS:
-        open_tag = f"<{element}"
-        open_lower = _ascii_lower(open_tag)
-        close_tag = f"</{element}>"
-        close_lower = _ascii_lower(close_tag)
-        from_idx = 0
-        while True:
-            start = lower.find(open_lower, from_idx)
-            if start == -1:
-                break
-            # Skip a longer element that merely starts with this name
-            # (`<textPath>` when looking for `<text>`): the character after
-            # the name must end the tag name.
-            after_name = start + len(open_tag)
-            boundary = lower[after_name] if after_name < len(lower) else None
-            if boundary is None or not (boundary.isspace() or boundary in (">", "/")):
-                from_idx = after_name
-                continue
-            body_rel = lower.find(">", start)
-            if body_rel == -1:
-                break
-            body_at = body_rel + 1
-            end = lower.find(close_lower, body_at)
-            if end == -1:
-                break
-            # Nested markup inside a <text> (a <tspan> per line) is read by
-            # the tspan pass; here just take the characters between the
-            # tags.
-            inner = _strip_inner_tags(raw[body_at:end]).strip()
+        for body in _element_bodies(raw, lower, element):
+            inner = _strip_inner_tags(body).strip()
             if inner:
                 _push_capped(out, inner, total_len)
                 _push_capped(out, "\n", total_len)
-            from_idx = end + len(close_tag)
     result = "".join(out)
     return result if result.strip() else None

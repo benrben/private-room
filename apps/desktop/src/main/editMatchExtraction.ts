@@ -121,52 +121,34 @@ export function isUnicodeWhitespace(c: string): boolean {
   return WHITE_SPACE_RE.test(c);
 }
 
-/** Ported verbatim from `extraction::fold_edit_char`. See the module doc for
- * why this switches on the NUMERIC code point rather than a literal
- * character in a `case` label. */
+// Zero-widths precede the whitespace guard (U+200B is not White_Space and
+// U+FEFF is a BOM); NUL is the matcher's paragraph/block sentinel.
+const EDIT_DROP_CODE_POINTS = new Set([0x0000, 0x200b, 0x200c, 0x200d, 0xfeff]);
+const EDIT_CHAR_FOLDS = new Map<number, string>([
+  [0x2018, "'"], [0x2019, "'"], [0x02bc, "'"], // apostrophes
+  [0x201c, '"'], [0x201d, '"'], // double quotes
+  [0x2010, "-"], [0x2011, "-"], [0x2012, "-"], [0x2013, "-"],
+  [0x2014, "-"], [0x2212, "-"], [0x05be, "-"], // dash/minus/maqaf
+]);
+const EDIT_PAIR_FOLDS = new Map<number, readonly [string, string]>([
+  [0xfb01, ["f", "i"]], // fi ligature
+  [0xfb02, ["f", "l"]], // fl ligature
+]);
+
+function mappedEditChar(codePoint: number): FoldOut | undefined {
+  if (EDIT_DROP_CODE_POINTS.has(codePoint)) return FOLD_DROP;
+  const character = EDIT_CHAR_FOLDS.get(codePoint);
+  if (character !== undefined) return foldChar(character);
+  const pair = EDIT_PAIR_FOLDS.get(codePoint);
+  return pair === undefined ? undefined : foldPair(pair[0], pair[1]);
+}
+
+/** Ported verbatim from `extraction::fold_edit_char`. The numeric lookup keeps
+ * the source's code-point semantics while making each fold family explicit. */
 export function foldEditChar(c: string): FoldOut {
-  switch (c.codePointAt(0)) {
-    // Zero-widths: must precede the whitespace guard (U+200B is NOT
-    // White_Space in Unicode, and U+FEFF is a BOM/no-break marker).
-    case 0x200b: // ZERO WIDTH SPACE
-    case 0x200c: // ZERO WIDTH NON-JOINER
-    case 0x200d: // ZERO WIDTH JOINER
-    case 0xfeff: // ZERO WIDTH NO-BREAK SPACE / BOM
-      return FOLD_DROP;
-    // NUL is never document content, and the docx/HTML/text matchers all use
-    // it as their PARAGRAPH/block separator — a sentinel that must never be
-    // matchable. NUL is not whitespace in Rust (nor under `White_Space`), so
-    // without this explicit guard a needle carrying one would survive
-    // normalization intact and could match a separator.
-    case 0x0000: // NUL
-      return FOLD_DROP;
-    // Curly / modifier apostrophes -> straight single quote.
-    case 0x2018: // LEFT SINGLE QUOTATION MARK
-    case 0x2019: // RIGHT SINGLE QUOTATION MARK
-    case 0x02bc: // MODIFIER LETTER APOSTROPHE
-      return foldChar("'");
-    // Curly double quotes -> straight double quote.
-    case 0x201c: // LEFT DOUBLE QUOTATION MARK
-    case 0x201d: // RIGHT DOUBLE QUOTATION MARK
-      return foldChar('"');
-    // Hyphen/dash/minus/maqaf family -> ASCII hyphen.
-    case 0x2010: // HYPHEN
-    case 0x2011: // NON-BREAKING HYPHEN
-    case 0x2012: // FIGURE DASH
-    case 0x2013: // EN DASH
-    case 0x2014: // EM DASH
-    case 0x2212: // MINUS SIGN
-    case 0x05be: // HEBREW PUNCTUATION MAQAF
-      return foldChar("-");
-    // fi/fl ligatures — boundary-safe expansion. Extracted PDF/docx text
-    // often carries these while the model types ASCII.
-    case 0xfb01: // LATIN SMALL LIGATURE FI
-      return foldPair("f", "i");
-    case 0xfb02: // LATIN SMALL LIGATURE FL
-      return foldPair("f", "l");
-    default:
-      return isUnicodeWhitespace(c) ? FOLD_SPACE : foldChar(c);
-  }
+  const mapped = mappedEditChar(c.codePointAt(0) ?? -1);
+  if (mapped !== undefined) return mapped;
+  return isUnicodeWhitespace(c) ? FOLD_SPACE : foldChar(c);
 }
 
 // ------------------------------------------------------------------ text decode
@@ -321,46 +303,54 @@ export function decodeBasicEntities(s: string): string {
   }
   let out = "";
   let rest = s;
-  for (;;) {
-    const amp = rest.indexOf("&");
-    if (amp === -1) {
-      return out + rest;
-    }
-    out += rest.slice(0, amp);
-    const after = rest.slice(amp + 1);
-    let semi = -1;
-    for (let i = 0; i < after.length && i <= MAX_ENTITY_LEN; i++) {
-      if (after[i] === ";") {
-        semi = i;
-        break;
-      }
-    }
-    if (semi === -1) {
-      // A bare `&` — emit it and carry on from just after it, so the next
-      // search cannot rediscover this same one and loop forever.
-      out += "&";
-      rest = after;
-      continue;
-    }
-    const body = after.slice(0, semi);
-    const decoded = decodeEntityBodyLoose(body);
-    out += decoded ?? `&${body};`;
-    rest = after.slice(semi + 1);
+  while (rest !== "") {
+    const segment = nextEntitySegment(rest);
+    out += segment.text;
+    rest = segment.rest;
   }
+  return out;
+}
+
+function entityTerminator(s: string): number {
+  const limit = Math.min(s.length, MAX_ENTITY_LEN + 1);
+  for (let index = 0; index < limit; index++) {
+    if (s[index] === ";") return index;
+  }
+  return -1;
+}
+
+function nextEntitySegment(rest: string): { readonly text: string; readonly rest: string } {
+  const amp = rest.indexOf("&");
+  if (amp === -1) return { text: rest, rest: "" };
+  const prefix = rest.slice(0, amp);
+  const after = rest.slice(amp + 1);
+  const semi = entityTerminator(after);
+  if (semi === -1) {
+    // A bare `&` — emit it and carry on from just after it, so the next
+    // search cannot rediscover this same one and loop forever.
+    return { text: `${prefix}&`, rest: after };
+  }
+  const body = after.slice(0, semi);
+  return { text: prefix + (decodeEntityBodyLoose(body) ?? `&${body};`), rest: after.slice(semi + 1) };
+}
+
+function scalarCharacter(code: number): string | null {
+  return isScalarValue(code) ? String.fromCodePoint(code) : null;
+}
+
+function decodeHexEntity(hex: string): string | null {
+  if (!/^[0-9a-fA-F]+$/.test(hex)) return null;
+  return scalarCharacter(Number.parseInt(hex, 16));
+}
+
+function decodeNumericEntity(digits: string): string | null {
+  if (digits.startsWith("x") || digits.startsWith("X")) return decodeHexEntity(digits.slice(1));
+  if (!/^[0-9]+$/.test(digits)) return null;
+  return scalarCharacter(Number.parseInt(digits, 10));
 }
 
 function decodeEntityBodyLoose(body: string): string | null {
-  if (body.startsWith("#")) {
-    const digits = body.slice(1);
-    let code: number | null = null;
-    if (digits.startsWith("x") || digits.startsWith("X")) {
-      const hex = digits.slice(1);
-      code = /^[0-9a-fA-F]+$/.test(hex) ? Number.parseInt(hex, 16) : null;
-    } else if (/^[0-9]+$/.test(digits)) {
-      code = Number.parseInt(digits, 10);
-    }
-    return code !== null && isScalarValue(code) ? String.fromCodePoint(code) : null;
-  }
+  if (body.startsWith("#")) return decodeNumericEntity(body.slice(1));
   return NAMED_ENTITIES.get(asciiLower(body)) ?? null;
 }
 
@@ -374,28 +364,37 @@ function decodeEntityBodyLoose(body: string): string | null {
  * `extraction::strip_tags`.
  */
 export function stripTags(input: string): string {
-  let out = "";
-  let inTag = false;
-  let quote: string | null = null;
-  for (const c of input) {
-    if (inTag) {
-      if (quote !== null) {
-        if (c === quote) {
-          quote = null;
-        }
-      } else if (c === '"' || c === "'") {
-        quote = c;
-      } else if (c === ">") {
-        inTag = false;
-        out += " ";
-      }
-    } else if (c === "<") {
-      inTag = true;
-    } else {
-      out += c;
-    }
+  const state = { out: "", inTag: false, quote: null as string | null };
+  for (const character of input) {
+    consumeTagCharacter(state, character);
   }
-  return decodeBasicEntities(out);
+  return decodeBasicEntities(state.out);
+}
+
+function consumeTagCharacter(state: { out: string; inTag: boolean; quote: string | null }, character: string): void {
+  if (!state.inTag) {
+    consumeTextCharacter(state, character);
+    return;
+  }
+  const tag = tagCharacterState(state.quote, character);
+  state.quote = tag.quote;
+  if (!tag.closed) return;
+  state.inTag = false;
+  state.out += " ";
+}
+
+function consumeTextCharacter(state: { out: string; inTag: boolean }, character: string): void {
+  if (character === "<") {
+    state.inTag = true;
+    return;
+  }
+  state.out += character;
+}
+
+function tagCharacterState(quote: string | null, character: string): { readonly quote: string | null; readonly closed: boolean } {
+  if (quote !== null) return { quote: character === quote ? null : quote, closed: false };
+  if (character === '"' || character === "'") return { quote: character, closed: false };
+  return { quote: null, closed: character === ">" };
 }
 
 /** Text of an OOXML part, keeping its paragraph structure: the paragraph

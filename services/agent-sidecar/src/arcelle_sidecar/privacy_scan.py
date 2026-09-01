@@ -123,14 +123,56 @@ def _chunks(text: str) -> list[str]:
     return out
 
 
+def _looks_like_email(text: str) -> bool:
+    return "@" in text and "." in text
+
+
+def _looks_like_phone(text: str) -> bool:
+    digits = sum(character.isdigit() for character in text)
+    return digits >= 6 and digits >= len(text) // 2
+
+
 def _guess_category(text: str) -> str:
     """Best-effort category for a bare-string finding (no dict around it)."""
-    if "@" in text and "." in text:
+    if _looks_like_email(text):
         return "email"
-    digits = sum(c.isdigit() for c in text)
-    if digits >= 6 and digits >= len(text) // 2:
+    if _looks_like_phone(text):
         return "phone"
     return "concept"
+
+
+def _finding_items(raw: str) -> list[Any] | None:
+    try:
+        data = json.loads(recover_json(raw))
+    except (ValueError, TypeError):
+        return None
+    if isinstance(data, dict):
+        return data.get("entities")
+    return data if isinstance(data, list) else None
+
+
+def _normalized_category(value: object) -> str:
+    category = str(value).strip()
+    return category if category in CATEGORIES else "concept"
+
+
+def _mapping_finding(item: dict[Any, Any]) -> tuple[str, str]:
+    text = str(item.get("text", "")).strip()
+    category = _normalized_category(item.get("category", ""))
+    return text, category
+
+
+def _item_finding(item: object) -> tuple[str, str] | None:
+    if isinstance(item, dict):
+        return _mapping_finding(item)
+    if isinstance(item, str):
+        text = item.strip()
+        return text, _guess_category(text)
+    return None
+
+
+def _is_verified_finding(text: str, folded_chunk: str) -> bool:
+    return len(text) >= 2 and text.casefold() in folded_chunk
 
 
 def _parse_findings(raw: str, chunk: str) -> list[dict[str, str]]:
@@ -142,35 +184,20 @@ def _parse_findings(raw: str, chunk: str) -> list[dict[str, str]]:
     a bare list of strings. Every finding is still verbatim-verified against
     the chunk — the tolerance is about SHAPE, never about content.
     """
-    try:
-        data = json.loads(recover_json(raw))
-    except (ValueError, TypeError):
-        return []
-    if isinstance(data, dict):
-        items = data.get("entities")
-    elif isinstance(data, list):
-        items = data
-    else:
-        items = None
+    items = _finding_items(raw)
     if not isinstance(items, list):
         return []
     low = chunk.casefold()
     out: list[dict[str, str]] = []
     for item in items:
-        if isinstance(item, dict):
-            text = str(item.get("text", "")).strip()
-            category = str(item.get("category", "")).strip() or "concept"
-            if category not in CATEGORIES:
-                category = "concept"
-        elif isinstance(item, str):
-            text = item.strip()
-            category = _guess_category(text)
-        else:
+        finding = _item_finding(item)
+        if finding is None:
             continue
+        text, category = finding
         # Verbatim check (case-insensitive): drop hallucinated strings. Length
         # floor keeps single characters / stray digits from becoming rules that
         # would shred ordinary text.
-        if len(text) < 2 or text.casefold() not in low:
+        if not _is_verified_finding(text, low):
             continue
         out.append({"text": text, "category": category})
     return out
@@ -192,6 +219,65 @@ class ScanResult(NamedTuple):
     chunks_failed: int = 0
     #: True when the per-scan finding cap cut the pass short.
     capped: bool = False
+
+
+def _cleaned_concepts(concepts: list[str] | None) -> list[str]:
+    return [concept.strip() for concept in (concepts or []) if concept.strip()]
+
+
+def _known_keys(known: list[str] | None) -> set[str]:
+    return {value.casefold() for value in (known or [])}
+
+
+def _scan_context(
+    concepts: list[str] | None, known: list[str] | None
+) -> tuple[str, set[str]]:
+    return _scan_prompt(_cleaned_concepts(concepts)), _known_keys(known)
+
+
+def _is_global_engine_failure(error: llm.LlmError) -> bool:
+    return error.code in {"MODEL_MISSING", "OLLAMA_DOWN"}
+
+
+async def _scan_chunk(
+    chunk: str, *, model: str, prompt: str, base_url: str
+) -> str | None:
+    try:
+        return await llm.generate(
+            model,
+            [system_message(prompt), user_message(chunk)],
+            base_url,
+            temperature=0.0,
+            num_predict=NUM_PREDICT,
+            format=SCAN_SCHEMA,
+        )
+    except asyncio.CancelledError:
+        # The client hung up (``until_hangup``). Not our failure to absorb.
+        raise
+    except llm.LlmError as error:
+        # A missing model or unreachable daemon is not one bad document chunk.
+        # Let the route preserve its MODEL_MISSING / OLLAMA_DOWN contract.
+        if _is_global_engine_failure(error):
+            raise
+    except Exception:  # noqa: BLE001 - any engine failure is one bad chunk
+        pass
+    log.warning("privacy scan: chunk failed, continuing")
+    return None
+
+
+def _add_new_findings(
+    found: dict[str, dict[str, str]],
+    findings: list[dict[str, str]],
+    known_keys: set[str],
+) -> bool:
+    for finding in findings:
+        key = finding["text"].casefold()
+        if key in known_keys or key in found:
+            continue
+        found[key] = finding
+        if len(found) >= MAX_FINDINGS:
+            return True
+    return False
 
 
 async def scan_text(
@@ -217,49 +303,20 @@ async def scan_text(
     """
     if is_nonlocal_model(model):
         raise ValueError("privacy scan must run on a local model")
-    concepts = [c.strip() for c in (concepts or []) if c.strip()]
-    known_keys = {k.casefold() for k in (known or [])}
-    prompt = _scan_prompt(concepts)
+    prompt, known_keys = _scan_context(concepts, known)
 
     found: dict[str, dict[str, str]] = {}
     failed = 0
     for chunk in _chunks(text):
-        try:
-            raw = await llm.generate(
-                model,
-                [system_message(prompt), user_message(chunk)],
-                base_url,
-                temperature=0.0,
-                num_predict=NUM_PREDICT,
-                format=SCAN_SCHEMA,
-            )
-        except asyncio.CancelledError:
-            # The client hung up (``until_hangup``). Not our failure to absorb.
-            raise
-        except llm.LlmError as exc:
-            # A missing model or unreachable daemon is not one bad document
-            # chunk. Swallowing either made the host try every file, report
-            # "20 incomplete files", and hide the actionable engine error.
-            # Let the route preserve its MODEL_MISSING / OLLAMA_DOWN contract.
-            if exc.code in {"MODEL_MISSING", "OLLAMA_DOWN"}:
-                raise
+        raw = await _scan_chunk(chunk, model=model, prompt=prompt, base_url=base_url)
+        if raw is None:
             failed += 1
-            log.warning("privacy scan: chunk failed, continuing")
             continue
-        except Exception:  # noqa: BLE001 - any engine failure is one bad chunk
-            failed += 1
-            log.warning("privacy scan: chunk failed, continuing")
-            continue
-        for finding in _parse_findings(raw, chunk):
-            key = finding["text"].casefold()
-            if key in known_keys or key in found:
-                continue
-            found[key] = finding
-            if len(found) >= MAX_FINDINGS:
-                # Capped, so the rest of the document was never read. The host
-                # re-scans with these entities in ``known``, so the next pass
-                # finds the NEXT 300 rather than the same ones.
-                return ScanResult(list(found.values()), False, failed, True)
+        if _add_new_findings(found, _parse_findings(raw, chunk), known_keys):
+            # Capped, so the rest of the document was never read. The host
+            # re-scans with these entities in ``known``, so the next pass
+            # finds the NEXT 300 rather than the same ones.
+            return ScanResult(list(found.values()), False, failed, True)
     return ScanResult(list(found.values()), failed == 0, failed, False)
 
 

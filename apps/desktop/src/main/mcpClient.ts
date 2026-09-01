@@ -136,43 +136,58 @@ export function configKey(cfg: ServerConfig): string {
  *
  * Ported verbatim from `parse_config`.
  */
-export function parseMcpConfig(json: string): Array<[string, ServerConfig]> {
-  let root: unknown;
+function parseMcpConfigJson(json: string): unknown {
   try {
-    root = JSON.parse(json);
+    return JSON.parse(json);
   } catch (e) {
     throw new Error(`Config is not valid JSON: ${errMessage(e)}`);
   }
-  const servers = isPlainObject(root) && isPlainObject(root["mcpServers"]) ? root["mcpServers"] : null;
-  if (servers === null) {
+}
+
+function mcpServers(root: unknown): Record<string, unknown> {
+  if (!isPlainObject(root) || !isPlainObject(root["mcpServers"])) {
     throw new Error('Config needs a top-level "mcpServers" object.');
   }
+  return root["mcpServers"];
+}
+
+function remoteMcpServer(server: Record<string, unknown>): boolean {
+  const type = typeof server["type"] === "string" ? server["type"] : "";
+  return type === "http" || type === "streamable-http" || type === "sse" || typeof server["url"] === "string";
+}
+
+function remoteTransport(name: string, server: Record<string, unknown>): Transport {
+  const url = server["url"];
+  if (typeof url !== "string") {
+    throw new Error(`Remote server "${name}" is missing "url".`);
+  }
+  return { kind: "http", url, headers: stringMap(server["headers"]) };
+}
+
+function localTransport(name: string, server: Record<string, unknown>): Transport {
+  const command = server["command"];
+  if (typeof command !== "string") {
+    throw new Error(`Server "${name}" needs a "command" (local) or a "url" (remote).`);
+  }
+  const rawArgs = server["args"];
+  const args = Array.isArray(rawArgs) ? rawArgs.filter((value): value is string => typeof value === "string") : [];
+  return { kind: "stdio", command, args, env: stringMap(server["env"]) };
+}
+
+function parsedMcpServer(name: string, raw: unknown): ServerConfig {
+  const server = isPlainObject(raw) ? raw : {};
+  const transport = remoteMcpServer(server) ? remoteTransport(name, server) : localTransport(name, server);
+  return { transport, disabled: server["disabled"] === true };
+}
+
+export function parseMcpConfig(json: string): Array<[string, ServerConfig]> {
+  const servers = mcpServers(parseMcpConfigJson(json));
   const out: Array<[string, ServerConfig]> = [];
   for (const [name, raw] of Object.entries(servers)) {
-    const s = isPlainObject(raw) ? raw : {};
-    const disabled = s["disabled"] === true;
     // Remote if it declares an http/https type OR simply carries a url. A
     // "command" present alongside a url still means remote — the url wins,
     // matching how Claude Desktop treats `"type": "http"`.
-    const ty = typeof s["type"] === "string" ? s["type"] : "";
-    const hasUrl = typeof s["url"] === "string";
-    let transport: Transport;
-    if (ty === "http" || ty === "streamable-http" || ty === "sse" || hasUrl) {
-      const url = s["url"];
-      if (typeof url !== "string") {
-        throw new Error(`Remote server "${name}" is missing "url".`);
-      }
-      transport = { kind: "http", url, headers: stringMap(s["headers"]) };
-    } else {
-      const command = s["command"];
-      if (typeof command !== "string") {
-        throw new Error(`Server "${name}" needs a "command" (local) or a "url" (remote).`);
-      }
-      const rawArgs = s["args"];
-      const args = Array.isArray(rawArgs) ? rawArgs.filter((x): x is string => typeof x === "string") : [];
-      transport = { kind: "stdio", command, args, env: stringMap(s["env"]) };
-    }
-    out.push([name, { transport, disabled }]);
+    out.push([name, parsedMcpServer(name, raw)]);
   }
   return out;
 }
@@ -298,6 +313,90 @@ function asStr(v: unknown): string {
   return typeof v === "string" ? v : "";
 }
 
+interface FlattenedToolOutput {
+  readonly parts: string[];
+  readonly images: string[];
+}
+
+function addTextBlock(block: Record<string, unknown>, output: FlattenedToolOutput): void {
+  const text = block["text"];
+  if (typeof text === "string") output.parts.push(text);
+}
+
+function addImageBlock(block: Record<string, unknown>, output: FlattenedToolOutput): void {
+  const mime = asStr(block["mimeType"]).toLowerCase();
+  if (!TOOL_IMAGE_MIMES.has(mime)) {
+    output.parts.push(`[image omitted: unsupported format "${mime}"]`);
+    return;
+  }
+  const data = asStr(block["data"]);
+  if (data.length > MAX_TOOL_IMAGE_B64) {
+    output.parts.push("[image omitted: too large to attach]");
+    return;
+  }
+  if (output.images.length >= MAX_TOOL_IMAGES) {
+    output.parts.push("[further images omitted]");
+    return;
+  }
+  output.images.push(data);
+}
+
+function resourceContent(resource: Record<string, unknown>): string {
+  const uri = asStr(resource["uri"]);
+  const name = uri === "" ? "resource" : uri;
+  if (typeof resource["text"] === "string") return resource["text"];
+  if (typeof resource["blob"] === "string") {
+    const mime = typeof resource["mimeType"] === "string" ? resource["mimeType"] : "unknown type";
+    return `[binary resource omitted: ${name} (${mime})]`;
+  }
+  return `[resource omitted: ${name} carried no content]`;
+}
+
+function addResourceBlock(block: Record<string, unknown>, output: FlattenedToolOutput): void {
+  output.parts.push(resourceContent(asRecord(block["resource"])));
+}
+
+function addResourceLinkBlock(block: Record<string, unknown>, output: FlattenedToolOutput): void {
+  const uri = asStr(block["uri"]);
+  output.parts.push(uri !== "" ? `[resource link: ${uri}]` : "[resource link omitted: no uri]");
+}
+
+const CALL_RESULT_BLOCK_HANDLERS = new Map<string, (block: Record<string, unknown>, output: FlattenedToolOutput) => void>([
+  ["text", addTextBlock],
+  ["image", addImageBlock],
+  ["resource", addResourceBlock],
+  ["resource_link", addResourceLinkBlock],
+]);
+
+function addCallResultBlock(raw: unknown, output: FlattenedToolOutput): void {
+  const block = asRecord(raw);
+  const type = block["type"];
+  if (typeof type !== "string") return;
+  const handler = CALL_RESULT_BLOCK_HANDLERS.get(type);
+  if (handler !== undefined) {
+    handler(block, output);
+    return;
+  }
+  output.parts.push(`[${type} content omitted]`);
+}
+
+function flattenedContent(result: Record<string, unknown>): FlattenedToolOutput {
+  const output: FlattenedToolOutput = { parts: [], images: [] };
+  for (const raw of asArray(result["content"])) addCallResultBlock(raw, output);
+  if (output.parts.length === 0 && output.images.length === 0 && "structuredContent" in result) {
+    output.parts.push(JSON.stringify(result["structuredContent"]));
+  }
+  return output;
+}
+
+function throwToolError(result: Record<string, unknown>, text: string): void {
+  if (result["isError"] === true) throw new Error(text === "" ? "Tool failed." : text);
+}
+
+function defaultToolText(text: string, images: readonly string[]): string {
+  return text === "" && images.length === 0 ? "(no output)" : text;
+}
+
 /**
  * Normalize a `tools/call` result (or throw when the tool reported `isError`).
  * Shared by both transports — `structuredContent` is a fallback, and empty
@@ -316,91 +415,46 @@ function asStr(v: unknown): string {
  * `block["type"].as_str()` returning `None`.
  */
 export function flattenCallResult(result: unknown): ToolOutput {
-  const r = asRecord(result);
-  const parts: string[] = [];
-  const images: string[] = [];
-  for (const raw of asArray(r["content"])) {
-    const block = asRecord(raw);
-    const type = typeof block["type"] === "string" ? block["type"] : undefined;
-    switch (type) {
-      case "text": {
-        const t = block["text"];
-        if (typeof t === "string") parts.push(t);
-        break;
-      }
-      case "image": {
-        const mime = asStr(block["mimeType"]).toLowerCase();
-        const data = asStr(block["data"]);
-        if (!TOOL_IMAGE_MIMES.has(mime)) {
-          parts.push(`[image omitted: unsupported format "${mime}"]`);
-        } else if (data.length > MAX_TOOL_IMAGE_B64) {
-          parts.push("[image omitted: too large to attach]");
-        } else if (images.length >= MAX_TOOL_IMAGES) {
-          parts.push("[further images omitted]");
-        } else {
-          images.push(data);
-        }
-        break;
-      }
-      // An embedded resource CARRIES its payload: `text` for a text resource,
-      // base64 `blob` for a binary one. Flattening it to "[resource content
-      // omitted]" threw away the very answer.
-      case "resource": {
-        const resource = asRecord(block["resource"]);
-        const uri = asStr(resource["uri"]);
-        const named = uri === "" ? "resource" : uri;
-        if (typeof resource["text"] === "string") {
-          parts.push(resource["text"]);
-        } else if (typeof resource["blob"] === "string") {
-          const mime = typeof resource["mimeType"] === "string" ? resource["mimeType"] : "unknown type";
-          parts.push(`[binary resource omitted: ${named} (${mime})]`);
-        } else {
-          parts.push(`[resource omitted: ${named} carried no content]`);
-        }
-        break;
-      }
-      // A link has no payload of its own; its uri IS the content.
-      case "resource_link": {
-        const uri = asStr(block["uri"]);
-        parts.push(uri !== "" ? `[resource link: ${uri}]` : "[resource link omitted: no uri]");
-        break;
-      }
-      case undefined:
-        break;
-      default:
-        parts.push(`[${type} content omitted]`);
-    }
-  }
-  if (parts.length === 0 && images.length === 0 && "structuredContent" in r) {
-    parts.push(JSON.stringify(r["structuredContent"]));
-  }
-  let text = parts.join("\n");
-  if (r["isError"] === true) {
-    throw new Error(text === "" ? "Tool failed." : text);
-  }
-  if (text === "" && images.length === 0) {
-    text = "(no output)";
-  }
-  return { text, images };
+  const record = asRecord(result);
+  const output = flattenedContent(record);
+  const text = output.parts.join("\n");
+  throwToolError(record, text);
+  return { text: defaultToolText(text, output.images), images: output.images };
+}
+
+function toolSchema(value: unknown): Record<string, unknown> {
+  return isPlainObject(value) ? value : { type: "object", properties: {} };
+}
+
+function toolAnnotations(value: unknown): Record<string, unknown> | null {
+  return isPlainObject(value) ? value : null;
+}
+
+function toolFromResult(value: unknown): Tool | null {
+  const record = asRecord(value);
+  if (typeof record["name"] !== "string") return null;
+  return {
+    name: record["name"],
+    description: asStr(record["description"]),
+    schema: toolSchema(record["inputSchema"]),
+    annotations: toolAnnotations(record["annotations"]),
+  };
+}
+
+function nextToolCursor(result: Record<string, unknown>): string | null {
+  return typeof result["nextCursor"] === "string" ? result["nextCursor"] : null;
 }
 
 /** Collect `tools/list` records (one page) into `tools`. Shared by both
  * transports; returns the `nextCursor` for pagination. Ported verbatim from
  * `collect_tools`. */
 export function collectTools(result: unknown, into: Tool[]): string | null {
-  const r = asRecord(result);
-  for (const raw of asArray(r["tools"])) {
-    const t = asRecord(raw);
-    if (typeof t["name"] === "string") {
-      into.push({
-        name: t["name"],
-        description: typeof t["description"] === "string" ? t["description"] : "",
-        schema: isPlainObject(t["inputSchema"]) ? t["inputSchema"] : { type: "object", properties: {} },
-        annotations: isPlainObject(t["annotations"]) ? t["annotations"] : null,
-      });
-    }
+  const record = asRecord(result);
+  for (const raw of asArray(record["tools"])) {
+    const tool = toolFromResult(raw);
+    if (tool !== null) into.push(tool);
   }
-  return typeof r["nextCursor"] === "string" ? r["nextCursor"] : null;
+  return nextToolCursor(record);
 }
 
 /** Whether a JSON-RPC reply carries a real `error` member. An explicit
@@ -412,533 +466,12 @@ function jsonRpcError(msg: Record<string, unknown>): string | null {
   const m = asRecord(err)["message"];
   return typeof m === "string" ? m : "unknown error";
 }
+import { StdioClient } from "./mcpStdioClient.js";
+export { lineReaderEofSequenceForTests, STDERR_TAIL_MAX, pushStderrLine, loginShellPath, resetLoginShellPathCacheForTests } from "./mcpStdioClient.js";
+export type { StdioConnectOptions } from "./mcpStdioClient.js";
 
-// -------------------------------------------------------------- line reader
+export { authErrorMessage, parseHttpMessage, connectMcpClient } from "./mcpHttpClient.js";
+export type { HttpConnectOptions, ConnectMcpClientOptions } from "./mcpHttpClient.js";
 
-/**
- * Reassembles newline-delimited bytes off a readable stream into whole lines,
- * one at a time — Node's analogue of `tokio::io::BufReader::lines()`. Only ONE
- * `nextLine()` call is ever outstanding at a time in this file's own usage
- * (each client serializes its own requests), which is what makes the
- * single-slot `waiter` below sufficient. See the module doc's first DEVIATION
- * note for the one cancel-safety gap this simplification has relative to tokio.
- */
-class LineReader {
-  private buffer = "";
-  private queue: string[] = [];
-  private waiter: ((line: string | null) => void) | null = null;
-  private ended = false;
 
-  constructor(stream: NodeJS.ReadableStream) {
-    stream.setEncoding("utf8");
-    stream.on("data", (chunk: string) => {
-      this.buffer += chunk;
-      let idx: number;
-      while ((idx = this.buffer.indexOf("\n")) !== -1) {
-        const line = this.buffer.slice(0, idx);
-        this.buffer = this.buffer.slice(idx + 1);
-        this.deliver(line);
-      }
-    });
-    const onEnd = (): void => {
-      this.ended = true;
-      this.deliver(null);
-    };
-    stream.on("end", onEnd);
-    stream.on("close", onEnd);
-    stream.on("error", onEnd);
-  }
-
-  private deliver(line: string | null): void {
-    if (this.waiter !== null) {
-      const w = this.waiter;
-      this.waiter = null;
-      w(line);
-    } else if (line !== null) {
-      this.queue.push(line);
-    }
-  }
-
-  /** Next full line, or `null` at EOF. Mirrors `Lines::next_line()`'s
-   * `Option<String>`. */
-  nextLine(): Promise<string | null> {
-    const queued = this.queue.shift();
-    if (queued !== undefined) {
-      return Promise.resolve(queued);
-    }
-    if (this.ended) {
-      return Promise.resolve(null);
-    }
-    return new Promise((resolve) => {
-      this.waiter = resolve;
-    });
-  }
-}
-
-/** Race one `nextLine()` read against an absolute deadline. Throws
- * `"__timeout__"` on expiry, which callers translate into the Rust source's own
- * wording (`"Server timed out on {method}."`). */
-async function nextLineWithDeadline(reader: LineReader, deadlineAt: number): Promise<string | null> {
-  const remaining = deadlineAt - Date.now();
-  if (remaining <= 0) {
-    throw new Error("__timeout__");
-  }
-  let timer: ReturnType<typeof setTimeout>;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error("__timeout__")), remaining);
-  });
-  try {
-    return await Promise.race([reader.nextLine(), timeout]);
-  } finally {
-    clearTimeout(timer!);
-  }
-}
-
-// ------------------------------------------------------------ stderr tail
-
-/** How much of a stdio server's stderr we keep for its error message, in UTF-8
- * bytes (matching Rust's byte-length cap). */
-export const STDERR_TAIL_MAX = 2000;
-
-/**
- * Append one stderr line to the retained tail, keeping the last
- * {@link STDERR_TAIL_MAX} UTF-8 bytes and landing the cut on a character
- * boundary — the JS analogue of the Rust source's own `is_char_boundary` walk,
- * whose doc explains the panic-and-deadlock a raw byte cut caused (a reader task
- * that panics leaves the mutex poisoned AND stops draining the pipe, so a chatty
- * child then blocks mid-write and the connector never leaves "Connecting…"). A
- * JS string slice cannot panic the way a raw byte slice did, but a naive cut CAN
- * still mangle a character; skipping UTF-8 continuation bytes (`0b10xxxxxx`) is
- * the same rule, done in one pass. Ported from `push_stderr_line`.
- */
-export function pushStderrLine(tail: string, line: string): string {
-  const next = tail + line + "\n";
-  const bytes = Buffer.from(next, "utf8");
-  if (bytes.length <= STDERR_TAIL_MAX) return next;
-  let cut = bytes.length - STDERR_TAIL_MAX;
-  while (cut < bytes.length && (bytes[cut]! & 0xc0) === 0x80) cut += 1;
-  return bytes.subarray(cut).toString("utf8");
-}
-
-// ------------------------------------------------------------- login shell
-
-let cachedLoginPath: string | null = null;
-
-/** GUI apps on macOS get a bare PATH, so `npx`/`uvx` from a server config would
- * not be found. Ask a login shell once, like `detect_external` does. Ported
- * from `login_shell_path` (the synchronous `spawn_blocking` body, called from
- * an async context here instead — Node has no blocking-pool distinction to
- * preserve). */
-export async function loginShellPath(): Promise<string> {
-  if (cachedLoginPath !== null) {
-    return cachedLoginPath;
-  }
-  const fromShell = await new Promise<string>((resolve) => {
-    execFile("zsh", ["-lc", 'printf %s "$PATH"'], (err, stdout) => {
-      resolve(err ? "" : stdout.trim());
-    });
-  });
-  const inherited = process.env["PATH"] ?? "";
-  const home = process.env["HOME"] ?? "";
-  cachedLoginPath = `${fromShell}:${inherited}:/opt/homebrew/bin:/usr/local/bin:${home}/.local/bin:${home}/.cargo/bin`;
-  return cachedLoginPath;
-}
-
-/** Test-only: forget the cached login-shell PATH so a test can observe a fresh
- * resolution. Not part of the Rust source (whose `OnceLock` is never reset
- * either) — added because this port's tests run in the same process. */
-export function resetLoginShellPathCacheForTests(): void {
-  cachedLoginPath = null;
-}
-
-// ------------------------------------------------------------- stdio client
-
-export interface StdioConnectOptions {
-  /** Stand-in for `crate::commands::cached_path_prefix()` — the downloaded-
-   * runtime PATH prefix (`uvx`/`npx` the app provisioned itself). That
-   * subsystem (`commands/runtimes.rs`) has no port in this migration yet, so
-   * this is injected; the default (empty prefix) means only what is already on
-   * the resolved login-shell PATH is found, exactly like an install that has
-   * provisioned nothing. */
-  cachedPathPrefix?: string;
-  connectTimeoutMs?: number;
-  callTimeoutMs?: number;
-  /** Override for {@link loginShellPath} — tests inject a fixed PATH instead of
-   * spawning a real login shell. */
-  resolvePath?: () => Promise<string>;
-}
-
-class StdioClient implements McpClient {
-  private nextId = 0;
-  private stderrTail = "";
-  private closed = false;
-
-  constructor(
-    private readonly child: ChildProcessWithoutNullStreams,
-    private readonly stdout: LineReader,
-    private readonly callTimeoutMs: number
-  ) {
-    child.on("exit", () => {
-      this.closed = true;
-    });
-    const stderr = new LineReader(child.stderr);
-    void (async () => {
-      for (;;) {
-        const line = await stderr.nextLine();
-        if (line === null) return;
-        this.stderrTail = pushStderrLine(this.stderrTail, line);
-      }
-    })();
-  }
-
-  static async connect(
-    command: string,
-    args: readonly string[],
-    env: Record<string, string>,
-    opts: StdioConnectOptions
-  ): Promise<{ client: StdioClient; tools: Tool[] }> {
-    const connectTimeoutMs = opts.connectTimeoutMs ?? CONNECT_TIMEOUT_MS;
-    const callTimeoutMs = opts.callTimeoutMs ?? CALL_TIMEOUT_MS;
-    const loginPath = opts.resolvePath !== undefined ? await opts.resolvePath() : await loginShellPath();
-    // A runtime the app downloaded for this user lives under the app's data
-    // folder, which is on no shell PATH — so without this prefix a provisioned
-    // `uvx`/`npx` is never found. First, so a provisioned tool wins over a
-    // broken system one.
-    const prefix = opts.cachedPathPrefix ?? "";
-    const path = prefix === "" ? loginPath : `${prefix}:${loginPath}`;
-
-    const child = spawn(command, [...args], {
-      env: { ...process.env, ...env, PATH: path },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    // A spawn failure (a command that is not on PATH) surfaces as an 'error'
-    // event, never a throw; waiting for whichever of the two fires is what
-    // turns it into Rust's own `Could not start "{command}": {e}`.
-    await new Promise<void>((resolve, reject) => {
-      const cleanup = (): void => {
-        child.removeListener("error", onError);
-        child.removeListener("spawn", onSpawn);
-      };
-      const onError = (e: Error): void => {
-        cleanup();
-        reject(new Error(`Could not start "${command}": ${e.message}`));
-      };
-      const onSpawn = (): void => {
-        cleanup();
-        // Mid-life errors surface through a closed stdout/EOF instead, but an
-        // unhandled 'error' event would take the whole process down.
-        child.on("error", () => undefined);
-        resolve();
-      };
-      child.once("error", onError);
-      child.once("spawn", onSpawn);
-    });
-
-    const stdout = new LineReader(child.stdout);
-    const client = new StdioClient(child, stdout, callTimeoutMs);
-
-    await client.request(
-      "initialize",
-      {
-        protocolVersion: PROTOCOL_VERSION,
-        capabilities: {},
-        clientInfo: { name: "Arcelle", version: CLIENT_VERSION },
-      },
-      connectTimeoutMs
-    );
-    await client.notify("notifications/initialized", {});
-
-    const tools: Tool[] = [];
-    let cursor: string | null = null;
-    for (;;) {
-      const params = cursor !== null ? { cursor } : {};
-      const result = await client.request("tools/list", params, connectTimeoutMs);
-      cursor = collectTools(result, tools);
-      if (cursor === null) break;
-    }
-    return { client, tools };
-  }
-
-  async callTool(name: string, args: unknown): Promise<ToolOutput> {
-    const a = isPlainObject(args) ? args : {};
-    const result = await this.request("tools/call", { name, arguments: a }, this.callTimeoutMs);
-    return flattenCallResult(result);
-  }
-
-  close(): void {
-    if (!this.closed) {
-      this.child.kill();
-      this.closed = true;
-    }
-  }
-
-  private async send(msg: unknown): Promise<void> {
-    const line = JSON.stringify(msg) + "\n";
-    await new Promise<void>((resolve, reject) => {
-      this.child.stdin.write(line, (err) => {
-        if (err) reject(new Error(`Server stdin closed: ${err.message}`));
-        else resolve();
-      });
-    });
-  }
-
-  private async notify(method: string, params: unknown): Promise<void> {
-    await this.send({ jsonrpc: "2.0", method, params });
-  }
-
-  /** Send a request and read lines until its response arrives. Server
-   * notifications are ignored; server→client requests get a stub reply so
-   * well-behaved servers don't hang (pings get a real pong). Ported verbatim
-   * from `StdioClient::request`. */
-  private async request(method: string, params: unknown, timeoutMs: number): Promise<unknown> {
-    this.nextId += 1;
-    const id = this.nextId;
-    await this.send({ jsonrpc: "2.0", id, method, params });
-
-    const deadlineAt = Date.now() + timeoutMs;
-    for (;;) {
-      let line: string | null;
-      try {
-        line = await nextLineWithDeadline(this.stdout, deadlineAt);
-      } catch {
-        throw new Error(`Server timed out on ${method}.`);
-      }
-      if (line === null) {
-        const tail = this.stderrTail.trim();
-        throw new Error(tail === "" ? "Server exited." : `Server exited: ${tail}`);
-      }
-      let v: unknown;
-      try {
-        v = JSON.parse(line.trim());
-      } catch {
-        continue; // servers sometimes log to stdout — skip
-      }
-      const msg = asRecord(v);
-      if (msg["id"] === id && msg["method"] === undefined) {
-        const err = jsonRpcError(msg);
-        if (err !== null) {
-          throw new Error(`${method} failed: ${err}`);
-        }
-        return msg["result"];
-      }
-      if (msg["id"] !== undefined && typeof msg["method"] === "string") {
-        const reply =
-          msg["method"] === "ping"
-            ? { jsonrpc: "2.0", id: msg["id"], result: {} }
-            : {
-                jsonrpc: "2.0",
-                id: msg["id"],
-                error: { code: -32601, message: "Not supported by this client." },
-              };
-        await this.send(reply);
-      }
-    }
-  }
-}
-
-// -------------------------------------------------------------- http client
-
-/** The message shown when a remote server answers with 401/403. An OAuth
- * challenge (a `WWW-Authenticate` header, RFC 9728) means "sign in" — telling
- * the user to "check the token in this connector's headers" when the connector
- * actually uses OAuth is the confusing case hit in the wild. A bare 401 with no
- * challenge really is a bad/missing token. Ported verbatim from
- * `auth_error_message`. */
-export function authErrorMessage(method: string, status: number, wwwAuthenticate: string | null): string {
-  if (wwwAuthenticate !== null) {
-    return (
-      `${method}: this connector needs you to sign in (HTTP ${status}). ` +
-      `Open it under Connectors and click “Connect account” to authorize.`
-    );
-  }
-  return (
-    `${method}: the remote server rejected the request (HTTP ${status}). ` +
-    `This connector needs a valid token — add one under its auth headers, ` +
-    `or use “Connect account” if it supports sign-in.`
-  );
-}
-
-/** Pull the JSON-RPC response with id `id` out of an HTTP reply body — either a
- * plain JSON object or an SSE stream of `data:` frames (streamable HTTP).
- * Ported verbatim from `parse_http_message`. */
-export function parseHttpMessage(ctype: string, body: string, id: number): unknown {
-  if (ctype.includes("text/event-stream") || body.trimStart().startsWith("event:")) {
-    for (const rawLine of body.split("\n")) {
-      const line = rawLine.trimStart();
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice("data:".length).trim();
-      if (data === "") continue;
-      try {
-        const v: unknown = JSON.parse(data);
-        const r = asRecord(v);
-        if (r["method"] === undefined && r["id"] === id) {
-          return v;
-        }
-      } catch {
-        // not JSON — keep scanning
-      }
-    }
-    return undefined;
-  }
-  try {
-    return JSON.parse(body.trim());
-  } catch {
-    return undefined;
-  }
-}
-
-export interface HttpConnectOptions {
-  connectTimeoutMs?: number;
-  callTimeoutMs?: number;
-}
-
-/**
- * A remote MCP server reached over streamable HTTP (JSON-RPC POST). The reply
- * is either `application/json` (one response) or `text/event-stream` (SSE
- * frames) — both are accepted. A server may hand back an `Mcp-Session-Id` on
- * `initialize`; it is echoed on every later request. Ported from `HttpClient`.
- */
-class HttpClient implements McpClient {
-  private nextId = 0;
-  private sessionId: string | null = null;
-
-  constructor(
-    private readonly url: string,
-    private readonly headers: Record<string, string>,
-    private readonly callTimeoutMs: number
-  ) {}
-
-  static async connect(
-    url: string,
-    headers: Record<string, string>,
-    opts: HttpConnectOptions
-  ): Promise<{ client: HttpClient; tools: Tool[] }> {
-    const connectTimeoutMs = opts.connectTimeoutMs ?? CONNECT_TIMEOUT_MS;
-    const callTimeoutMs = opts.callTimeoutMs ?? CALL_TIMEOUT_MS;
-    const client = new HttpClient(url, headers, callTimeoutMs);
-    await client.request(
-      "initialize",
-      {
-        protocolVersion: PROTOCOL_VERSION,
-        capabilities: {},
-        clientInfo: { name: "Arcelle", version: CLIENT_VERSION },
-      },
-      connectTimeoutMs
-    );
-    await client.notify("notifications/initialized", {}, connectTimeoutMs);
-
-    const tools: Tool[] = [];
-    let cursor: string | null = null;
-    for (;;) {
-      const params = cursor !== null ? { cursor } : {};
-      const result = await client.request("tools/list", params, connectTimeoutMs);
-      cursor = collectTools(result, tools);
-      if (cursor === null) break;
-    }
-    return { client, tools };
-  }
-
-  async callTool(name: string, args: unknown): Promise<ToolOutput> {
-    const a = isPlainObject(args) ? args : {};
-    const result = await this.request("tools/call", { name, arguments: a }, this.callTimeoutMs);
-    return flattenCallResult(result);
-  }
-
-  close(): void {
-    // Nothing to tear down: every request is its own HTTP round trip.
-  }
-
-  /** POST one JSON body, applying the configured headers, the protocol version,
-   * and the captured session id. On the way back, capture any `Mcp-Session-Id`
-   * the server assigns and any `WWW-Authenticate` header (an OAuth challenge).
-   * Ported from `HttpClient::post`. */
-  private async post(
-    body: unknown,
-    timeoutMs: number
-  ): Promise<{ status: number; contentType: string; text: string; wwwAuthenticate: string | null }> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let resp: Response;
-    try {
-      resp = await fetch(this.url, {
-        method: "POST",
-        signal: controller.signal,
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json, text/event-stream",
-          "MCP-Protocol-Version": PROTOCOL_VERSION,
-          ...this.headers,
-          ...(this.sessionId !== null ? { "Mcp-Session-Id": this.sessionId } : {}),
-        },
-        body: JSON.stringify(body),
-      });
-    } catch (e) {
-      if (e instanceof Error && e.name === "AbortError") {
-        throw new Error("Remote server timed out.");
-      }
-      throw new Error(`Could not reach the remote server: ${errMessage(e)}`);
-    } finally {
-      clearTimeout(timer);
-    }
-    const sid = resp.headers.get("mcp-session-id");
-    if (sid !== null) {
-      this.sessionId = sid;
-    }
-    const contentType = resp.headers.get("content-type") ?? "";
-    const wwwAuthenticate = resp.headers.get("www-authenticate");
-    const text = await resp.text();
-    return { status: resp.status, contentType, text, wwwAuthenticate };
-  }
-
-  private async notify(method: string, params: unknown, timeoutMs: number): Promise<void> {
-    const { status, wwwAuthenticate } = await this.post({ jsonrpc: "2.0", method, params }, timeoutMs);
-    // 200 or 202 (Accepted, empty body) are both fine for a notification.
-    if (status === 401 || status === 403) {
-      throw new Error(authErrorMessage(method, status, wwwAuthenticate));
-    }
-  }
-
-  private async request(method: string, params: unknown, timeoutMs: number): Promise<unknown> {
-    this.nextId += 1;
-    const id = this.nextId;
-    const { status, contentType, text, wwwAuthenticate } = await this.post(
-      { jsonrpc: "2.0", id, method, params },
-      timeoutMs
-    );
-    if (status === 401 || status === 403) {
-      throw new Error(authErrorMessage(method, status, wwwAuthenticate));
-    }
-    if (status < 200 || status >= 300) {
-      const snippet = Array.from(text).slice(0, 200).join("");
-      throw new Error(`${method}: remote server returned HTTP ${status} ${snippet}`);
-    }
-    const msg = parseHttpMessage(contentType, text, id);
-    if (msg === undefined) {
-      throw new Error(`${method}: no JSON-RPC response in the reply`);
-    }
-    const r = asRecord(msg);
-    const err = jsonRpcError(r);
-    if (err !== null) {
-      throw new Error(`${method} failed: ${err}`);
-    }
-    return r["result"];
-  }
-}
-
-// --------------------------------------------------------------- top-level
-
-export interface ConnectMcpClientOptions extends StdioConnectOptions, HttpConnectOptions {}
-
-/** Spawn/open the server, run the initialize handshake and list its tools.
- * Ported from `Client::connect`. */
-export async function connectMcpClient(
-  config: ServerConfig,
-  opts: ConnectMcpClientOptions = {}
-): Promise<{ client: McpClient; tools: Tool[] }> {
-  if (config.transport.kind === "stdio") {
-    const { command, args, env } = config.transport;
-    return StdioClient.connect(command, args, env, opts);
-  }
-  const { url, headers } = config.transport;
-  return HttpClient.connect(url, headers, opts);
-}
+export { CLIENT_VERSION, PROTOCOL_VERSION, StdioClient, asRecord, errMessage, isPlainObject, jsonRpcError };

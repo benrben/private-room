@@ -62,7 +62,7 @@
  * TYPES: this project's tsconfig carries no `dom` lib (main-process code has
  * no browser DOM of its own), and Electron's ambient declarations contribute a
  * bare-bones global `Document` that would silently typecheck against the wrong
- * shape. So `DomNode`/`DomElement`/`DomDocument` below are this file's own
+ * shape. So `DomNode`/`DomElement`/`DomDocument` in `articleTypes.ts` are this file's own
  * minimal structural types for exactly the surface it uses — linkedom's real
  * objects satisfy them at runtime — and each boundary into a library whose
  * `.d.ts` insists on the ambient name is one explicit, narrow cast rather than
@@ -72,31 +72,17 @@
 import { parseHTML } from "linkedom";
 import { Readability } from "@mozilla/readability";
 import type { PageMeta } from "../../shared/apiTypes.js";
+import type {
+  ArticleBody,
+  DomDocument,
+  DomElement,
+  DomNode,
+  InternalMetaReader,
+  LibDomDocument,
+  PageCapture,
+} from "./articleTypes.js";
 
-// ---------------------------------------------------------------------------
-// Minimal structural DOM types (see module comment)
-// ---------------------------------------------------------------------------
-
-interface DomNode {
-  nodeType: number;
-  textContent: string | null;
-  childNodes: ArrayLike<DomNode>;
-}
-
-interface DomElement extends DomNode {
-  tagName: string;
-  children: ArrayLike<DomElement>;
-  attributes: ArrayLike<{ name: string }>;
-  getAttribute(name: string): string | null;
-  removeAttribute(name: string): void;
-  querySelectorAll(selector: string): ArrayLike<DomElement>;
-}
-
-interface DomDocument extends DomNode {
-  documentElement: DomElement | null;
-  body: (DomElement & { innerHTML: string }) | null;
-  querySelectorAll(selector: string): ArrayLike<DomElement>;
-}
+export type { ArticleBody, InternalMetaReader, PageCapture } from "./articleTypes.js";
 
 /** `parseHTML`'s own declared return type resolves against the same missing
  * `dom` lib, so the boundary is one explicit cast rather than a type this file
@@ -107,33 +93,8 @@ function parseDocument(html: string, pageUrl?: string): DomDocument {
   return (parseHTML(html, globals) as unknown as { document: DomDocument }).document;
 }
 
-/** `@mozilla/readability`'s `.d.ts` types its constructor parameter as the
- * same missing global `Document` — this is the one place that type needs to be
- * named, and only to cast through it. */
-type LibDomDocument = ConstructorParameters<typeof Readability>[0];
-
 function asLibDomDocument(document: DomDocument): LibDomDocument {
   return document as unknown as LibDomDocument;
-}
-
-/** The readable article: the same content in the three shapes the room stores
- * it in — HTML for the viewer, Markdown for the file, plain text for search. */
-export interface ArticleBody {
-  /** Article markup with the site's chrome removed, relative `src`/`href`
-   * resolved against the page URL, and inline event-handler attributes
-   * stripped. */
-  html: string;
-  markdown: string;
-  text: string;
-}
-
-/** A page read apart: what it declares, and the article inside it. */
-export interface PageCapture {
-  meta: PageMeta;
-  /** `null` when there is no article to extract — a search-results page, an
-   * app shell, a page that never loaded. The caller must SAY so rather than
-   * present the chrome as an article. */
-  article: ArticleBody | null;
 }
 
 /** Below this, "the article" is a caption or a paywall stub, not a body. The
@@ -199,22 +160,6 @@ function readPageInner(html: string, url?: string): PageCapture {
 // ---------------------------------------------------------------------------
 // Metadata
 // ---------------------------------------------------------------------------
-
-/** The shape of Readability's own (undocumented, underscore-prefixed) metadata
- * reader — called directly rather than through `.parse()`; see this file's
- * module comment, points 1 and 2. `article.test.ts` pins that both members are
- * still there, so a library upgrade that renames them goes RED rather than
- * silently stripping the author, site and date off every saved page. */
-export interface InternalMetaReader {
-  _getJSONLD(doc: LibDomDocument): Record<string, unknown>;
-  _getArticleMetadata(jsonld: Record<string, unknown>): {
-    title?: string;
-    byline?: string;
-    siteName?: string;
-    publishedTime?: string;
-    excerpt?: string;
-  };
-}
 
 /** The metadata reader `.parse()` itself uses, reachable without parsing.
  *  Exported only so the tripwire test can assert it exists. */
@@ -368,6 +313,10 @@ export function htmlToMarkdown(html: string): string {
   for (const child of Array.from(document.body?.childNodes ?? [])) {
     writeBlock(child, raw, 0);
   }
+  return normalizeBlockSpacing(raw);
+}
+
+function normalizeBlockSpacing(raw: string[]): string {
   // Blocks each end with their own blank line; collapse the runs that nesting
   // produces so the file does not read as double-spaced.
   let text = "";
@@ -399,101 +348,125 @@ function rustLines(s: string): string[] {
   return parts;
 }
 
+type BlockWriter = (node: DomElement, out: string[], depth: number) => void;
+
+const BLOCK_WRITERS: ReadonlyMap<string, BlockWriter> = new Map([
+  ["h1", writeHeadingBlock],
+  ["h2", writeHeadingBlock],
+  ["h3", writeHeadingBlock],
+  ["h4", writeHeadingBlock],
+  ["h5", writeHeadingBlock],
+  ["h6", writeHeadingBlock],
+  ["p", writeInlineBlock],
+  ["figcaption", writeInlineBlock],
+  ["blockquote", writeBlockQuote],
+  ["ul", writeList],
+  ["ol", writeList],
+  ["pre", writePreformattedBlock],
+  ["hr", writeHorizontalRule],
+  ["table", writeTableBlock],
+  ["img", writeInlineBlock],
+]);
+
 /** Emit one block-level node. `depth` is the list nesting level. */
 function writeBlock(node: DomNode, out: string[], depth: number): void {
   if (node.nodeType === TEXT_NODE) {
-    const t = collapse(node.textContent ?? "");
-    if (t !== "") pushBlock(out, t);
+    writeTextBlock(node, out);
     return;
   }
   if (!isElement(node)) return;
-  const name = tagOf(node);
-
-  switch (name) {
-    case "h1":
-    case "h2":
-    case "h3":
-    case "h4":
-    case "h5":
-    case "h6": {
-      const level = Number.parseInt(name.slice(1), 10) || 1;
-      const text = inline(node);
-      if (text !== "") pushBlock(out, `${"#".repeat(level)} ${text}`);
-      break;
-    }
-    case "p":
-    case "figcaption": {
-      const text = inline(node);
-      if (text !== "") pushBlock(out, text);
-      break;
-    }
-    case "blockquote": {
-      const inner: string[] = [];
-      for (const child of Array.from(node.childNodes)) writeBlock(child, inner, depth);
-      const quoted = inner
-        .join("")
-        .split("\n")
-        .filter((l) => l.trim() !== "")
-        .map((l) => `> ${l}`);
-      if (quoted.length > 0) pushBlock(out, quoted.join("\n"));
-      break;
-    }
-    case "ul":
-    case "ol": {
-      const ordered = name === "ol";
-      const indent = "  ".repeat(depth);
-      let n = 0;
-      const items: string[] = [];
-      for (const li of Array.from(node.childNodes)) {
-        if (!isElement(li) || tagOf(li) !== "li") continue;
-        n += 1;
-        const marker = ordered ? `${n}. ` : "- ";
-        const text = inline(li);
-        if (text !== "") items.push(`${indent}${marker}${text}\n`);
-        // A nested list is a block inside the item, not inline text.
-        for (const child of Array.from(li.childNodes)) {
-          if (isElement(child) && (tagOf(child) === "ul" || tagOf(child) === "ol")) {
-            writeBlock(child, items, depth + 1);
-          }
-        }
-      }
-      const joined = items.join("");
-      if (joined.trim() !== "") pushBlock(out, joined.replace(/\n+$/, ""));
-      break;
-    }
-    case "pre": {
-      const code = node.textContent ?? "";
-      if (code.trim() !== "") pushBlock(out, `\`\`\`\n${code.replace(/\s+$/, "")}\n\`\`\``);
-      break;
-    }
-    case "hr":
-      pushBlock(out, "---");
-      break;
-    case "table": {
-      const table = writeTable(node);
-      if (table !== "") pushBlock(out, table);
-      break;
-    }
-    case "img": {
-      const text = inline(node);
-      if (text !== "") pushBlock(out, text);
-      break;
-    }
-    default: {
-      // Anything else (div, section, article, figure, aside kept by the
-      // scorer…) is a container: recurse when it holds blocks, otherwise treat
-      // its inline content as one paragraph. Without the second half a
-      // `<div>bare text</div>` would vanish.
-      const children = Array.from(node.childNodes);
-      if (children.some(isBlockNode)) {
-        for (const child of children) writeBlock(child, out, depth);
-      } else {
-        const text = inline(node);
-        if (text !== "") pushBlock(out, text);
-      }
-      break;
-    }
+  const writer = BLOCK_WRITERS.get(tagOf(node));
+  if (writer) {
+    writer(node, out, depth);
+    return;
   }
+  writeContainerBlock(node, out, depth);
+}
+
+function writeTextBlock(node: DomNode, out: string[]): void {
+  const text = collapse(node.textContent ?? "");
+  if (text !== "") pushBlock(out, text);
+}
+
+function writeHeadingBlock(node: DomElement, out: string[]): void {
+  const level = Number.parseInt(tagOf(node).slice(1), 10) || 1;
+  const text = inline(node);
+  if (text !== "") pushBlock(out, `${"#".repeat(level)} ${text}`);
+}
+
+function writeInlineBlock(node: DomElement, out: string[]): void {
+  const text = inline(node);
+  if (text !== "") pushBlock(out, text);
+}
+
+function writeBlockQuote(node: DomElement, out: string[], depth: number): void {
+  const inner: string[] = [];
+  for (const child of Array.from(node.childNodes)) writeBlock(child, inner, depth);
+  const quoted = inner
+    .join("")
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => `> ${line}`);
+  if (quoted.length > 0) pushBlock(out, quoted.join("\n"));
+}
+
+function isListItem(node: DomNode): node is DomElement {
+  return isElement(node) && tagOf(node) === "li";
+}
+
+function listMarker(listName: string, index: number): string {
+  return listName === "ol" ? `${index + 1}. ` : "- ";
+}
+
+function isNestedList(node: DomNode): node is DomElement {
+  return isElement(node) && (tagOf(node) === "ul" || tagOf(node) === "ol");
+}
+
+function writeListItem(item: DomElement, out: string[], indent: string, marker: string, depth: number): void {
+  const text = inline(item);
+  if (text !== "") out.push(`${indent}${marker}${text}\n`);
+  // A nested list is a block inside the item, not inline text.
+  for (const child of Array.from(item.childNodes)) {
+    if (isNestedList(child)) writeBlock(child, out, depth + 1);
+  }
+}
+
+function writeList(node: DomElement, out: string[], depth: number): void {
+  const items: string[] = [];
+  const listName = tagOf(node);
+  const indent = "  ".repeat(depth);
+  Array.from(node.childNodes)
+    .filter(isListItem)
+    .forEach((item, index) => writeListItem(item, items, indent, listMarker(listName, index), depth));
+  const joined = items.join("");
+  if (joined.trim() !== "") pushBlock(out, joined.replace(/\n+$/, ""));
+}
+
+function writePreformattedBlock(node: DomElement, out: string[]): void {
+  const code = node.textContent ?? "";
+  if (code.trim() !== "") pushBlock(out, `\`\`\`\n${code.replace(/\s+$/, "")}\n\`\`\``);
+}
+
+function writeHorizontalRule(_node: DomElement, out: string[]): void {
+  pushBlock(out, "---");
+}
+
+function writeTableBlock(node: DomElement, out: string[]): void {
+  const table = writeTable(node);
+  if (table !== "") pushBlock(out, table);
+}
+
+function writeContainerBlock(node: DomElement, out: string[], depth: number): void {
+  // Anything else (div, section, article, figure, aside kept by the scorer…)
+  // is a container: recurse when it holds blocks, otherwise treat its inline
+  // content as one paragraph. Without the second half a `<div>bare text</div>`
+  // would vanish.
+  const children = Array.from(node.childNodes);
+  if (children.some(isBlockNode)) {
+    for (const child of children) writeBlock(child, out, depth);
+    return;
+  }
+  writeInlineBlock(node, out);
 }
 
 /** Markdown rows for one table. Headerless tables get an empty header row, so
@@ -527,56 +500,75 @@ function inline(node: DomNode): string {
   return collapse(parts.join(""));
 }
 
+type InlineWriter = (node: DomElement, out: string[]) => void;
+
+const INLINE_WRITERS: ReadonlyMap<string, InlineWriter> = new Map([
+  ["a", writeInlineLink],
+  ["img", writeInlineImage],
+  ["br", writeLineBreak],
+  ["code", writeInlineCode],
+  ["kbd", writeInlineCode],
+  ["samp", writeInlineCode],
+  ["strong", writeStrong],
+  ["b", writeStrong],
+  ["em", writeEmphasis],
+  ["i", writeEmphasis],
+]);
+
 function inlineInto(node: DomNode, out: string[]): void {
   if (node.nodeType === TEXT_NODE) {
     out.push(node.textContent ?? "");
     return;
   }
   if (!isElement(node)) return;
-  switch (tagOf(node)) {
-    case "a": {
-      const text = collapse(node.textContent ?? "");
-      const href = node.getAttribute("href") ?? "";
-      // A link with no text is furniture (an icon, an anchor); a `javascript:`
-      // href is not somewhere the reader can go.
-      if (text === "") return;
-      if (href === "" || href.startsWith("javascript:")) {
-        out.push(text);
-      } else {
-        out.push(`[${text}](${href})`);
-      }
-      break;
-    }
-    case "img": {
-      const src = node.getAttribute("src") ?? "";
-      if (src !== "") {
-        const alt = collapse(node.getAttribute("alt") ?? "");
-        out.push(`![${alt}](${src})`);
-      }
-      break;
-    }
-    case "br":
-      out.push(" ");
-      break;
-    case "code":
-    case "kbd":
-    case "samp": {
-      const text = collapse(node.textContent ?? "");
-      if (text !== "") out.push(`\`${text}\``);
-      break;
-    }
-    case "strong":
-    case "b":
-      wrapChildren(node, out, "**");
-      break;
-    case "em":
-    case "i":
-      wrapChildren(node, out, "*");
-      break;
-    default:
-      for (const child of Array.from(node.childNodes)) inlineInto(child, out);
-      break;
+  const writer = INLINE_WRITERS.get(tagOf(node));
+  if (writer) {
+    writer(node, out);
+    return;
   }
+  writeInlineChildren(node, out);
+}
+
+function writeInlineLink(node: DomElement, out: string[]): void {
+  const text = collapse(node.textContent ?? "");
+  const href = node.getAttribute("href") ?? "";
+  // A link with no text is furniture (an icon, an anchor); a `javascript:`
+  // href is not somewhere the reader can go.
+  if (text === "") return;
+  if (href === "" || href.startsWith("javascript:")) {
+    out.push(text);
+    return;
+  }
+  out.push(`[${text}](${href})`);
+}
+
+function writeInlineImage(node: DomElement, out: string[]): void {
+  const src = node.getAttribute("src") ?? "";
+  if (src !== "") {
+    const alt = collapse(node.getAttribute("alt") ?? "");
+    out.push(`![${alt}](${src})`);
+  }
+}
+
+function writeLineBreak(_node: DomElement, out: string[]): void {
+  out.push(" ");
+}
+
+function writeInlineCode(node: DomElement, out: string[]): void {
+  const text = collapse(node.textContent ?? "");
+  if (text !== "") out.push(`\`${text}\``);
+}
+
+function writeStrong(node: DomElement, out: string[]): void {
+  wrapChildren(node, out, "**");
+}
+
+function writeEmphasis(node: DomElement, out: string[]): void {
+  wrapChildren(node, out, "*");
+}
+
+function writeInlineChildren(node: DomElement, out: string[]): void {
+  for (const child of Array.from(node.childNodes)) inlineInto(child, out);
 }
 
 function wrapChildren(el: DomElement, out: string[], marker: string): void {

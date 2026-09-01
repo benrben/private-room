@@ -43,25 +43,50 @@ function isWorkspaceRoom(room: RoomContentHandle): boolean {
   ).get() !== undefined;
 }
 
-function previewDestination(room: RoomContentHandle, originalId: string, extension: string): string {
+type PreviewSourceRow = { name: string; relative_path: string | null };
+
+function previewSource(room: RoomContentHandle, originalId: string): PreviewSourceRow {
   const row = room.db.prepare(
     "SELECT name, relative_path FROM files WHERE id = ? AND trashed_at IS NULL",
-  ).get(originalId) as { name: string; relative_path: string | null } | undefined;
+  ).get(originalId) as PreviewSourceRow | undefined;
   if (row === undefined) throw new Error("The original file is not in this room.");
-  const parsed = path.parse(row.relative_path ?? row.name);
+  return row;
+}
+
+function previewFileName(source: PreviewSourceRow, extension: string): { parsed: path.ParsedPath; suffix: string; wanted: string } {
+  const parsed = path.parse(source.relative_path ?? source.name);
   const suffix = extension.replace(/^\./, "");
   const wanted = `${parsed.name}-preview.${suffix}`;
-  if (!isWorkspaceRoom(room)) return availableName(room.db, wanted);
-  let n = 1;
+  return { parsed, suffix, wanted };
+}
+
+function numberedPreviewName(wanted: string, suffix: string, number: number): string {
+  if (number === 1) return wanted;
+  return `${path.parse(wanted).name} (${number}).${suffix}`;
+}
+
+function availableWorkspacePreviewPath(
+  room: RoomContentHandle,
+  parsed: path.ParsedPath,
+  wanted: string,
+  suffix: string,
+): string {
+  let number = 1;
   for (;;) {
-    const name = n === 1 ? wanted : `${path.parse(wanted).name} (${n}).${suffix}`;
+    const name = numberedPreviewName(wanted, suffix, number);
     const relative = parsed.dir ? path.join(parsed.dir, name) : name;
     const taken = room.db.prepare(
       "SELECT 1 FROM files WHERE path_key = lower(?) AND trashed_at IS NULL",
     ).get(pathKey(relative));
     if (taken === undefined) return relative;
-    n += 1;
+    number += 1;
   }
+}
+
+function previewDestination(room: RoomContentHandle, originalId: string, extension: string): string {
+  const { parsed, suffix, wanted } = previewFileName(previewSource(room, originalId), extension);
+  if (!isWorkspaceRoom(room)) return availableName(room.db, wanted);
+  return availableWorkspacePreviewPath(room, parsed, wanted, suffix);
 }
 
 /** Persist bytes as a normal file and link them as the hidden viewer preview.
@@ -200,6 +225,30 @@ export interface SnapshotUnknownFormatOptions {
   prepare?(png: Buffer): Promise<SnapshotPreparedPreview | null>;
 }
 
+async function prepareSnapshotPng(
+  png: Buffer,
+  prepare: SnapshotUnknownFormatOptions["prepare"],
+): Promise<SnapshotPreparedPreview | null> {
+  if (prepare !== undefined) return prepare(png);
+  return { bytes: png, mimeType: "image/png", extension: "png" };
+}
+
+async function renderPreparedSnapshot(
+  name: string,
+  bytes: Buffer,
+  render: PreviewRenderFn,
+  prepare: SnapshotUnknownFormatOptions["prepare"],
+): Promise<SnapshotPreparedPreview | null> {
+  try {
+    const png = await render(name, bytes);
+    return png === null ? null : await prepareSnapshotPng(png, prepare);
+  } catch {
+    // Quick Look is a best-effort import enhancement. A timeout, unavailable
+    // sidecar, or broken format must never reject the original import.
+    return null;
+  }
+}
+
 /** Import-time, one-shot unknown-format fallback. Reopens reuse the stored
  * preview and never call Quick Look again. Concurrent calls share one render. */
 export function snapshotUnknownFormat(
@@ -216,19 +265,7 @@ export function snapshotUnknownFormat(
   const task = (async (): Promise<DerivedPreviewStoreResult> => {
     const original = await readRoomFile(room, originalId);
     if (original.bytes === null || original.bytes.length === 0) return { kind: "unavailable" };
-    let prepared: SnapshotPreparedPreview | null;
-    try {
-      const png = await render(original.name, original.bytes);
-      prepared = png === null
-        ? null
-        : options.prepare === undefined
-          ? { bytes: png, mimeType: "image/png", extension: "png" }
-          : await options.prepare(png);
-    } catch {
-      // Quick Look is a best-effort import enhancement. A timeout, unavailable
-      // sidecar, or broken format must never reject the original import.
-      return { kind: "unavailable" };
-    }
+    const prepared = await renderPreparedSnapshot(original.name, original.bytes, render, options.prepare);
     if (prepared === null) return { kind: "unavailable" };
     return storeDerivedPreview(
       room,

@@ -127,6 +127,14 @@ describe("rejectVoice / forgetVoice", () => {
     // The corrections must not outlive the voice they were about.
     expect(db.prepare("SELECT COUNT(*) FROM voice_rejects").pluck().get() as number).toBe(0);
   });
+
+  it("does not persist an empty name or silent rejected print", () => {
+    const db = freshRoom();
+    rejectVoice(db, "   ", print([1, 0, 0, 0], 200));
+    rejectVoice(db, "Dana", { v: [0, 0, 0, 0], f: 200 });
+
+    expect(db.prepare("SELECT COUNT(*) FROM voice_rejects").pluck().get()).toBe(0);
+  });
 });
 
 describe("corrupt data", () => {
@@ -143,6 +151,17 @@ describe("corrupt data", () => {
     enrollVoice(db, "Dana", print([1, 0, 0, 0], 200));
     rejectVoice(db, "Someone Else", print([0, 1, 0, 0], 200));
     expect(knownVoices(db)[0]?.rejects).toHaveLength(0);
+  });
+
+  it("a truncated reject blob for a saved voice is dropped", () => {
+    const db = freshRoom();
+    enrollVoice(db, "Dana", print([1, 0, 0, 0], 200));
+    db.prepare("INSERT INTO voice_rejects(name, emb) VALUES (?, ?)").run(
+      "Dana",
+      Buffer.from([1, 2, 3]),
+    );
+
+    expect(knownVoices(db)[0]?.rejects).toEqual([]);
   });
 });
 

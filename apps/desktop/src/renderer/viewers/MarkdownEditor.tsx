@@ -25,6 +25,18 @@ import "./markdowneditor.css";
 
 type Layout = "split" | "source" | "preview";
 
+function layoutTitle(layout: Layout): string {
+  if (layout === "source") return "Just the Markdown";
+  if (layout === "split") return "Markdown and the page, side by side";
+  return "Just the page";
+}
+
+function layoutLabel(layout: Layout): string {
+  if (layout === "source") return "Source";
+  if (layout === "split") return "Split";
+  return "Preview";
+}
+
 interface Props {
   value: string;
   onSave: (value: string) => void | Promise<boolean | void>;
@@ -110,16 +122,10 @@ export default function MarkdownEditor({
               key={l}
               className={`mde-layout-btn${layout === l ? " active" : ""}`}
               aria-pressed={layout === l}
-              title={
-                l === "source"
-                  ? "Just the Markdown"
-                  : l === "split"
-                    ? "Markdown and the page, side by side"
-                    : "Just the page"
-              }
+              title={layoutTitle(l)}
               onClick={() => setLayout(l)}
             >
-              {l === "source" ? "Source" : l === "split" ? "Split" : "Preview"}
+              {layoutLabel(l)}
             </button>
           ))}
         </div>

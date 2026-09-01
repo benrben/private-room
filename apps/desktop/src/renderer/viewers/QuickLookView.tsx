@@ -55,33 +55,52 @@ export default function QuickLookView({
   return (
     <div className="ql-view">
       {children}
-      {state.phase === "loading" && (
-        <div className="empty-hint">Asking macOS to draw a preview…</div>
-      )}
-      {state.phase === "ready" && (
-        <figure className="ql-figure">
-          <img src={state.src} alt="" />
-          <figcaption className="viewer-status">
-            Drawn by macOS Quick Look — a picture of the file, so text here
-            can't be selected or searched. <strong>Export</strong> saves the
-            original out unchanged.
-          </figcaption>
-        </figure>
-      )}
-      {state.phase === "none" && !children && (
-        <div className="empty-hint">
-          No preview available for this file type — this Mac has nothing
-          installed that can draw it either. Its content is still stored safely
-          inside the room, and <strong>Export</strong> saves the original out
-          unchanged.
-        </div>
-      )}
-      {state.phase === "error" && !children && (
-        <div className="empty-hint">
-          The preview couldn't be drawn ({state.message}). The file itself is
-          unaffected.
-        </div>
-      )}
+      <QuickLookPreview state={state} hasChildren={Boolean(children)} />
+    </div>
+  );
+}
+
+function QuickLookPreview({ state, hasChildren }: { state: State; hasChildren: boolean }) {
+  if (state.phase === "loading") {
+    return <div className="empty-hint">Asking macOS to draw a preview…</div>;
+  }
+  if (state.phase === "ready") {
+    return (
+      <figure className="ql-figure">
+        <img src={state.src} alt="" />
+        <figcaption className="viewer-status">
+          Drawn by macOS Quick Look — a picture of the file, so text here
+          can't be selected or searched. <strong>Export</strong> saves the
+          original out unchanged.
+        </figcaption>
+      </figure>
+    );
+  }
+  return <QuickLookUnavailable state={state} hasChildren={hasChildren} />;
+}
+
+function QuickLookUnavailable({
+  state,
+  hasChildren,
+}: {
+  state: Extract<State, { phase: "none" | "error" }>;
+  hasChildren: boolean;
+}) {
+  if (hasChildren) return null;
+  if (state.phase === "none") {
+    return (
+      <div className="empty-hint">
+        No preview available for this file type — this Mac has nothing
+        installed that can draw it either. Its content is still stored safely
+        inside the room, and <strong>Export</strong> saves the original out
+        unchanged.
+      </div>
+    );
+  }
+  return (
+    <div className="empty-hint">
+      The preview couldn't be drawn ({state.message}). The file itself is
+      unaffected.
     </div>
   );
 }

@@ -1,0 +1,483 @@
+
+.sk-flags {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+}
+.sk-flag {
+  white-space: nowrap;
+}
+/* Two lines of the trigger sentence, clamped. -webkit-line-clamp is the only
+   line clamp WebKit has and this app ships on WebKit, so the prefixed
+   properties are the real ones here, not a fallback. */
+.sk-card-desc {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.sk-card-foot {
+  margin-top: auto;
+  padding-top: var(--sp-2);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px var(--sp-2);
+}
+.sk-card-meta {
+  color: var(--faint);
+  font-size: var(--fs-micro);
+}
+/* The owning specialist, shown only when a skill actually has one. A general
+   skill draws no chip at all rather than an "everyone" chip nobody needs. */
+.sk-card-owner {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ----- the empty state -----
+   Not a grey box saying there is nothing here: a worked example of the thing
+   the page wants you to make, drawn as one index card.
+
+   It has to be impossible to mistake for an installed skill, so it carries
+   three independent signals — a dashed border (the system's mark for a
+   provisional boundary), a tape label reading "Example", and a caption that
+   says in words that it is not installed. It contains no button and nothing
+   focusable, so it is also unreachable by keyboard, which is the fourth. */
+
+.sk-empty {
+  display: grid;
+  gap: var(--sp-4);
+  justify-items: start;
+}
+.sk-empty-head {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: var(--fs-card);
+  font-weight: 600;
+}
+.sk-empty-copy {
+  margin: 0;
+  max-width: 52ch;
+  color: var(--muted);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+.sk-example {
+  margin: 0;
+  width: min(100%, 460px);
+  display: grid;
+  gap: var(--sp-2);
+}
+.sk-example-cap {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+}
+.sk-example-card {
+  display: grid;
+  gap: var(--sp-2);
+  /* Dashed, in pencil rather than pen: .nb-rule-dash uses the same idiom for
+     a boundary that is provisional. This card is not a real object. */
+  border-style: dashed;
+  border-color: var(--rule);
+}
+.sk-example-card:hover {
+  border-color: var(--rule);
+}
+.sk-example-name {
+  color: var(--text-strong);
+  font-size: var(--fs-card);
+  font-weight: 600;
+}
+.sk-example-desc {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+/* The folder listing. Paths are technical data, so they are in the mono face
+   per the type contract — never the hand. The dashed thread is .nb-connect,
+   which spans the element's own box and needs nothing measured. */
+.sk-tree {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 var(--sp-4);
+  display: grid;
+  gap: 5px;
+  --nb-connect-at: 3px;
+}
+.sk-tree > li {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-2);
+}
+.sk-tree code {
+  font-size: var(--fs-micro);
+  color: var(--text);
+}
+.sk-tree > li > span {
+  color: var(--faint);
+  font-size: var(--fs-micro);
+}
+
+/* ==========================================================================
+   2. SKILLS — THE EDITOR
+   One skill, opened. The left column is SKILL.md; the right is the folder it
+   travels in, grouped by what each file is FOR.
+   ========================================================================== */
+
+.sk-editor {
+  /* The resource editor below is absolutely positioned against this box, so
+     the containing block is declared here rather than inherited from whatever
+     ancestor happens to be positioned this month. */
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: transparent;
+  /* Both dimensions are shared with .sk-file's inset — one definition, so the
+     overlay can never drift out of register with the head and the aside. */
+  --sk-head-h: 49px;
+  --sk-aside-w: 268px;
+}
+.sk-editor-head {
+  flex: none;
+  height: var(--sk-head-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-4);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line) 2%,
+    var(--line) 98%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+.sk-editor-actions {
+  display: flex;
+  gap: var(--sp-2);
+}
+.sk-editor-layout {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(420px, 1fr) var(--sk-aside-w);
+}
+.sk-main {
+  min-width: 0;
+  overflow-y: auto;
+  padding: var(--sp-6) var(--sp-6) 72px;
+}
+.sk-head-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+  margin-bottom: var(--sp-6);
+}
+/* The kicker/title/flags column. A flex item's min-width defaults to `auto`,
+   so a long skill name would widen the row past the pane rather than wrap. */
+.sk-head-row > div {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.sk-kicker {
+  display: block;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.sk-editor-title {
+  margin: 6px 0 var(--sp-2);
+  color: var(--text-strong);
+  font-size: var(--fs-section);
+  font-family: var(--display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+.sk-enable {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 24px;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  cursor: pointer;
+}
+/* The native checkbox is the real control — .mkt-sw is only its drawing — so
+   it keeps its name and its keyboard behaviour and is merely moved off the
+   pixels. Not display:none, which would take it out of the tab order. */
+.sk-enable input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+/* The switch has to show focus, because the input it belongs to cannot. */
+.sk-enable input:focus-visible + .mkt-sw {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* …and it has to show CHECKED, which it never has. `.mkt-sw` draws the face,
+   but the only `:checked` rule for it in marketplace.css is scoped to
+   `.mkt-tgl` — a wrapper this control does not use — so the knob has always
+   sat in the off position while the word beside it read "Enabled". The word
+   was the only honest part of the control. Written here because `.sk-enable`
+   is this file's; marketplace.css cannot reach it.
+
+   Green, not the accent the marketplace switch uses: on THIS page "enabled"
+   already has a colour — `skillFlags()` tapes an `nb-sem-done` "Enabled" flag
+   on the same skill — and the accent is the selection ink everywhere else. */
+.sk-enable input:checked + .mkt-sw {
+  background: var(--sem-done);
+}
+.sk-enable input:checked + .mkt-sw::after {
+  transform: translateX(13px);
+}
+
+.sk-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 var(--sp-4);
+  max-width: 62ch;
+}
+.sk-field > span {
+  color: var(--text);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+}
+.sk-field small {
+  margin-left: 6px;
+  color: var(--faint);
+  font-weight: 400;
+}
+.sk-field input,
+.sk-field textarea,
+.sk-field select {
+  width: 100%;
+}
+.sk-field textarea {
+  resize: vertical;
+  line-height: var(--lh-body);
+}
+/* SKILL.md's body is a text FILE, so it is set in the mono face with a real
+   tab stop — and never in the hand, which is reserved and would also mangle
+   a procedure. The mono stack falls through per glyph, so Hebrew, CJK and
+   the rest still render in a face that has them. */
+.sk-instructions {
+  max-width: none;
+}
+.sk-instructions textarea {
+  min-height: 330px;
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  line-height: 1.55;
+  tab-size: 2;
+}
+.sk-danger {
+  margin-top: var(--sp-6);
+  padding-top: var(--sp-4);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 2%,
+    var(--line-soft) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+.sk-danger > span {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+/* ----- the folder pane -----
+   A drawn left rule instead of a filled sidebar: the pane is a division of
+   the sheet, not a second surface laid on it. */
+
+.sk-res {
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-4) var(--sp-3) var(--sp-6);
+  background: transparent;
+  background-image: linear-gradient(
+    180deg,
+    transparent 0%,
+    var(--line) 3%,
+    var(--line) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 1px 100%;
+  background-position: left top;
+}
+.sk-res-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 var(--sp-2) var(--sp-3);
+}
+.sk-res-head strong {
+  color: var(--text-strong);
+  font-size: var(--fs-meta);
+}
+/* "Encrypted inside this room" is a privacy statement: it stays visible, it
+   stays in the sans, and it is quiet rather than hidden. */
+.sk-res-head small {
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  line-height: var(--lh-body);
+}
+/* One group per KIND of file the folder actually holds. A group with nothing
+   in it is not drawn at all — four empty slots would say a skill is missing
+   things it was never supposed to have. */
+.sk-res-group {
+  margin-top: var(--sp-3);
+}
+.sk-res-group-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-2) var(--sp-1);
+}
+.sk-res-group-head > span:first-child {
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.sk-res-group-head .nb-circled {
+  margin-left: auto;
+}
+.sk-res-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 34px;
+  padding: 6px var(--sp-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  text-align: left;
+  transition:
+    background-color var(--dur-fast) var(--ease-pen),
+    color var(--dur-fast) var(--ease-pen);
+}
+.sk-res-row:hover {
+  background-color: var(--hover);
+  border-color: transparent;
+  color: var(--text);
+}
+/* The open file. A marker edge plus the pen on the name — colour is never
+   carrying "which file am I editing" on its own. */
+.sk-res-row.active {
+  color: var(--text);
+  background-color: var(--accent-ghost);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.sk-res-row svg {
+  flex: none;
+  color: var(--faint);
+}
+.sk-res-row.active svg {
+  color: var(--accent);
+}
+.sk-res-row > span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.sk-res-row strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-meta);
+  font-weight: 500;
+}
+/* Paths and sizes are technical data — mono, tabular, and truncated from the
+   END so the extension stays visible. */
+.sk-res-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+}
+.sk-res-add {
+  display: flex;
+  gap: 6px;
+  margin-top: var(--sp-4);
+  padding: 0 var(--sp-2);
+}
+.sk-res-add input {
+  min-width: 0;
+  flex: 1;
+  padding: 5px 8px;
+  font-size: var(--fs-micro);
+}
+.sk-res-add button {
+  flex: none;
+  min-width: 28px;
+  min-height: 28px;
+  padding: var(--sp-1);
+}
+.sk-res-note {
+  margin: var(--sp-4) var(--sp-2) 0;
+}
+.sk-res-note > summary {
+  font-size: var(--fs-micro);
+}
+.sk-res-note .sk-note-body {
+  padding-left: var(--sp-2);
+  font-size: var(--fs-micro);
+}
+
+/* ----- the resource editor -----
+   The second opaque surface: it covers the SKILL.md column, so it has to
+   occlude it. Anything less and two documents' text would overlap. */
+
+.sk-file {
+  position: absolute;
+  inset: var(--sk-head-h) var(--sk-aside-w) 0 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+}

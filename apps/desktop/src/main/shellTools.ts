@@ -87,9 +87,13 @@ export interface ShellDeps {
 /** The real {@link ShellDeps.openWithApp}. REJECTS on a non-zero exit (an app
  * name macOS cannot resolve, a target `open` refuses) rather than swallowing
  * it, so the caller's `await` fails the way every other command's does. */
-export function execFileOpenWithApp(app: string, target: string): Promise<void> {
+export function execFileOpenWithApp(
+  app: string,
+  target: string,
+  runExecFile: typeof execFile = execFile,
+): Promise<void> {
   return new Promise((resolve, reject) => {
-    execFile("/usr/bin/open", ["-a", app, target], (error) => {
+    runExecFile("/usr/bin/open", ["-a", app, target], (error) => {
       if (error) {
         reject(error);
       } else {
@@ -135,22 +139,28 @@ export async function openPath(deps: ShellDeps, args: Commands["open_path"]["arg
   }
 }
 
+function revealPaths(paths: unknown): string[] {
+  if (!Array.isArray(paths) || paths.length === 0) {
+    throw new Error("reveal_item_in_dir needs a non-empty `paths` array.");
+  }
+  return paths.map(revealPath);
+}
+
+function revealPath(target: unknown): string {
+  if (typeof target !== "string" || target === "") {
+    throw new Error("reveal_item_in_dir: every path must be a non-empty string.");
+  }
+  return target;
+}
+
 export function revealItemInDir(
   deps: ShellDeps,
   args: Commands["reveal_item_in_dir"]["args"]
 ): void {
-  if (!Array.isArray(args.paths) || args.paths.length === 0) {
-    throw new Error("reveal_item_in_dir needs a non-empty `paths` array.");
-  }
-  for (const target of args.paths) {
-    if (typeof target !== "string" || target === "") {
-      throw new Error("reveal_item_in_dir: every path must be a non-empty string.");
-    }
-  }
   // Checked in full BEFORE revealing any of them: `showItemInFolder` is
   // synchronous and takes one path, so a bad entry halfway through a list would
   // otherwise leave the first half revealed and the call rejected.
-  for (const target of args.paths) {
+  for (const target of revealPaths(args.paths)) {
     deps.shell.showItemInFolder(target);
   }
 }

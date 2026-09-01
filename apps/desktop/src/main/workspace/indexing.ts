@@ -22,6 +22,10 @@ export type WorkspaceStreamExtractor = (
   stream: Readable,
 ) => Promise<StreamExtractionResult>;
 
+type IndexCandidateOutcome = "ready" | "unsupported" | "failed" | "staleDiscarded";
+
+const STALE_INDEX_RESULT = "STALE_INDEX_RESULT";
+
 function candidateStillCurrent(
   db: Database.Database,
   fileId: string,
@@ -36,6 +40,23 @@ function candidateStillCurrent(
   } catch {
     return false;
   }
+}
+
+function extractionStillCurrent(
+  db: Database.Database,
+  candidate: IndexCandidate,
+  extracted: StreamExtractionResult,
+): boolean {
+  return extracted.sha256 === candidate.content_sha256
+    && candidateStillCurrent(db, candidate.id, candidate.content_sha256);
+}
+
+function isStaleIndexResult(error: unknown): boolean {
+  return error instanceof Error && error.message === STALE_INDEX_RESULT;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /**
@@ -93,7 +114,15 @@ export class WorkspaceIndexService {
       failed: 0,
       staleDiscarded: 0,
     };
-    const candidates = this.workspace.db.prepare(
+    for (const candidate of this.indexCandidates()) {
+      if (this.closed) break;
+      this.recordOutcome(result, await this.indexCandidate(candidate));
+    }
+    return result;
+  }
+
+  private indexCandidates(): IndexCandidate[] {
+    return this.workspace.db.prepare(
       `SELECT id, name, content_sha256 FROM files
        WHERE storage_kind = 'workspace' AND trashed_at IS NULL
          AND origin_destination <> '${DERIVED_PREVIEW_DESTINATION}'
@@ -101,50 +130,56 @@ export class WorkspaceIndexService {
          AND content_sha256 IS NOT NULL
        ORDER BY last_seen_at, created_at`,
     ).all() as IndexCandidate[];
+  }
 
-    for (const candidate of candidates) {
-      if (this.closed) break;
-      try {
-        const extracted = await this.extract(candidate.name, this.workspace.readStream(candidate.id));
-        if (
-          extracted.sha256 !== candidate.content_sha256
-          || !candidateStillCurrent(this.workspace.db, candidate.id, candidate.content_sha256)
-        ) {
-          result.staleDiscarded += 1;
-          continue;
-        }
-        const state = extracted.text === null ? "unsupported" : "ready";
-        this.workspace.db.transaction(() => {
-          if (!candidateStillCurrent(this.workspace.db, candidate.id, candidate.content_sha256)) {
-            throw new Error("STALE_INDEX_RESULT");
-          }
-          clearChunks(this.workspace.db, candidate.id);
-          insertChunks(this.workspace.db, candidate.id, extracted.text);
-          this.workspace.db.prepare(
-            `UPDATE files SET extracted_text = ?, ai_summary = NULL,
-               index_state = ?, index_error = NULL
-             WHERE id = ? AND content_sha256 = ?`,
-          ).run(extracted.text, state, candidate.id, candidate.content_sha256);
-        })();
-        if (state === "ready") result.ready += 1;
-        else result.unsupported += 1;
-      } catch (error) {
-        if (error instanceof Error && error.message === "STALE_INDEX_RESULT") {
-          result.staleDiscarded += 1;
-          continue;
-        }
-        if (candidateStillCurrent(this.workspace.db, candidate.id, candidate.content_sha256)) {
-          this.workspace.db.prepare(
-            `UPDATE files SET index_state = 'failed', index_error = ?
-             WHERE id = ? AND content_sha256 = ?`,
-          ).run(error instanceof Error ? error.message : String(error), candidate.id, candidate.content_sha256);
-          result.failed += 1;
-        } else {
-          result.staleDiscarded += 1;
-        }
+  private async extractCurrent(candidate: IndexCandidate): Promise<StreamExtractionResult | undefined> {
+    const extracted = await this.extract(candidate.name, this.workspace.readStream(candidate.id));
+    return extractionStillCurrent(this.workspace.db, candidate, extracted) ? extracted : undefined;
+  }
+
+  private commitExtraction(candidate: IndexCandidate, extracted: StreamExtractionResult): IndexCandidateOutcome {
+    const state = extracted.text === null ? "unsupported" : "ready";
+    this.workspace.db.transaction(() => {
+      if (!candidateStillCurrent(this.workspace.db, candidate.id, candidate.content_sha256)) {
+        throw new Error(STALE_INDEX_RESULT);
       }
+      clearChunks(this.workspace.db, candidate.id);
+      insertChunks(this.workspace.db, candidate.id, extracted.text);
+      this.workspace.db.prepare(
+        `UPDATE files SET extracted_text = ?, ai_summary = NULL,
+           index_state = ?, index_error = NULL
+         WHERE id = ? AND content_sha256 = ?`,
+      ).run(extracted.text, state, candidate.id, candidate.content_sha256);
+    })();
+    return state;
+  }
+
+  private recordFailure(candidate: IndexCandidate, error: unknown): IndexCandidateOutcome {
+    if (!candidateStillCurrent(this.workspace.db, candidate.id, candidate.content_sha256)) {
+      return "staleDiscarded";
     }
-    return result;
+    this.workspace.db.prepare(
+      `UPDATE files SET index_state = 'failed', index_error = ?
+       WHERE id = ? AND content_sha256 = ?`,
+    ).run(errorText(error), candidate.id, candidate.content_sha256);
+    return "failed";
+  }
+
+  private async indexCandidate(candidate: IndexCandidate): Promise<IndexCandidateOutcome> {
+    try {
+      const extracted = await this.extractCurrent(candidate);
+      if (extracted === undefined) return "staleDiscarded";
+      return this.commitExtraction(candidate, extracted);
+    } catch (error) {
+      return isStaleIndexResult(error) ? "staleDiscarded" : this.recordFailure(candidate, error);
+    }
+  }
+
+  private recordOutcome(result: WorkspaceIndexResult, outcome: IndexCandidateOutcome): void {
+    if (outcome === "ready") result.ready += 1;
+    else if (outcome === "unsupported") result.unsupported += 1;
+    else if (outcome === "failed") result.failed += 1;
+    else result.staleDiscarded += 1;
   }
 
   close(): void {

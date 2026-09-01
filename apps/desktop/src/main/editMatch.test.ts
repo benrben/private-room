@@ -34,14 +34,19 @@ import {
   MAX_FUZZY_BYTES,
   PREVIEW_CLIP,
   commitPlans,
+  computeEdit,
   computeEditBytes,
   countBatchOps,
   extractText,
   parseBatchOps,
   planBatch,
+  planBatchWorkspace,
   planSetCells,
+  planSetCellsWorkspace,
   planSingleEdit,
+  planSingleEditWorkspace,
   planWriteFile,
+  planWriteFileWorkspace,
   runEditFile,
   runEditFileRefined,
   runEditFiles,
@@ -114,6 +119,24 @@ function expectPlainError(fn: () => unknown): Error {
     throw e;
   }
   throw new Error("expected an Error to be thrown");
+}
+
+function dbWithPrepareFailure(
+  db: Database.Database,
+  blocked: (sql: string) => boolean,
+): Database.Database {
+  return new Proxy(db, {
+    get(target, property) {
+      if (property === "prepare") {
+        return (sql: string) => {
+          if (blocked(sql)) throw new Error("storage unavailable");
+          return target.prepare(sql);
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as Database.Database;
 }
 
 // ------------------------------------------------------------------ single edit
@@ -638,6 +661,20 @@ describe("edit_match — diff preview", () => {
     expect(plans[0]!.after).toBe("goodbye world");
   });
 
+  it("a clipped unchanged preview keeps the complete boundary-safe head", () => {
+    // The clip ends exactly between an astral character's surrogate halves.
+    // An unchanged preview also takes firstDifference's prefix path and the
+    // start-at-zero branch, so it must neither split the emoji nor invent a
+    // leading ellipsis.
+    const db = freshRoom();
+    const content = `${"x".repeat(PREVIEW_CLIP - 1)}\u{1F600}`;
+    seedTextFile(db, "boundary.md", content);
+    const [plan] = planWriteFile(db, "boundary.md", content);
+    expect(plan!.clipped).toBe(true);
+    expect(plan!.before).toBe("x".repeat(PREVIEW_CLIP - 1));
+    expect(plan!.after).toBe(plan!.before);
+  });
+
   it("a legacy-encoded file previews as text, not replacement boxes", () => {
     // windows-1252 bytes read lossily became U+FFFD everywhere, so the
     // approval card showed boxes for every accented letter.
@@ -1077,6 +1114,150 @@ describe("edit_match — additional coverage and merge regressions", () => {
     );
     expect(err.outcome).toBe("not_found");
     expect(err.message).toContain('"A" section');
+  });
+
+  it("REGRESSION: positional refinement inside a section keeps full-document offsets", () => {
+    // Slicing to the section and then applying candidate offsets to the full
+    // document changes the similarly named quote before the heading. The
+    // candidates must instead retain full-document positions while filtering.
+    const out = computeEditBytes(
+      "report.md",
+      Buffer.from("intro: value\n# Target\nvalue\n# Later\nvalue\n", "utf8"),
+      "value",
+      "changed",
+      false,
+      { section: "Target", prefixContext: "# Target\n" },
+    );
+    expect(out.bytes.toString("utf8")).toBe("intro: value\n# Target\nchanged\n# Later\nvalue\n");
+  });
+
+  it("REGRESSION: unsupported extraction stays absent instead of decoding binary preview bytes", () => {
+    expect(extractText("opaque.bin", Buffer.from([0xff, 0x00, 0xfe]))).toBeNull();
+  });
+
+  it("section validation reports a heading-less document without searching it", () => {
+    const err = expectEditError(() =>
+      computeEditBytes("plain.md", Buffer.from("ordinary prose", "utf8"), "ordinary", "changed", false, { section: "Target" })
+    );
+    expect(err.outcome).toBe("not_found");
+    expect(err.message).toContain("has no headings");
+  });
+
+  it("section fallback preserves its all and ambiguity safeguards", () => {
+    const unique = Buffer.from("# Target\nFee is \u{201C}5%\u{201D}\n", "utf8");
+    const allError = expectEditError(() =>
+      computeEditBytes("report.md", unique, 'Fee is "5%"', 'Fee is "7%"', true, { section: "Target" })
+    );
+    expect(allError.outcome).toBe("all_needs_exact");
+
+    const ambiguous = Buffer.from("# Target\nFee is \u{201C}5%\u{201D}\nFee is \u{201C}5%\u{201D}\n", "utf8");
+    const ambiguousError = expectEditError(() =>
+      computeEditBytes("report.md", ambiguous, 'Fee is "5%"', 'Fee is "7%"', false, { section: "Target" })
+    );
+    expect(ambiguousError.outcome).toBe("ambiguous");
+    expect(ambiguousError.message).toContain('"Target" section');
+  });
+
+  it("section fallback observes the UTF-8 fuzzy-size ceiling", () => {
+    const content = `# Target\n${"文".repeat(Math.ceil(MAX_FUZZY_BYTES / 3))}`;
+    const err = expectEditError(() =>
+      computeEditBytes("large.md", Buffer.from(content, "utf8"), "missing quote", "x", false, { section: "Target" })
+    );
+    expect(err.outcome).toBe("not_found");
+    expect(err.message).toContain("has to be exact");
+  }, 30_000);
+
+  it("positional empty quotes return the refinement diagnostic instead of matching boundaries", () => {
+    const err = expectEditError(() =>
+      computeEditBytes("notes.md", Buffer.from("content", "utf8"), "", "x", false, { occurrence: 1 })
+    );
+    expect(err.outcome).toBe("not_found");
+    expect(err.message).toContain("occurrence needs");
+  });
+
+  it("workspace planners read current bytes while retaining DB name resolution", async () => {
+    const db = freshRoom();
+    const noteId = seedTextFile(db, "note.md", "old value");
+    const sheetId = seedTextFile(db, "sheet.csv", "a,b\n1,2\n");
+    let reads = 0;
+    const workspace = {
+      readBuffer: async (id: string) => {
+        reads += 1;
+        return currentBytes(db, id);
+      },
+    } as unknown as Parameters<typeof planSingleEditWorkspace>[1];
+
+    expect((await planSingleEditWorkspace(db, workspace, { name: "note.md", oldText: "old", newText: "new", all: false }))[0]!.newBytes!.toString()).toBe("new value");
+    expect((await planWriteFileWorkspace(db, workspace, "note.md", "replacement"))[0]!.newBytes!.toString()).toBe("replacement");
+    expect((await planSetCellsWorkspace(db, workspace, "sheet.csv", null, [["B2", "9"]]))[0]!.newBytes!.toString()).toBe("a,b\n1,9\n");
+
+    const batch = await planBatchWorkspace(db, workspace, [
+      { op: "edit", name: "note.md", oldText: "old", newText: "new" },
+      { op: "edit", name: "note.md", oldText: "new", newText: "latest" },
+      { op: "rename", name: "note.md", newName: "renamed" },
+    ]);
+    expect(batch).toHaveLength(1);
+    expect(batch[0]!.fileId).toBe(noteId);
+    expect(batch[0]!.newBytes!.toString()).toBe("latest value");
+    expect(batch[0]!.renameTo).toBe("renamed.md");
+    // Single/batch calls read current storage; the batch itself caches repeated
+    // edits of the same id before it delegates to the shared planner.
+    expect(reads).toBe(4);
+    expect(currentBytes(db, sheetId).toString()).toBe("a,b\n1,2\n");
+  });
+
+  it("refined exact ambiguity keeps the positional-retry guidance", () => {
+    const err = expectEditError(() =>
+      computeEditBytes(
+        "report.md",
+        Buffer.from("# Target\ncost is 5\ncost is 5\n", "utf8"),
+        "cost is 5",
+        "cost is 7",
+        false,
+        { section: "Target" },
+      )
+    );
+    expect(err.outcome).toBe("ambiguous");
+    expect(err.message).toContain("Add prefix_context/suffix_context");
+  });
+
+  it("preserves storage-read failures and absent-byte diagnostics across planners", () => {
+    const db = freshRoom();
+    const id = seedTextFile(db, "note.md", "old");
+    const unreadable = dbWithPrepareFailure(db, (sql) => sql.includes("SELECT original_bytes FROM files"));
+
+    expect(expectEditError(() => computeEdit(unreadable, "note.md", "old", "new", false, {})).outcome).toBe("wrong_type");
+    expect(expectEditError(() => planWriteFile(unreadable, "note.md", "new")).outcome).toBe("error");
+    expect(expectEditError(() => planSetCells(unreadable, "note.md", null, [["A1", "new"]])).outcome).toBe("error");
+    expect(expectPlainError(() => planBatch(unreadable, [{ op: "edit", name: "note.md", oldText: "old", newText: "new" }])).message).toContain("storage unavailable");
+
+    db.prepare("UPDATE files SET original_bytes = NULL WHERE id = ?").run(id);
+    expect(expectEditError(() => computeEdit(db, "note.md", "old", "new", false, {})).message).toContain("no stored content");
+    expect(expectEditError(() => planSetCells(db, "note.md", null, [["A1", "new"]])).message).toContain("no stored content");
+  });
+
+  it("workspace validation retains the public planner error categories", async () => {
+    const db = freshRoom();
+    seedTextFile(db, "note.md", "old");
+    insertFile(db, "image.png", "image/png", Buffer.from([1]), null, "upload");
+    const workspace = { readBuffer: async () => Buffer.from("old") } as unknown as Parameters<typeof planSingleEditWorkspace>[1];
+
+    expect(expectEditError(() => planWriteFile(db, "missing.md", "x")).outcome).toBe("not_found");
+    await expect(planSingleEditWorkspace(db, workspace, { name: "note.md", oldText: "", newText: "x", all: false })).rejects.toMatchObject({ outcome: "not_found" });
+    await expect(planSingleEditWorkspace(db, workspace, { name: "missing.md", oldText: "old", newText: "x", all: false })).rejects.toMatchObject({ outcome: "not_found" });
+    await expect(planWriteFileWorkspace(db, workspace, "missing.md", "x")).rejects.toMatchObject({ outcome: "not_found" });
+    await expect(planWriteFileWorkspace(db, workspace, "image.png", "x")).rejects.toMatchObject({ outcome: "wrong_type" });
+    await expect(planSetCellsWorkspace(db, workspace, "missing.csv", null, [["A1", "x"]])).rejects.toMatchObject({ outcome: "not_found" });
+    await expect(planBatchWorkspace(db, workspace, [{ op: "edit", name: "missing.md", oldText: "old", newText: "x" }])).rejects.toThrow("missing.md");
+  });
+
+  it("wraps commit write failures as an edit error and retains the batch-failure tag", () => {
+    const db = freshRoom();
+    seedTextFile(db, "note.md", "old");
+    const unwritable = dbWithPrepareFailure(db, (sql) => sql.includes("UPDATE files SET original_bytes"));
+    const err = expectEditError(() => runEditFile(unwritable, "note.md", "old", "new", false));
+    expect(err.outcome).toBe("error");
+    expect(EditError.batchFailure("batch message")).toMatchObject({ message: "batch message", outcome: "failed" });
   });
 
   it("a replacement that CONTAINS the quote is spliced once, never re-scanned", () => {

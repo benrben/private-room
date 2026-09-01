@@ -1,5 +1,10 @@
 import { useEffect, useState } from "react";
-import { checkForUpdate, getVersion, installUpdate, type AvailableUpdate } from "../platform";
+import {
+  checkForUpdate,
+  getVersion,
+  installUpdate,
+  type AvailableUpdate,
+} from "../platform";
 import {
   AlertIcon,
   CircleCheckIcon,
@@ -15,7 +20,216 @@ import { autoUpdateCheckEnabled, setAutoUpdateCheck } from "../updater";
  * depend on an un-exported class name). */
 type UpdateHandle = AvailableUpdate;
 
-type Phase = "idle" | "checking" | "available" | "downloading" | "uptodate" | "error";
+type Phase =
+  | "idle"
+  | "checking"
+  | "available"
+  | "downloading"
+  | "uptodate"
+  | "error";
+
+interface UpdateActionProps {
+  phase: Phase;
+  update: UpdateHandle | null;
+  onCheck: () => void;
+  onInstall: () => void;
+}
+
+interface UpdateStatusProps {
+  phase: Phase;
+  update: UpdateHandle | null;
+  pct: number | null;
+  error: string;
+}
+
+function updateIntro(autoCheck: boolean): string {
+  return autoCheck
+    ? "It checks quietly on launch;"
+    : "The launch check is switched off, so nothing is contacted until you ask;";
+}
+
+function autoCheckDetail(autoCheck: boolean): string {
+  return autoCheck
+    ? "Check for updates on launch — Arcelle contacts GitHub each time it starts."
+    : "OFF — Arcelle never contacts GitHub on its own. Checking here still works.";
+}
+
+function downloadMessage(pct: number | null): string {
+  if (pct != null && pct >= 100) return "Installing… the app will relaunch.";
+  return `Downloading the update…${pct != null ? ` ${pct}%` : ""}`;
+}
+
+function BrandLockup() {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 16,
+        marginBottom: 22,
+        lineHeight: 0,
+      }}
+    >
+      <Logomark size={64} />
+      <Wordmark size={38} />
+    </div>
+  );
+}
+
+function AutoCheckToggle({
+  autoCheck,
+  onChange,
+}: {
+  autoCheck: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <div className="settings-toggle-row" data-agent-blocked="true">
+      <label className="switch">
+        <input
+          type="checkbox"
+          checked={autoCheck}
+          aria-label="Check for updates automatically on launch"
+          onChange={(event) => onChange(event.target.checked)}
+        />
+        <span className="switch-track" aria-hidden="true">
+          <span className="switch-thumb" />
+        </span>
+      </label>
+      <span>{autoCheckDetail(autoCheck)}</span>
+    </div>
+  );
+}
+
+function UpdateAction({
+  phase,
+  update,
+  onCheck,
+  onInstall,
+}: UpdateActionProps) {
+  if (phase === "available" && update) {
+    return (
+      <button className="primary btn-ic" onClick={onInstall}>
+        <DownloadIcon size={14} /> Download &amp; install v{update.version}
+      </button>
+    );
+  }
+  const busy = phase === "checking" || phase === "downloading";
+  return (
+    <button className="subtle btn-ic" disabled={busy} onClick={onCheck}>
+      <DownloadIcon size={14} />{" "}
+      {phase === "checking" ? "Checking…" : "Check for updates"}
+    </button>
+  );
+}
+
+function UpdateNotice({
+  phase,
+  update,
+}: Pick<UpdateStatusProps, "phase" | "update">) {
+  if (phase === "uptodate") {
+    return (
+      <div
+        className="settings-hint btn-ic"
+        style={{ marginTop: 8, color: "var(--ok, var(--accent))" }}
+      >
+        <CircleCheckIcon size={14} /> You're on the latest version.
+      </div>
+    );
+  }
+  if (phase === "available" && update) {
+    return (
+      <div className="settings-hint" style={{ marginTop: 8 }}>
+        Version <strong>v{update.version}</strong> is available. Installing
+        replaces this app and relaunches it — save your work first.
+      </div>
+    );
+  }
+  return null;
+}
+
+function DownloadProgress({
+  phase,
+  pct,
+}: Pick<UpdateStatusProps, "phase" | "pct">) {
+  if (phase !== "downloading") return null;
+  return (
+    <div className="pull-progress" style={{ marginTop: 8 }}>
+      <div className="pull-bar">
+        <div
+          className="pull-bar-fill"
+          style={{
+            width: `${pct ?? 0}%`,
+            ...(pct == null ? { opacity: 0.6 } : null),
+          }}
+        />
+      </div>
+      <span>{downloadMessage(pct)}</span>
+    </div>
+  );
+}
+
+function UpdateError({
+  phase,
+  error,
+}: Pick<UpdateStatusProps, "phase" | "error">) {
+  if (phase !== "error") return null;
+  return (
+    <div className="gate-error btn-ic" style={{ marginTop: 8 }}>
+      <AlertIcon size={14} className="warn-ic" /> {error}
+    </div>
+  );
+}
+
+function UpdateStatus({ phase, update, pct, error }: UpdateStatusProps) {
+  return (
+    <>
+      <UpdateNotice phase={phase} update={update} />
+      <DownloadProgress phase={phase} pct={pct} />
+      <UpdateError phase={phase} error={error} />
+    </>
+  );
+}
+
+function LogsSection({
+  logDir,
+  logErr,
+  onReveal,
+}: {
+  logDir: string;
+  logErr: string;
+  onReveal: () => void;
+}) {
+  return (
+    <>
+      <h3 style={{ marginTop: 24 }}>Logs</h3>
+      <p className="settings-hint">
+        Arcelle keeps two small log files — one for the app and one for its AI
+        service. They record what the app <em>did</em>: which tools an agent was
+        given, which model answered, how long it took, whether a Stop landed.
+        Nothing from a room goes in them — no messages, no file contents, not
+        even file names — so they're safe to attach to a bug report.
+      </p>
+      <div className="model-row" style={{ justifyContent: "space-between" }}>
+        <span>Show the log files in Finder</span>
+        <button className="subtle btn-ic" onClick={onReveal}>
+          <FolderIcon size={14} /> Reveal logs
+        </button>
+      </div>
+      {logDir ? (
+        <div className="settings-hint" style={{ marginTop: 8 }}>
+          Opened <code>{logDir}</code> — look for <code>arcelle-host.log</code>
+          and <code>arcelle-sidecar.log</code>.
+        </div>
+      ) : null}
+      {logErr ? (
+        <div className="gate-error btn-ic" style={{ marginTop: 8 }}>
+          <AlertIcon size={14} className="warn-ic" /> {logErr}
+        </div>
+      ) : null}
+    </>
+  );
+}
 
 /**
  * Updates & version — the manual counterpart to the silent launch check.
@@ -39,10 +253,14 @@ export default function AboutSection() {
   const [logErr, setLogErr] = useState<string>("");
   // Read once from the same preference the launch check reads, so the box
   // shows what is actually in force rather than a fresh-install default.
-  const [autoCheck, setAutoCheck] = useState<boolean>(() => autoUpdateCheckEnabled());
+  const [autoCheck, setAutoCheck] = useState<boolean>(() =>
+    autoUpdateCheckEnabled(),
+  );
 
   useEffect(() => {
-    getVersion().then(setCurrent).catch(() => setCurrent(""));
+    getVersion()
+      .then(setCurrent)
+      .catch(() => setCurrent(""));
   }, []);
 
   async function runCheck() {
@@ -85,163 +303,54 @@ export default function AboutSection() {
       setLogDir(await api.revealLogs());
     } catch (e) {
       setLogDir("");
-      setLogErr(typeof e === "string" ? e : "The logs folder could not be opened.");
+      setLogErr(
+        typeof e === "string" ? e : "The logs folder could not be opened.",
+      );
     }
   }
 
-  const busy = phase === "checking" || phase === "downloading";
-
   return (
     <section id="set-about">
-      {/* The brand lockup: the mark large enough for the folds to read, and
-          the handwritten wordmark beside it. This is the only screen in the
-          product that shows the brand at rest rather than as a 26px chip in a
-          toolbar, so it is worth the room. The version deliberately is NOT
-          repeated here — it already has a functional row of its own directly
-          below, next to the button that acts on it.
-
-          Inline styles rather than a class because this file already styles
-          its one-off rows that way and the settings stylesheet is not this
-          component's to grow. */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 16,
-          marginBottom: 22,
-          lineHeight: 0,
-        }}
-      >
-        <Logomark size={64} />
-        <Wordmark size={38} />
-      </div>
-
+      <BrandLockup />
       <h3>Updates &amp; version</h3>
       <p className="settings-hint">
         Arcelle updates itself from its signed GitHub releases.{" "}
-        {autoCheck
-          ? "It checks quietly on launch;"
-          : "The launch check is switched off, so nothing is contacted until you ask;"}{" "}
-        use the button below to check right now and install the latest release
-        in one click.
+        {updateIntro(autoCheck)} use the button below to check right now and
+        install the latest release in one click.
       </p>
-
-      {/* The launch check reaches GitHub before any room is unlocked, which
-          makes it one of only two things this app sends anywhere on its own.
-          The preference has existed since the check did; until now nothing
-          wrote it, so the only way to switch it off was to edit localStorage
-          by hand — a promise the README made on the app's behalf that the app
-          itself did not keep. `data-agent-blocked` for the same reason every
-          other outbound-network switch is: it is the user's decision, not an
-          agent's. */}
-      <div className="settings-toggle-row" data-agent-blocked="true">
-        <label className="switch">
-          <input
-            type="checkbox"
-            checked={autoCheck}
-            aria-label="Check for updates automatically on launch"
-            onChange={(e) => setAutoCheck(setAutoUpdateCheck(e.target.checked))}
-          />
-          <span className="switch-track" aria-hidden="true">
-            <span className="switch-thumb" />
-          </span>
-        </label>
-        <span>
-          {autoCheck
-            ? "Check for updates on launch — Arcelle contacts GitHub each time it starts."
-            : "OFF — Arcelle never contacts GitHub on its own. Checking here still works."}
-        </span>
-      </div>
-
+      <AutoCheckToggle
+        autoCheck={autoCheck}
+        onChange={(checked) => setAutoCheck(setAutoUpdateCheck(checked))}
+      />
       <div className="model-row" style={{ justifyContent: "space-between" }}>
         <span>
           Current version <strong>{current ? `v${current}` : "…"}</strong>
         </span>
-
-        {phase === "available" && update ? (
-          <button className="primary btn-ic" onClick={() => void runInstall()}>
-            <DownloadIcon size={14} /> Download &amp; install v{update.version}
-          </button>
-        ) : (
-          <button className="subtle btn-ic" disabled={busy} onClick={() => void runCheck()}>
-            <DownloadIcon size={14} />{" "}
-            {phase === "checking" ? "Checking…" : "Check for updates"}
-          </button>
-        )}
+        <UpdateAction
+          phase={phase}
+          update={update}
+          onCheck={() => void runCheck()}
+          onInstall={() => void runInstall()}
+        />
       </div>
-
-      {phase === "uptodate" && (
-        <div className="settings-hint btn-ic" style={{ marginTop: 8, color: "var(--ok, var(--accent))" }}>
-          <CircleCheckIcon size={14} /> You're on the latest version.
-        </div>
-      )}
-
-      {phase === "available" && update && (
-        <div className="settings-hint" style={{ marginTop: 8 }}>
-          Version <strong>v{update.version}</strong> is available. Installing
-          replaces this app and relaunches it — save your work first.
-        </div>
-      )}
-
-      {phase === "downloading" && (
-        <div className="pull-progress" style={{ marginTop: 8 }}>
-          <div className="pull-bar">
-            <div
-              className="pull-bar-fill"
-              style={{ width: `${pct ?? 0}%`, ...(pct == null ? { opacity: 0.6 } : null) }}
-            />
-          </div>
-          <span>
-            {pct != null && pct >= 100
-              ? "Installing… the app will relaunch."
-              : `Downloading the update…${pct != null ? ` ${pct}%` : ""}`}
-          </span>
-        </div>
-      )}
-
-      {phase === "error" && (
-        <div className="gate-error btn-ic" style={{ marginTop: 8 }}>
-          <AlertIcon size={14} className="warn-ic" /> {err}
-        </div>
-      )}
-
-      <h3 style={{ marginTop: 24 }}>Logs</h3>
-      <p className="settings-hint">
-        Arcelle keeps two small log files — one for the app and one for its AI
-        service. They record what the app <em>did</em>: which tools an agent was
-        given, which model answered, how long it took, whether a Stop landed.
-        Nothing from a room goes in them — no messages, no file contents, not
-        even file names — so they're safe to attach to a bug report.
-      </p>
-
-      <div className="model-row" style={{ justifyContent: "space-between" }}>
-        <span>Show the log files in Finder</span>
-        <button className="subtle btn-ic" onClick={() => void showLogs()}>
-          <FolderIcon size={14} /> Reveal logs
-        </button>
-      </div>
-
-      {logDir && (
-        <div className="settings-hint" style={{ marginTop: 8 }}>
-          Opened <code>{logDir}</code> — look for{" "}
-          <code>arcelle-host.log</code> and <code>arcelle-sidecar.log</code>.
-        </div>
-      )}
-
-      {logErr && (
-        <div className="gate-error btn-ic" style={{ marginTop: 8 }}>
-          <AlertIcon size={14} className="warn-ic" /> {logErr}
-        </div>
-      )}
+      <UpdateStatus phase={phase} update={update} pct={pct} error={err} />
+      <LogsSection
+        logDir={logDir}
+        logErr={logErr}
+        onReveal={() => void showLogs()}
+      />
     </section>
   );
 }
 
 /** A short, human message for a caught updater error (offline, no release, etc.). */
 function errText(e: unknown): string {
-  const raw = typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
+  const raw =
+    typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
   if (/network|timeout|dns|connection|offline|failed to fetch/i.test(raw)) {
     return "Couldn't reach the release server — check your connection and try again.";
   }
   return raw || "The update check failed. Please try again.";
 }
+
+export const aboutSectionTestables = { downloadMessage, errText };

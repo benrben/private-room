@@ -51,6 +51,27 @@ function pushDocxPart(parts: string[], bytes: Uint8Array, entry: string, label: 
   parts.push(`\n[${label}]\n${text}`);
 }
 
+function pushExtraDocxParts(parts: string[], bytes: Uint8Array): void {
+  for (const [entry, label] of DOCX_EXTRA_PARTS) {
+    pushDocxPart(parts, bytes, entry, label);
+  }
+}
+
+function headerFooterLabel(name: string): string | null {
+  if (name.startsWith("word/header")) return "header";
+  if (name.startsWith("word/footer")) return "footer";
+  return null;
+}
+
+function pushDocxHeaderFooterParts(parts: string[], bytes: Uint8Array): void {
+  for (const name of zipEntryNames(bytes)) {
+    const label = headerFooterLabel(name);
+    if (label !== null && name.endsWith(".xml")) {
+      pushDocxPart(parts, bytes, name, label);
+    }
+  }
+}
+
 /** Ported from `docx::extract_docx`. `null` when `word/document.xml` can't be
  * read at all. */
 export function extractDocx(bytes: Uint8Array): string | null {
@@ -59,16 +80,9 @@ export function extractDocx(bytes: Uint8Array): string | null {
     return null;
   }
   const parts: string[] = [xmlParasToText(xml, "</w:p>")];
-  for (const [entry, label] of DOCX_EXTRA_PARTS) {
-    pushDocxPart(parts, bytes, entry, label);
-  }
+  pushExtraDocxParts(parts, bytes);
   // Headers and footers are per-section parts; take them in archive order.
-  for (const name of zipEntryNames(bytes)) {
-    const label = name.startsWith("word/header") ? "header" : name.startsWith("word/footer") ? "footer" : null;
-    if (label !== null && name.endsWith(".xml")) {
-      pushDocxPart(parts, bytes, name, label);
-    }
-  }
+  pushDocxHeaderFooterParts(parts, bytes);
   return parts.join("");
 }
 
@@ -98,6 +112,172 @@ const PARA_SENTINEL_NODE = -1;
  * Built with `String.fromCharCode` so no raw NUL sits in this source file. */
 const PARA_SENTINEL = String.fromCharCode(0);
 
+interface DocxTextScan {
+  readonly nodes: DocxTextNode[];
+  readonly hay: string[];
+  readonly map: Array<[number, number]>;
+  lastSpace: boolean;
+  position: number;
+}
+
+type DocxMarkup =
+  | { readonly kind: "text"; readonly tagStart: number }
+  | { readonly kind: "paragraph"; readonly tagStart: number };
+
+type DocxTextNodeScan =
+  | { readonly kind: "stop" }
+  | { readonly kind: "skip"; readonly nextPosition: number }
+  | { readonly kind: "node"; readonly nextPosition: number; readonly node: DocxTextNode };
+
+function textMarkupPrecedesParagraph(textStart: number, paragraphStart: number): boolean {
+  return textStart !== -1 && (paragraphStart === -1 || textStart < paragraphStart);
+}
+
+function nextDocxMarkup(xml: string, position: number): DocxMarkup | null {
+  const textStart = xml.indexOf("<w:t", position);
+  const paragraphStart = xml.indexOf("</w:p>", position);
+  if (textStart === -1 && paragraphStart === -1) {
+    return null;
+  }
+  return textMarkupPrecedesParagraph(textStart, paragraphStart)
+    ? { kind: "text", tagStart: textStart }
+    : { kind: "paragraph", tagStart: paragraphStart };
+}
+
+function looksLikeDocxTextTag(afterTagName: string): boolean {
+  return afterTagName.startsWith(">");
+}
+
+function looksLikeDocxTextTagWithAttributes(afterTagName: string): boolean {
+  return afterTagName.startsWith(" ");
+}
+
+function isDocxTextTag(afterTagName: string): boolean {
+  return looksLikeDocxTextTag(afterTagName) || looksLikeDocxTextTagWithAttributes(afterTagName);
+}
+
+function isSelfClosingDocxTextTag(afterTagName: string, tagEnd: number): boolean {
+  return tagEnd >= 1 && afterTagName[tagEnd - 1] === "/";
+}
+
+function skipDocxTextTag(tagStart: number, offset: number): DocxTextNodeScan {
+  return { kind: "skip", nextPosition: tagStart + offset };
+}
+
+function scanDocxTextContent(xml: string, tagStart: number, tagEnd: number): DocxTextNodeScan {
+  const bodyStart = tagStart + 4 + tagEnd + 1;
+  const bodyEnd = xml.indexOf("</w:t>", bodyStart);
+  if (bodyEnd === -1) {
+    return { kind: "stop" };
+  }
+  const text = [...decodeBasicEntities(xml.slice(bodyStart, bodyEnd))];
+  return {
+    kind: "node",
+    nextPosition: bodyEnd + 6,
+    node: { tagStart, bodyStart, bodyEnd, text },
+  };
+}
+
+function scanDocxTextTag(xml: string, tagStart: number): DocxTextNodeScan {
+  const afterTagName = xml.slice(tagStart + 4);
+  if (!isDocxTextTag(afterTagName)) {
+    return skipDocxTextTag(tagStart, 4);
+  }
+  const tagEnd = afterTagName.indexOf(">");
+  if (tagEnd === -1) {
+    return { kind: "stop" };
+  }
+  if (isSelfClosingDocxTextTag(afterTagName, tagEnd)) {
+    return skipDocxTextTag(tagStart, 4 + tagEnd + 1);
+  }
+  return scanDocxTextContent(xml, tagStart, tagEnd);
+}
+
+function appendDocxSpace(scan: DocxTextScan, nodeIndex: number, characterIndex: number): void {
+  if (!scan.lastSpace) {
+    scan.hay.push(" ");
+    scan.map.push([nodeIndex, characterIndex]);
+    scan.lastSpace = true;
+  }
+}
+
+function appendDocxCharacter(scan: DocxTextScan, nodeIndex: number, characterIndex: number, character: string): void {
+  scan.hay.push(character);
+  scan.map.push([nodeIndex, characterIndex]);
+  scan.lastSpace = false;
+}
+
+function appendDocxCharacterPair(
+  scan: DocxTextScan,
+  nodeIndex: number,
+  characterIndex: number,
+  first: string,
+  second: string,
+): void {
+  appendDocxCharacter(scan, nodeIndex, characterIndex, first);
+  appendDocxCharacter(scan, nodeIndex, characterIndex, second);
+}
+
+function appendFoldedDocxCharacter(scan: DocxTextScan, nodeIndex: number, characterIndex: number, character: string): void {
+  const fold = foldEditChar(character);
+  switch (fold.kind) {
+    case "space":
+      appendDocxSpace(scan, nodeIndex, characterIndex);
+      break;
+    case "drop":
+      break;
+    case "char":
+      appendDocxCharacter(scan, nodeIndex, characterIndex, fold.c);
+      break;
+    case "pair":
+      appendDocxCharacterPair(scan, nodeIndex, characterIndex, fold.a, fold.b);
+      break;
+  }
+}
+
+function appendFoldedDocxText(scan: DocxTextScan, nodeIndex: number, text: readonly string[]): void {
+  for (let characterIndex = 0; characterIndex < text.length; characterIndex++) {
+    appendFoldedDocxCharacter(scan, nodeIndex, characterIndex, text[characterIndex]!);
+  }
+}
+
+function appendDocxParagraphBoundary(scan: DocxTextScan, tagStart: number): void {
+  scan.hay.push(PARA_SENTINEL);
+  scan.map.push([PARA_SENTINEL_NODE, 0]);
+  scan.lastSpace = true;
+  scan.position = tagStart + 6;
+}
+
+function appendDocxTextNode(scan: DocxTextScan, node: DocxTextNode): void {
+  appendFoldedDocxText(scan, scan.nodes.length, node.text);
+  scan.nodes.push(node);
+}
+
+function consumeDocxTextMarkup(scan: DocxTextScan, xml: string, tagStart: number): boolean {
+  const result = scanDocxTextTag(xml, tagStart);
+  if (result.kind === "stop") {
+    return false;
+  }
+  scan.position = result.nextPosition;
+  if (result.kind === "skip") {
+    return true;
+  }
+  appendDocxTextNode(scan, result.node);
+  return true;
+}
+
+function advanceDocxTextScan(scan: DocxTextScan, xml: string): boolean {
+  const markup = nextDocxMarkup(xml, scan.position);
+  if (markup === null) {
+    return false;
+  }
+  if (markup.kind === "paragraph") {
+    appendDocxParagraphBoundary(scan, markup.tagStart);
+    return true;
+  }
+  return consumeDocxTextMarkup(scan, xml, markup.tagStart);
+}
+
 /**
  * Scan `xml` for `<w:t>` text nodes, keeping paragraph boundaries. Returns
  * the nodes plus a "virtual text" stream (whitespace-collapsed,
@@ -105,116 +285,70 @@ const PARA_SENTINEL = String.fromCharCode(0);
  * `[nodeIndex, charOffsetWithinNode]`. Ported from `docx::scan_docx_text`.
  */
 function scanDocxText(xml: string): { nodes: DocxTextNode[]; hay: string[]; map: Array<[number, number]> } {
-  const nodes: DocxTextNode[] = [];
-  const hay: string[] = [];
-  const map: Array<[number, number]> = [];
-  let lastSpace = true;
-  let i = 0;
-  for (;;) {
-    const nextT = xml.indexOf("<w:t", i);
-    const nextP = xml.indexOf("</w:p>", i);
-    if (nextT === -1 && nextP === -1) {
-      break;
-    }
-    if (nextT !== -1 && (nextP === -1 || nextT < nextP)) {
-      // Only a real `<w:t>` / `<w:t attr…>`, not `<w:tab/>` etc.
-      const after = xml.slice(nextT + 4);
-      if (!(after.startsWith(">") || after.startsWith(" "))) {
-        i = nextT + 4;
-        continue;
-      }
-      const gt = after.indexOf(">");
-      if (gt === -1) {
-        break;
-      }
-      // Self-closing empty node: `<w:t/>` or `<w:t …/>`.
-      if (gt >= 1 && after[gt - 1] === "/") {
-        i = nextT + 4 + gt + 1;
-        continue;
-      }
-      const bodyStart = nextT + 4 + gt + 1;
-      const bodyEnd = xml.indexOf("</w:t>", bodyStart);
-      if (bodyEnd === -1) {
-        break;
-      }
-      const text = [...decodeBasicEntities(xml.slice(bodyStart, bodyEnd))];
-      const ni = nodes.length;
-      // Fold each char through the shared edit table so a docx match tolerates
-      // the same curly-quote/NBSP/dash/ligature drift the plain-text matcher
-      // does. Paragraph bounds stay via the sentinels below.
-      for (let ci = 0; ci < text.length; ci++) {
-        const fold = foldEditChar(text[ci]!);
-        switch (fold.kind) {
-          case "space":
-            if (!lastSpace) {
-              hay.push(" ");
-              map.push([ni, ci]);
-              lastSpace = true;
-            }
-            break;
-          case "drop":
-            break;
-          case "char":
-            hay.push(fold.c);
-            map.push([ni, ci]);
-            lastSpace = false;
-            break;
-          case "pair":
-            // Both halves map back to the SAME source char, so a match
-            // spanning either replaces that whole character.
-            hay.push(fold.a);
-            map.push([ni, ci]);
-            hay.push(fold.b);
-            map.push([ni, ci]);
-            lastSpace = false;
-            break;
-        }
-      }
-      nodes.push({ tagStart: nextT, bodyStart, bodyEnd, text });
-      i = bodyEnd + 6;
-    } else {
-      // Paragraph boundary: an unmatchable separator.
-      hay.push(PARA_SENTINEL);
-      map.push([PARA_SENTINEL_NODE, 0]);
-      lastSpace = true;
-      i = nextP + 6;
-    }
+  const scan: DocxTextScan = {
+    nodes: [],
+    hay: [],
+    map: [],
+    lastSpace: true,
+    position: 0,
+  };
+  while (advanceDocxTextScan(scan, xml)) {
+    // Each step either moves the scanner forward or stops it.
   }
-  return { nodes, hay, map };
+  return { nodes: scan.nodes, hay: scan.hay, map: scan.map };
+}
+
+interface CollapsedWhitespace {
+  readonly out: string[];
+  lastSpace: boolean;
+}
+
+function appendCollapsedSpace(scan: CollapsedWhitespace): void {
+  if (!scan.lastSpace) {
+    scan.out.push(" ");
+    scan.lastSpace = true;
+  }
+}
+
+function appendCollapsedNonSpace(scan: CollapsedWhitespace, character: string): void {
+  scan.out.push(character);
+  scan.lastSpace = false;
+}
+
+function appendCollapsedPair(scan: CollapsedWhitespace, first: string, second: string): void {
+  appendCollapsedNonSpace(scan, first);
+  appendCollapsedNonSpace(scan, second);
+}
+
+function appendCollapsedCharacter(scan: CollapsedWhitespace, character: string): void {
+  const fold = foldEditChar(character);
+  switch (fold.kind) {
+    case "space":
+      appendCollapsedSpace(scan);
+      break;
+    case "drop":
+      break;
+    case "char":
+      appendCollapsedNonSpace(scan, fold.c);
+      break;
+    case "pair":
+      appendCollapsedPair(scan, fold.a, fold.b);
+      break;
+  }
 }
 
 /** Whitespace-collapsed, fold-table-applied needle — matching must survive
  * the different spacing the model sees in extracted text vs. what the runs
  * actually contain. Ported from `docx::collapse_ws`. */
 function collapseWs(s: string): string[] {
-  const out: string[] = [];
-  let lastSpace = true;
+  const scan: CollapsedWhitespace = { out: [], lastSpace: true };
   for (const ch of s) {
-    const fold = foldEditChar(ch);
-    switch (fold.kind) {
-      case "space":
-        if (!lastSpace) {
-          out.push(" ");
-          lastSpace = true;
-        }
-        break;
-      case "drop":
-        break;
-      case "char":
-        out.push(fold.c);
-        lastSpace = false;
-        break;
-      case "pair":
-        out.push(fold.a);
-        out.push(fold.b);
-        lastSpace = false;
-        break;
-    }
+    appendCollapsedCharacter(scan, ch);
   }
-  while (out.length > 0 && out[out.length - 1] === " ") {
-    out.pop();
+  while (scan.out.length > 0 && scan.out[scan.out.length - 1] === " ") {
+    scan.out.pop();
   }
-  return out;
+  return scan.out;
 }
 
 /** Ported from `docx::find_sub`. */
@@ -245,6 +379,85 @@ function hasEdgeWhitespace(s: string): boolean {
   return isUnicodeWhitespace(chars[0]!) || isUnicodeWhitespace(chars[chars.length - 1]!);
 }
 
+type DocxNodeEdit = [number, number, string];
+type DocxEdits = Array<DocxNodeEdit[]>;
+
+function clearIntermediateDocxNodes(edits: DocxEdits, fromNode: number, toNode: number): void {
+  for (let nodeIndex = fromNode + 1; nodeIndex < toNode; nodeIndex++) {
+    edits[nodeIndex]!.push([0, Number.MAX_SAFE_INTEGER, ""]);
+  }
+}
+
+function addDocxMatchEdit(
+  edits: DocxEdits,
+  nodes: readonly DocxTextNode[],
+  map: ReadonlyArray<readonly [number, number]>,
+  start: number,
+  length: number,
+  replacement: string,
+): void {
+  const [firstNode, firstOffset] = map[start]!;
+  const [lastNode, lastOffset] = map[start + length - 1]!;
+  if (firstNode === lastNode) {
+    edits[firstNode]!.push([firstOffset, lastOffset + 1, replacement]);
+    return;
+  }
+  edits[firstNode]!.push([firstOffset, nodes[firstNode]!.text.length, replacement]);
+  clearIntermediateDocxNodes(edits, firstNode, lastNode);
+  edits[lastNode]!.push([0, lastOffset + 1, ""]);
+}
+
+function collectDocxEdits(
+  nodes: readonly DocxTextNode[],
+  hay: readonly string[],
+  map: ReadonlyArray<readonly [number, number]>,
+  needle: readonly string[],
+  replacement: string,
+): { edits: DocxEdits; count: number } {
+  const edits: DocxEdits = nodes.map(() => []);
+  let count = 0;
+  let from = 0;
+  for (;;) {
+    const start = findSub(hay, needle, from);
+    if (start === -1) break;
+    count += 1;
+    from = start + needle.length;
+    addDocxMatchEdit(edits, nodes, map, start, needle.length, replacement);
+  }
+  return { edits, count };
+}
+
+function applyDocxNodeEdits(text: readonly string[], edits: readonly DocxNodeEdit[]): string {
+  let updated = [...text];
+  const sorted = [...edits].sort((a, b) => a[0] - b[0]);
+  for (let index = sorted.length - 1; index >= 0; index--) {
+    const [start, endRaw, replacement] = sorted[index]!;
+    const end = Math.min(endRaw, updated.length);
+    updated = updated.slice(0, start).concat([...replacement], updated.slice(end));
+  }
+  return updated.join("");
+}
+
+function rewriteDocxNode(xml: string, node: DocxTextNode, newText: string): string {
+  let out = xml.slice(0, node.bodyStart) + encodeXmlText(newText) + xml.slice(node.bodyEnd);
+  const tag = out.slice(node.tagStart, node.bodyStart);
+  if (hasEdgeWhitespace(newText) && !tag.includes("xml:space")) {
+    out = `${out.slice(0, node.bodyStart - 1)} xml:space="preserve"${out.slice(node.bodyStart - 1)}`;
+  }
+  return out;
+}
+
+function applyDocxEdits(xml: string, nodes: readonly DocxTextNode[], edits: DocxEdits): string {
+  let out = xml;
+  for (let nodeIndex = nodes.length - 1; nodeIndex >= 0; nodeIndex--) {
+    const nodeEdits = edits[nodeIndex]!;
+    if (nodeEdits.length === 0) continue;
+    const node = nodes[nodeIndex]!;
+    out = rewriteDocxNode(out, node, applyDocxNodeEdits(node.text, nodeEdits));
+  }
+  return out;
+}
+
 /**
  * Replace `old` with `newText` across the document's text nodes, tolerant of
  * whitespace and typographic drift. Returns the patched xml plus the match
@@ -256,60 +469,13 @@ export function replaceInTextNodes(xml: string, old: string, newText: string): {
     return { xml, count: 0 };
   }
   const { nodes, hay, map } = scanDocxText(xml);
-
-  // edits[node] = [fromChar, toCharExclusive, replacement][]
-  const edits: Array<Array<[number, number, string]>> = nodes.map(() => []);
-  let count = 0;
-  let from = 0;
-  for (;;) {
-    const s = findSub(hay, needle, from);
-    if (s === -1) {
-      break;
-    }
-    count += 1;
-    from = s + needle.length;
-    const [n1, off1] = map[s]!;
-    const [n2, off2] = map[s + needle.length - 1]!;
-    if (n1 === n2) {
-      edits[n1]!.push([off1, off2 + 1, newText]);
-    } else {
-      edits[n1]!.push([off1, nodes[n1]!.text.length, newText]);
-      for (let ni = n1 + 1; ni < n2; ni++) {
-        edits[ni]!.push([0, Number.MAX_SAFE_INTEGER, ""]);
-      }
-      edits[n2]!.push([0, off2 + 1, ""]);
-    }
-  }
+  const { edits, count } = collectDocxEdits(nodes, hay, map, needle, newText);
   if (count === 0) {
     return { xml, count: 0 };
   }
-
   // Rewrite changed nodes, splicing right-to-left so earlier positions stay
   // valid while later ones are rewritten first.
-  let out = xml;
-  for (let ni = nodes.length - 1; ni >= 0; ni--) {
-    const nodeEdits = edits[ni]!;
-    if (nodeEdits.length === 0) {
-      continue;
-    }
-    const node = nodes[ni]!;
-    let text = [...node.text];
-    const sorted = [...nodeEdits].sort((a, b) => a[0] - b[0]);
-    for (let k = sorted.length - 1; k >= 0; k--) {
-      const [start, endRaw, repl] = sorted[k]!;
-      const end = Math.min(endRaw, text.length);
-      const tail = text.slice(end);
-      text = text.slice(0, start).concat([...repl], tail);
-    }
-    const newNodeText = text.join("");
-    out = out.slice(0, node.bodyStart) + encodeXmlText(newNodeText) + out.slice(node.bodyEnd);
-    // Word trims un-flagged edge whitespace; keep it explicit.
-    const tag = out.slice(node.tagStart, node.bodyStart);
-    if (hasEdgeWhitespace(newNodeText) && !tag.includes("xml:space")) {
-      out = `${out.slice(0, node.bodyStart - 1)} xml:space="preserve"${out.slice(node.bodyStart - 1)}`;
-    }
-  }
-  return { xml: out, count };
+  return { xml: applyDocxEdits(xml, nodes, edits), count };
 }
 
 /** `Result<(Vec<u8>, usize), String>` — the exact shape
@@ -340,12 +506,7 @@ export function docxReplaceText(bytes: Uint8Array, old: string, newText: string)
         `appears in the file. Searched for: "${old}"`,
     };
   }
-  let archive: ZipEntry[];
-  try {
-    archive = parseZip(bytes);
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
-  }
+  const archive: ZipEntry[] = parseZip(bytes);
   const writeEntries: ZipWriteEntry[] = archive.map((entry) =>
     entry.name === "word/document.xml"
       ? { name: entry.name, data: Buffer.from(patched, "utf8") }

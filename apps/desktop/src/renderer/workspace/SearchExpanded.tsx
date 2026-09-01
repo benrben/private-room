@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, fileKindLabel, formatSize } from "../api";
+import { api, fileKindLabel } from "../api";
 import type { FileMeta, SearchResults } from "../api";
-import { ChatBubbleIcon, CloseIcon, FileTypeIcon, MemoryIcon } from "../icons";
-import { fileLabel, formatWhen } from "./composer";
 import type { FlatResult } from "./types";
 
 /** The ⌘K launcher's EXPANDED results: everything the room's own "Find" area
@@ -39,16 +37,16 @@ import type { FlatResult } from "./types";
 /** Which of the three things a room-wide search looks at. */
 export type SourceKey = "files" | "messages" | "memories";
 /** How recently a file was added. */
-type WhenKey = "any" | "today" | "week" | "month" | "year";
+export type WhenKey = "any" | "today" | "week" | "month" | "year";
 /** WHERE the words were found. This is a real distinction in the backend and
  * not a guess: `search_all` returns a snippet for a content (FTS) hit and an
  * empty snippet for a file whose NAME matched, precisely so the two can be
  * told apart downstream. */
-type MatchKey = "any" | "text" | "name";
+export type MatchKey = "any" | "text" | "name";
 /** Order of the file group. Only files carry a date, a size and a name, so
  * this control says "Sort files" on screen rather than implying it reorders
  * conversations and memories too. */
-type SortKey = "best" | "newest" | "oldest" | "name";
+export type SortKey = "best" | "newest" | "oldest" | "name";
 
 export interface FindFilters {
   sources: SourceKey[];
@@ -69,13 +67,13 @@ export const DEFAULT_FILTERS: FindFilters = {
   sort: "best",
 };
 
-const SOURCE_LABELS: Record<SourceKey, string> = {
+export const SOURCE_LABELS: Record<SourceKey, string> = {
   files: "Files",
   messages: "Conversations",
   memories: "Memories",
 };
 
-const WHEN_LABELS: Record<WhenKey, string> = {
+export const WHEN_LABELS: Record<WhenKey, string> = {
   any: "Any time",
   today: "Today",
   week: "Past 7 days",
@@ -83,13 +81,13 @@ const WHEN_LABELS: Record<WhenKey, string> = {
   year: "Past year",
 };
 
-const MATCH_LABELS: Record<MatchKey, string> = {
+export const MATCH_LABELS: Record<MatchKey, string> = {
   any: "Anywhere",
   text: "In the text",
   name: "In the file name",
 };
 
-const SORT_LABELS: Record<SortKey, string> = {
+export const SORT_LABELS: Record<SortKey, string> = {
   best: "Best match",
   newest: "Newest first",
   oldest: "Oldest first",
@@ -141,21 +139,32 @@ function parseRecent(raw: string | null): string[] {
 /** Reads back a stored filter set, keeping only values this build still
  * understands. A room written by a newer build must degrade to a search that
  * runs, never to a filter the launcher cannot render. */
+function savedSources(value: unknown): SourceKey[] {
+  if (!Array.isArray(value)) return DEFAULT_FILTERS.sources;
+  const sources = value.filter((source): source is SourceKey =>
+    (ALL_SOURCES as string[]).includes(source as string),
+  );
+  return sources.length > 0 ? sources : DEFAULT_FILTERS.sources;
+}
+
+function savedKinds(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((kind): kind is string => typeof kind === "string") : [];
+}
+
+function savedChoice<Key extends string>(value: unknown, choices: Record<Key, string>, fallback: Key): Key {
+  return typeof value === "string" && value in choices ? (value as Key) : fallback;
+}
+
 function parseFilters(v: unknown): FindFilters {
   const o = (v ?? {}) as Partial<Record<keyof FindFilters, unknown>>;
-  const sources = Array.isArray(o.sources)
-    ? (o.sources.filter((s): s is SourceKey =>
-        (ALL_SOURCES as string[]).includes(s as string),
-      ) as SourceKey[])
-    : DEFAULT_FILTERS.sources;
   return {
     // An empty source list would be a saved search that can never match
     // anything, so it falls back to "look everywhere".
-    sources: sources.length > 0 ? sources : DEFAULT_FILTERS.sources,
-    kinds: Array.isArray(o.kinds) ? o.kinds.filter((k): k is string => typeof k === "string") : [],
-    when: typeof o.when === "string" && o.when in WHEN_LABELS ? (o.when as WhenKey) : "any",
-    match: typeof o.match === "string" && o.match in MATCH_LABELS ? (o.match as MatchKey) : "any",
-    sort: typeof o.sort === "string" && o.sort in SORT_LABELS ? (o.sort as SortKey) : "best",
+    sources: savedSources(o.sources),
+    kinds: savedKinds(o.kinds),
+    when: savedChoice(o.when, WHEN_LABELS, "any"),
+    match: savedChoice(o.match, MATCH_LABELS, "any"),
+    sort: savedChoice(o.sort, SORT_LABELS, "best"),
   };
 }
 
@@ -259,35 +268,51 @@ export function useRecentAndSaved() {
  * of characters (Turkish dotted capital İ is the usual one) lower-case into
  * two code units and would shift every offset after them, so that case bails
  * out to "no highlighting" rather than marking the wrong letters. */
-export function splitMatches(
+interface MatchLocation {
+  at: number;
+  length: number;
+}
+
+function isBetterMatch(current: MatchLocation | null, at: number, length: number): boolean {
+  if (current === null) return true;
+  if (at < current.at) return true;
+  return at === current.at && length > current.length;
+}
+
+function nextMatch(hay: string, terms: string[], start: number): MatchLocation | null {
+  let next: MatchLocation | null = null;
+  for (const term of terms) {
+    const at = hay.indexOf(term, start);
+    if (at !== -1 && isBetterMatch(next, at, term.length)) next = { at, length: term.length };
+  }
+  return next;
+}
+
+function appendMatch(
+  runs: { text: string; hit: boolean }[],
   text: string,
-  terms: string[],
-): { text: string; hit: boolean }[] {
-  if (!text || terms.length === 0) return [{ text, hit: false }];
+  start: number,
+  match: MatchLocation,
+): void {
+  if (match.at > start) runs.push({ text: text.slice(start, match.at), hit: false });
+  runs.push({ text: text.slice(match.at, match.at + match.length), hit: true });
+}
+
+export function splitMatches(text: string, terms: string[]): { text: string; hit: boolean }[] {
+  if (!text) return [{ text, hit: false }];
+  if (terms.length === 0) return [{ text, hit: false }];
   const hay = text.toLowerCase();
   if (hay.length !== text.length) return [{ text, hit: false }];
   const out: { text: string; hit: boolean }[] = [];
   let i = 0;
   while (i < text.length) {
-    let at = -1;
-    let len = 0;
-    for (const t of terms) {
-      const p = hay.indexOf(t, i);
-      if (p === -1) continue;
-      // Earliest wins; on a tie the longer term wins, so searching "form" and
-      // "formula" marks the whole word rather than four letters of it.
-      if (at === -1 || p < at || (p === at && t.length > len)) {
-        at = p;
-        len = t.length;
-      }
-    }
-    if (at === -1) {
+    const match = nextMatch(hay, terms, i);
+    if (match === null) {
       out.push({ text: text.slice(i), hit: false });
       break;
     }
-    if (at > i) out.push({ text: text.slice(i, at), hit: false });
-    out.push({ text: text.slice(at, at + len), hit: true });
-    i = at + len;
+    appendMatch(out, text, i, match);
+    i = match.at + match.length;
   }
   return out;
 }
@@ -320,7 +345,7 @@ function whenCutoff(k: WhenKey): number | null {
 
 /** A compact date for the margin of a row. The year is only written when it
  * is not this one — a notebook margin says "Mar 4", not "Mar 4, 2026". */
-function shortWhen(iso: string): string {
+export function shortWhen(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
   const opts: Intl.DateTimeFormatOptions =
@@ -350,7 +375,7 @@ export function filterSummary(f: FindFilters): string[] {
  * still known, and `fileKind` reads the extension, so the row still gets the
  * right glyph instead of falling back to a generic one. Everything derived
  * from real metadata (size, date, type word) is suppressed at the call site. */
-function placeholderMeta(id: string, name: string): FileMeta {
+export function placeholderMeta(id: string, name: string): FileMeta {
   return {
     id,
     name,
@@ -387,57 +412,93 @@ const EMPTY_SHOWN: ShownResults = { files: [], messages: [], memories: [] };
  * this file's own rendering both have to agree on exactly which rows are
  * showing, so both read this same function rather than two copies of the
  * same narrowing logic drifting apart. */
+function fileHitsForMatch(results: SearchResults, filters: FindFilters): SearchResults["files"] {
+  if (!filters.sources.includes("files")) return [];
+  if (filters.match === "name") return results.files.filter((hit) => hit.snippet === "");
+  if (filters.match === "text") return results.files.filter((hit) => hit.snippet !== "");
+  return results.files;
+}
+
+function matchesFileMetadataFilter(
+  hit: SearchResults["files"][number],
+  fileById: Map<string, FileMeta>,
+  kinds: Set<string>,
+  cutoff: number | null,
+): boolean {
+  const meta = fileById.get(hit.id);
+  // A hit whose file has left the room cannot answer a question about its type
+  // or its date, so a filter that asks one excludes it.
+  if (!meta) return false;
+  if (kinds.size > 0 && !kinds.has(fileKindLabel(meta))) return false;
+  if (cutoff === null) return true;
+  const at = Date.parse(meta.createdAt);
+  return !Number.isNaN(at) && at >= cutoff;
+}
+
+function filterFileMetadata(
+  hits: SearchResults["files"],
+  fileById: Map<string, FileMeta>,
+  kinds: Set<string>,
+  cutoff: number | null,
+): SearchResults["files"] {
+  if (kinds.size === 0 && cutoff === null) return hits;
+  return hits.filter((hit) => matchesFileMetadataFilter(hit, fileById, kinds, cutoff));
+}
+
+function compareFileNames(a: string, b: string): number {
+  return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+}
+
+function compareFileDates(a: FileMeta, b: FileMeta, sort: SortKey): number {
+  const comparison = a.createdAt.localeCompare(b.createdAt);
+  if (comparison === 0) return compareFileNames(a.name, b.name);
+  return sort === "newest" ? -comparison : comparison;
+}
+
+function compareFileHits(
+  a: SearchResults["files"][number],
+  b: SearchResults["files"][number],
+  sort: SortKey,
+  fileById: Map<string, FileMeta>,
+): number {
+  const aMeta = fileById.get(a.id);
+  const bMeta = fileById.get(b.id);
+  // A hit with no metadata has nothing to sort ON; it sinks rather than
+  // landing in an arbitrary place and looking like a ranking.
+  if (!aMeta) return bMeta ? 1 : 0;
+  if (!bMeta) return -1;
+  return sort === "name" ? compareFileNames(aMeta.name, bMeta.name) : compareFileDates(aMeta, bMeta, sort);
+}
+
+function sortFileHits(
+  hits: SearchResults["files"],
+  sort: SortKey,
+  fileById: Map<string, FileMeta>,
+): SearchResults["files"] {
+  if (sort === "best") return hits;
+  return [...hits].sort((a, b) => compareFileHits(a, b, sort, fileById));
+}
+
+function textHitsForSource<Type extends "messages" | "memories">(
+  results: SearchResults,
+  filters: FindFilters,
+  source: Type,
+): SearchResults[Type] {
+  return filters.match !== "name" && filters.sources.includes(source) ? results[source] : [];
+}
+
 export function applyFindFilters(
   results: SearchResults | null,
   filters: FindFilters,
   fileById: Map<string, FileMeta>,
 ): ShownResults {
   if (!results) return EMPTY_SHOWN;
+  const kinds = new Set(filters.kinds);
   const cutoff = whenCutoff(filters.when);
-  const kindSet = new Set(filters.kinds);
-  const wantKind = kindSet.size > 0;
-
-  let fileHits = filters.sources.includes("files") ? results.files : [];
-  if (filters.match === "name") fileHits = fileHits.filter((h) => h.snippet === "");
-  if (filters.match === "text") fileHits = fileHits.filter((h) => h.snippet !== "");
-  if (wantKind || cutoff !== null) {
-    fileHits = fileHits.filter((h) => {
-      const meta = fileById.get(h.id);
-      // A hit whose file has left the room cannot answer a question about
-      // its type or its date, so a filter that asks one excludes it.
-      if (!meta) return false;
-      if (wantKind && !kindSet.has(fileKindLabel(meta))) return false;
-      if (cutoff !== null) {
-        const at = Date.parse(meta.createdAt);
-        if (Number.isNaN(at) || at < cutoff) return false;
-      }
-      return true;
-    });
-  }
-  if (filters.sort !== "best") {
-    const key = (id: string) => fileById.get(id);
-    const byName = (a: string, b: string) =>
-      a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
-    fileHits = [...fileHits].sort((a, b) => {
-      const ma = key(a.id);
-      const mb = key(b.id);
-      // A hit with no metadata has nothing to sort ON; it sinks rather than
-      // landing in an arbitrary place and looking like a ranking.
-      if (!ma || !mb) return (ma ? 0 : 1) - (mb ? 0 : 1);
-      if (filters.sort === "name") return byName(ma.name, mb.name);
-      const cmp = ma.createdAt.localeCompare(mb.createdAt);
-      return filters.sort === "newest" ? -cmp || byName(ma.name, mb.name) : cmp || byName(ma.name, mb.name);
-    });
-  }
-
-  // A message and a memory are text and nothing else: they have no name to
-  // match in, so "In the file name" excludes them by definition rather than
-  // by accident.
-  const textOnly = filters.match !== "name";
   return {
-    files: fileHits,
-    messages: filters.sources.includes("messages") && textOnly ? results.messages : [],
-    memories: filters.sources.includes("memories") && textOnly ? results.memories : [],
+    files: sortFileHits(filterFileMetadata(fileHitsForMatch(results, filters), fileById, kinds, cutoff), filters.sort, fileById),
+    messages: textHitsForSource(results, filters, "messages"),
+    memories: textHitsForSource(results, filters, "memories"),
   };
 }
 
@@ -476,520 +537,6 @@ export function flattenShown(shown: ShownResults): FlatResult[] {
    Rendering
    ========================================================================== */
 
-/** Renders `text` with the searched words marked, one node per run.
- *
- * `<mark>` is the element the browser and the screen reader already understand
- * for "this is why you are looking at this"; find.css's `.nb-mark` clears the
- * UA's own yellow and paints the highlighter over it. */
-function Highlight({ text, terms }: { text: string; terms: string[] }) {
-  const parts = splitMatches(text, terms);
-  return (
-    <>
-      {parts.map((p, i) =>
-        p.hit ? (
-          <mark key={i} className="nb-mark">
-            {p.text}
-          </mark>
-        ) : (
-          <span key={i}>{p.text}</span>
-        ),
-      )}
-    </>
-  );
-}
 
-/** The "Where / Type / Added / Match" strip, plus the sources' own counts and
- * a "Clear filters" escape. Shown only once there is a real query and a real
- * result set to narrow — see the call site in Overlays.tsx. */
-export function SearchFiltersBar({
-  filters,
-  onChange,
-  results,
-  kindsPresent,
-  messagesOrMemoriesShown,
-  showSort,
-}: {
-  filters: FindFilters;
-  onChange: (next: FindFilters) => void;
-  results: SearchResults | null;
-  kindsPresent: string[];
-  /** Whether any message or memory row is currently showing. The "Added"
-   * filter reads a file's `createdAt` and nothing else has one — this gates a
-   * caveat explaining that messages/memories are listed regardless of it,
-   * rather than letting a reader assume the date filter silently excludes
-   * them the way the Type filter would. */
-  messagesOrMemoriesShown: boolean;
-  /** Whether there is a file row to order. Only files carry a date, a size
-   * and a name to sort BY — Sort would otherwise offer a control that visibly
-   * does nothing. */
-  showSort: boolean;
-}) {
-  const patch = (p: Partial<FindFilters>) => onChange({ ...filters, ...p });
-  const toggleSource = (s: SourceKey) => {
-    const on = filters.sources.includes(s);
-    const next = on ? filters.sources.filter((x) => x !== s) : [...filters.sources, s];
-    // Turning the last one off would leave a search that cannot match
-    // anything and no way back, so the last remaining source stays on.
-    if (next.length === 0) return;
-    onChange({ ...filters, sources: ALL_SOURCES.filter((x) => next.includes(x)) });
-  };
-  const toggleKind = (k: string) => {
-    onChange({
-      ...filters,
-      kinds: filters.kinds.includes(k) ? filters.kinds.filter((x) => x !== k) : [...filters.kinds, k],
-    });
-  };
-  const active = filterSummary(filters);
-  return (
-    <div className="find-filters">
-      <div className="find-filter-group" role="group" aria-label="Where to look">
-        <span className="find-filter-label">Where</span>
-        <div className="find-chips">
-          {ALL_SOURCES.map((s) => {
-            const on = filters.sources.includes(s);
-            const n =
-              s === "files"
-                ? (results?.files.length ?? 0)
-                : s === "messages"
-                  ? (results?.messages.length ?? 0)
-                  : (results?.memories.length ?? 0);
-            return (
-              <button
-                key={s}
-                type="button"
-                className={`nb-chip nb-chip-btn find-chip${on ? " is-on" : ""}`}
-                aria-pressed={on}
-                title={on ? `Leave ${SOURCE_LABELS[s]} out` : `Include ${SOURCE_LABELS[s]}`}
-                onClick={() => toggleSource(s)}
-              >
-                {on && <span className="nb-ico nb-ico-check find-chip-tick" aria-hidden />}
-                <span>{SOURCE_LABELS[s]}</span>
-                <span className="find-chip-n">{n}</span>
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {filters.sources.includes("files") && kindsPresent.length > 1 && (
-        <div className="find-filter-group" role="group" aria-label="File type">
-          <span className="find-filter-label">Type</span>
-          <div className="find-chips">
-            <button
-              type="button"
-              className={`nb-chip nb-chip-btn find-chip${filters.kinds.length === 0 ? " is-on" : ""}`}
-              aria-pressed={filters.kinds.length === 0}
-              title="Every kind of file"
-              onClick={() => patch({ kinds: [] })}
-            >
-              {filters.kinds.length === 0 && (
-                <span className="nb-ico nb-ico-check find-chip-tick" aria-hidden />
-              )}
-              <span>All</span>
-            </button>
-            {kindsPresent.map((k) => {
-              const on = filters.kinds.includes(k);
-              return (
-                <button
-                  key={k}
-                  type="button"
-                  className={`nb-chip nb-chip-btn find-chip${on ? " is-on" : ""}`}
-                  aria-pressed={on}
-                  onClick={() => toggleKind(k)}
-                >
-                  {on && <span className="nb-ico nb-ico-check find-chip-tick" aria-hidden />}
-                  <span>{k}</span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      <div className="find-filter-selects">
-        <label className="find-filter-select">
-          <span className="find-filter-label">Added</span>
-          <select
-            value={filters.when}
-            title="Narrow by when a file was added to this room"
-            onChange={(e) => patch({ when: e.target.value as WhenKey })}
-          >
-            {(Object.keys(WHEN_LABELS) as WhenKey[]).map((k) => (
-              <option key={k} value={k}>
-                {WHEN_LABELS[k]}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="find-filter-select">
-          <span className="find-filter-label">Match</span>
-          <select
-            value={filters.match}
-            title="Where the words were found"
-            onChange={(e) => patch({ match: e.target.value as MatchKey })}
-          >
-            {(Object.keys(MATCH_LABELS) as MatchKey[]).map((k) => (
-              <option key={k} value={k}>
-                {MATCH_LABELS[k]}
-              </option>
-            ))}
-          </select>
-        </label>
-        {showSort && (
-          <label className="find-filter-select">
-            <span className="find-filter-label">Sort files</span>
-            <select
-              value={filters.sort}
-              title="Order the file results — conversations and memories keep the room's own ranking"
-              onChange={(e) => patch({ sort: e.target.value as SortKey })}
-            >
-              {(Object.keys(SORT_LABELS) as SortKey[]).map((k) => (
-                <option key={k} value={k}>
-                  {SORT_LABELS[k]}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
-        {active.length > 0 && (
-          <button type="button" className="nb-btn nb-btn-quiet find-clear" onClick={() => onChange(DEFAULT_FILTERS)}>
-            Clear filters
-          </button>
-        )}
-      </div>
-
-      {filters.when !== "any" && messagesOrMemoriesShown && (
-        <p className="find-caveat">
-          Dates come from when a file was added. Conversations and memories are
-          not dated in this room's index, so they are listed whatever this is
-          set to.
-        </p>
-      )}
-    </div>
-  );
-}
-
-/** The Files / Conversations / Memories groups, in the launcher's row style —
- * icon, highlighted title or snippet, a meta line, the date pencilled in the
- * margin. `selectedIndex` is the launcher's own arrow-key position; a row
- * knows it is "sel" the same way the launcher's Commands rows do. */
-export function SearchResultRows({
-  shown,
-  files,
-  fileById,
-  terms,
-  selectedIndex,
-  registerRowRef,
-  onSelectIndex,
-  onOpenResult,
-  onOpenFile,
-}: {
-  shown: ShownResults;
-  /** Every file in the room, for `fileLabel`'s duplicate-name disambiguation —
-   * the same list the retired Find page read it from. */
-  files: FileMeta[];
-  fileById: Map<string, FileMeta>;
-  terms: string[];
-  selectedIndex: number;
-  registerRowRef: (idx: number) => (el: HTMLButtonElement | null) => void;
-  onSelectIndex: (idx: number) => void;
-  onOpenResult: (hit: FlatResult) => void;
-  onOpenFile: (id: string) => void;
-}) {
-  const msgOffset = shown.files.length;
-  const memOffset = shown.files.length + shown.messages.length;
-  return (
-    <div className="find-groups">
-      {shown.files.length > 0 && (
-        <section className="find-group">
-          <h2 className="find-group-head">
-            <span className="nb-cat nb-mark-blue">Files</span>
-            <span className="find-group-n">{shown.files.length}</span>
-          </h2>
-          <div className="find-rows nb-list">
-            {shown.files.map((h, i) => {
-              const meta = fileById.get(h.id);
-              const shape = meta ?? placeholderMeta(h.id, h.name);
-              const nameOnly = h.snippet === "";
-              const note = meta
-                ? nameOnly
-                  ? "the name matched, not the text"
-                  : meta.partiallyIndexed
-                    ? "only the first part of this file is indexed"
-                    : meta.source === "generated"
-                      ? "written by the AI in this room"
-                      : ""
-                : "no longer in this room";
-              return (
-                <button
-                  key={h.id}
-                  ref={registerRowRef(i)}
-                  type="button"
-                  className={`find-row${selectedIndex === i ? " is-sel" : ""}`}
-                  title={meta ? `Open ${h.name}` : h.name}
-                  onMouseEnter={() => onSelectIndex(i)}
-                  onClick={() =>
-                    // A name-only hit has no passage to scroll to, so it opens
-                    // the file plainly rather than sending the viewer hunting
-                    // for words the document does not contain.
-                    nameOnly
-                      ? onOpenFile(h.id)
-                      : onOpenResult({ kind: "file", id: h.id, name: h.name, snippet: h.snippet })
-                  }
-                >
-                  <span className="find-row-ico" aria-hidden>
-                    <FileTypeIcon file={shape} size={16} />
-                  </span>
-                  <span className="find-row-main">
-                    <span className="find-row-title" dir="auto">
-                      <Highlight text={fileLabel(h.name, files)} terms={terms} />
-                    </span>
-                    {!nameOnly && (
-                      <span className="find-row-snippet" dir="auto">
-                        <Highlight text={h.snippet} terms={terms} />
-                      </span>
-                    )}
-                    <span className="find-row-meta">
-                      {meta ? (
-                        <>
-                          <span className="find-row-kind">{fileKindLabel(meta)}</span>
-                          <span className="find-row-dot" aria-hidden>
-                            ·
-                          </span>
-                          <span>{formatSize(meta.sizeBytes)}</span>
-                        </>
-                      ) : (
-                        <span className="find-row-kind">file</span>
-                      )}
-                      {note !== "" && <span className="find-row-note">{note}</span>}
-                    </span>
-                  </span>
-                  {meta && (
-                    <span className="find-row-date" title={formatWhen(meta.createdAt)}>
-                      {shortWhen(meta.createdAt)}
-                    </span>
-                  )}
-                </button>
-              );
-            })}
-          </div>
-        </section>
-      )}
-
-      {shown.messages.length > 0 && (
-        <section className="find-group">
-          <h2 className="find-group-head">
-            <span className="nb-cat nb-mark-green">Conversations</span>
-            <span className="find-group-n">{shown.messages.length}</span>
-          </h2>
-          <div className="find-rows nb-list">
-            {shown.messages.map((m, i) => {
-              const idx = msgOffset + i;
-              return (
-                <button
-                  key={m.messageId}
-                  ref={registerRowRef(idx)}
-                  type="button"
-                  className={`find-row${selectedIndex === idx ? " is-sel" : ""}`}
-                  title="Show this message in the conversation"
-                  onMouseEnter={() => onSelectIndex(idx)}
-                  onClick={() =>
-                    onOpenResult({ kind: "message", chatId: m.chatId, messageId: m.messageId, snippet: m.snippet })
-                  }
-                >
-                  <span className="find-row-ico" aria-hidden>
-                    <ChatBubbleIcon size={16} />
-                  </span>
-                  <span className="find-row-main">
-                    <span className="find-row-snippet find-row-lead" dir="auto">
-                      <Highlight text={m.snippet} terms={terms} />
-                    </span>
-                    <span className="find-row-meta">
-                      <span className="find-row-kind">message</span>
-                      <span className="find-row-note">opens in the transcript</span>
-                    </span>
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        </section>
-      )}
-
-      {shown.memories.length > 0 && (
-        <section className="find-group">
-          <h2 className="find-group-head">
-            <span className="nb-cat nb-mark-pink">Memories</span>
-            <span className="find-group-n">{shown.memories.length}</span>
-          </h2>
-          <div className="find-rows nb-list">
-            {shown.memories.map((m, i) => {
-              const idx = memOffset + i;
-              return (
-                <button
-                  key={m.id}
-                  ref={registerRowRef(idx)}
-                  type="button"
-                  className={`find-row${selectedIndex === idx ? " is-sel" : ""}`}
-                  title="Show this in Memory"
-                  onMouseEnter={() => onSelectIndex(idx)}
-                  onClick={() => onOpenResult({ kind: "memory", id: m.id, snippet: m.snippet })}
-                >
-                  <span className="find-row-ico" aria-hidden>
-                    <MemoryIcon size={16} />
-                  </span>
-                  <span className="find-row-main">
-                    <span className="find-row-snippet find-row-lead" dir="auto">
-                      <Highlight text={m.snippet} terms={terms} />
-                    </span>
-                    <span className="find-row-meta">
-                      <span className="find-row-kind">memory</span>
-                      <span className="find-row-note">the AI may use this when relevant</span>
-                    </span>
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        </section>
-      )}
-    </div>
-  );
-}
-
-/** "Save this search" / "Ask the room instead" — the two things worth doing
- * with a query besides opening a hit. Shown once a query has actually run. */
-export function SearchQueryActions({
-  query,
-  isSaved,
-  onToggleSaved,
-  onAsk,
-}: {
-  query: string;
-  isSaved: boolean;
-  onToggleSaved: () => void;
-  onAsk: (q: string) => void;
-}) {
-  return (
-    <div className="find-query-actions">
-      <button
-        type="button"
-        className={`nb-chip nb-chip-btn find-chip${isSaved ? " is-on" : ""}`}
-        aria-pressed={isSaved}
-        title={isSaved ? "Stop keeping this search" : "Keep this search — words and filters — in this room"}
-        onClick={onToggleSaved}
-      >
-        {isSaved && <span className="nb-ico nb-ico-check find-chip-tick" aria-hidden />}
-        <span>{isSaved ? "Saved" : "Save this search"}</span>
-      </button>
-      <button
-        type="button"
-        className="nb-btn find-ask"
-        title="Hand these words to the room's AI instead of listing hits"
-        onClick={() => onAsk(query)}
-      >
-        Ask the room instead
-      </button>
-    </div>
-  );
-}
-
-/** Idle recall — shown while the query field is empty, above the Commands
- * list. Recent searches are automatic; saved ones are a deliberate keep. */
-export function SearchIdlePanel({
-  recent,
-  saved,
-  onRunRecent,
-  onRunSaved,
-  onRemoveSaved,
-  onClearRecent,
-}: {
-  recent: string[];
-  saved: SavedSearch[];
-  onRunRecent: (q: string) => void;
-  onRunSaved: (s: SavedSearch) => void;
-  onRemoveSaved: (q: string) => void;
-  onClearRecent: () => void;
-}) {
-  if (recent.length === 0 && saved.length === 0) return null;
-  return (
-    <div className="find-idle">
-      {saved.length > 0 && (
-        <section>
-          <h2 className="find-group-head">
-            <span className="nb-cat nb-mark-yellow">Saved searches</span>
-            <span className="find-group-n">{saved.length}</span>
-          </h2>
-          <div className="find-rows nb-list">
-            {saved.map((s) => {
-              const summary = filterSummary(s.filters);
-              return (
-                <div key={s.q} className="find-saved-row">
-                  <button
-                    type="button"
-                    className="find-row find-saved-run"
-                    title={`Search this room for “${s.q}” again`}
-                    onClick={() => onRunSaved(s)}
-                  >
-                    <span className="find-row-ico" aria-hidden>
-                      <span className="nb-bookmark" />
-                    </span>
-                    <span className="find-row-main">
-                      <span className="find-row-title" dir="auto">
-                        {s.q}
-                      </span>
-                      <span className="find-row-meta">
-                        {summary.length > 0 ? (
-                          summary.map((w) => (
-                            <span key={w} className="find-row-kind">
-                              {w}
-                            </span>
-                          ))
-                        ) : (
-                          <span className="find-row-kind">the whole room</span>
-                        )}
-                      </span>
-                    </span>
-                  </button>
-                  <button
-                    type="button"
-                    className="find-saved-del"
-                    title={`Stop keeping “${s.q}”`}
-                    aria-label={`Stop keeping the saved search “${s.q}”`}
-                    onClick={() => onRemoveSaved(s.q)}
-                  >
-                    <CloseIcon size={12} />
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-      )}
-      {recent.length > 0 && (
-        <section>
-          <h2 className="find-group-head">
-            <span className="nb-cat nb-mark-yellow">Recent</span>
-            <span className="find-group-n">{recent.length}</span>
-          </h2>
-          <div className="find-chips find-recent">
-            {recent.map((r) => (
-              <button
-                key={r}
-                type="button"
-                className="nb-chip nb-chip-btn find-chip"
-                title={`Search for “${r}” again`}
-                onClick={() => onRunRecent(r)}
-              >
-                <span dir="auto">{r}</span>
-              </button>
-            ))}
-            <button type="button" className="nb-btn nb-btn-quiet find-clear" onClick={onClearRecent}>
-              Clear recent
-            </button>
-          </div>
-        </section>
-      )}
-    </div>
-  );
-}
+export { SearchFiltersBar } from "./SearchFiltersBar";
+export { SearchIdlePanel, SearchQueryActions, SearchResultRows } from "./SearchResultRows";

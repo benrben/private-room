@@ -676,6 +676,26 @@ describe("locateInImage", () => {
     ).rejects.toThrow("MODEL_MISSING:qwen2.5vl");
   });
 
+  it("surfaces a stopped vision pass instead of treating it as an empty box list", async () => {
+    const { db } = freshRoom();
+    const file = insertFile(db, "photo.png", "image/png", new Uint8Array([1]), null, "library");
+    setSetting(db, "model", "qwen2.5vl");
+    const groundingDeps: GroundingPickDeps = {
+      ollamaCapabilities: async () => ["vision"],
+      ensureProviderCatalog: async () => {},
+      providerModelVision: () => undefined,
+      privacyDoorActive: () => false,
+    };
+
+    await expect(
+      locateInImage(db, file.id, "q", {
+        listModels: async () => ["qwen2.5vl"],
+        groundingDeps,
+        post: async () => ({ kind: "stopped" }),
+      })
+    ).rejects.toThrow("The vision pass was stopped.");
+  });
+
   it("throws rather than fabricating an answer when 'boxes' is missing or malformed", async () => {
     const { db } = freshRoom();
     const file = insertFile(db, "photo.png", "image/png", new Uint8Array([1]), null, "library");
@@ -717,6 +737,48 @@ describe("locateInImage", () => {
       ).rejects.toThrow(/unreadable result/);
     } finally {
       delete proto.boxes;
+    }
+  });
+
+  it("uses the default Codex capability context before reporting an image-blocked room", async () => {
+    const { db } = freshRoom();
+    const file = insertFile(db, "photo.png", "image/png", new Uint8Array([1]), null, "library");
+    setSetting(db, "model", "codex-cli::gpt-5.6-sol");
+    setActivePolicyForTests();
+
+    await expect(
+      locateInImage(db, file.id, "q", { listModels: async () => [] })
+    ).rejects.toThrow(/privacy door/i);
+  });
+
+  it("runs both default provider-catalog seams before refusing an unknown provider vision model", async () => {
+    const ensureProviderCatalog = vi.fn(async () => {});
+    try {
+      vi.resetModules();
+      vi.doMock("./providers.js", async (importOriginal) => {
+        const actual = await importOriginal<typeof import("./providers.js")>();
+        return {
+          ...actual,
+          ensureProviderCatalog,
+          providerModelVision: () => false,
+        };
+      });
+      const { locateInImage: locateWithDefaultProviderDeps } = await import("./visionTools.js");
+      const { db } = freshRoom();
+      const file = insertFile(db, "photo.png", "image/png", new Uint8Array([1]), null, "library");
+      setSetting(db, "model", "openrouter::unknown-vision-model");
+
+      await expect(
+        locateWithDefaultProviderDeps(db, file.id, "q", { listModels: async () => [] })
+      ).rejects.toThrow(NO_VISION_MODEL);
+      expect(ensureProviderCatalog).toHaveBeenCalledTimes(2);
+      expect(ensureProviderCatalog).toHaveBeenCalledWith(
+        "openrouter::unknown-vision-model",
+        expect.anything()
+      );
+    } finally {
+      vi.doUnmock("./providers.js");
+      vi.resetModules();
     }
   });
 
@@ -920,6 +982,16 @@ describe("parseBoxes / boxesFromItems, adversarial model output", () => {
 });
 
 describe("prepareImage, adversarial bytes", () => {
+  it("keeps declared dimensions when decode fails after a readable PNG header", async () => {
+    const real = await sharp({ create: { width: 40, height: 20, channels: 3, background: "#123456" } })
+      .png()
+      .toBuffer();
+    const headerReadableButTruncated = real.subarray(0, 65);
+
+    const prepared = await prepareImage(headerReadableButTruncated);
+    expect(prepared).toEqual({ bytes: headerReadableButTruncated, width: 40, height: 20 });
+  });
+
   it("a TRUNCATED PNG never fabricates a canvas it did not produce", async () => {
     const real = await sharp({ create: { width: 40, height: 20, channels: 3, background: "#123456" } })
       .png()

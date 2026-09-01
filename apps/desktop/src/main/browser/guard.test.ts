@@ -1,7 +1,7 @@
 // Port of the #[cfg(test)] mod tests in src-tauri/src/web/guard.rs.
 
 import { describe, expect, it } from "vitest";
-import { checkPublicHttpUrl, isPublicIp, resolvePublicAddr } from "./guard.js";
+import { checkPublicHttpUrl, hostResolvesPrivate, isPublicIp, resolvePublicAddr } from "./guard.js";
 
 describe("blocks_local_and_private_urls", () => {
   it("blocks local and private-network URLs", () => {
@@ -25,6 +25,10 @@ describe("blocks_local_and_private_urls", () => {
       expect(() => checkPublicHttpUrl(url), `should block ${url}`).toThrow();
     }
     expect(() => checkPublicHttpUrl("https://example.com/page")).not.toThrow();
+  });
+
+  it("rejects malformed URLs before any hostname policy is evaluated", () => {
+    expect(() => checkPublicHttpUrl("not a URL")).toThrow("Invalid URL: not a URL");
   });
 
   it("allows public neighbors of the newly blocked ranges", () => {
@@ -87,6 +91,20 @@ describe("every_redirect_target_shape_the_hop_check_blocked_is_still_blocked", (
 });
 
 describe("resolve_rejects_private_literal_hosts", () => {
+  it("fails closed when DNS fails or returns no addresses", async () => {
+    const unavailable = async () => {
+      throw new Error("DNS unavailable");
+    };
+    const empty = async () => [];
+
+    await expect(resolvePublicAddr("unavailable.example", 443, unavailable)).rejects.toThrow(
+      "Could not resolve the address for unavailable.example.",
+    );
+    await expect(resolvePublicAddr("empty.example", 443, empty)).rejects.toThrow(
+      "Could not resolve the address for empty.example.",
+    );
+  });
+
   it("rejects literal private/loopback hosts and accepts a literal public IP", async () => {
     // These resolve locally (no real DNS) to loopback/private ranges.
     await expect(resolvePublicAddr("127.0.0.1", 80)).rejects.toThrow();
@@ -117,6 +135,13 @@ describe("resolve_rejects_private_literal_hosts", () => {
     await expect(resolvePublicAddr("rebound.example", 443, rebound)).rejects.toThrow(
       /private network/i,
     );
+  });
+});
+
+describe("hostResolvesPrivate", () => {
+  it("reports a private literal and treats failed lookups as unknown rather than private", async () => {
+    await expect(hostResolvesPrivate("127.0.0.1", 80)).resolves.toBe(true);
+    await expect(hostResolvesPrivate("invalid..hostname", 80)).resolves.toBe(false);
   });
 });
 

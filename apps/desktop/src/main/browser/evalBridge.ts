@@ -73,6 +73,55 @@ export interface BridgeOptions {
  *  always rethrows as the named `EVAL_TIMED_OUT`. */
 const TIMEOUT_MARKER = Symbol("evalJson timeout");
 
+interface EvaluationTimeout {
+  promise: Promise<never>;
+  cancel(): void;
+}
+
+function timeoutAfter(timeoutMs: number): EvaluationTimeout {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return {
+    promise: new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(TIMEOUT_MARKER), timeoutMs);
+    }),
+    cancel: () => clearTimeout(timer),
+  };
+}
+
+function evaluationError(error: unknown): Error {
+  return new Error(error === TIMEOUT_MARKER ? EVAL_TIMED_OUT : EVAL_LOST);
+}
+
+async function evaluateWithinTimeout(
+  host: EvalHost,
+  pageId: string,
+  js: string,
+  timeoutMs: number,
+): Promise<string> {
+  const timeout = timeoutAfter(timeoutMs);
+  let raw: string;
+  try {
+    raw = await Promise.race([host.evaluate(pageId, js), timeout.promise]);
+  } catch (error) {
+    throw evaluationError(error);
+  } finally {
+    timeout.cancel();
+  }
+  return raw;
+}
+
+function isMissingAnswer(raw: unknown): boolean {
+  return raw === "" || raw === null || raw === undefined;
+}
+
+function parseEvaluationAnswer(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`The page answered with something unreadable: ${(error as Error).message}`);
+  }
+}
+
 /** One page-script round trip, JSON-decoded. Port of `eval_json`. */
 export async function evalJson(
   host: EvalHost,
@@ -81,36 +130,14 @@ export async function evalJson(
   opts: BridgeOptions = {},
 ): Promise<unknown> {
   const timeoutMs = opts.timeoutMs ?? EVAL_TIMEOUT_MS;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let raw: string;
-  try {
-    raw = await Promise.race([
-      host.evaluate(pageId, js),
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(TIMEOUT_MARKER), timeoutMs);
-      }),
-    ]);
-  } catch (e) {
-    if (e === TIMEOUT_MARKER) throw new Error(EVAL_TIMED_OUT);
-    // Every other rejection reads as the document having gone away under the
-    // call — the Electron analogue of wry's dropped completion handler. See
-    // readiness.ts's header for why this port refuses to invent a third
-    // reading of "the call never came back".
-    throw new Error(EVAL_LOST);
-  } finally {
-    clearTimeout(timer);
-  }
-  if (raw === "" || raw === null || raw === undefined) {
+  const raw = await evaluateWithinTimeout(host, pageId, js, timeoutMs);
+  if (isMissingAnswer(raw)) {
     // The page script is written never to throw and always to answer an
     // object, so nothing at all means the script is not present on this
     // document (still loading, or a document that refused it).
     throw new Error(SCRIPT_REFUSED);
   }
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    throw new Error(`The page answered with something unreadable: ${(e as Error).message}`);
-  }
+  return parseEvaluationAnswer(raw);
 }
 
 /** The expression every op is sent as. Always evaluates to an object: a page
@@ -192,6 +219,32 @@ export async function probeReady(
   }
 }
 
+interface ReadinessWaitState {
+  isReady: boolean;
+  isRefused: boolean;
+  couldStillLoad: boolean;
+}
+
+function readinessWaitState(readiness: Readiness | null, couldStillLoad: boolean): ReadinessWaitState {
+  return {
+    isReady: readiness === "ready",
+    isRefused: readiness === "refused",
+    couldStillLoad: couldStillLoad || readiness === "loading",
+  };
+}
+
+function readinessTimeout(couldStillLoad: boolean, budgetMs: number): Error {
+  if (!couldStillLoad) return new Error(SCRIPT_REFUSED);
+  return new Error(
+    `The page did not finish loading within ${Math.round(budgetMs / 1000)}s. ` +
+      `It may be very slow, or it may have refused to load.`,
+  );
+}
+
+function exceededBudget(started: number, budgetMs: number): boolean {
+  return Date.now() - started > budgetMs;
+}
+
 /**
  * Wait until the injected page script answers. Port of `wait_ready`.
  *
@@ -220,16 +273,11 @@ export async function waitReady(
   let couldStillLoad = false;
   for (;;) {
     const readiness = await probeReady(host, pageId, isBlank(), opts);
-    if (readiness === "ready") return;
-    if (readiness === "refused") throw new Error(SCRIPT_REFUSED);
-    if (readiness === "loading") couldStillLoad = true;
-    if (Date.now() - started > budgetMs) {
-      if (!couldStillLoad) throw new Error(SCRIPT_REFUSED);
-      throw new Error(
-        `The page did not finish loading within ${Math.round(budgetMs / 1000)}s. ` +
-          `It may be very slow, or it may have refused to load.`,
-      );
-    }
+    const state = readinessWaitState(readiness, couldStillLoad);
+    if (state.isReady) return;
+    if (state.isRefused) throw new Error(SCRIPT_REFUSED);
+    couldStillLoad = state.couldStillLoad;
+    if (exceededBudget(started, budgetMs)) throw readinessTimeout(couldStillLoad, budgetMs);
     await sleep(READY_POLL_MS);
   }
 }
@@ -262,6 +310,93 @@ export interface CallAsyncOptions extends BridgeOptions {
   onNavigated?(): void;
 }
 
+interface StartedAction {
+  docBefore: string | null;
+  ticket: string;
+}
+
+interface TicketAnswer {
+  done?: unknown;
+  value?: unknown;
+}
+
+type TicketPoll =
+  | { kind: "pending" }
+  | { kind: "done"; value: unknown }
+  | { kind: "failed"; error: unknown };
+
+async function startAction(
+  host: EvalHost,
+  pageId: string,
+  op: string,
+  args: unknown,
+  opts: CallAsyncOptions,
+): Promise<StartedAction> {
+  const docBefore = await docId(host, pageId);
+  const begun = (await callPage(host, pageId, "begin", { op, args }, opts)) as { ticket?: unknown };
+  const ticket = begun?.ticket;
+  if (typeof ticket !== "string") throw new Error("The page did not start that action.");
+  return { docBefore, ticket };
+}
+
+function ticketPollAnswer(taken: TicketAnswer): TicketPoll {
+  if (taken?.done === true) return { kind: "done", value: taken.value ?? null };
+  return { kind: "pending" };
+}
+
+async function pollTicket(host: EvalHost, pageId: string, ticket: string, opts: CallAsyncOptions): Promise<TicketPoll> {
+  try {
+    const taken = (await callPage(host, pageId, "take", { ticket }, opts)) as TicketAnswer;
+    return ticketPollAnswer(taken);
+  } catch (error) {
+    return { kind: "failed", error };
+  }
+}
+
+function documentDidNotChange(docBefore: string | null, docAfter: string | null): boolean {
+  return docAfter === null || docAfter === docBefore;
+}
+
+async function snapshotOrNull(host: EvalHost, pageId: string, opts: CallAsyncOptions): Promise<unknown> {
+  try {
+    return await callPage(host, pageId, "snapshot", {}, opts);
+  } catch {
+    return null;
+  }
+}
+
+async function recoverNavigation(
+  host: EvalHost,
+  pageId: string,
+  action: StartedAction,
+  ticketError: unknown,
+  isBlank: () => boolean,
+  navBudgetMs: number,
+  opts: CallAsyncOptions,
+): Promise<unknown> {
+  await waitReady(host, pageId, isBlank, navBudgetMs, opts).catch(() => undefined);
+  const docAfter = await docId(host, pageId);
+  if (documentDidNotChange(action.docBefore, docAfter)) throw ticketError;
+  opts.onNavigated?.();
+  return { ok: true, navigated: true, snapshot: await snapshotOrNull(host, pageId, opts) };
+}
+
+function actionTimedOut(started: number, budgetMs: number): boolean {
+  return Date.now() - started > budgetMs;
+}
+
+interface CallAsyncConfig {
+  sleep: Sleep;
+  navBudgetMs: number;
+}
+
+function callAsyncConfig(opts: CallAsyncOptions): CallAsyncConfig {
+  return {
+    sleep: opts.sleep ?? realSleep,
+    navBudgetMs: opts.navBudgetMs ?? READY_BUDGET_NAV_MS,
+  };
+}
+
 /**
  * Call an ASYNCHRONOUS page op (`act`, `settle`, `annotate`) by ticket. Port of
  * `call_async`.
@@ -288,47 +423,19 @@ export async function callAsync(
   isBlank: () => boolean,
   opts: CallAsyncOptions = {},
 ): Promise<unknown> {
-  const sleep = opts.sleep ?? realSleep;
-  const navBudgetMs = opts.navBudgetMs ?? READY_BUDGET_NAV_MS;
-
-  const docBefore = await docId(host, pageId);
-  const begun = (await callPage(host, pageId, "begin", { op, args }, opts)) as { ticket?: unknown };
-  const ticket = begun?.ticket;
-  if (typeof ticket !== "string") {
-    throw new Error("The page did not start that action.");
-  }
-
+  const config = callAsyncConfig(opts);
+  const action = await startAction(host, pageId, op, args, opts);
   const started = Date.now();
   for (;;) {
-    await sleep(POLL_INTERVAL_MS);
-    try {
-      const taken = (await callPage(host, pageId, "take", { ticket }, opts)) as {
-        done?: unknown;
-        value?: unknown;
-      };
-      if (taken?.done === true) {
-        return taken.value ?? null;
-      }
-    } catch (e) {
-      // Either "Unknown ticket …" or the empty-answer "will not run the page
-      // script" — both are what a document swap looks like from here. Let the
-      // replacement document finish arriving before judging.
-      await waitReady(host, pageId, isBlank, navBudgetMs, opts).catch(() => undefined);
-      const docAfter = await docId(host, pageId);
-      if (docAfter === null || docAfter === docBefore) throw e;
-      // Journalled BEFORE the snapshot, as in Rust: the fact that the page
-      // moved is what the record is for, and it must survive a snapshot that
-      // fails.
-      opts.onNavigated?.();
-      let snapshot: unknown = null;
-      try {
-        snapshot = await callPage(host, pageId, "snapshot", {}, opts);
-      } catch {
-        snapshot = null;
-      }
-      return { ok: true, navigated: true, snapshot };
+    await config.sleep(POLL_INTERVAL_MS);
+    const polled = await pollTicket(host, pageId, action.ticket, opts);
+    if (polled.kind === "done") return polled.value;
+    if (polled.kind === "failed") {
+      // A lost ticket is only success when the replacement document proves the
+      // action navigated; otherwise the original page error remains exact.
+      return recoverNavigation(host, pageId, action, polled.error, isBlank, config.navBudgetMs, opts);
     }
-    if (Date.now() - started > budgetMs) {
+    if (actionTimedOut(started, budgetMs)) {
       throw new Error(
         `The page was still working after ${Math.round(budgetMs / 1000)}s — it may be stuck loading.`,
       );

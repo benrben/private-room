@@ -1,0 +1,498 @@
+/* ==========================================================================
+   create.css — the Create page (pictures and video).
+
+   Everything here composes from the `.nb-*` primitives in paper.css and reads
+   colour from tokens.css. Nothing below names a colour, so light mode falls
+   out of the same rules — there is deliberately no light-mode override block
+   at the end of this file.
+
+   THE ONE RULE THAT SHAPES THIS SURFACE. The page's whole job is to be honest
+   about which models can draw, so the two categories on it — what a model
+   MAKES (image / video) and where it RUNS (this Mac / off it) — must never
+   collide on one signal. Medium is carried by the marker hue on a tape label
+   AND, for video, by a perforated film edge down the card; locality is carried
+   by a separate tape label with its own word. A card is therefore readable
+   with no colour vision at all, which is the same standard the rest of the
+   notebook holds.
+   ========================================================================== */
+
+/* ==========================================================================
+   1. THE PAGE
+   ========================================================================== */
+
+.cr-page {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  background: transparent;
+}
+
+.cr-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-6);
+  padding: var(--sp-6) max(var(--sp-6), calc((100% - 1180px) / 2)) 0;
+}
+
+/* The rung every other rail destination title sits on (.rh-title, .sk-title,
+   .mem-title). 800 was also unrenderable: Space Grotesk is bundled 300–700. */
+.cr-title {
+  font-size: var(--fs-page);
+  font-family: var(--display);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.08;
+  color: var(--text-strong);
+  margin: 0 0 var(--sp-2);
+  text-wrap: balance;
+}
+
+.cr-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-4) max(var(--sp-6), calc((100% - 1180px) / 2)) 72px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+/* A quiet line of prose for a loading, empty or failed state. Sized from the
+   body scale rather than shrunk — a status is not less important for being
+   short, and this is the only thing on screen while it shows. */
+.cr-note {
+  font-size: var(--fs-body);
+  color: var(--muted);
+  padding: var(--sp-3) 0;
+}
+.cr-note-bad {
+  color: var(--danger);
+}
+.cr-dim {
+  color: var(--faint);
+}
+
+/* ==========================================================================
+   2. THE LEDGER — the capability gate, stated as a number
+
+   This sits above the gallery because the gallery is an ARGUMENT: these
+   models and not those. A shelf that silently omits Claude and everything
+   local reads as a broken page, so the denominator and the reasons come
+   first.
+   ========================================================================== */
+
+.cr-ledger {
+  padding: var(--sp-4) var(--sp-6);
+}
+
+.cr-ledger-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-6);
+  flex-wrap: wrap;
+}
+
+.cr-ledger-count {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
+/* The analyst's ring around the figure that matters. The drawn radii stay —
+   the ring is what makes this the page's one emphasised number — but the
+   figure itself is a total the app computed, so it is set in the sans. */
+.cr-ledger-big {
+  font-size: 32px;
+  line-height: 1;
+  font-weight: 700;
+  color: var(--accent);
+  padding: 5px 13px 7px;
+  border: 2px solid var(--accent);
+  border-radius: 48% 52% 50% 50% / 56% 44% 54% 46%;
+}
+
+.cr-ledger-text {
+  font-size: var(--fs-lead);
+  line-height: 1.4;
+  max-width: 30ch;
+}
+.cr-ledger-text b {
+  color: var(--text-strong);
+  font-weight: 800;
+}
+.cr-ledger-text span {
+  display: block;
+  font-size: var(--fs-meta);
+  color: var(--muted);
+  margin-top: 3px;
+  line-height: var(--lh-body);
+}
+
+.cr-tally {
+  display: flex;
+  gap: var(--sp-6);
+  flex-wrap: wrap;
+}
+.cr-tally-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.cr-tally-n {
+  font-family: var(--mono);
+  font-size: 21px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-strong);
+}
+.cr-tally-l {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+/* The marker dot is a SECOND signal beside the word, never the only one — a
+   fill this small cannot clear 3:1 in light mode. */
+.cr-tally-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex: 0 0 auto;
+}
+
+/* ----- the disclosure ----- */
+
+.cr-why {
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-3);
+  border-top: 1px dashed var(--line-soft);
+}
+
+.cr-why-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-family: var(--sans);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  color: var(--muted);
+}
+.cr-why-toggle:hover {
+  color: var(--text);
+}
+.cr-why-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.cr-why-chevron {
+  display: inline-block;
+  font-size: 15px;
+  line-height: 1;
+  transition: transform var(--dur) var(--ease-pen);
+}
+.cr-why-chevron.is-open {
+  transform: rotate(90deg);
+}
+
+.cr-why-body {
+  margin-top: var(--sp-3);
+  display: flex;
+  flex-direction: column;
+}
+
+.cr-why-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  padding: 6px 0;
+  border-bottom: 1px dotted var(--line-soft);
+}
+.cr-why-row:last-child {
+  border-bottom: none;
+}
+.cr-why-who {
+  min-width: 190px;
+  flex: 0 0 auto;
+  font-size: var(--fs-micro);
+  font-weight: 700;
+  color: var(--text);
+}
+.cr-why-reason {
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  line-height: var(--lh-body);
+}
+.cr-why-eg {
+  font-family: var(--mono);
+  color: var(--faint);
+}
+
+/* ==========================================================================
+   3. CONTROLS
+   ========================================================================== */
+
+.cr-controls {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+}
+
+.cr-tabs {
+  display: flex;
+  gap: var(--sp-6);
+}
+
+.cr-tab {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 0 0 6px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-family: var(--sans);
+  font-size: var(--fs-card);
+  font-weight: 700;
+  color: var(--faint);
+  transition: color var(--dur-fast) var(--ease-pen);
+}
+.cr-tab:hover {
+  color: var(--muted);
+}
+.cr-tab.is-active {
+  color: var(--text-strong);
+}
+.cr-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.cr-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 190px;
+  padding: 5px 10px;
+  color: var(--faint);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+.cr-search:focus-within {
+  border-color: var(--accent);
+}
+.cr-search input {
+  width: 100%;
+  border: none;
+  background: none;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--text);
+}
+
+/* ==========================================================================
+   4. THE WORKTABLE — the workspace beside the bench
+
+   This used to be a grid of forty model index cards next to a compose panel.
+   The cards were handsome and they were the wrong thing: choosing a model is
+   one decision made once per session, and spending the whole page on it
+   pushed the PICTURES — what the page exists to produce — below the fold and
+   into a list of filenames. The model is a dropdown on the bench now, and the
+   work gets the room.
+   ========================================================================== */
+
+.cr-worktable {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 330px;
+  gap: var(--sp-6);
+  align-items: start;
+}
+
+.cr-canvas {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+.cr-canvas-empty {
+  padding: var(--sp-6) var(--sp-4);
+}
+
+.cr-canvas-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: var(--sp-3);
+}
+
+.cr-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 5px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  min-width: 0;
+}
+.cr-tile:hover {
+  border-color: var(--accent);
+  background: var(--hover);
+}
+.cr-tile:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.cr-tile img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  display: block;
+}
+/* A clip has no still to show. Saying "clip" beats drawing an empty frame,
+   which reads as a picture that failed to load. */
+.cr-tile-clip {
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: var(--radius-sm);
+  background: var(--hover);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  color: var(--faint);
+  font-size: 10px;
+  font-family: var(--mono);
+}
+.cr-tile-name {
+  font-size: 11px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ----- which model, as one line ----- */
+
+.cr-picker {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.cr-model-select {
+  width: 100%;
+  font-size: 12px;
+}
+.cr-model-filter {
+  font-size: 11px;
+  padding: 4px 6px;
+}
+/* The facts the index cards used to carry — engine, whether it leaves the
+   Mac, whether it can make sound — for the ONE model actually chosen, which
+   is the only one they were ever needed for. */
+.cr-picker-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 2px;
+}
+.cr-picker-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+.cr-picker-desc {
+  margin: 0;
+  font-size: 11px;
+  line-height: var(--lh-body);
+  color: var(--muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* ==========================================================================
+   5. THE BENCH
+   ========================================================================== */
+
+.cr-bench {
+  position: sticky;
+  top: var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding: var(--sp-4);
+}
+
+.cr-bench-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+.cr-bench-head h2 {
+  margin: 0;
+  font-family: var(--hand);
+  font-size: 19px;
+  font-weight: 700;
+  color: var(--text-strong);
+}
+
+.cr-bench-model {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  background: var(--selected);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--mk-berry) 40%, transparent);
+}
+.cr-bench-slug {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: 500;
+  color: var(--text);
+  word-break: break-word;
+}
+
+.cr-field-label {
+  display: block;
+  margin-bottom: 7px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.cr-field {
+  display: block;
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--input-bg);
+  font-family: var(--sans);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--text);
+  resize: vertical;
+}

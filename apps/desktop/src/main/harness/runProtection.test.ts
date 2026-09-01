@@ -1,8 +1,9 @@
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createWorkspaceRoom } from "../workspace/roomLayout.js";
 import { WorkspaceService } from "../workspace/workspaceService.js";
 import { RunProtection } from "./runProtection.js";
@@ -16,6 +17,44 @@ afterEach(async () => {
 });
 
 describe("RunProtection conflict recovery", () => {
+  it("does not record a final change set for a read-only run", async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-read-only-run-"));
+    roots.push(parent);
+    const workspaceRoot = path.join(parent, "Room");
+    const { db, descriptor } = createWorkspaceRoom(
+      workspaceRoot,
+      "correct horse battery staple",
+      "Room",
+    );
+    const workspace = new WorkspaceService(db, workspaceRoot);
+    try {
+      const context: HarnessContext = {
+        runId: "read-only-run",
+        roomId: descriptor.roomId,
+        provider: "codex",
+        model: "gpt-test",
+        workspacePath: workspaceRoot,
+        runtimePath: path.join(parent, "runtime"),
+        privacyMode: "local",
+        writeEnabled: false,
+        exposureVerified: true,
+      };
+      const protection = new RunProtection(workspace, descriptor.roomId);
+      await protection.createBaseline(context);
+
+      await workspace.createFile("untracked.txt", Readable.from(["created later"]), "agent");
+
+      await expect(protection.captureFinalState(context.runId)).resolves.toEqual({
+        changedPaths: [], changedFiles: [], count: 0,
+      });
+      await protection.finish(context.runId, "completed");
+      await expect(protection.rollback(context.runId))
+        .rejects.toThrow("This run has no complete rollback baseline.");
+    } finally {
+      db.close();
+    }
+  });
+
   it("keeps every change classification stable across repeated capture and finalization", async () => {
     const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-run-idempotency-"));
     roots.push(parent);
@@ -144,6 +183,159 @@ describe("RunProtection conflict recovery", () => {
     }
   });
 
+  it("removes an unchanged file created by a completed write run", async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-run-created-"));
+    roots.push(parent);
+    const workspaceRoot = path.join(parent, "Room");
+    const { db, descriptor } = createWorkspaceRoom(
+      workspaceRoot,
+      "correct horse battery staple",
+      "Room",
+    );
+    const workspace = new WorkspaceService(db, workspaceRoot);
+    try {
+      const context: HarnessContext = {
+        runId: "created-run",
+        roomId: descriptor.roomId,
+        provider: "codex",
+        model: "gpt-test",
+        workspacePath: workspaceRoot,
+        runtimePath: path.join(parent, "runtime"),
+        privacyMode: "local",
+        writeEnabled: true,
+        exposureVerified: true,
+      };
+      const protection = new RunProtection(workspace, descriptor.roomId);
+      await protection.createBaseline(context);
+      await workspace.createFile("created.txt", Readable.from(["agent output"]), "agent");
+      await protection.finish(context.runId, "completed");
+
+      const rollback = await new RunProtection(workspace, descriptor.roomId).rollback(context.runId);
+      expect(rollback).toEqual({ restored: [], removedCreated: ["created.txt"], conflicts: [] });
+      expect(existsSync(path.join(workspaceRoot, "created.txt"))).toBe(false);
+      expect((await protection.listHistory())[0]).toMatchObject({
+        rollbackStatus: "completed",
+        changes: [{ relativePath: "created.txt", rollbackState: "removed" }],
+      });
+
+      const changedContext = { ...context, runId: "created-conflict-run", provider: "claude" };
+      const changedRun = new RunProtection(workspace, descriptor.roomId);
+      await changedRun.createBaseline(changedContext);
+      await workspace.createFile("changed.txt", Readable.from(["agent output"]), "agent");
+      await changedRun.finish(changedContext.runId, "completed");
+      await writeFile(path.join(workspaceRoot, "changed.txt"), "later user edit", "utf8");
+
+      await expect(new RunProtection(workspace, descriptor.roomId).rollback(changedContext.runId))
+        .resolves.toEqual({ restored: [], removedCreated: [], conflicts: ["changed.txt"] });
+      expect(await readFile(path.join(workspaceRoot, "changed.txt"), "utf8")).toBe("later user edit");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("does not overwrite a later file at a moved baseline path", async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-run-moved-conflict-"));
+    roots.push(parent);
+    const workspaceRoot = path.join(parent, "Room");
+    const source = path.join(parent, "source.txt");
+    await writeFile(source, "before agent", "utf8");
+    const { db, descriptor } = createWorkspaceRoom(
+      workspaceRoot,
+      "correct horse battery staple",
+      "Room",
+    );
+    const workspace = new WorkspaceService(db, workspaceRoot);
+    try {
+      const file = await workspace.importFile(source, "notes.txt");
+      const context: HarnessContext = {
+        runId: "moved-conflict-run",
+        roomId: descriptor.roomId,
+        provider: "arcelle-deep",
+        model: "gpt-test",
+        workspacePath: workspaceRoot,
+        runtimePath: path.join(parent, "runtime"),
+        privacyMode: "local",
+        writeEnabled: true,
+        exposureVerified: true,
+      };
+      const protection = new RunProtection(workspace, descriptor.roomId);
+      await protection.createBaseline(context);
+      await workspace.move(file.fileId, "Archive/notes.txt");
+      await protection.finish(context.runId, "completed");
+      await writeFile(path.join(workspaceRoot, "notes.txt"), "later user edit", "utf8");
+
+      await expect(new RunProtection(workspace, descriptor.roomId).rollback(context.runId))
+        .resolves.toEqual({ restored: [], removedCreated: [], conflicts: ["notes.txt"] });
+      expect(await readFile(path.join(workspaceRoot, "notes.txt"), "utf8")).toBe("later user edit");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("reports when no baseline-copy filename is available", async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-run-copy-name-"));
+    roots.push(parent);
+    const workspaceRoot = path.join(parent, "Room");
+    const { db, descriptor } = createWorkspaceRoom(
+      workspaceRoot,
+      "correct horse battery staple",
+      "Room",
+    );
+    const workspace = new WorkspaceService(db, workspaceRoot);
+    try {
+      const protection = new RunProtection(
+        workspace,
+        descriptor.roomId,
+        async () => undefined,
+        undefined,
+        () => true,
+      );
+      const finder = protection as unknown as { availableBaselineCopyPath(relativePath: string): string };
+      expect(() => finder.availableBaselineCopyPath("notes.txt"))
+        .toThrow("Could not find an available name for the baseline copy.");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("marks a failed baseline snapshot as failed and clears its write-run state", async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-run-snapshot-failure-"));
+    roots.push(parent);
+    const workspaceRoot = path.join(parent, "Room");
+    const source = path.join(parent, "source.txt");
+    await writeFile(source, "before agent", "utf8");
+    const { db, descriptor } = createWorkspaceRoom(
+      workspaceRoot,
+      "correct horse battery staple",
+      "Room",
+    );
+    const workspace = new WorkspaceService(db, workspaceRoot);
+    try {
+      await workspace.importFile(source, "notes.txt");
+      const context: HarnessContext = {
+        runId: "snapshot-failure-run",
+        roomId: descriptor.roomId,
+        provider: "codex",
+        model: "gpt-test",
+        workspacePath: workspaceRoot,
+        runtimePath: path.join(parent, "runtime"),
+        privacyMode: "local",
+        writeEnabled: true,
+        exposureVerified: true,
+      };
+      vi.spyOn(workspace, "snapshot").mockRejectedValueOnce(new Error("object store unavailable"));
+      const protection = new RunProtection(workspace, descriptor.roomId);
+
+      await expect(protection.createBaseline(context))
+        .rejects.toThrow("The protected write baseline could not be completed: object store unavailable");
+      expect(db.prepare("SELECT status FROM agent_runs WHERE run_id = ?").get(context.runId))
+        .toEqual({ status: "failed" });
+      await protection.finish(context.runId, "failed");
+    } finally {
+      db.close();
+    }
+  });
+
   it("retains recent audit history and prunes only old runs beyond the count floor", async () => {
     const parent = await mkdtemp(path.join(os.tmpdir(), "arcelle-run-retention-"));
     roots.push(parent);
@@ -219,22 +411,25 @@ describe("RunProtection conflict recovery", () => {
       expect(progress.at(-1)).toMatchObject({
         operationId: "run-1", operation: "write-baseline", phase: "completed", status: "completed",
       });
+      await workspace.move(file.fileId, "Archive/notes.txt");
       await workspace.writeAtomic(file.fileId, Readable.from(["agent edit"]));
       await protection.finish(context.runId, "completed");
 
-      await writeFile(path.join(workspaceRoot, "notes.txt"), "later user edit", "utf8");
+      await writeFile(path.join(workspaceRoot, "Archive/notes.txt"), "later user edit", "utf8");
       // New instance = new app process. Neither operation may depend on the
       // old in-memory writeRuns/orchestrator state.
       const restarted = new RunProtection(workspace, descriptor.roomId);
       const rollback = await restarted.rollback(context.runId);
-      expect(rollback.conflicts).toEqual(["notes.txt"]);
-      expect(await readFile(path.join(workspaceRoot, "notes.txt"), "utf8")).toBe("later user edit");
+      expect(rollback.conflicts).toEqual(["Archive/notes.txt"]);
+      expect(await readFile(path.join(workspaceRoot, "Archive/notes.txt"), "utf8")).toBe("later user edit");
 
       const secondRestart = new RunProtection(workspace, descriptor.roomId);
+      await expect(secondRestart.restoreBaselineAsCopies(context.runId, [...rollback.conflicts, "missing.txt"]))
+        .rejects.toThrow("One or more requested files do not belong to this rollback baseline.");
       const copies = await secondRestart.restoreBaselineAsCopies(context.runId, rollback.conflicts);
       expect(copies).toEqual(["notes (baseline).txt"]);
       expect(await readFile(path.join(workspaceRoot, copies[0]!), "utf8")).toBe("before agent");
-      expect(await readFile(path.join(workspaceRoot, "notes.txt"), "utf8")).toBe("later user edit");
+      expect(await readFile(path.join(workspaceRoot, "Archive/notes.txt"), "utf8")).toBe("later user edit");
       const copyRow = db.prepare(
         "SELECT original_bytes, source, relative_path FROM files WHERE relative_path = ?",
       ).get(copies[0]) as { original_bytes: Buffer | null; source: string; relative_path: string };

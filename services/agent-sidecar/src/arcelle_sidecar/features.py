@@ -62,17 +62,24 @@ def _parse_questions(raw: str) -> list[str]:
     fence-wraps its JSON or prefixes a ``<think>`` span, the strict parse
     rejected it, and the front page silently showed no starter questions at
     all."""
+    return _question_strings(_json_object(raw))[:3]
+
+
+def _json_object(raw: str) -> dict[str, Any] | None:
     try:
         data = json.loads(recover_json(raw))
     except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _question_strings(data: dict[str, Any] | None) -> list[str]:
+    if data is None:
         return []
-    if not isinstance(data, dict):
+    questions = data.get("questions")
+    if not isinstance(questions, list):
         return []
-    arr = data.get("questions")
-    if not isinstance(arr, list):
-        return []
-    strings = [q for q in arr if isinstance(q, str)]
-    return [q for q in strings if q.strip()][:3]
+    return [question for question in questions if isinstance(question, str) and question.strip()]
 
 
 async def front_page_labels(
@@ -136,18 +143,23 @@ def _parse_or_fallback(raw: str, text: str) -> tuple[str, str]:
     :func:`_parse_questions` needs it: a fence-wrapped reply from a cloud model
     fell straight through to the fallback, so the feedback form quietly used
     the user's first line as the issue title and never told anyone."""
-    try:
-        data = json.loads(recover_json(raw))
-    except (ValueError, TypeError):
-        data = None
-    if isinstance(data, dict):
-        title = data.get("title")
-        body = data.get("body")
-        if isinstance(title, str) and isinstance(body, str):
-            title, body = title.strip(), body.strip()
-            if title and body:
-                return title, body
-    # Resilience: the words survive any model misfire.
+    parsed = _feedback_fields(_json_object(raw))
+    return parsed if parsed is not None else _feedback_fallback(text)
+
+
+def _feedback_fields(data: dict[str, Any] | None) -> tuple[str, str] | None:
+    if data is None:
+        return None
+    title = data.get("title")
+    body = data.get("body")
+    if not isinstance(title, str) or not isinstance(body, str):
+        return None
+    title, body = title.strip(), body.strip()
+    return (title, body) if title and body else None
+
+
+def _feedback_fallback(text: str) -> tuple[str, str]:
+    """Keep the user's words when the structured model reply is unusable."""
     first_line = text.split("\n", 1)[0].rstrip("\r")
     return (first_line or "Feedback")[:70], f"## What happened\n\n{text}"
 

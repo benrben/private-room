@@ -1,4 +1,5 @@
 import { GraphIcon, PodcastIcon, StudioIcon } from "../icons";
+import type { ComponentType } from "react";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 /* The AI column's own stylesheet — the Studio shelf and the Activity journal —
@@ -14,16 +15,137 @@ import { WSActions } from "./actions";
  * file are different work, so a run started elsewhere must not grey out the row
  * in front of you — the same false reading AiPane's summary row was fixed for.
  * Both facts come off the job's plan, which is what `start_studio_job` wrote. */
+type StudioKind = "flashcards" | "mindmap" | "podcast";
+
+type StudioCard = {
+  kind: StudioKind;
+  title: string;
+  copy: string;
+  className: string;
+  Icon: ComponentType<{ size?: number }>;
+};
+
+const studioCards: StudioCard[] = [
+  {
+    kind: "flashcards",
+    title: "Flashcards",
+    copy: "A flip-card deck you can review",
+    className: "studio-row nb-mark-blue",
+    Icon: StudioIcon,
+  },
+  {
+    kind: "mindmap",
+    title: "Mind map",
+    copy: "See how the ideas connect",
+    className: "studio-row ap-sig-b nb-mark-green",
+    Icon: GraphIcon,
+  },
+  {
+    kind: "podcast",
+    title: "Podcast script",
+    copy: "A two-host transcript (script only)",
+    className: "studio-row ap-sig-c nb-mark-yellow",
+    Icon: PodcastIcon,
+  },
+];
+
+function isRunningStudioJob(job: WSState["jobs"][number]) {
+  return job.kind === "studio" && ["running", "queued"].includes(job.status);
+}
+
+function studioPlan(job: WSState["jobs"][number]) {
+  return job.plan as { kind?: string; scope?: string | null } | null;
+}
+
+function planIsInScope(
+  plan: { scope?: string | null } | null,
+  scope: string | undefined,
+) {
+  return (plan?.scope ?? undefined) === scope;
+}
+
+function addStudioKind(kinds: Set<string>, plan: { kind?: string } | null) {
+  if (plan?.kind) kinds.add(plan.kind);
+}
+
 function runningKinds(s: WSState, scope?: string): Set<string> {
   const kinds = new Set<string>();
-  for (const j of s.jobs) {
-    if (j.kind !== "studio") continue;
-    if (j.status !== "running" && j.status !== "queued") continue;
-    const plan = j.plan as { kind?: string; scope?: string | null } | null;
-    if ((plan?.scope ?? undefined) !== scope) continue;
-    if (plan?.kind) kinds.add(plan.kind);
+  for (const job of s.jobs) {
+    if (!isRunningStudioJob(job)) continue;
+    const plan = studioPlan(job);
+    if (!planIsInScope(plan, scope)) continue;
+    addStudioKind(kinds, plan);
   }
   return kinds;
+}
+
+function StudioCardButton({
+  card,
+  isRunning,
+  scope,
+  openStudioPrompt,
+}: {
+  card: StudioCard;
+  isRunning: boolean;
+  scope?: string;
+  openStudioPrompt: WSActions["openStudioPrompt"];
+}) {
+  const { Icon } = card;
+  return (
+    <button
+      className={card.className}
+      disabled={isRunning}
+      onClick={() => openStudioPrompt(card.kind, scope)}
+    >
+      <span className="studio-row-icon">
+        <Icon size={14} />
+      </span>
+      <span className="studio-row-text">
+        <span className="studio-row-title">{card.title}</span>
+        <span className="studio-row-copy">{card.copy}</span>
+      </span>
+      <span
+        className={`studio-row-state${isRunning ? " is-working nb-tape nb-sem-pending" : ""}`}
+      >
+        {isRunning ? "Working…" : "Create"}
+      </span>
+    </button>
+  );
+}
+
+function RoomAiActions({
+  actionDefs,
+  aiBusy,
+  scope,
+  openAiAction,
+}: {
+  actionDefs: NonNullable<WSState["aiActionDefs"]>;
+  aiBusy: boolean;
+  scope?: string;
+  openAiAction: WSActions["openAiAction"];
+}) {
+  const roomActions = actionDefs.filter((action) => action.scope === "room");
+  if (roomActions.length === 0) return null;
+  return (
+    <>
+      <div className="studio-section-title">
+        AI actions · {scope ? "this folder" : "whole room"}
+      </div>
+      <div className="ai-action-grid">
+        {roomActions.map((action) => (
+          <button
+            key={action.id}
+            className="ai-action-chip"
+            disabled={aiBusy}
+            title={action.description}
+            onClick={() => openAiAction(action, scope ?? null, null)}
+          >
+            {action.title}
+          </button>
+        ))}
+      </div>
+    </>
+  );
 }
 
 /** The Studio Shelf (D5/D12). `scope` is a file id (this file) or undefined
@@ -48,92 +170,26 @@ export default function StudioShelf({
   a: WSActions;
 }) {
   const running = runningKinds(s, scope);
-  const cards = running.has("flashcards");
-  const mind = running.has("mindmap");
-  const pod = running.has("podcast");
   return (
     <div className="studio-shelf">
       <div className="studio-section-title">
         {scope ? "From the open file" : "From this room's sources"}
       </div>
-      <button
-        className="studio-row nb-mark-blue"
-        disabled={cards}
-        onClick={() => a.openStudioPrompt("flashcards", scope)}
-      >
-        <span className="studio-row-icon">
-          <StudioIcon size={14} />
-        </span>
-        <span className="studio-row-text">
-          <span className="studio-row-title">Flashcards</span>
-          <span className="studio-row-copy">A flip-card deck you can review</span>
-        </span>
-        <span
-          className={`studio-row-state${cards ? " is-working nb-tape nb-sem-pending" : ""}`}
-        >
-          {cards ? "Working…" : "Create"}
-        </span>
-      </button>
-      <button
-        className="studio-row ap-sig-b nb-mark-green"
-        disabled={mind}
-        onClick={() => a.openStudioPrompt("mindmap", scope)}
-      >
-        <span className="studio-row-icon">
-          <GraphIcon size={14} />
-        </span>
-        <span className="studio-row-text">
-          <span className="studio-row-title">Mind map</span>
-          <span className="studio-row-copy">See how the ideas connect</span>
-        </span>
-        <span
-          className={`studio-row-state${mind ? " is-working nb-tape nb-sem-pending" : ""}`}
-        >
-          {mind ? "Working…" : "Create"}
-        </span>
-      </button>
-      <button
-        className="studio-row ap-sig-c nb-mark-yellow"
-        disabled={pod}
-        onClick={() => a.openStudioPrompt("podcast", scope)}
-      >
-        <span className="studio-row-icon">
-          <PodcastIcon size={14} />
-        </span>
-        <span className="studio-row-text">
-          <span className="studio-row-title">Podcast script</span>
-          <span className="studio-row-copy">
-            A two-host transcript (script only)
-          </span>
-        </span>
-        <span
-          className={`studio-row-state${pod ? " is-working nb-tape nb-sem-pending" : ""}`}
-        >
-          {pod ? "Working…" : "Create"}
-        </span>
-      </button>
-      {(s.aiActionDefs ?? []).some((x) => x.scope === "room") && (
-        <>
-          <div className="studio-section-title">
-            AI actions · {scope ? "this folder" : "whole room"}
-          </div>
-          <div className="ai-action-grid">
-            {(s.aiActionDefs ?? [])
-              .filter((x) => x.scope === "room")
-              .map((x) => (
-                <button
-                  key={x.id}
-                  className="ai-action-chip"
-                  disabled={s.aiBusy}
-                  title={x.description}
-                  onClick={() => a.openAiAction(x, scope ?? null, null)}
-                >
-                  {x.title}
-                </button>
-              ))}
-          </div>
-        </>
-      )}
+      {studioCards.map((card) => (
+        <StudioCardButton
+          key={card.kind}
+          card={card}
+          isRunning={running.has(card.kind)}
+          scope={scope}
+          openStudioPrompt={a.openStudioPrompt}
+        />
+      ))}
+      <RoomAiActions
+        actionDefs={s.aiActionDefs ?? []}
+        aiBusy={s.aiBusy}
+        scope={scope}
+        openAiAction={a.openAiAction}
+      />
     </div>
   );
 }

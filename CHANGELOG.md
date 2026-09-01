@@ -3,6 +3,19 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.26.12 — 2026-09-01
+
+Arcelle's desktop and sidecar internals have been split into focused modules
+without changing their public behavior. Every production function is now
+covered on all executable lines with CRAAP and complexity at or below 6, and
+every production file is at or below 600 lines. The quality gate now measures
+these constraints directly and runs the desktop coverage workload in parallel.
+
+Packaging now exercises the real Electron startup path before shipping. This
+release fixes an ESM keychain-helper import that could stop the packaged app
+before its first window appeared, and verifies the packaged native database,
+real model resources, sidecar executable, signature, and renderer startup.
+
 ## 0.26.11 — 2026-08-30
 
 Automatic updates now work directly from v0.26.9. Release archives use the

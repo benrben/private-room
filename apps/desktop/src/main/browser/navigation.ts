@@ -127,6 +127,35 @@ interface NavigationAttempt {
   preventDefault(): void;
 }
 
+function navigationUrl(value: string): URL | null {
+  try {
+    return new URL(value);
+  } catch {
+    return null;
+  }
+}
+
+function rejectAppLink(event: NavigationAttempt, deps: NavigationDeps): void {
+  deps.journal(
+    "open",
+    event.url,
+    "This link opens another app, which the private browser does not do — nothing was loaded.",
+  );
+  event.preventDefault();
+}
+
+function rejectNonPublicUrl(event: NavigationAttempt, deps: NavigationDeps): void {
+  deps.journal("blocked", event.url, "Navigation blocked: private or non-web address.");
+  deps.emitBlocked(event.url);
+  event.preventDefault();
+}
+
+function recordNavigation(event: NavigationAttempt, url: URL, deps: NavigationDeps): void {
+  if (event.isMainFrame && isRecordableUrl(url)) {
+    deps.recordMainFrameUrl(event.url);
+  }
+}
+
 /**
  * The gate itself, as one pure-ish decision over one attempted navigation, so
  * both events share exactly one implementation. Port of `navigation_allowed`.
@@ -136,10 +165,8 @@ export function gateNavigation(
   event: NavigationAttempt,
   deps: NavigationDeps,
 ): void {
-  let parsed: URL;
-  try {
-    parsed = new URL(event.url);
-  } catch {
+  const parsed = navigationUrl(event.url);
+  if (parsed === null) {
     // Nothing this gate recognises as a real destination; leave Chromium's own
     // handling of it alone rather than inventing a verdict.
     return;
@@ -150,25 +177,16 @@ export function gateNavigation(
   if (parsed.protocol === "about:") return;
 
   if (isAppLinkScheme(parsed.protocol)) {
-    deps.journal(
-      "open",
-      event.url,
-      "This link opens another app, which the private browser does not do — nothing was loaded.",
-    );
-    event.preventDefault();
+    rejectAppLink(event, deps);
     return;
   }
 
   if (!isPublicHttpUrl(event.url)) {
-    deps.journal("blocked", event.url, "Navigation blocked: private or non-web address.");
-    deps.emitBlocked(event.url);
-    event.preventDefault();
+    rejectNonPublicUrl(event, deps);
     return;
   }
 
-  if (event.isMainFrame && isRecordableUrl(parsed)) {
-    deps.recordMainFrameUrl(event.url);
-  }
+  recordNavigation(event, parsed, deps);
   void recheckHostOffThread(contents, parsed, deps);
 }
 

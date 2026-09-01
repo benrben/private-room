@@ -418,6 +418,29 @@ describe("browserPreview", () => {
     expect(imageCalls).toBe(1);
     db.close();
   });
+
+  it("degrades both rejected and absent image responses to empty preview fields", async () => {
+    const db = freshRoom();
+    const imageCalls: string[] = [];
+    const deps: PreviewDeps = {
+      db,
+      fetchPreview: async () => ({
+        text: "",
+        imageUrl: "https://a/rejected.png",
+        iconUrl: "https://a/missing.ico",
+      }),
+      fetchImage: async (url) => {
+        imageCalls.push(url);
+        if (url.endsWith("rejected.png")) throw new Error("image fetch blocked");
+        return null;
+      },
+    };
+
+    const [preview] = await browserPreview(deps, ["https://a/page"]);
+    expect(preview).toMatchObject({ image: null, icon: null, done: true });
+    expect(imageCalls).toEqual(["https://a/rejected.png", "https://a/missing.ico"]);
+    db.close();
+  });
 });
 
 describe("importSearchResult", () => {

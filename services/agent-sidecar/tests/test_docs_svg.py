@@ -10,6 +10,7 @@ comment calls out explicitly.
 
 from __future__ import annotations
 
+from arcelle_sidecar.docs import svg
 from arcelle_sidecar.docs.svg import extract_svg
 
 
@@ -80,3 +81,32 @@ def test_non_ascii_body_content_stays_aligned_across_element_passes() -> None:
     assert "מבחן" in text
     assert "emoji test \U0001f389" in text
     assert "Café résumé" in text
+
+
+def test_nested_markup_and_unmatched_closing_angle_brackets_are_preserved_as_before() -> None:
+    """Tags are removed, entities decoded, and a stray closing angle bracket
+    is ignored.  The nested `tspan` is intentionally reported once through
+    its parent `text` and once by the dedicated `tspan` pass.
+    """
+    text = extract_svg(
+        "<svg><text>Lead <tspan>middle</tspan> tail > end &amp; done</text></svg>"
+    )
+    assert text == "Lead middle tail  end & done\nmiddle\n"
+
+
+def test_unfinished_svg_text_elements_read_as_nothing() -> None:
+    """A recognized open tag needs both its closing `>` and closing element.
+    Malformed input must stop extraction rather than inventing prose.
+    """
+    assert extract_svg("<svg><text") is None
+    assert extract_svg("<svg><text ") is None
+    assert extract_svg("<svg><text>unclosed") is None
+
+
+def test_svg_extraction_caps_at_a_whole_utf8_character(monkeypatch) -> None:
+    """The cap is a byte limit, so a multibyte character is never cut in two
+    and later elements add nothing once the cap is full.
+    """
+    monkeypatch.setattr(svg, "_MAX_DERIVED_CHARS", 3)
+    assert svg.extract_svg("<svg><text>åå</text></svg>") == "å\n"
+    assert svg.extract_svg("<svg><text>ab</text><text>x</text></svg>") == "ab\n"

@@ -180,6 +180,10 @@ describe("normalizeNeedle", () => {
     expect(normalizeNeedle("\u{201C}hi\u{201D} \u{2013} bye").join("")).toBe('"hi" - bye');
   });
 
+  it("expands a ligature in a needle without leaving surrounding collapsed spaces behind", () => {
+    expect(normalizeNeedle("  a \u{FB01}  b  ")).toEqual(["a", " ", "f", "i", " ", "b"]);
+  });
+
   it("never produces the paragraph sentinel, even for a multi-newline run", () => {
     const out = normalizeNeedle("a\n\n\nb").join("");
     expect(out).toBe("a b");

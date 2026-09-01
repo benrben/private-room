@@ -119,6 +119,32 @@ def _field(parsed: Any, key: str) -> str:
     return ""
 
 
+async def _parsed_structured_reply(
+    model: str,
+    messages: list[Message],
+    schema: dict[str, Any],
+    base_url: str,
+    *,
+    keep_alive: str,
+    num_predict: int | None,
+    privacy: dict[str, Any] | None,
+    provider: Any | None,
+) -> Any:
+    """Generate and parse one schema-primed response without retry policy."""
+    raw = await llm.generate(
+        model,
+        messages,
+        base_url,
+        temperature=PASS_TEMPERATURE,
+        num_predict=num_predict,
+        keep_alive=keep_alive,
+        format=schema,
+        privacy=privacy,
+        provider=provider,
+    )
+    return json.loads(recover_json(raw))
+
+
 async def _structured_call(
     model: str,
     messages: list[Message],
@@ -144,35 +170,110 @@ async def _structured_call(
     * otherwise the parsed JSON value (any JSON — the caller reads fields safely).
     """
     primed = prime_schema(messages, schema)
-    for attempt in range(2):
+    for _attempt in range(2):
         try:
-            raw = await llm.generate(
+            return await _parsed_structured_reply(
                 model,
                 primed,
+                schema,
                 base_url,
-                temperature=PASS_TEMPERATURE,
-                num_predict=num_predict,
                 keep_alive=keep_alive,
-                format=schema,
+                num_predict=num_predict,
                 privacy=privacy,
                 provider=provider,
             )
         except llm.LlmError as exc:
             if _is_fatal(exc.code):
                 raise
-            if attempt == 0:
-                continue
-            return _SKIP
-        try:
-            return json.loads(recover_json(raw))
         except (json.JSONDecodeError, ValueError):
-            if attempt == 0:
-                continue
-            return _SKIP
+            pass
     return _SKIP
 
 
 # --- the three steps --------------------------------------------------------
+
+
+def _map_spec(mode: str, window_text: str) -> tuple[str, str, int]:
+    """Return the prompt system, artifact key, and byte cap for one map mode."""
+    if mode == "stitch":
+        # ``window_text.len()`` is BYTES in Rust — size the cap on byte length.
+        return (
+            MAP_SYSTEM_STITCH,
+            "result",
+            max(len(window_text.encode("utf-8")) * 3, PASS_NOTES_MAX),
+        )
+    return MAP_SYSTEM_MERGE, "notes", PASS_NOTES_MAX
+
+
+def _map_messages(
+    system: str,
+    *,
+    file_name: str,
+    instruction: str,
+    part: int,
+    total: int,
+    start: int,
+    end: int,
+    text_len: int,
+    thread: str,
+    window_text: str,
+) -> list[Message]:
+    thread_block = thread if thread else "(this is the first part)"
+    user = (
+        f"File: {file_name}\nGoal: {instruction}\n"
+        f"This is part {part + 1} of {total} — characters {start}-{end} of {text_len}.\n\n"
+        f"Thread from the earlier parts:\n{thread_block}\n\n"
+        f"Text of THIS part:\n{window_text}"
+    )
+    return [system_message(system), user_message(user)]
+
+
+def _map_schema(result_key: str) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {result_key: {"type": "string"}, "thread": {"type": "string"}},
+        "required": [result_key, "thread"],
+    }
+
+
+def _map_fallback(
+    *,
+    stitch: bool,
+    thread: str,
+    window_text: str,
+    result_cap: int,
+) -> dict[str, Any]:
+    if stitch:
+        # A transform cannot honestly fall back to untranslated source text.
+        return {"result": "", "thread": thread, "skipped": True}
+    fallback = truncate_bytes(window_text.strip(), result_cap)
+    if fallback:
+        return {"result": fallback, "thread": thread, "skipped": False}
+    return {"result": "", "thread": thread, "skipped": True}
+
+
+def _map_artifact(
+    parsed: Any,
+    *,
+    stitch: bool,
+    result_key: str,
+    result_cap: int,
+    thread: str,
+    window_text: str,
+) -> dict[str, Any]:
+    result = "" if parsed is _SKIP else _field(parsed, result_key).strip()
+    if not result:
+        return _map_fallback(
+            stitch=stitch,
+            thread=thread,
+            window_text=window_text,
+            result_cap=result_cap,
+        )
+    return {
+        "result": truncate_bytes(result, result_cap),
+        "thread": truncate_bytes(_field(parsed, "thread").strip(), PASS_THREAD_MAX),
+        "skipped": False,
+    }
 
 
 async def run_map(
@@ -201,27 +302,20 @@ async def run_map(
     reading, stitch mode marks it skipped (see the fallback branch below).
     """
     stitch = mode == "stitch"
-    system = MAP_SYSTEM_STITCH if stitch else MAP_SYSTEM_MERGE
-    thread_block = thread if thread else "(this is the first part)"
-    user = (
-        f"File: {file_name}\nGoal: {instruction}\n"
-        f"This is part {part + 1} of {total} — characters {start}-{end} of {text_len}.\n\n"
-        f"Thread from the earlier parts:\n{thread_block}\n\n"
-        f"Text of THIS part:\n{window_text}"
+    system, result_key, result_cap = _map_spec(mode, window_text)
+    schema = _map_schema(result_key)
+    messages = _map_messages(
+        system,
+        file_name=file_name,
+        instruction=instruction,
+        part=part,
+        total=total,
+        start=start,
+        end=end,
+        text_len=text_len,
+        thread=thread,
+        window_text=window_text,
     )
-    if stitch:
-        result_key = "result"
-        # window_text.len() is BYTES in Rust — size the cap on the byte length.
-        result_cap = max(len(window_text.encode("utf-8")) * 3, PASS_NOTES_MAX)
-    else:
-        result_key = "notes"
-        result_cap = PASS_NOTES_MAX
-    schema = {
-        "type": "object",
-        "properties": {result_key: {"type": "string"}, "thread": {"type": "string"}},
-        "required": [result_key, "thread"],
-    }
-    messages = [system_message(system), user_message(user)]
     parsed = await _structured_call(
         model,
         messages,
@@ -232,35 +326,14 @@ async def run_map(
         privacy=privacy,
         provider=provider,
     )
-    result = "" if parsed is _SKIP else _field(parsed, result_key).strip()
-    if not result:
-        # The structured reply was a double-failure (_SKIP) or a valid-but-EMPTY
-        # reply. A small model often can't wrap CODE / CSV / tabular content — full
-        # of braces and quotes — in the forced JSON, so it returns nothing usable
-        # even for a window that clearly HAS text.
-        if stitch:
-            # STITCH TRANSFORMS the text (translate, rewrite), so the source is
-            # not a stand-in for its own transform: pasting it back would publish
-            # a chunk of the ORIGINAL language into the translation, unmarked,
-            # while the footer still claimed complete coverage. Mark the window
-            # skipped — Rust then writes "[part N could not be processed]" where
-            # it belongs and counts it in the coverage line.
-            return {"result": "", "thread": thread, "skipped": True}
-        # MERGE only READS the window into notes, so the raw text IS a faithful
-        # (if unsummarized) reading of it. Rather than drop the window — which
-        # reads to the user as "1 of N parts could not be processed" for a file
-        # we can plainly see — keep it so the content is still COVERED: the
-        # section step composes from it, or failing that publishes it raw. Only a
-        # genuinely empty window is marked skipped.
-        fallback = truncate_bytes(window_text.strip(), result_cap)
-        if fallback:
-            return {"result": fallback, "thread": thread, "skipped": False}
-        return {"result": "", "thread": thread, "skipped": True}
-    return {
-        "result": truncate_bytes(result, result_cap),
-        "thread": truncate_bytes(_field(parsed, "thread").strip(), PASS_THREAD_MAX),
-        "skipped": False,
-    }
+    return _map_artifact(
+        parsed,
+        stitch=stitch,
+        result_key=result_key,
+        result_cap=result_cap,
+        thread=thread,
+        window_text=window_text,
+    )
 
 
 async def run_section(

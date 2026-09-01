@@ -89,3 +89,18 @@ def test_markdown_nested_list_with_table_in_list_item() -> None:
         "\n\n"
         "- Second top item\n"
     )
+
+
+def test_markdown_keeps_plain_text_and_handles_empty_inline_nodes() -> None:
+    # Text and comments are separate BeautifulSoup node types. The former
+    # remains prose at document level; the latter is not article text in the
+    # dom_query model that this serializer preserves.
+    assert html_to_markdown("top-level prose<!-- ignored -->") == "top-level prose\n"
+    assert html_to_markdown("") == ""
+    assert html_to_markdown("<table></table>") == ""
+
+    md = html_to_markdown(
+        "<p><!-- ignored --><a><!-- icon --></a><strong></strong><br>"
+        '<img src="https://x.test/image.png" alt="sample image"></p>'
+    )
+    assert md == "![sample image](https://x.test/image.png)\n"

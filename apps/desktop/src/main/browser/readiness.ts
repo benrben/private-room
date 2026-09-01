@@ -54,6 +54,20 @@ export const SCRIPT_REFUSED =
 
 export type Readiness = "ready" | "loading" | "refused";
 
+type ReadinessProbe = { ok?: unknown; url?: unknown; refused?: unknown } | null | undefined;
+
+function completedProbe(probe: ReadinessProbe, recordIsBlank: boolean): Readiness | null {
+  if (!probe || probe.ok !== true) {
+    return null;
+  }
+  const onBlank = probe.url === START_BLANK;
+  return onBlank && !recordIsBlank ? "loading" : "ready";
+}
+
+function refusedProbe(probe: ReadinessProbe): boolean {
+  return probe !== null && probe !== undefined && probe.refused === true;
+}
+
 /**
  * What the readiness probe learned. Port of `classify_ready`.
  *
@@ -64,13 +78,12 @@ export type Readiness = "ready" | "loading" | "refused";
  * question as "the page we asked for is up".
  */
 export function classifyReady(v: unknown, recordIsBlank: boolean): Readiness {
-  const obj = v as { ok?: unknown; url?: unknown; refused?: unknown } | null | undefined;
-  if (obj && obj.ok === true) {
-    const onBlank = obj.url === START_BLANK;
-    return onBlank && !recordIsBlank ? "loading" : "ready";
+  const probe = v as ReadinessProbe;
+  const completed = completedProbe(probe, recordIsBlank);
+  if (completed !== null) {
+    return completed;
   }
-  if (obj && obj.refused === true) return "refused";
-  return "loading";
+  return refusedProbe(probe) ? "refused" : "loading";
 }
 
 /**

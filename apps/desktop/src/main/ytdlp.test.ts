@@ -135,7 +135,9 @@ async function mkTempDir(prefix = "ytdlp-test-"): Promise<string> {
 /** A data dir with a placeholder binary already installed and freshly
  * stamped, so `ensureYtdlp` takes its already-installed fast path: no fetch,
  * no `-U`, letting a test isolate the caller's own orchestration. */
-async function withInstalledBin<T>(fn: (dataDir: string) => Promise<T>): Promise<T> {
+async function withInstalledBin<T>(
+  fn: (dataDir: string) => Promise<T>,
+): Promise<T> {
   const dataDir = await mkTempDir();
   try {
     const dest = ytdlpPath(dataDir);
@@ -162,7 +164,10 @@ function argAfter(args: string[], flag: string): string | undefined {
  * had not delivered yet, and the stderr-tail assertions would be green
  * whether or not the concurrent drain worked.
  */
-async function closeFake(fake: FakeProcess, code: number | null): Promise<void> {
+async function closeFake(
+  fake: FakeProcess,
+  code: number | null,
+): Promise<void> {
   fake.stdout.end();
   fake.stderr.end();
   await new Promise((r) => setTimeout(r, 0));
@@ -196,15 +201,27 @@ const FILE_META: FileMeta = {
 
 describe("looksLikeMacosBinary", () => {
   it("accepts Mach-O 64/32-bit and both byte orders of a universal binary", () => {
-    expect(looksLikeMacosBinary(new Uint8Array([0xcf, 0xfa, 0xed, 0xfe, 0x07]))).toBe(true);
-    expect(looksLikeMacosBinary(new Uint8Array([0xce, 0xfa, 0xed, 0xfe]))).toBe(true);
-    expect(looksLikeMacosBinary(new Uint8Array([0xca, 0xfe, 0xba, 0xbe]))).toBe(true);
-    expect(looksLikeMacosBinary(new Uint8Array([0xbe, 0xba, 0xfe, 0xca]))).toBe(true);
+    expect(
+      looksLikeMacosBinary(new Uint8Array([0xcf, 0xfa, 0xed, 0xfe, 0x07])),
+    ).toBe(true);
+    expect(looksLikeMacosBinary(new Uint8Array([0xce, 0xfa, 0xed, 0xfe]))).toBe(
+      true,
+    );
+    expect(looksLikeMacosBinary(new Uint8Array([0xca, 0xfe, 0xba, 0xbe]))).toBe(
+      true,
+    );
+    expect(looksLikeMacosBinary(new Uint8Array([0xbe, 0xba, 0xfe, 0xca]))).toBe(
+      true,
+    );
   });
 
   it("rejects an error page, a zip, a truncated body, and nothing at all", () => {
-    expect(looksLikeMacosBinary(new TextEncoder().encode("<!DOCTYPE html>"))).toBe(false);
-    expect(looksLikeMacosBinary(new Uint8Array([0x50, 0x4b, 0x03, 0x04]))).toBe(false); // "PK\x03\x04"
+    expect(
+      looksLikeMacosBinary(new TextEncoder().encode("<!DOCTYPE html>")),
+    ).toBe(false);
+    expect(looksLikeMacosBinary(new Uint8Array([0x50, 0x4b, 0x03, 0x04]))).toBe(
+      false,
+    ); // "PK\x03\x04"
     expect(looksLikeMacosBinary(new Uint8Array([0xcf, 0xfa]))).toBe(false);
     expect(looksLikeMacosBinary(new Uint8Array([]))).toBe(false);
   });
@@ -212,7 +229,9 @@ describe("looksLikeMacosBinary", () => {
 
 describe("parseYtdlpPercent", () => {
   it("parses progress lines and ignores noise", () => {
-    expect(parseYtdlpPercent("[download]  42.7% of 12.3MiB at 1.2MiB/s")).toBe(42.7);
+    expect(parseYtdlpPercent("[download]  42.7% of 12.3MiB at 1.2MiB/s")).toBe(
+      42.7,
+    );
     expect(parseYtdlpPercent("[download] 100% of 5MiB")).toBe(100);
     expect(parseYtdlpPercent("[youtube] abc: Downloading webpage")).toBeNull();
     expect(parseYtdlpPercent("[download] Destination: x.mp4")).toBeNull();
@@ -230,24 +249,33 @@ describe("parseYtdlpPercent", () => {
 describe("parseYtdlpTotalBytes", () => {
   it("reads the total off a progress line, and 'of' noise never parses as a size", () => {
     const mib = 1024 * 1024;
-    expect(parseYtdlpTotalBytes("[download]  42.7% of 12.3MiB at 1.2MiB/s")).toBe(
-      Math.trunc(12.3 * mib)
-    );
+    expect(
+      parseYtdlpTotalBytes("[download]  42.7% of 12.3MiB at 1.2MiB/s"),
+    ).toBe(Math.trunc(12.3 * mib));
     // HLS totals arrive as estimates, both spellings.
-    expect(parseYtdlpTotalBytes("[download]   0.1% of ~ 871.20MiB at 11.33MiB/s")).toBe(
-      Math.trunc(871.2 * mib)
-    );
-    expect(parseYtdlpTotalBytes("[download]   0.1% of ~4.71GiB at 1MiB/s")).toBe(
-      Math.trunc(4.71 * 1024 * mib)
-    );
-    expect(parseYtdlpTotalBytes("[download] 100% of 246.27KiB in 00:00:00")).toBe(
-      Math.trunc(246.27 * 1024)
-    );
+    expect(
+      parseYtdlpTotalBytes("[download]   0.1% of ~ 871.20MiB at 11.33MiB/s"),
+    ).toBe(Math.trunc(871.2 * mib));
+    expect(
+      parseYtdlpTotalBytes("[download]   0.1% of ~4.71GiB at 1MiB/s"),
+    ).toBe(Math.trunc(4.71 * 1024 * mib));
+    expect(
+      parseYtdlpTotalBytes("[download] 100% of 246.27KiB in 00:00:00"),
+    ).toBe(Math.trunc(246.27 * 1024));
     // A false positive here aborts a legitimate download.
-    expect(parseYtdlpTotalBytes("[download] Downloading fragment 1 of 100")).toBeNull();
-    expect(parseYtdlpTotalBytes("[download] Got error. Retrying (attempt 1 of 3)...")).toBeNull();
+    expect(
+      parseYtdlpTotalBytes("[download] Downloading fragment 1 of 100"),
+    ).toBeNull();
+    expect(
+      parseYtdlpTotalBytes(
+        "[download] Got error. Retrying (attempt 1 of 3)...",
+      ),
+    ).toBeNull();
     expect(parseYtdlpTotalBytes("[download] 50% of 12.3TiB")).toBeNull(); // unknown unit
-    expect(parseYtdlpTotalBytes("[youtube] abc: Downloading webpage")).toBeNull();
+    expect(parseYtdlpTotalBytes("[download] Destination: clip.mp4")).toBeNull();
+    expect(
+      parseYtdlpTotalBytes("[youtube] abc: Downloading webpage"),
+    ).toBeNull();
     expect(parseYtdlpTotalBytes("")).toBeNull();
   });
 });
@@ -267,7 +295,10 @@ describe("formatSelector", () => {
       expect(formatSelector(false, height)).not.toContain("+");
       expect(formatSelector(true, height)).toContain("+");
     }
-    for (const selector of [formatSelector(false, null), formatSelector(true, null)]) {
+    for (const selector of [
+      formatSelector(false, null),
+      formatSelector(true, null),
+    ]) {
       expect(selector.startsWith("b[ext=mp4]/")).toBe(true);
     }
   });
@@ -295,11 +326,40 @@ describe("formatSelector", () => {
 describe("qualityOptions", () => {
   const info = {
     formats: [
-      { format_id: "140", vcodec: "none", acodec: "mp4a.40.2", filesize: 50_000_000 },
-      { format_id: "136", vcodec: "avc1.64001f", acodec: "none", height: 720, filesize: 400_000_000 },
-      { format_id: "247", vcodec: "vp9", acodec: "none", height: 720, filesize: 300_000_000 },
-      { format_id: "137", vcodec: "avc1.640028", acodec: "none", height: 1080, filesize_approx: 900_000_000 },
-      { format_id: "18", vcodec: "avc1.42001E", acodec: "mp4a.40.2", height: 360, filesize: 80_000_000 },
+      {
+        format_id: "140",
+        vcodec: "none",
+        acodec: "mp4a.40.2",
+        filesize: 50_000_000,
+      },
+      {
+        format_id: "136",
+        vcodec: "avc1.64001f",
+        acodec: "none",
+        height: 720,
+        filesize: 400_000_000,
+      },
+      {
+        format_id: "247",
+        vcodec: "vp9",
+        acodec: "none",
+        height: 720,
+        filesize: 300_000_000,
+      },
+      {
+        format_id: "137",
+        vcodec: "avc1.640028",
+        acodec: "none",
+        height: 1080,
+        filesize_approx: 900_000_000,
+      },
+      {
+        format_id: "18",
+        vcodec: "avc1.42001E",
+        acodec: "mp4a.40.2",
+        height: 360,
+        filesize: 80_000_000,
+      },
       { format_id: "sb0", vcodec: "none", acodec: "none" },
     ],
   };
@@ -327,8 +387,23 @@ describe("qualityOptions", () => {
   });
 
   it("an unknown size is offered as fitting rather than refused on a guess", () => {
-    const noSizes = { formats: [{ vcodec: "avc1", acodec: "mp4a", height: 720 }] };
-    expect(qualityOptions(noSizes, true)).toEqual([{ height: 720, approxBytes: null, fits: true }]);
+    const noSizes = {
+      formats: [{ vcodec: "avc1", acodec: "mp4a", height: 720 }],
+    };
+    expect(qualityOptions(noSizes, true)).toEqual([
+      { height: 720, approxBytes: null, fits: true },
+    ]);
+  });
+
+  it("folds known and unknown audio sizes without losing the known maximum", () => {
+    expect(qualityOptions({
+      formats: [
+        { vcodec: "none", acodec: "mp4a", filesize: 100 },
+        { vcodec: "none", acodec: "mp4a" },
+        { vcodec: "none", acodec: "mp4a", filesize: 200 },
+        { vcodec: "avc1", acodec: "none", height: 720, filesize: 300 },
+      ],
+    }, true)).toEqual([{ height: 720, approxBytes: 500, fits: true }]);
   });
 
   it("survives junk where an object or a number was expected", () => {
@@ -336,7 +411,12 @@ describe("qualityOptions", () => {
     expect(qualityOptions("nope", true)).toEqual([]);
     expect(qualityOptions({ formats: "nope" }, true)).toEqual([]);
     expect(
-      qualityOptions({ formats: [null, 7, { vcodec: "avc1", acodec: "mp4a", height: "720" }] }, true)
+      qualityOptions(
+        {
+          formats: [null, 7, { vcodec: "avc1", acodec: "mp4a", height: "720" }],
+        },
+        true,
+      ),
     ).toEqual([]);
   });
 
@@ -349,11 +429,15 @@ describe("qualityOptions", () => {
 
 describe("explainDownloadFailure", () => {
   it("only the split-stream-without-ffmpeg failure gets install guidance", () => {
-    const formatErr = "ERROR: [youtube] abc: Requested format is not available.";
-    expect(explainDownloadFailure(formatErr, false)).toContain("brew install ffmpeg");
+    const formatErr =
+      "ERROR: [youtube] abc: Requested format is not available.";
+    expect(explainDownloadFailure(formatErr, false)).toContain(
+      "brew install ffmpeg",
+    );
     // With ffmpeg present that error means something else — don't prescribe.
     expect(explainDownloadFailure(formatErr, true)).not.toContain("ffmpeg");
-    const other = "ERROR: unable to download video data: HTTP Error 403: Forbidden";
+    const other =
+      "ERROR: unable to download video data: HTTP Error 403: Forbidden";
     const explained = explainDownloadFailure(other, false);
     expect(explained).toContain(other);
     expect(explained).not.toContain("brew");
@@ -381,7 +465,9 @@ describe("youtubeVideoId", () => {
 
   it("rejects an id outside the 8-16 char alnum/-/_ shape", () => {
     expect(youtubeVideoId("https://youtu.be/short")).toBeNull();
-    expect(youtubeVideoId("https://youtu.be/waytoolongtobeavalidytid")).toBeNull();
+    expect(
+      youtubeVideoId("https://youtu.be/waytoolongtobeavalidytid"),
+    ).toBeNull();
     expect(youtubeVideoId("https://youtu.be/not!valid!")).toBeNull();
   });
 });
@@ -404,7 +490,11 @@ describe("constants that encode a decision", () => {
 describe("ytdlpPath", () => {
   it("lives under <dataDir>/bin/yt-dlp", () => {
     expect(ytdlpPath("/Users/x/Library/Application Support/Arcelle")).toBe(
-      path.join("/Users/x/Library/Application Support/Arcelle", "bin", "yt-dlp")
+      path.join(
+        "/Users/x/Library/Application Support/Arcelle",
+        "bin",
+        "yt-dlp",
+      ),
     );
   });
 });
@@ -419,7 +509,9 @@ describe("findFfmpeg", () => {
     const found = findFfmpeg({
       isFile: (p) => {
         seen.push(p);
-        return p === "/opt/local/bin/ffmpeg" || p === "/somewhere/on/path/ffmpeg";
+        return (
+          p === "/opt/local/bin/ffmpeg" || p === "/somewhere/on/path/ffmpeg"
+        );
       },
       pathEnv: "/somewhere/on/path",
     });
@@ -436,13 +528,16 @@ describe("findFfmpeg", () => {
       findFfmpeg({
         isFile: (p) => p === "/opt/homebrew/bin/ffmpeg",
         pathEnv: "/usr/bin:/bin:/usr/sbin:/sbin",
-      })
+      }),
     ).toBe("/opt/homebrew/bin/ffmpeg");
   });
 
   it("falls back to PATH when none of the explicit paths has one", () => {
     expect(
-      findFfmpeg({ isFile: (p) => p === "/somewhere/ffmpeg", pathEnv: "/nope:/somewhere" })
+      findFfmpeg({
+        isFile: (p) => p === "/somewhere/ffmpeg",
+        pathEnv: "/nope:/somewhere",
+      }),
     ).toBe("/somewhere/ffmpeg");
   });
 });
@@ -450,9 +545,13 @@ describe("findFfmpeg", () => {
 describe("mediaProgressToEventSender", () => {
   it("wraps status/percent into the ytdlp-progress wire shape", () => {
     const events: Array<[string, unknown]> = [];
-    const progress = mediaProgressToEventSender((event, payload) => events.push([event, payload]));
+    const progress = mediaProgressToEventSender((event, payload) =>
+      events.push([event, payload]),
+    );
     progress("Downloading the video…", 42.5);
-    expect(events).toEqual([["ytdlp-progress", { status: "Downloading the video…", percent: 42.5 }]]);
+    expect(events).toEqual([
+      ["ytdlp-progress", { status: "Downloading the video…", percent: 42.5 }],
+    ]);
   });
 
   it("swallows a send that throws, matching turn.ts's TurnId.emit", () => {
@@ -531,7 +630,7 @@ describe("runCapturing (scripted fake process)", () => {
     // routine. Decoding each chunk as it arrived turned both halves into
     // U+FFFD — and because U+FFFD is perfectly legal inside a JSON string,
     // nothing threw: the title just silently came back as "???".
-    const text = 'title: מוזיקה 🎬 音楽';
+    const text = "title: מוזיקה 🎬 音楽";
     const buf = Buffer.from(text, "utf8");
     const cut = buf.indexOf(Buffer.from("🎬", "utf8")) + 2; // mid-codepoint
     // Each half is undecodable ALONE — that is the hazard, and asserting it
@@ -590,7 +689,7 @@ describe("ensureYtdlp (injected fetch, real filesystem)", () => {
       await expect(
         ensureYtdlp(dataDir, () => {}, {
           fetchFn: fakeFetchOk([fakeBinaryBytes(10)], MAX_YTDLP_BYTES + 1),
-        })
+        }),
       ).rejects.toThrow(/implausibly large/);
       await expect(fsp.stat(ytdlpPath(dataDir))).rejects.toThrow();
       await expect(fsp.stat(`${ytdlpPath(dataDir)}.part`)).rejects.toThrow();
@@ -606,7 +705,7 @@ describe("ensureYtdlp (injected fetch, real filesystem)", () => {
         ensureYtdlp(dataDir, () => {}, {
           fetchFn: fakeFetchOk([fakeBinaryBytes(600), new Uint8Array(600)]),
           maxBytes: 1000,
-        })
+        }),
       ).rejects.toThrow(/implausibly large/);
       await expect(fsp.stat(`${ytdlpPath(dataDir)}.part`)).rejects.toThrow();
     } finally {
@@ -620,7 +719,7 @@ describe("ensureYtdlp (injected fetch, real filesystem)", () => {
       const html = new Uint8Array(MIN_YTDLP_BYTES + 10);
       html.set(new TextEncoder().encode("<!DOCTYPE html>"), 0);
       await expect(
-        ensureYtdlp(dataDir, () => {}, { fetchFn: fakeFetchOk([html]) })
+        ensureYtdlp(dataDir, () => {}, { fetchFn: fakeFetchOk([html]) }),
       ).rejects.toThrow(/not the video downloader/);
       await expect(fsp.stat(`${ytdlpPath(dataDir)}.part`)).rejects.toThrow();
     } finally {
@@ -632,7 +731,9 @@ describe("ensureYtdlp (injected fetch, real filesystem)", () => {
     const dataDir = await mkTempDir();
     try {
       await expect(
-        ensureYtdlp(dataDir, () => {}, { fetchFn: fakeFetchOk([fakeBinaryBytes(10)]) })
+        ensureYtdlp(dataDir, () => {}, {
+          fetchFn: fakeFetchOk([fakeBinaryBytes(10)]),
+        }),
       ).rejects.toThrow(/not the video downloader/);
     } finally {
       await fsp.rm(dataDir, { recursive: true, force: true });
@@ -644,9 +745,14 @@ describe("ensureYtdlp (injected fetch, real filesystem)", () => {
     try {
       await expect(
         ensureYtdlp(dataDir, () => {}, {
-          fetchFn: async () => ({ ok: false, status: 404, headers: { get: () => null }, body: null }),
-        })
-      ).rejects.toThrow(/HTTP 404/);
+          fetchFn: async () => ({
+            ok: false,
+            status: 404,
+            headers: { get: () => null },
+            body: null,
+          }),
+        }),
+      ).rejects.toThrow(/^downloader fetch failed: HTTP 404$/);
     } finally {
       await fsp.rm(dataDir, { recursive: true, force: true });
     }
@@ -673,9 +779,35 @@ describe("ensureYtdlp (injected fetch, real filesystem)", () => {
         },
       });
       await expect(
-        ensureYtdlp(dataDir, () => {}, { fetchFn: stalling, fetchTimeoutMs: 40 })
+        ensureYtdlp(dataDir, () => {}, {
+          fetchFn: stalling,
+          fetchTimeoutMs: 40,
+        }),
       ).rejects.toThrow(/gave up after/);
       await expect(fsp.stat(`${ytdlpPath(dataDir)}.part`)).rejects.toThrow();
+    } finally {
+      await fsp.rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("propagates a body-reader failure without installing a partial binary", async () => {
+    const dataDir = await mkTempDir();
+    try {
+      const brokenReader: FetchLike = async () => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        body: {
+          getReader: () => ({
+            read: async () => Promise.reject(new Error("connection reset")),
+          }),
+        },
+      });
+
+      await expect(
+        ensureYtdlp(dataDir, () => {}, { fetchFn: brokenReader }),
+      ).rejects.toThrow("connection reset");
+      await expect(fsp.stat(ytdlpPath(dataDir))).rejects.toThrow();
     } finally {
       await fsp.rm(dataDir, { recursive: true, force: true });
     }
@@ -690,13 +822,15 @@ describe("ensureYtdlp (injected fetch, real filesystem)", () => {
       const stuck: FetchLike = () => {
         fetches++;
         return new Promise((_resolve, reject) =>
-          setTimeout(() => reject(new Error("released for test cleanup")), 50)
+          setTimeout(() => reject(new Error("released for test cleanup")), 50),
         );
       };
-      const first = ensureYtdlp(dataDir, () => {}, { fetchFn: stuck }).catch(() => {});
-      await expect(ensureYtdlp(dataDir, () => {}, { fetchFn: stuck })).rejects.toThrow(
-        /already being installed/
+      const first = ensureYtdlp(dataDir, () => {}, { fetchFn: stuck }).catch(
+        () => {},
       );
+      await expect(
+        ensureYtdlp(dataDir, () => {}, { fetchFn: stuck }),
+      ).rejects.toThrow(/already being installed/);
       await first;
       expect(fetches).toBe(1);
     } finally {
@@ -812,7 +946,7 @@ describe("refreshYtdlpIfStale", () => {
             queueMicrotask(() => fake.emit("error", new Error("EACCES")));
             return fake;
           },
-        })
+        }),
       ).resolves.toBeUndefined();
       expect((await fsp.stat(dest)).mtimeMs).toBeCloseTo(longAgo.getTime(), -2);
     });
@@ -825,7 +959,10 @@ describe("refreshYtdlpIfStale", () => {
       await fsp.utimes(dest, longAgo, longAgo);
       const fake = new FakeProcess(); // never closes on its own
       await expect(
-        refreshYtdlpIfStale(dest, () => {}, { spawnFn: () => fake, updateBudgetMs: 20 })
+        refreshYtdlpIfStale(dest, () => {}, {
+          spawnFn: () => fake,
+          updateBudgetMs: 20,
+        }),
       ).resolves.toBeUndefined();
       expect(fake.killed).toBe(true);
       expect((await fsp.stat(dest)).mtimeMs).toBeCloseTo(longAgo.getTime(), -2);
@@ -863,7 +1000,7 @@ describe("pumpDownloadProgress (scripted stdout, no process at all)", () => {
       (s, p) => calls.push([s, p]),
       MAX_DOWNLOAD_BYTES,
       60_000,
-      30
+      30,
     );
     stdout.write("[youtube] abc: Downloading webpage\n");
     stdout.write("[download]  42.7% of 12.3MiB at 1.2MiB/s\n");
@@ -885,7 +1022,7 @@ describe("pumpDownloadProgress (scripted stdout, no process at all)", () => {
       (_s, p) => calls.push(p),
       MAX_DOWNLOAD_BYTES,
       60_000,
-      30
+      30,
     );
     stdout.write("[download]   0.1% of ~4.71GiB at 1MiB/s\n");
     const reason = await done;
@@ -897,7 +1034,14 @@ describe("pumpDownloadProgress (scripted stdout, no process at all)", () => {
   it("honors a Stop raised mid-download, while the downloader is silent", async () => {
     const stdout = new PassThrough(); // never ends on its own
     const cancel = new CancelFlag();
-    const done = pumpDownloadProgress({ stdout }, cancel, () => {}, MAX_DOWNLOAD_BYTES, 60_000, 15);
+    const done = pumpDownloadProgress(
+      { stdout },
+      cancel,
+      () => {},
+      MAX_DOWNLOAD_BYTES,
+      60_000,
+      15,
+    );
     await new Promise((r) => setTimeout(r, 40));
     cancel.store(true);
     expect(await done).toBe("Stopped.");
@@ -912,7 +1056,7 @@ describe("pumpDownloadProgress (scripted stdout, no process at all)", () => {
       () => {},
       MAX_DOWNLOAD_BYTES,
       25,
-      10
+      10,
     );
     expect(reason).toContain("gave up after");
     expect(reason).toContain("it may be stalled.");
@@ -925,13 +1069,22 @@ describe("pumpDownloadProgress (scripted stdout, no process at all)", () => {
 
   it("a stream that simply ends returns null — the caller reads the real exit code", async () => {
     const stdout = new PassThrough();
-    const done = pumpDownloadProgress({ stdout }, undefined, () => {}, MAX_DOWNLOAD_BYTES, 60_000, 30);
+    const done = pumpDownloadProgress(
+      { stdout },
+      undefined,
+      () => {},
+      MAX_DOWNLOAD_BYTES,
+      60_000,
+      30,
+    );
     stdout.end();
     expect(await done).toBeNull();
   });
 
   it("no stdout at all resolves null immediately", async () => {
-    expect(await pumpDownloadProgress({ stdout: null }, undefined, () => {})).toBeNull();
+    expect(
+      await pumpDownloadProgress({ stdout: null }, undefined, () => {}),
+    ).toBeNull();
   });
 });
 
@@ -946,7 +1099,7 @@ describe("runYtdlpDownload (scripted fake process)", () => {
     code: number,
     stdoutLines: string[] = [],
     stderrLines: string[] = [],
-    capture?: (args: string[]) => void
+    capture?: (args: string[]) => void,
   ): SpawnFn {
     return (_command, args) => {
       capture?.(args);
@@ -957,7 +1110,8 @@ describe("runYtdlpDownload (scripted fake process)", () => {
           const dir = path.dirname(template);
           await fsp.mkdir(dir, { recursive: true });
           for (const f of files) {
-            const body = typeof f.bytes === "number" ? Buffer.alloc(f.bytes, 7) : f.bytes;
+            const body =
+              typeof f.bytes === "number" ? Buffer.alloc(f.bytes, 7) : f.bytes;
             await fsp.writeFile(path.join(dir, f.name), body);
           }
         }
@@ -986,7 +1140,7 @@ describe("runYtdlpDownload (scripted fake process)", () => {
           0,
           ["[download]  50.0% of 1.00KiB at 1.0KiB/s"],
           [],
-          (args) => (seen = args)
+          (args) => (seen = args),
         ),
       });
       try {
@@ -994,7 +1148,9 @@ describe("runYtdlpDownload (scripted fake process)", () => {
         expect(seen).toContain("--no-playlist");
         expect(seen).toContain("--newline");
         expect(seen).toContain("--no-warnings");
-        expect(argAfter(seen, "--ffmpeg-location")).toBe("/opt/homebrew/bin/ffmpeg");
+        expect(argAfter(seen, "--ffmpeg-location")).toBe(
+          "/opt/homebrew/bin/ffmpeg",
+        );
         expect(argAfter(seen, "-f")).toBe(formatSelector(true, 720));
         expect(argAfter(seen, "-o")).toContain("%(title).100B.%(ext)s");
         expect(seen[seen.length - 1]).toBe(PUBLIC_URL);
@@ -1012,7 +1168,13 @@ describe("runYtdlpDownload (scripted fake process)", () => {
       const result = await runYtdlpDownload(dataDir, PUBLIC_URL, {
         progress: () => {},
         findFfmpegFn: () => null,
-        spawnFn: spawnFnWriting([{ name: "clip.mp4", bytes: 32 }], 0, [], [], (a) => (seen = a)),
+        spawnFn: spawnFnWriting(
+          [{ name: "clip.mp4", bytes: 32 }],
+          0,
+          [],
+          [],
+          (a) => (seen = a),
+        ),
       });
       try {
         expect(seen).not.toContain("--ffmpeg-location");
@@ -1029,15 +1191,20 @@ describe("runYtdlpDownload (scripted fake process)", () => {
       const err = await runYtdlpDownload(dataDir, PUBLIC_URL, {
         progress: () => {},
         findFfmpegFn: () => null,
-        spawnFn: spawnFnWriting([], 1, [], [
-          "line one, dropped",
-          "line two",
-          "line three",
-          "ERROR: [youtube] abc: Requested format is not available.",
-        ]),
+        spawnFn: spawnFnWriting(
+          [],
+          1,
+          [],
+          [
+            "line one, dropped",
+            "line two",
+            "line three",
+            "ERROR: [youtube] abc: Requested format is not available.",
+          ],
+        ),
       }).then(
         () => null,
-        (e: unknown) => e as Error
+        (e: unknown) => e as Error,
       );
       expect(err).not.toBeNull();
       expect(err?.message).toContain("brew install ffmpeg");
@@ -1066,7 +1233,7 @@ describe("runYtdlpDownload (scripted fake process)", () => {
             });
             return fake;
           },
-        })
+        }),
       ).rejects.toThrow(/couldn't start the video downloader: spawn ENOENT/);
     });
   });
@@ -1078,7 +1245,7 @@ describe("runYtdlpDownload (scripted fake process)", () => {
           progress: () => {},
           findFfmpegFn: () => null,
           spawnFn: spawnFnWriting([], 0, ["[download] 100% of 1.00KiB"]),
-        })
+        }),
       ).rejects.toThrow(/produced no file/);
     });
   });
@@ -1096,10 +1263,12 @@ describe("runYtdlpDownload (scripted fake process)", () => {
             0,
             [],
             [],
-            (args) => (workDir = path.dirname(argAfter(args, "-o") as string))
+            (args) => (workDir = path.dirname(argAfter(args, "-o") as string)),
           ),
-        })
-      ).rejects.toThrow("The video is 2 MB — larger than the 1 MB limit for a room file.");
+        }),
+      ).rejects.toThrow(
+        "The video is 2 MB — larger than the 1 MB limit for a room file.",
+      );
       await expect(fsp.stat(workDir)).rejects.toThrow();
     });
   });
@@ -1115,10 +1284,12 @@ describe("runYtdlpDownload (scripted fake process)", () => {
           spawnFn: (_cmd, args) => {
             workDir = path.dirname(argAfter(args, "-o") as string);
             fake = new FakeProcess(); // never finishes; the engine must kill it
-            queueMicrotask(() => fake?.stdout.write("[download]   0.1% of ~4.71GiB at 1MiB/s\n"));
+            queueMicrotask(() =>
+              fake?.stdout.write("[download]   0.1% of ~4.71GiB at 1MiB/s\n"),
+            );
             return fake;
           },
-        })
+        }),
       ).rejects.toThrow(/Stopped before downloading it\./);
       expect(fake?.killed).toBe(true);
       await expect(fsp.stat(workDir)).rejects.toThrow();
@@ -1159,7 +1330,7 @@ describe("runYtdlpDownload (scripted fake process)", () => {
           mediaDownloadBudgetMs: 40,
           cancelPollMs: 10,
           spawnFn: () => new FakeProcess(),
-        })
+        }),
       ).rejects.toThrow(/gave up after/);
       expect(Date.now() - started).toBeLessThan(1000);
     });
@@ -1213,7 +1384,7 @@ describe("runYtdlpDownload (scripted fake process)", () => {
             spawned = true;
             return new FakeProcess();
           },
-        })
+        }),
       ).rejects.toThrow(/downloader fetch failed/);
       expect(spawned).toBe(false);
     } finally {
@@ -1236,14 +1407,16 @@ describe("the SSRF pre-flight is on the public entry points, not optional", () =
           spawned = true;
           return new FakeProcess();
         },
-      })
+      }),
     ).rejects.toThrow(/Local and private-network/);
     expect(spawned).toBe(false);
   });
 
   it("downloadMediaToTemp refuses a .local name before spawning anything", async () => {
     await expect(
-      downloadMediaToTemp("/tmp/unused", "http://printer.local/v.mp4", { progress: () => {} })
+      downloadMediaToTemp("/tmp/unused", "http://printer.local/v.mp4", {
+        progress: () => {},
+      }),
     ).rejects.toThrow(/Local and private-network/);
   });
 
@@ -1257,7 +1430,7 @@ describe("the SSRF pre-flight is on the public entry points, not optional", () =
           spawned = true;
           return new FakeProcess();
         },
-      })
+      }),
     ).rejects.toThrow(/Local and private-network/);
     expect(spawned).toBe(false);
   });
@@ -1272,7 +1445,10 @@ describe("the SSRF pre-flight is on the public entry points, not optional", () =
           const dir = path.dirname(argAfter(args, "-o") as string);
           void (async () => {
             await fsp.mkdir(dir, { recursive: true });
-            await fsp.writeFile(path.join(dir, "clip.mp4"), Buffer.alloc(64, 1));
+            await fsp.writeFile(
+              path.join(dir, "clip.mp4"),
+              Buffer.alloc(64, 1),
+            );
             await closeFake(fake, 0);
           })();
           return fake;
@@ -1299,7 +1475,7 @@ describe("listMediaFormats / probeMediaFormats", () => {
           spawned = true;
           return new FakeProcess();
         },
-      })
+      }),
     ).rejects.toThrow(WEB_OFF_MESSAGE);
     expect(spawned).toBe(false);
   });
@@ -1307,7 +1483,14 @@ describe("listMediaFormats / probeMediaFormats", () => {
   it("parses a successful probe's JSON into quality options", async () => {
     await withInstalledBin(async (dataDir) => {
       const info = {
-        formats: [{ vcodec: "avc1.4d401f", acodec: "mp4a.40.2", height: 480, filesize: 12_345 }],
+        formats: [
+          {
+            vcodec: "avc1.4d401f",
+            acodec: "mp4a.40.2",
+            height: 480,
+            filesize: 12_345,
+          },
+        ],
       };
       const options = await listMediaFormats(PUBLIC_URL, {
         dataDir,
@@ -1322,7 +1505,9 @@ describe("listMediaFormats / probeMediaFormats", () => {
           return fake;
         },
       });
-      expect(options).toEqual([{ height: 480, approxBytes: 12_345, fits: true }]);
+      expect(options).toEqual([
+        { height: 480, approxBytes: 12_345, fits: true },
+      ]);
     });
   });
 
@@ -1334,7 +1519,9 @@ describe("listMediaFormats / probeMediaFormats", () => {
     await withInstalledBin(async (dataDir) => {
       const info = {
         title: "מוזיקה 🎬 音楽",
-        formats: [{ vcodec: "avc1", acodec: "mp4a", height: 720, filesize: 1234 }],
+        formats: [
+          { vcodec: "avc1", acodec: "mp4a", height: 720, filesize: 1234 },
+        ],
       };
       const buf = Buffer.from(JSON.stringify(info), "utf8");
       const cut = buf.indexOf(Buffer.from("🎬", "utf8")) + 2; // mid-codepoint
@@ -1388,7 +1575,12 @@ describe("listMediaFormats / probeMediaFormats", () => {
           return fake;
         },
       });
-      expect(seen).toEqual(["--no-playlist", "--no-warnings", "-j", PUBLIC_URL]);
+      expect(seen).toEqual([
+        "--no-playlist",
+        "--no-warnings",
+        "-j",
+        PUBLIC_URL,
+      ]);
     });
   });
 
@@ -1406,8 +1598,10 @@ describe("listMediaFormats / probeMediaFormats", () => {
             })();
             return fake;
           },
-        })
-      ).rejects.toThrow(/Couldn't look up this video's qualities: noise ERROR: Unsupported URL/);
+        }),
+      ).rejects.toThrow(
+        /Couldn't look up this video's qualities: noise ERROR: Unsupported URL/,
+      );
     });
   });
 
@@ -1420,7 +1614,7 @@ describe("listMediaFormats / probeMediaFormats", () => {
           webAccessAllowed: () => true,
           spawnFn: () => fake,
           formatProbeBudgetMs: 25,
-        })
+        }),
       ).rejects.toThrow(/took too long/);
       expect(fake.killed).toBe(true);
     });
@@ -1440,7 +1634,7 @@ describe("listMediaFormats / probeMediaFormats", () => {
             })();
             return fake;
           },
-        })
+        }),
       ).rejects.toThrow(/made no sense/);
     });
   });
@@ -1456,7 +1650,7 @@ describe("listMediaFormats / probeMediaFormats", () => {
             queueMicrotask(() => fake.emit("error", new Error("spawn EACCES")));
             return fake;
           },
-        })
+        }),
       ).rejects.toThrow(/couldn't start the video downloader: spawn EACCES/);
     });
   });
@@ -1509,7 +1703,7 @@ describe("importMediaUrl / importYoutubeVideo", () => {
           spawned = true;
           return new FakeProcess();
         },
-      })
+      }),
     ).rejects.toThrow(WEB_OFF_MESSAGE);
     expect(spawned).toBe(false);
     expect(imported).toBe(false);
@@ -1536,7 +1730,10 @@ describe("importMediaUrl / importYoutubeVideo", () => {
       const [staged, name, url] = seen[0] as [string, string, string];
       expect(name).toBe("clip.mp4");
       expect(url).toBe(PUBLIC_URL); // trimmed before the funnel sees it
-      expect(progress).toContainEqual(["Sealing the video into the room…", null]);
+      expect(progress).toContainEqual([
+        "Sealing the video into the room…",
+        null,
+      ]);
       expect(progress).toContainEqual(["Done", 100]);
       await expect(fsp.stat(path.dirname(staged))).rejects.toThrow(); // work dir swept
     });
@@ -1557,7 +1754,7 @@ describe("importMediaUrl / importYoutubeVideo", () => {
           findFfmpegFn: () => null,
           spawnFn: spawnFnWritingVideo("x"),
           progress: (s) => progress.push(s),
-        })
+        }),
       ).rejects.toThrow("room is sealed");
       expect(progress).toContain("Done");
       expect(workDir).not.toBe("");
@@ -1596,7 +1793,7 @@ describe("importMediaUrl / importYoutubeVideo", () => {
           spawned = true;
           return new FakeProcess();
         },
-      })
+      }),
     ).rejects.toThrow("That doesn't look like a YouTube video link.");
     expect(asked).toBe(false);
     expect(spawned).toBe(false);
@@ -1614,7 +1811,7 @@ describe("importMediaUrl / importYoutubeVideo", () => {
           return false;
         },
         importDownload: () => FILE_META,
-      })
+      }),
     ).rejects.toThrow(WEB_OFF_MESSAGE);
     expect(asked).toBe(true);
   });

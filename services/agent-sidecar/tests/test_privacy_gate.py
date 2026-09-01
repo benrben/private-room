@@ -44,6 +44,11 @@ def test_nonlocal_detection() -> None:
     assert privacy.is_nonlocal_model(f"codex-cli{sep}gpt{sep}high")
 
 
+def test_scan_prompt_includes_user_concept_rules() -> None:
+    prompt = privacy_scan._scan_prompt(["my health", "family finances"])
+    assert "my health; family finances" in prompt
+
+
 # --- mechanics ---------------------------------------------------------------
 
 
@@ -53,6 +58,21 @@ def test_redact_longest_first_and_case_insensitive() -> None:
     assert out == "[Person A] lives at [Address A]. [Person B] was here."
     assert p.report.replacements == 3
     assert p.report.entities_hidden == 3
+
+
+def test_policy_compilation_trims_drops_and_indexes_rules() -> None:
+    p = privacy.PrivacyPolicy(
+        rules=[
+            (" Ben ", " [Person B] "),
+            ("Ben Reich", "[Person A]"),
+            ("", "[Dropped]"),
+            ("Ignored", " "),
+        ]
+    )
+
+    assert p.rules == [("Ben Reich", "[Person A]"), ("Ben", "[Person B]")]
+    assert p.redact_text("BEN REICH and ben") == "[Person A] and [Person B]"
+    assert p.restore_text("[person a] and [PERSON B]") == "Ben Reich and Ben"
 
 
 def test_restore_roundtrip_including_case_drift() -> None:
@@ -143,6 +163,30 @@ def test_output_redactor_never_releases_a_secret_split_across_deltas() -> None:
     assert "Ben Reich" not in visible
     assert "abcDEF12345678" not in visible
     assert "[Person A]" in visible
+    assert "[Protected secret]" in visible
+
+
+def test_output_redactor_keeps_short_text_through_empty_deltas() -> None:
+    redactor = privacy.PrivacyPolicy(active=True).output_redactor()
+
+    assert redactor.feed("") == ""
+    assert redactor.feed("short output") == ""
+    assert redactor.feed("") == ""
+    assert redactor.flush() == "short output"
+
+
+def test_output_redactor_uses_one_placeholder_for_an_overlapping_secret() -> None:
+    secret = "canary=abcDEF12345678"
+    redactor = privacy.PrivacyPolicy(
+        active=True, rules=[(secret, "[Private canary]")]
+    ).output_redactor()
+
+    visible = redactor.feed("x" * 400 + " " + secret)
+    visible += redactor.feed("y" * 400)
+    visible += redactor.flush()
+
+    assert secret not in visible
+    assert "[Private canary]" not in visible
     assert "[Protected secret]" in visible
 
 
@@ -370,6 +414,18 @@ def test_parse_findings_drops_hallucinations_and_bad_categories() -> None:
     assert {f["text"] for f in found} == {"Ben Reich", "12 Herzl St"}
     by_text = {f["text"]: f["category"] for f in found}
     assert by_text["12 Herzl St"] == "concept"  # unknown category folds to concept
+
+
+def test_parse_findings_rejects_unusable_shapes() -> None:
+    chunk = "Ben Reich"
+    invalid_replies = [
+        "not JSON",
+        '"Ben Reich"',
+        '{"entities": "Ben Reich"}',
+        '{"entities": [42]}',
+    ]
+    for raw in invalid_replies:
+        assert privacy_scan._parse_findings(raw, chunk) == []
 
 
 async def test_scan_refuses_nonlocal_model() -> None:

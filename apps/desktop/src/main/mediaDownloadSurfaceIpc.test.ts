@@ -125,4 +125,25 @@ describe("downloaded media transcribes itself", () => {
       ]);
     });
   });
+
+  it("a synchronous transcription boundary failure is reported without failing the import", async () => {
+    await withRoom(async ({ state, root, events, emit }) => {
+      const staged = path.join(root, "staged-sync-failure.m4a");
+      await writeFile(staged, Buffer.from("pretend audio"));
+      const engine = createDownloadEngineDeps(state, root, emit, {
+        extractText: async () => null,
+        transcribe: (() => {
+          throw new Error("fabricated synchronous transcription failure");
+        }) as never,
+      });
+
+      const meta = await engine.importDownload!(staged, "sync-failure.m4a", "https://example.com/sync");
+
+      expect(getFileMeta(state.room!.conn, meta.id).name).toBe("sync-failure.m4a");
+      expect(events).toContainEqual([
+        "stt-progress",
+        ["sync-failure.m4a", "failed: fabricated synchronous transcription failure"],
+      ]);
+    });
+  });
 });

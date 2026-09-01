@@ -280,58 +280,59 @@ export function resolveFieldCodes(text: string, asHtml: boolean): string {
   let out = "";
   let rest = text;
   for (;;) {
-    const at = rest.indexOf(HYPERLINK);
-    if (at === -1) {
-      break;
-    }
-    const before = rest.slice(0, at);
-    const after = rest.slice(at + HYPERLINK.length);
-
-    const q1 = after.indexOf('"');
-    if (q1 === -1) {
-      out += before + HYPERLINK;
-      rest = after;
-      continue;
-    }
-    const q2rel = after.slice(q1 + 1).indexOf('"');
-    if (q2rel === -1) {
-      out += before + HYPERLINK;
-      rest = after;
-      continue;
-    }
-
-    // Only treat it as a field if what sits between the keyword and the
-    // quote looks like the rest of a field instruction — otherwise the word
-    // "HYPERLINK" is just a word someone wrote. Everything Word puts there
-    // before the target is a SWITCH, and every switch starts with a
-    // backslash, so a bare word in that gap means the next quote belongs to
-    // a later sentence and swallowing it would delete every word in
-    // between.
-    const gap = after.slice(0, q1);
-    const gapTokens = gap.split(RUST_WHITESPACE).filter((tok) => tok.length > 0);
-    if (
-      Buffer.byteLength(gap, "utf8") > MAX_FIELD_GAP ||
-      !gapTokens.every((tok) => tok.startsWith("\\"))
-    ) {
-      out += before + HYPERLINK;
-      rest = after;
-      continue;
-    }
-
-    const target = after.slice(q1 + 1, q1 + 1 + q2rel);
-    out += before;
-    // Trailing whitespace before the field belongs to the prose, not the link.
-    if (asHtml && looksLikeUrl(target)) {
-      out += `<a href="${escapeAttr(target)}">${escapeText(target)}</a>`;
-    } else if (!asHtml) {
-      out += target;
-    } else {
-      out += escapeText(target);
-    }
-    rest = after.slice(q1 + 1 + q2rel + 1);
+    const field = nextHyperlinkField(rest);
+    if (field === null) break;
+    out += field.before;
+    if (field.target !== null) out += renderedFieldTarget(field.target, asHtml);
+    rest = field.rest;
   }
   out += rest;
   return out;
+}
+
+interface HyperlinkField {
+  readonly before: string;
+  readonly target: string | null;
+  readonly rest: string;
+}
+
+function nextHyperlinkField(text: string): HyperlinkField | null {
+  const at = text.indexOf(HYPERLINK);
+  if (at === -1) return null;
+  const before = text.slice(0, at);
+  const after = text.slice(at + HYPERLINK.length);
+  const quotes = fieldQuotePositions(after);
+  if (quotes === null || !isHyperlinkFieldGap(after.slice(0, quotes.first))) {
+    return { before: before + HYPERLINK, target: null, rest: after };
+  }
+  const target = after.slice(quotes.first + 1, quotes.first + 1 + quotes.secondRelative);
+  return { before, target, rest: after.slice(quotes.first + quotes.secondRelative + 2) };
+}
+
+interface FieldQuotePositions {
+  readonly first: number;
+  readonly secondRelative: number;
+}
+
+function fieldQuotePositions(text: string): FieldQuotePositions | null {
+  const first = text.indexOf('"');
+  if (first === -1) return null;
+  const secondRelative = text.slice(first + 1).indexOf('"');
+  return secondRelative === -1 ? null : { first, secondRelative };
+}
+
+function isHyperlinkFieldGap(gap: string): boolean {
+  // Only treat it as a field if what sits between the keyword and the quote
+  // looks like the rest of a field instruction — otherwise the word
+  // "HYPERLINK" is just a word someone wrote. Everything Word puts there
+  // before the target is a SWITCH, and every switch starts with a backslash.
+  const tokens = gap.split(RUST_WHITESPACE).filter((token) => token.length > 0);
+  return Buffer.byteLength(gap, "utf8") <= MAX_FIELD_GAP && tokens.every((token) => token.startsWith("\\"));
+}
+
+function renderedFieldTarget(target: string, asHtml: boolean): string {
+  if (asHtml && looksLikeUrl(target)) return `<a href="${escapeAttr(target)}">${escapeText(target)}</a>`;
+  return asHtml ? escapeText(target) : target;
 }
 
 /** Conservative: only schemes a document viewer should ever make clickable.

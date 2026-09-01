@@ -36,7 +36,7 @@ import http from "node:http";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { PAGE_SCRIPT_PATH } from "./pageScript.js";
+import { PAGE_SCRIPT_PATHS } from "./pageScript.js";
 
 const WORKER_PATH = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -60,8 +60,9 @@ async function runWorker(
   return new Promise((resolve, reject) => {
     execFile(
       electronPath,
-      // The worker's own arg contract: scenario, the page script, then extras.
-      [WORKER_PATH, scenario as string, PAGE_SCRIPT_PATH, ...extras],
+      // The worker's own arg contract: scenario, ordered page-script paths,
+      // then extras.
+      [WORKER_PATH, scenario as string, JSON.stringify(PAGE_SCRIPT_PATHS), ...extras],
       { env, timeout: timeoutMs },
       (error, stdout, stderr) => {
         if (error) {

@@ -277,39 +277,66 @@ function noteLine(n: RecNote): string {
  * only change the output for input Rust itself renders unsorted.
  */
 export function transcriptText(meta: RecMeta, header = "(live recording)"): string {
-  let out = `${header}\n`;
-  const { chapters, notes } = meta;
-  let ci = 0;
-  let ni = 0;
+  const state = newTranscriptState(header);
   for (const seg of meta.segments) {
-    const text = segmentVisibleText(seg);
-    if (text === "") {
-      continue;
-    }
-    while (ci < chapters.length && (chapters[ci] as RecChapter).t0 <= seg.t0) {
-      const c = chapters[ci] as RecChapter;
-      out += `\n## ${formatStamp(c.t0)} ${c.title}\n`;
-      ci++;
-    }
-    while (ni < notes.length && (notes[ni] as RecNote).t0 <= seg.t0) {
-      const n = notes[ni] as RecNote;
-      out += `${formatStamp(n.t0)} ${noteLine(n)}\n`;
-      ni++;
-    }
-    const marked = meta.highlights.some((h) => h.t0 < seg.t1 && seg.t0 < Math.max(h.t1, h.t0 + 1));
-    const who = displaySpeaker(meta, seg.speaker);
-    out += `${marked ? "* " : ""}${formatStamp(seg.t0)} ${who}: ${text}\n`;
+    appendTranscriptSegment(state, meta, seg);
   }
-  // Anything anchored past the last phrase still belongs in the text.
-  for (; ci < chapters.length; ci++) {
-    const c = chapters[ci] as RecChapter;
-    out += `\n## ${formatStamp(c.t0)} ${c.title}\n`;
+  appendTranscriptTail(state, meta);
+  return state.out;
+}
+
+interface TranscriptState {
+  out: string;
+  chapterIndex: number;
+  noteIndex: number;
+}
+
+function newTranscriptState(header: string): TranscriptState {
+  return { out: `${header}\n`, chapterIndex: 0, noteIndex: 0 };
+}
+
+function appendTranscriptSegment(state: TranscriptState, meta: RecMeta, segment: RecSegment): void {
+  const text = segmentVisibleText(segment);
+  if (text === "") {
+    return;
   }
-  for (; ni < notes.length; ni++) {
-    const n = notes[ni] as RecNote;
-    out += `${formatStamp(n.t0)} ${noteLine(n)}\n`;
+  appendMetadataThrough(state, meta, segment.t0);
+  const marker = isHighlighted(meta.highlights, segment) ? "* " : "";
+  state.out += `${marker}${formatStamp(segment.t0)} ${displaySpeaker(meta, segment.speaker)}: ${text}\n`;
+}
+
+function appendMetadataThrough(state: TranscriptState, meta: RecMeta, time: number): void {
+  while (state.chapterIndex < meta.chapters.length && meta.chapters[state.chapterIndex]!.t0 <= time) {
+    appendChapter(state, meta.chapters[state.chapterIndex]!);
+    state.chapterIndex += 1;
   }
-  return out;
+  while (state.noteIndex < meta.notes.length && meta.notes[state.noteIndex]!.t0 <= time) {
+    appendNote(state, meta.notes[state.noteIndex]!);
+    state.noteIndex += 1;
+  }
+}
+
+function appendTranscriptTail(state: TranscriptState, meta: RecMeta): void {
+  while (state.chapterIndex < meta.chapters.length) {
+    appendChapter(state, meta.chapters[state.chapterIndex]!);
+    state.chapterIndex += 1;
+  }
+  while (state.noteIndex < meta.notes.length) {
+    appendNote(state, meta.notes[state.noteIndex]!);
+    state.noteIndex += 1;
+  }
+}
+
+function appendChapter(state: TranscriptState, chapter: RecChapter): void {
+  state.out += `\n## ${formatStamp(chapter.t0)} ${chapter.title}\n`;
+}
+
+function appendNote(state: TranscriptState, note: RecNote): void {
+  state.out += `${formatStamp(note.t0)} ${noteLine(note)}\n`;
+}
+
+function isHighlighted(highlights: readonly RecHighlight[], segment: RecSegment): boolean {
+  return highlights.some((highlight) => highlight.t0 < segment.t1 && segment.t0 < Math.max(highlight.t1, highlight.t0 + 1));
 }
 
 /** Merge a new cut into the (sorted, disjoint) cut list. Rust mutates its
@@ -362,41 +389,85 @@ export function encodeWav(samples: Float32Array | readonly number[]): Buffer {
  * tolerant, expects 16-bit PCM. Throws — Rust's `Result<Vec<f32>, String>`
  * error arm — for anything that is not a readable WAV. */
 export function decodeWav(bytes: Buffer | Uint8Array): Float32Array {
-  const b = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
-  if (b.length < 44 || b.toString("ascii", 0, 4) !== "RIFF" || b.toString("ascii", 8, 12) !== "WAVE") {
-    throw new Error("not a WAV file");
-  }
-  let channels = 1;
-  let pos = 12;
-  let dataStart = -1;
-  let dataSize = 0;
-  while (pos + 8 <= b.length) {
-    const id = b.toString("ascii", pos, pos + 4);
-    const size = b.readUInt32LE(pos + 4);
-    const body = pos + 8;
-    if (id === "fmt " && body + 4 <= b.length) {
-      channels = Math.max(b.readUInt16LE(body + 2), 1);
-    } else if (id === "data") {
-      dataStart = body;
-      dataSize = Math.min(size, Math.max(b.length - body, 0));
-      break;
-    }
-    pos = body + size + (size & 1);
-  }
-  if (dataStart < 0) {
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  requireWavHeader(buffer);
+  const data = wavDataChunk(buffer);
+  if (data === null) {
     throw new Error("WAV has no data chunk");
   }
-  const frameBytes = 2 * channels;
-  const frames = Math.trunc(dataSize / frameBytes);
-  const out = new Float32Array(frames);
-  for (let i = 0; i < frames; i++) {
-    let acc = 0;
-    for (let c = 0; c < channels; c++) {
-      acc += b.readInt16LE(dataStart + i * frameBytes + c * 2);
-    }
-    out[i] = acc / channels / 32768;
+  return decodeWavFrames(buffer, data);
+}
+
+function requireWavHeader(buffer: Buffer): void {
+  if (!hasWavHeader(buffer)) {
+    throw new Error("not a WAV file");
   }
-  return out;
+}
+
+function hasWavHeader(buffer: Buffer): boolean {
+  return buffer.length >= 44 && buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WAVE";
+}
+
+interface WavDataChunk {
+  readonly channels: number;
+  readonly start: number;
+  readonly size: number;
+}
+
+function wavDataChunk(buffer: Buffer): WavDataChunk | null {
+  let channels = 1;
+  let pos = 12;
+  while (pos + 8 <= buffer.length) {
+    const chunk = wavChunkAt(buffer, pos);
+    if (isFormatChunk(chunk, buffer.length)) {
+      channels = Math.max(buffer.readUInt16LE(chunk.body + 2), 1);
+    }
+    if (chunk.id === "data") {
+      return { channels, start: chunk.body, size: readableChunkSize(chunk, buffer.length) };
+    }
+    pos = nextChunkPosition(chunk);
+  }
+  return null;
+}
+
+interface WavChunk {
+  readonly id: string;
+  readonly size: number;
+  readonly body: number;
+}
+
+function wavChunkAt(buffer: Buffer, start: number): WavChunk {
+  return { id: buffer.toString("ascii", start, start + 4), size: buffer.readUInt32LE(start + 4), body: start + 8 };
+}
+
+function isFormatChunk(chunk: WavChunk, length: number): boolean {
+  return chunk.id === "fmt " && chunk.body + 4 <= length;
+}
+
+function readableChunkSize(chunk: WavChunk, length: number): number {
+  return Math.min(chunk.size, Math.max(length - chunk.body, 0));
+}
+
+function nextChunkPosition(chunk: WavChunk): number {
+  return chunk.body + chunk.size + (chunk.size & 1);
+}
+
+function decodeWavFrames(buffer: Buffer, data: WavDataChunk): Float32Array {
+  const frameBytes = 2 * data.channels;
+  const frames = Math.trunc(data.size / frameBytes);
+  const output = new Float32Array(frames);
+  for (let frame = 0; frame < frames; frame += 1) {
+    output[frame] = averageWavFrame(buffer, data.start + frame * frameBytes, data.channels);
+  }
+  return output;
+}
+
+function averageWavFrame(buffer: Buffer, start: number, channels: number): number {
+  let sum = 0;
+  for (let channel = 0; channel < channels; channel += 1) {
+    sum += buffer.readInt16LE(start + channel * 2);
+  }
+  return sum / channels / 32768;
 }
 
 /**

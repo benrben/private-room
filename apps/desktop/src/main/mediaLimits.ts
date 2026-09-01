@@ -324,20 +324,35 @@ export function parseImageModels(value: unknown, into: Map<string, MediaLimits>)
     const id = jstr(jget(model, "id"));
     if (id === null) continue;
     seen += 1;
-    const params = jget(model, "supported_parameters");
-    const resolutions = strings(jget(jget(params, "resolution"), "values"));
-    const aspectRatios = strings(jget(jget(params, "aspect_ratio"), "values"));
-    const maxReferences = jUnsignedInt(jget(jget(params, "input_references"), "max"));
-    // Fill what is not already there rather than replace it: on a slug the
-    // video endpoint also published, its sizes are the ones the clip has to
-    // honour, and the images endpoint's silence corrects nothing.
-    const entry = into.get(id) ?? emptyMediaLimits();
-    if (entry.resolutions.length === 0) entry.resolutions = resolutions;
-    if (entry.aspectRatios.length === 0) entry.aspectRatios = aspectRatios;
-    if (entry.maxReferences === null) entry.maxReferences = maxReferences;
-    into.set(id, entry);
+    mergeImageLimits(into, id, imageModelLimits(model));
   }
   return seen;
+}
+
+interface ImageModelLimits {
+  readonly resolutions: string[];
+  readonly aspectRatios: string[];
+  readonly maxReferences: number | null;
+}
+
+function imageModelLimits(model: unknown): ImageModelLimits {
+  const parameters = jget(model, "supported_parameters");
+  return {
+    resolutions: strings(jget(jget(parameters, "resolution"), "values")),
+    aspectRatios: strings(jget(jget(parameters, "aspect_ratio"), "values")),
+    maxReferences: jUnsignedInt(jget(jget(parameters, "input_references"), "max")),
+  };
+}
+
+function mergeImageLimits(into: Map<string, MediaLimits>, id: string, image: ImageModelLimits): void {
+  // Fill what is not already there rather than replace it: on a slug the
+  // video endpoint also published, its sizes are the ones the clip has to
+  // honour, and the images endpoint's silence corrects nothing.
+  const entry = into.get(id) ?? emptyMediaLimits();
+  if (entry.resolutions.length === 0) entry.resolutions = image.resolutions;
+  if (entry.aspectRatios.length === 0) entry.aspectRatios = image.aspectRatios;
+  if (entry.maxReferences === null) entry.maxReferences = image.maxReferences;
+  into.set(id, entry);
 }
 
 // ───────────────────────────────────────────────────────────────── fetching
@@ -386,35 +401,53 @@ function limitsAreStale(): boolean {
 /** The actual fetch-and-merge, run inside the single-flight lock below.
  * `media_limits.rs::ensure_media_limits`'s body past the lock acquisition. */
 async function fetchAndMergeLimits(key: string, deps: MediaLimitsDeps): Promise<void> {
-  const found = new Map<string, MediaLimits>();
   // A catalogue counts as arrived only when it NAMED models. A 200 carrying
   // no `data` array — an outage page, a renamed field — parses to nothing,
   // and calling that "loaded" would tell the Create page that endpoint
   // serves no model at all, which empties the shelf and blames the provider
   // for it.
-  let videos = false;
-  let images = false;
-
-  const videosValue = await getJson(key, "/videos/models", deps.fetchJson);
-  if (videosValue !== null) {
-    videos = parseVideoModels(videosValue, found) > 0;
-  }
-  const imagesValue = await getJson(key, "/images/models", deps.fetchJson);
-  if (imagesValue !== null) {
-    images = parseImageModels(imagesValue, found) > 0;
-  }
-
-  if (found.size > 0) {
-    for (const [slug, limits] of found) {
-      limitsCache.set(slug, limits);
-    }
-  }
-  if (videos) videosLoaded = true;
-  if (images) imagesLoaded = true;
+  const fetched = await fetchedMediaLimits(key, deps);
+  mergeMediaLimits(fetched.found);
+  recordFetchedCatalogues(fetched.videos, fetched.images);
   // Nothing arrived — let the next caller try again rather than sitting on
   // an empty table. A half table IS stamped, but only counts as fresh for
   // `RETRY_HALF_AFTER_MS` (see `limitsAreStale`).
-  fetchedAtMs = videos || images ? Date.now() : null;
+  fetchedAtMs = fetched.videos || fetched.images ? Date.now() : null;
+}
+
+interface FetchedMediaLimits {
+  readonly found: Map<string, MediaLimits>;
+  readonly videos: boolean;
+  readonly images: boolean;
+}
+
+async function fetchedMediaLimits(key: string, deps: MediaLimitsDeps): Promise<FetchedMediaLimits> {
+  const found = new Map<string, MediaLimits>();
+  const videos = await fetchedCatalogue(key, "/videos/models", deps.fetchJson, found, parseVideoModels);
+  const images = await fetchedCatalogue(key, "/images/models", deps.fetchJson, found, parseImageModels);
+  return { found, videos, images };
+}
+
+async function fetchedCatalogue(
+  key: string,
+  path: string,
+  fetchJson: FetchJsonLike,
+  found: Map<string, MediaLimits>,
+  parse: (value: unknown, into: Map<string, MediaLimits>) => number
+): Promise<boolean> {
+  const value = await getJson(key, path, fetchJson);
+  return value === null ? false : parse(value, found) > 0;
+}
+
+function mergeMediaLimits(found: ReadonlyMap<string, MediaLimits>): void {
+  for (const [slug, limits] of found) {
+    limitsCache.set(slug, limits);
+  }
+}
+
+function recordFetchedCatalogues(videos: boolean, images: boolean): void {
+  if (videos) videosLoaded = true;
+  if (images) imagesLoaded = true;
 }
 
 async function withLimitsFetchLock(fn: () => Promise<void>): Promise<void> {

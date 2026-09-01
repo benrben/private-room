@@ -25,7 +25,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import type { BrowseJournalRow } from "../../shared/apiTypes.js";
 import { Browser, WAIT_READY_BUDGET_MS, type BrowserDeps } from "./browser.js";
-import { PAGE_SCRIPT_PATH } from "./pageScript.js";
+import { PAGE_SCRIPT_PATHS } from "./pageScript.js";
 import type { Bounds } from "./tabs.js";
 import type { CreatePageDeps, LivePage, WindowContentView } from "./webviewManager.js";
 import {
@@ -86,7 +86,7 @@ const REAL_BOUNDS: Bounds = { x: 0, y: 0, width: 1200, height: 800 };
 
 /** The page script the real browser actually loads — the same file both Rust
  *  assertions below read. */
-const PAGE_JS = readFileSync(PAGE_SCRIPT_PATH, "utf8");
+const PAGE_JS = PAGE_SCRIPT_PATHS.map((scriptPath) => readFileSync(scriptPath, "utf8")).join("\n");
 
 describe("the two constants this module shares with the page script", () => {
   /**

@@ -20,6 +20,7 @@ can reconstruct the exact same error strings its callers already match on.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, AsyncIterator
 from urllib.parse import urlsplit
 
@@ -68,6 +69,33 @@ def _provider_host(provider: Any) -> str | None:
     return urlsplit(str(base)).netloc or str(base)
 
 
+def _response_error_message(exc: ResponseError) -> str:
+    """The Ollama response error's body, falling back to its exception text."""
+    return getattr(exc, "error", None) or str(exc)
+
+
+def _is_missing_model(status: int, message: str) -> bool:
+    """Whether an Ollama response names the unpulled-model condition."""
+    return status == 404 and "not found" in message.lower()
+
+
+def _classify_response_error(exc: ResponseError) -> LlmError:
+    """Map an Ollama response failure to its established sentinel error."""
+    status = getattr(exc, "status_code", -1)
+    message = _response_error_message(exc)
+    if _is_missing_model(status, message):
+        return LlmError("MODEL_MISSING", message)
+    return LlmError("ENGINE_ERROR", message)
+
+
+def _classify_transport_error(exc: Exception, provider_host: str | None) -> LlmError:
+    """Name a remote provider without misreporting its failure as Ollama's."""
+    if provider_host:
+        detail = str(exc) or type(exc).__name__
+        return LlmError("ENGINE_ERROR", f"Could not reach {provider_host}: {detail}")
+    return LlmError("OLLAMA_DOWN", str(exc))
+
+
 def _classify(exc: Exception, *, provider_host: str | None = None) -> LlmError:
     """Map an ollama-client / transport exception to the sentinel error contract.
 
@@ -88,21 +116,34 @@ def _classify(exc: Exception, *, provider_host: str | None = None) -> LlmError:
     if isinstance(exc, ProviderApiError):
         return LlmError("ENGINE_ERROR", str(exc))
     if isinstance(exc, ResponseError):
-        status = getattr(exc, "status_code", -1)
-        msg = getattr(exc, "error", None) or str(exc)
-        if status == 404 and "not found" in msg.lower():
-            return LlmError("MODEL_MISSING", msg)
-        return LlmError("ENGINE_ERROR", msg)
+        return _classify_response_error(exc)
     # Connect refused / DNS / timeout: the daemon is down or unreachable. The old
     # Rust path mapped both is_connect() and is_timeout() to OLLAMA_DOWN.
     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.TimeoutException, ConnectionError)):
-        if provider_host:
-            # httpx raises several of these with an empty message; the class
-            # name is the only fact left, and it is better than a blank line.
-            detail = str(exc) or type(exc).__name__
-            return LlmError("ENGINE_ERROR", f"Could not reach {provider_host}: {detail}")
-        return LlmError("OLLAMA_DOWN", str(exc))
+        return _classify_transport_error(exc, provider_host)
     return LlmError("ENGINE_ERROR", str(exc))
+
+
+def _embedding_input(
+    model: str, texts: list[str], privacy: dict[str, Any] | None
+) -> list[str]:
+    """Copy or redact the complete embedding batch before it leaves the room."""
+    policy = privacy_mod.policy_from_payload(privacy)
+    if policy is not None and policy.active and privacy_mod.is_nonlocal_model(model):
+        return [policy.redact_text(text) for text in texts]
+    return list(texts)
+
+
+async def _embed_request(
+    model: str,
+    texts: list[str],
+    base_url: str,
+    keep_alive: str | None,
+    async_client_type: Any,
+) -> list[list[float]]:
+    client = async_client_type(host=base_url)
+    resp = await client.embed(model=model, input=texts, keep_alive=keep_alive)
+    return [list(vector) for vector in resp.embeddings]
 
 
 async def embed(
@@ -121,15 +162,71 @@ async def embed(
     """
     if not texts:
         return []
-    policy = privacy_mod.policy_from_payload(privacy)
-    if policy is not None and policy.active and privacy_mod.is_nonlocal_model(model):
-        texts = [policy.redact_text(t) for t in texts]
+    batch = _embedding_input(model, texts, privacy)
     try:
-        client = AsyncClient(host=base_url)
-        resp = await client.embed(model=model, input=list(texts), keep_alive=keep_alive)
+        return await _embed_request(model, batch, base_url, keep_alive, AsyncClient)
     except Exception as exc:  # noqa: BLE001 - re-raised as the sentinel contract
         raise _classify(exc) from exc
-    return [list(v) for v in resp.embeddings]
+
+
+def _restore_generated_text(engaged: privacy_mod.PrivacyPolicy | None, text: str) -> str:
+    return engaged.restore_text(text) if engaged else text
+
+
+async def _generate_external(
+    model: str,
+    messages: list[Message],
+    format: dict[str, Any] | None,
+    images: list[str] | None,
+) -> str:
+    return await external_llm.generate_external(model, messages, format=format, images=images)
+
+
+async def _generate_provider(
+    model: str,
+    provider: Any,
+    temperature: float | None,
+    messages: list[Message],
+    format: dict[str, Any] | None,
+    images: list[str] | None,
+) -> str:
+    chat = OpenAICompatibleChatModel(model, provider, temperature)
+    try:
+        return await chat.generate(messages, format=format, images=images)
+    except Exception as exc:  # noqa: BLE001
+        raise _classify(exc, provider_host=_provider_host(provider)) from exc
+
+
+def _local_chat(
+    model: str,
+    base_url: str,
+    temperature: float | None,
+    num_ctx: int | None,
+    num_predict: int | None,
+    keep_alive: str | None,
+) -> OllamaChatModel:
+    kwargs: dict[str, Any] = {"model": model, "base_url": base_url}
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if num_ctx is not None:
+        kwargs["num_ctx"] = num_ctx
+    if num_predict is not None:
+        kwargs["num_predict"] = num_predict
+    if keep_alive is not None:
+        kwargs["keep_alive"] = keep_alive
+    return OllamaChatModel(**kwargs)
+
+
+async def _generate_local(
+    chat: OllamaChatModel,
+    messages: list[Message],
+    format: dict[str, Any] | None,
+    images: list[str] | None,
+) -> str:
+    try:
+        return await chat.generate(messages, format=format, images=images)
+    except Exception as exc:  # noqa: BLE001
+        raise _classify(exc) from exc
 
 
 async def generate(
@@ -168,32 +265,88 @@ async def generate(
     policy = privacy_mod.policy_from_payload(privacy)
     messages, images, engaged = privacy_mod.guard_outbound(model, messages, policy, images)
     if external_llm.is_external_model(model):
-        text = await external_llm.generate_external(
-            model, messages, format=format, images=images
-        )
-        return engaged.restore_text(text) if engaged else text
-    if provider is not None:
-        chat = OpenAICompatibleChatModel(model, provider, temperature)
-        try:
-            text = await chat.generate(messages, format=format, images=images)
-        except Exception as exc:  # noqa: BLE001
-            raise _classify(exc, provider_host=_provider_host(provider)) from exc
-        return engaged.restore_text(text) if engaged else text
-    kwargs: dict[str, Any] = {"model": model, "base_url": base_url}
-    if temperature is not None:
-        kwargs["temperature"] = temperature
-    if num_ctx is not None:
-        kwargs["num_ctx"] = num_ctx
-    if num_predict is not None:
-        kwargs["num_predict"] = num_predict
-    if keep_alive is not None:
-        kwargs["keep_alive"] = keep_alive
-    chat = OllamaChatModel(**kwargs)
+        text = await _generate_external(model, messages, format, images)
+    elif provider is not None:
+        text = await _generate_provider(model, provider, temperature, messages, format, images)
+    else:
+        chat = _local_chat(model, base_url, temperature, num_ctx, num_predict, keep_alive)
+        text = await _generate_local(chat, messages, format, images)
+    return _restore_generated_text(engaged, text)
+
+
+def _stream_restorer(policy: privacy_mod.PrivacyPolicy | None) -> Any | None:
+    """Create the stateful placeholder restorer only for a guarded request."""
+    if policy is None:
+        return None
+    return policy.restorer()
+
+
+def _restore_stream_delta(restorer: Any | None, delta: str) -> str:
+    """Restore one streamed delta when the privacy door engaged."""
+    if restorer is None:
+        return delta
+    return restorer.feed(delta)
+
+
+def _flush_stream_restorer(restorer: Any | None) -> str:
+    """Release the bounded partial placeholder held at stream end, if any."""
+    if restorer is None:
+        return ""
+    return restorer.flush()
+
+
+async def _restored_stream(
+    source: AsyncIterator[str], policy: privacy_mod.PrivacyPolicy | None
+) -> AsyncIterator[str]:
+    """Yield a source stream after applying its optional privacy restoration."""
+    restorer = _stream_restorer(policy)
+    async for delta in source:
+        restored = _restore_stream_delta(restorer, delta)
+        if restored:
+            yield restored
+    tail = _flush_stream_restorer(restorer)
+    if tail:
+        yield tail
+
+
+async def _classified_stream(
+    source: AsyncIterator[str], *, provider_host: str | None = None
+) -> AsyncIterator[str]:
+    """Translate a local or provider stream failure into the gateway contract."""
     try:
-        text = await chat.generate(messages, format=format, images=images)
-    except Exception as exc:  # noqa: BLE001
-        raise _classify(exc) from exc
-    return engaged.restore_text(text) if engaged else text
+        async for delta in source:
+            yield delta
+    except Exception as exc:  # noqa: BLE001 - re-raised as the sentinel contract
+        raise _classify(exc, provider_host=provider_host) from exc
+
+
+@dataclass(frozen=True)
+class _LocalStreamRequest:
+    """The complete local-engine request passed from the public stream seam."""
+
+    model: str
+    messages: list[Message]
+    base_url: str
+    temperature: float | None
+    num_ctx: int | None
+    keep_alive: str | None
+    format: dict[str, Any] | None
+    images: list[str] | None
+
+
+def _ollama_stream(request: _LocalStreamRequest) -> AsyncIterator[str]:
+    """Build the configured local stream without duplicating error handling."""
+    kwargs: dict[str, Any] = {"model": request.model, "base_url": request.base_url}
+    if request.temperature is not None:
+        kwargs["temperature"] = request.temperature
+    if request.num_ctx is not None:
+        kwargs["num_ctx"] = request.num_ctx
+    if request.keep_alive is not None:
+        kwargs["keep_alive"] = request.keep_alive
+    chat = OllamaChatModel(**kwargs)
+    return _classified_stream(
+        chat.generate_stream(request.messages, format=request.format, images=request.images)
+    )
 
 
 async def generate_stream(
@@ -229,59 +382,30 @@ async def generate_stream(
     policy = privacy_mod.policy_from_payload(privacy)
     messages, images, engaged = privacy_mod.guard_outbound(model, messages, policy, images)
     if external_llm.is_external_model(model):
-        restorer = engaged.restorer() if engaged else None
-        async for delta in external_llm.generate_external_stream(
+        source = external_llm.generate_external_stream(
             model, messages, format=format, images=images
-        ):
-            if restorer is not None:
-                delta = restorer.feed(delta)
-                if not delta:
-                    continue
-            yield delta
-        if restorer is not None:
-            tail = restorer.flush()
-            if tail:
-                yield tail
-        return
-    if provider is not None:
+        )
+    elif provider is not None:
         chat = OpenAICompatibleChatModel(model, provider, temperature)
-        restorer = engaged.restorer() if engaged else None
-        try:
-            async for delta in chat.generate_stream(messages, format=format, images=images):
-                if restorer is not None:
-                    delta = restorer.feed(delta)
-                    if not delta:
-                        continue
-                yield delta
-        except Exception as exc:  # noqa: BLE001
-            raise _classify(exc, provider_host=_provider_host(provider)) from exc
-        if restorer is not None:
-            tail = restorer.flush()
-            if tail:
-                yield tail
-        return
-    kwargs: dict[str, Any] = {"model": model, "base_url": base_url}
-    if temperature is not None:
-        kwargs["temperature"] = temperature
-    if num_ctx is not None:
-        kwargs["num_ctx"] = num_ctx
-    if keep_alive is not None:
-        kwargs["keep_alive"] = keep_alive
-    chat = OllamaChatModel(**kwargs)
-    restorer = engaged.restorer() if engaged else None
-    try:
-        async for delta in chat.generate_stream(messages, format=format, images=images):
-            if restorer is not None:
-                delta = restorer.feed(delta)
-                if not delta:
-                    continue
-            yield delta
-    except Exception as exc:  # noqa: BLE001 - re-raised as the sentinel contract
-        raise _classify(exc) from exc
-    if restorer is not None:
-        tail = restorer.flush()
-        if tail:
-            yield tail
+        source = _classified_stream(
+            chat.generate_stream(messages, format=format, images=images),
+            provider_host=_provider_host(provider),
+        )
+    else:
+        source = _ollama_stream(
+            _LocalStreamRequest(
+                model=model,
+                messages=messages,
+                base_url=base_url,
+                temperature=temperature,
+                num_ctx=num_ctx,
+                keep_alive=keep_alive,
+                format=format,
+                images=images,
+            )
+        )
+    async for delta in _restored_stream(source, engaged):
+        yield delta
 
 
 async def delete(model: str, base_url: str) -> None:

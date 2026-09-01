@@ -19,6 +19,10 @@ import { describe, expect, it } from "vitest";
 import { byteLength, partitionWindows, sliceUtf8, smartFilter } from "./extractionWindow.js";
 
 describe("smartFilter", () => {
+  it("keeps an empty extraction empty", () => {
+    expect(smartFilter("")).toBe("");
+  });
+
   it("filter_keeps_prose_drops_junk", () => {
     const blob = "QmFzZTY0anVuaw".repeat(9); // 126-char unbroken run
     const text =
@@ -169,6 +173,9 @@ describe("partitionWindows", () => {
     // Empty text -> no windows; tiny text -> one window.
     expect(partitionWindows("", 2_000, 100)).toEqual([]);
     expect(partitionWindows("short", 2_000, 100)).toEqual([[0, 5]]);
+
+    const unaligned = partitionWindows("é".repeat(3_000), 2_001, 101);
+    expect(unaligned.every(([start, end]) => sliceUtf8("é".repeat(3_000), start, end) !== null)).toBe(true);
   });
 });
 

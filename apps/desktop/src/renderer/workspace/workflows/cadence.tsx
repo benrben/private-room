@@ -35,8 +35,64 @@ export interface Cadence {
 
 /** A phrase plus its exact value, with the dangling preposition dropped when
  * there is no value to hang off it. */
-function at(word: string, value: string): { note: string; exact: string | null } {
-  return value ? { note: `${word} at`, exact: value } : { note: word, exact: null };
+function at(
+  word: string,
+  value: string,
+): { note: string; exact: string | null } {
+  return value
+    ? { note: `${word} at`, exact: value }
+    : { note: word, exact: null };
+}
+
+function fileCadence(): Cadence {
+  return {
+    mark: "nb-mark-pink",
+    note: "when you run it on a file",
+    exact: null,
+  };
+}
+
+function manualCadence(): Cadence {
+  return { mark: "", note: "only when you run it", exact: null };
+}
+
+function pausedCadence(): Cadence {
+  return { mark: "", note: "schedule paused", exact: null };
+}
+
+function isPaused(
+  schedule: Schedule | ScheduleArg | null | undefined,
+): boolean {
+  return !!schedule && "enabled" in schedule && schedule.enabled === false;
+}
+
+function weeklyCadence(param: string): Cadence {
+  const [index, exact] = param.split(/\s+/);
+  const day = DOW[Number(index)];
+  return {
+    mark: "nb-mark-blue",
+    ...at(day ? `every ${day}` : "every week", exact || ""),
+  };
+}
+
+function intervalCadence(param: string): Cadence {
+  return {
+    mark: "nb-mark-green",
+    note: param ? "on a timer, every" : "on a timer",
+    exact: param ? `${param} min` : null,
+  };
+}
+
+function unknownCadence(kind: string, param: string): Cadence {
+  return { mark: "", note: kind, exact: param || null };
+}
+
+function cadenceFor(kind: string, param: string): Cadence {
+  if (kind === "daily")
+    return { mark: "nb-mark-yellow", ...at("every day", param) };
+  if (kind === "weekly") return weeklyCadence(param);
+  if (kind === "interval") return intervalCadence(param);
+  return unknownCadence(kind, param);
 }
 
 export function cadenceOf(
@@ -46,37 +102,20 @@ export function cadenceOf(
   // Asked first because it is absolute: a file-scoped workflow takes a file as
   // its input, and the scheduler refuses it outright (see SchedulePopover's
   // `disabled` branch). Whatever a stale schedule row says, this is the truth.
-  if (binding?.scope === "file") {
-    return { mark: "nb-mark-pink", note: "when you run it on a file", exact: null };
-  }
+  if (binding?.scope === "file") return fileCadence();
   const kind = schedule?.kind ?? "";
-  if (!kind) return { mark: "", note: "only when you run it", exact: null };
+  if (!kind) return manualCadence();
   // `Schedule` always carries `enabled`; `ScheduleArg` may omit it, and a
   // template that omits it means "on".
-  const enabled = schedule && "enabled" in schedule ? schedule.enabled !== false : true;
   // A switched-off schedule is not a manual workflow — it is a scheduled one
   // that is not running. Saying "only when you run it" would quietly lose the
   // fact that there is a schedule sitting there waiting to be turned back on.
-  if (!enabled) return { mark: "", note: "schedule paused", exact: null };
+  if (isPaused(schedule)) return pausedCadence();
 
   const param = (schedule?.param ?? "").trim();
-  if (kind === "daily") return { mark: "nb-mark-yellow", ...at("every day", param) };
-  if (kind === "weekly") {
-    // "5 16:00" — day index then time, exactly as the scheduler stores it.
-    const parts = param.split(/\s+/);
-    const day = DOW[Number(parts[0])];
-    return { mark: "nb-mark-blue", ...at(day ? `every ${day}` : "every week", parts[1] || "") };
-  }
-  if (kind === "interval") {
-    return {
-      mark: "nb-mark-green",
-      note: param ? "on a timer, every" : "on a timer",
-      exact: param ? `${param} min` : null,
-    };
-  }
   // An unknown kind from a newer backend still reads as words rather than as a
   // raw token, and still earns no colour it has not been given a meaning for.
-  return { mark: "", note: kind, exact: param || null };
+  return cadenceFor(kind, param);
 }
 
 /** The cadence written out: a handwritten calendar note, then the exact time in

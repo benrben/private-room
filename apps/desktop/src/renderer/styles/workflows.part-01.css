@@ -1,0 +1,500 @@
+/* ---------- workflows ----------
+   The automation surface: a gallery of index cards, one workflow drawn as a
+   run of connected notebook blocks, and a ruled timeline of what it has done.
+
+   Everything here composes from the .nb-* primitives in paper.css and reads
+   its colour from tokens.css. Nothing below names a colour, so light mode
+   falls out of the same rules — there is deliberately no light-mode override
+   block at the end of this file.
+
+   ----- the one rule that shapes this surface -----
+
+   A workflow card has to say two different things at once: WHAT KIND of
+   workflow it is (daily, weekly, on a timer, on a file, manual) and HOW ITS
+   LAST RUN WENT (done, failed, running). Both want colour, and there are only
+   five markers, so they are separated by TREATMENT instead:
+
+     identity  a marker EDGE down the card's left side, set from a hue class
+               (.nb-mark-*) that src/workspace/workflows/cadence.tsx picks.
+     status    a BADGE carrying the word, set from the SEMANTIC markers
+               (--sem-done / --sem-urgent / --sem-linked).
+
+   That is why cadence never reaches for .nb-sem-*: green already means
+   "this finished" on the same card, and a hue cannot mean two things at once.
+   Neither signal is ever colour alone — the edge rides with a handwritten
+   cadence note, the badge rides with its status word.
+
+   ----- shared with the Scripts page -----
+
+   .wf-badge, .dot-ok/.dot-err/.dot-run, .run-*, .wf-popover and .caption are
+   rendered by src/workspace/scripts/ScriptRow.tsx as well, which reuses the
+   RunHistory and SchedulePopover components outright. Nothing in those blocks
+   may depend on a .wf-page ancestor, or the Scripts page loses it. */
+
+/* ==========================================================================
+   1. THE PAGE
+   ========================================================================== */
+
+.wf-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.wf-page .viewer-head {
+  gap: var(--sp-2);
+}
+
+.wf-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  /* Transparent, so the dotted sheet painted on <html> runs straight through
+     the page: panes are frames drawn onto one sheet, never filled boxes.
+
+     The content is capped at a broadsheet measure and centred WITHOUT a
+     wrapper element — the gutters are the padding. Below 1100px the max()
+     falls back to the plain gutter, so this is one declaration instead of a
+     container query plus an extra div. */
+  background: transparent;
+  padding: var(--sp-6) max(var(--sp-6), calc((100% - 1100px) / 2)) 72px;
+}
+
+/* ----- section heads -----
+   The same drawn rule Room Home uses: a stroke that thins at both ends, laid
+   on as a background so it costs no element and gives a screen reader nothing
+   extra to walk past. */
+.wf-section-label,
+.wf-toolbar,
+.wf-sec-head {
+  padding-bottom: var(--sp-2);
+  margin: 0 0 var(--sp-3);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 2%,
+    var(--line-soft) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+/* Was 11.5px, under the 12px floor the type scale sets as the smallest size
+   allowed anywhere. Letterspacing carries the emphasis instead. */
+.wf-section-label,
+.wf-sec-head {
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-strong);
+}
+.wf-sec-head {
+  margin-top: var(--sp-8);
+}
+/* The gallery's second "Your workflows" heading, once the template drawer is
+   open above it. */
+.wf-section-label-again {
+  margin-top: var(--sp-6);
+}
+
+/* A label that shares its rule with the toolbar buttons beside it hands the
+   rule to the TOOLBAR, so the stroke spans the whole column rather than
+   stopping at the end of the word. */
+.wf-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.wf-toolbar .wf-section-label {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  background-image: none;
+}
+.wf-new-btn {
+  flex: none;
+  font-size: var(--fs-meta);
+}
+
+/* ==========================================================================
+   2. "DESCRIBE A WORKFLOW" — the AI-authoring bar
+   The one control on this page that has to explain itself before it can be
+   used, so the instruction leads at instruction size and the field is the
+   dominant mark. Pink is AI attribution product-wide, which is why the frame
+   carries a pen-ink edge over a faint wash of the same hue rather than a
+   filled panel — the same recipe Room Home's attention strips use.
+   ========================================================================== */
+
+.wf-compose {
+  max-width: 820px;
+  margin: 0 0 var(--sp-6);
+  padding: var(--sp-4);
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius-lg);
+  background-image: linear-gradient(
+    98deg,
+    color-mix(in srgb, var(--accent-fill) 14%, transparent) 0%,
+    color-mix(in srgb, var(--accent-fill) 7%, transparent) 62%,
+    color-mix(in srgb, var(--accent-fill) 11%, transparent) 100%
+  );
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.wf-compose-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+  /* Never set an instruction small. */
+  font-size: var(--fs-lead);
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--text-strong);
+}
+.wf-compose-spark {
+  display: inline-flex;
+  flex: none;
+  color: var(--accent);
+  line-height: 1;
+}
+/* The field first, then the button under its right edge: the old row pinned a
+   button beside a textarea that grows, so the two kept renegotiating their
+   widths as the description got longer. DOM order is unchanged, so the tab
+   order is still field then button. */
+.wf-compose-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--sp-2);
+}
+.wf-compose-input {
+  width: 100%;
+  /* User-typed text is always the interface sans — never the hand. */
+  font-family: var(--sans);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  color: var(--text);
+  background: color-mix(in srgb, var(--raised) 62%, transparent);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-2) var(--sp-3);
+  resize: none;
+  overflow-y: auto;
+  /* Three lines at rest so the field reads as a place to write a sentence.
+     ComposeBar auto-grows it in JS and clamps at 136px — the same number as
+     this max-height, and the two have to be changed together. */
+  min-height: 76px;
+  max-height: 8.5rem;
+}
+.wf-compose-input::placeholder {
+  color: var(--faint);
+}
+/* The drawn double outline from the spec: the border goes to the pen, a
+   hairline goes just inside it, and the ring sits outside. */
+.wf-compose-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 42%, transparent);
+}
+.wf-compose-btn {
+  flex: none;
+}
+
+/* ==========================================================================
+   3. INDEX CARDS
+   A template or a saved workflow, drawn as a card on the sheet: a marker tab
+   down the left edge for its cadence, a ruled line under the title the way an
+   index card is ruled, and a drawn ring around its category mark.
+   ========================================================================== */
+
+.wf-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(252px, 1fr));
+  gap: var(--sp-4);
+  align-items: stretch;
+}
+
+.wf-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  /* Extra left padding leaves the marker tab its own margin. */
+  padding: var(--sp-4) var(--sp-4) var(--sp-3) calc(var(--sp-4) + 4px);
+  text-align: left;
+  color: inherit;
+  background: transparent;
+  /* 72% of the pen at rest, full strength on hover — the pen pressing harder
+     rather than a colour change. Even at 72% it clears the 3:1 a clickable
+     card's boundary owes. */
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-radius: var(--radius);
+  /* The identity edge, drawn in the marker's INK and not its fill: 3px of
+     marker fill measures ~1.7:1 on ivory, and an identity stroke is meaningful
+     non-text that owes 3:1. A workflow with no cadence gets the pencil edge
+     rather than a colour it has not earned. */
+  box-shadow: inset 3px 0 0 var(--mk-ink, var(--rule-strong));
+  cursor: pointer;
+  transition:
+    border-color var(--dur-fast) var(--ease-pen),
+    transform var(--dur-fast) var(--ease-pen),
+    box-shadow var(--dur-fast) var(--ease-pen);
+}
+.wf-card:hover {
+  border-color: var(--sketch);
+  transform: translateY(-2px);
+  /* box-shadow is one property, so the identity edge has to be restated here
+     — dropping it would make a card lose its cadence the moment the pointer
+     arrived. */
+  box-shadow:
+    inset 3px 0 0 var(--mk-ink, var(--rule-strong)),
+    0 6px 18px var(--shadow-lift);
+}
+.wf-card:active {
+  transform: translateY(1px);
+}
+/* The cards are role="button" — they owe a visible keyboard focus mark. */
+.wf-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* A dashed edge is the system's mark for a boundary that is provisional, and
+   an empty pipeline is exactly that. It has no cadence to advertise. */
+.wf-card-blank {
+  border-style: dashed;
+  border-color: var(--rule-strong);
+  box-shadow: none;
+}
+.wf-card-blank:hover {
+  border-color: var(--sketch);
+  box-shadow: 0 6px 18px var(--shadow-lift);
+}
+
+/* The index card's ruled header line. */
+.wf-card-top {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding-bottom: var(--sp-2);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+
+/* ----- the category mark -----
+   The glyph itself stays a component from src/icons — one icon family for the
+   whole app, and minting a second hand-drawn set for nine categories is
+   exactly what the brief warns against. What makes it read as drawn is the
+   ring: an ellipse that is not the same radius on any corner, inked in the
+   card's own cadence colour, the same trick .nb-circled uses. Fixed radii, so
+   it draws identically every render. */
+.wf-card-emoji {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  color: var(--mk-ink, var(--ink-2));
+  border: 1.5px solid color-mix(in srgb, var(--mk-ink, var(--rule-strong)) 66%, transparent);
+  border-radius: 58% 54% 60% 52% / 54% 60% 52% 58%;
+  transition: border-color var(--dur-fast) var(--ease-pen);
+}
+.wf-card:hover .wf-card-emoji,
+.wf-card:focus-visible .wf-card-emoji {
+  border-color: var(--mk-ink, var(--sketch));
+}
+.wf-card-name {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-card);
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Pink is "saved / personal" across the product, and the pin glyph carries the
+   meaning so the colour never has to. */
+.wf-card-pin {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  color: var(--sem-saved);
+}
+.wf-card-desc {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+/* Pushed to the bottom edge, so a run of cards of different heights still
+   lines its cadence notes up along one row. */
+.wf-card-foot {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-top: auto;
+  padding-top: var(--sp-2);
+}
+/* Always visible, never a hover-only affordance: the old rule faded it in at
+   opacity 0 on :hover alone, which told a keyboard user nothing at all. */
+.wf-card-cta {
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  color: var(--muted);
+  transition: color var(--dur-fast) var(--ease-pen);
+}
+.wf-card.tmpl:hover .wf-card-cta,
+.wf-card.tmpl:focus-visible .wf-card-cta {
+  color: var(--accent);
+}
+
+/* ----- the handwritten calendar note -----
+   The human half of the cadence signal (the marker edge is the other half).
+   A phrase like "every Fri at" is a margin note and belongs to the hand; the
+   clock time it ends on is technical data and stays mono and tabular, so a
+   schedule never reads as though the app rounded it. */
+.wf-cadence {
+  display: inline-flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 6px;
+}
+.wf-cadence-note {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--ink-2);
+}
+.wf-cadence-at {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+/* A countdown is a duration the app is computing as you watch — the sans,
+   one tier quieter than the cadence it belongs to. */
+.wf-cadence-in {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--faint);
+}
+
+/* ==========================================================================
+   4. STATUS BADGES
+   A strip of tape stuck to the page. The WORD carries the meaning and the
+   marker only reinforces it, so every badge is readable with colour ignored
+   entirely. Also rendered by the Scripts page — keep it self-contained.
+   ========================================================================== */
+
+.wf-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-1) var(--sp-2);
+}
+.wf-detail-badges {
+  margin-bottom: var(--sp-3);
+}
+.wf-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px var(--sp-2);
+  font-size: var(--fs-micro);
+  line-height: 1.5;
+  color: var(--ink);
+  white-space: nowrap;
+  border-radius: 2px 3px 2px 4px / 4px 2px 3px 2px;
+  /* RESET, not a fallback. A card sets --mk/--mk-ink for its cadence edge and
+     custom properties INHERIT, so a plain badge sitting inside a daily
+     workflow's card would otherwise quietly wear that card's yellow and claim
+     a status it does not have. The status variants below set them again for
+     themselves, at higher specificity. */
+  --mk: transparent;
+  --mk-ink: var(--rule);
+  /* A plain badge is a pencil outline on the sheet; one that carries a status
+     picks up the marker wash as well. --ink on a 30% wash measures ~10:1 in
+     every hue and both themes. */
+  background: color-mix(in srgb, var(--mk) 30%, transparent);
+  box-shadow: inset 0 0 0 1px var(--mk-ink);
+}
+
+/* Run status. Each variant also puts a distinct SHAPE in front of the word —
+   a filled disc, a diamond, an open ring — so the three are still told apart
+   in greyscale, by a screen reader, or by anyone who cannot separate the
+   green badge from the red one. */
+.wf-badge.dot-ok {
+  --mk: var(--sem-done-fill);
+  --mk-ink: var(--sem-done);
+}
+.wf-badge.dot-err {
+  --mk: var(--sem-urgent-fill);
+  --mk-ink: var(--sem-urgent);
+}
+.wf-badge.dot-run {
+  --mk: var(--sem-linked-fill);
+  --mk-ink: var(--sem-linked);
+}
+.wf-badge.dot-ok::before,
+.wf-badge.dot-err::before,
+.wf-badge.dot-run::before {
+  content: "";
+  flex: none;
+  width: 8px;
+  height: 8px;
+  background: var(--mk-ink);
+  pointer-events: none;
+}
+.wf-badge.dot-ok::before {
+  border-radius: 50%;
+}
+.wf-badge.dot-err::before {
+  border-radius: 1px;
+  transform: rotate(45deg);
+}
+.wf-badge.dot-run::before {
+  background: transparent;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 2px var(--mk-ink);
+}
+
+/* Not run status: a draft is work waiting for review (pending), and an
+   agent-authored draft is AI attribution (saved/pink). */
+.wf-badge.draft {
+  --mk: var(--sem-pending-fill);
+  --mk-ink: var(--sem-pending);
+}
+.wf-badge.agent {
+  --mk: var(--sem-saved-fill);
+  --mk-ink: var(--sem-saved);
+}
+
+/* ==========================================================================
+   5. THE WORKFLOW ICON PICKER
+   ========================================================================== */
+
+.wf-icon-pick {
+  position: relative;
+}
+.wf-icon-btn {
+  width: 30px;
+  height: 30px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+}

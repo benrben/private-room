@@ -99,6 +99,19 @@ def test_unsafe_or_unrelated_nested_jpg_is_not_a_preview() -> None:
     assert iwork.iwork_preview_entry(names) is None
 
 
+def test_unsafe_pdf_names_cannot_hide_a_later_safe_preview() -> None:
+    # Names with NULs, Windows separators, absolute paths, and traversal are
+    # ignored before preview selection; only the later safe archive entry wins.
+    names = [
+        "\x00QuickLook/Preview.pdf",
+        "QuickLook\\Preview.pdf",
+        "/QuickLook/Preview.pdf",
+        "../QuickLook/Preview.pdf",
+        "QuickLook/Preview.pdf",
+    ]
+    assert iwork.iwork_preview_entry(names) == "QuickLook/Preview.pdf"
+
+
 # --------------------------------------------------------------- extract_iwork
 
 
@@ -145,6 +158,27 @@ def test_jpg_preview_has_no_text_but_is_handled_consistently() -> None:
 
 def test_non_zip_garbage_returns_none() -> None:
     assert iwork.extract_iwork(b"not a zip archive at all") is None
+
+
+def test_preview_entry_stops_when_the_archive_cannot_be_opened(monkeypatch) -> None:
+    data = _zip_bytes({"QuickLook/Preview.pdf": _pdf_bytes("unopenable archive")})
+    monkeypatch.setattr(iwork, "_iwork_archive", lambda _data: None)
+    assert iwork.extract_iwork(data) is None
+
+
+def test_iwork_read_helpers_refuse_unreadable_archives_and_entries(monkeypatch) -> None:
+    assert iwork._iwork_archive(b"not a zip archive at all") is None
+
+    data = _zip_bytes({"QuickLook/Preview.pdf": b"preview"})
+    archive = iwork._iwork_archive(data)
+    assert archive is not None
+    assert iwork._iwork_preview_bytes(archive, "missing.pdf") is None
+
+    def unreadable_preview(*_args, **_kwargs):
+        raise zipfile.BadZipFile("corrupt preview")
+
+    monkeypatch.setattr(archive, "open", unreadable_preview)
+    assert iwork._iwork_preview_bytes(archive, "QuickLook/Preview.pdf") is None
 
 
 def test_preview_entry_with_unparsable_pdf_bytes_returns_none() -> None:

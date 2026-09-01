@@ -6,6 +6,7 @@ from arcelle_sidecar.budget import (
     fit_to_window,
     json_chars,
     msg_len,
+    tail_bytes,
     total_chars,
     trim_messages_to_window,
     window_budget_bytes,
@@ -37,6 +38,26 @@ def test_json_chars_matches_compact_utf8_wire_shape() -> None:
     assert json_chars(value) == len(
         '{"name":"write_file","text":"שלום"}'.encode("utf-8")
     )
+
+
+def test_tail_bytes_keeps_the_end_without_splitting_utf8_characters() -> None:
+    assert tail_bytes("abé", 4) == "abé"
+    assert tail_bytes("abé", 3) == "bé"
+    assert tail_bytes("abé", 2) == "é"
+
+
+def test_trimming_a_non_local_or_newly_fitted_local_payload_is_a_no_op() -> None:
+    non_local = [{"role": "user", "content": _big(100_000)}]
+    assert trim_messages_to_window(non_local, 0, None) is False
+
+    messages = [
+        {"role": "system", "content": "rules"},
+        {"role": "tool", "content": _big(100_000), "tool_name": "fetch_page"},
+        {"role": "user", "content": "What changed?"},
+    ]
+    assert trim_messages_to_window(messages, 0, 4096) is True
+    assert "cut here" in messages[1]["content"]
+    assert total_chars(messages, 0) <= window_budget_bytes(4096)
 
 
 # --------------------------------------------------------------------------- #
@@ -288,6 +309,22 @@ def test_many_results_share_what_the_fixed_parts_leave() -> None:
     # result being kept whole while the others vanish.
     for m in out[1:]:
         assert m["content"].startswith("x") and "cut here" in m["content"]
+
+
+def test_a_result_inside_its_equal_share_is_left_whole() -> None:
+    """Equal sharing cuts only the results that exceed their allocation."""
+    short_result = _big(100)
+    messages = [
+        {"role": "system", "content": "rules"},
+        {"role": "tool", "content": short_result, "tool_name": "web_search"},
+        {"role": "tool", "content": _big(10_000), "tool_name": "fetch_page"},
+    ]
+
+    out, cut = fit_oversized_results(messages, 1_000)
+
+    assert cut is True
+    assert out[1]["content"] == short_result
+    assert "cut here" in out[2]["content"]
 
 
 def test_the_tool_catalog_counts_against_the_same_budget() -> None:

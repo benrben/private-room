@@ -227,6 +227,16 @@ class TestRefusals:
         assert response.status_code == 400
         assert "missing" in response.json()["error"]
 
+    def test_an_unresolvable_speech_model_path_is_refused(self, staged) -> None:
+        """An invalid path is a request refusal, not an uncaught filesystem error."""
+        media, model = staged
+        body = _body(media, model)
+        body["modelPath"] = "\x00not-a-path"
+        with TestClient(_app()) as client:
+            response = _post(client, body)
+        assert response.status_code == 400
+        assert "speech model path was refused" in response.json()["error"]
+
     def test_a_negative_max_speakers_is_refused_not_clamped(self, staged) -> None:
         """0 discovers and a positive value pins; a negative one is a caller bug
         and gets a refusal rather than a silently corrected cap."""

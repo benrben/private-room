@@ -177,6 +177,24 @@ export const realActivePolicy: ActivePolicy = (): RedactionPolicy | null => {
 // The real ToolDispatcher factory
 // ============================================================================
 
+type RoomServerRunOptions = {
+  workspace?: RoomToolDispatcherOptions["workspace"];
+  /**
+   * Give this one short-lived bridge controlled write access to a normal
+   * workspace room. The persistent Leash bridge deliberately omits this: it
+   * has no owning chat turn or harness rollback boundary.
+   *
+   * The request is always clamped by the room's writer lease. A caller cannot
+   * turn a read-only duplicate/process view into a writer merely by setting
+   * this flag.
+   */
+  workspaceWriteEnabled?: boolean;
+  privacyBypass?: boolean;
+  /** Run-scoped effects for the owning chat turn. Persistent room servers
+   * omit this and keep their existing throwaway-effects posture. */
+  sharedEffects?: RoomToolDispatcherOptions["sharedEffects"];
+};
+
 /**
  * The dispatcher factory {@link bridgeStarterFor} calls ONCE per bridge start:
  * a real `RoomToolDispatcher` over `liveContext.ts`'s real `ExecToolDeps`,
@@ -214,59 +232,73 @@ export function roomServerDispatcherFactory(
   webEnabled: boolean,
   scope: ToolScope,
   lanes: WebLanes,
-  runOptions?: {
-    workspace?: RoomToolDispatcherOptions["workspace"];
-    /**
-     * Give this one short-lived bridge controlled write access to a normal
-     * workspace room. The persistent Leash bridge deliberately omits this:
-     * it has no owning chat turn or harness rollback boundary.
-     *
-     * The request is always clamped by the room's writer lease. A caller
-     * cannot turn a read-only duplicate/process view into a writer merely by
-     * setting this flag.
-     */
-    workspaceWriteEnabled?: boolean;
-    privacyBypass?: boolean;
-    /** Run-scoped effects for the owning chat turn. Persistent room servers
-     * omit this and keep their existing throwaway-effects posture. */
-    sharedEffects?: RoomToolDispatcherOptions["sharedEffects"];
-  },
+  runOptions?: RoomServerRunOptions,
 ) => ToolDispatcher {
   const readLiveLanes = (): WebLanes =>
     openRoomWebLanes((): { db: Database.Database } | null =>
       state.room === null ? null : { db: state.room.conn }
     );
 
-  return (webEnabled, scope, lanes, runOptions = {}): ToolDispatcher => {
-    const routes = services === undefined ? [] : liveMcpRoutes(state, services.mcp.manager);
-    const base: RoomToolDispatcherOptions = {
-      webEnabled,
-      lanes,
-      routes,
-      advisor: null,
-      runCancel: null,
-      sharedEffects: runOptions.sharedEffects ?? null,
-      privacyBypass: runOptions.privacyBypass ?? false,
-      activePolicy: realActivePolicy,
-      webThrottle: createWebThrottle(),
-      execDeps: liveExecToolDeps(state, emit, services === undefined ? {} : { services }),
-      // The persistent bridge is read-only. Short-lived chat turns may opt in
-      // to controlled WorkspaceService writes; native harnesses instead pass
-      // their own baseline-protected workspace bridge above.
-      workspace: runOptions.workspace !== undefined
-        ? runOptions.workspace
-        : state.room?.workspace === undefined
-          ? null
-          : createWorkspaceMcpBridge(
-              state,
-              runOptions.workspaceWriteEnabled === true && state.room.readOnly !== true,
-            ),
-    };
-    return withCatalogTelemetry(
-      new RoomToolDispatcher(liveLanesDispatcherOptions(base, readLiveLanes)),
-      null
-    );
+  return (webEnabled, _scope, lanes, runOptions = {}): ToolDispatcher =>
+    createRoomServerDispatcher(state, emit, services, readLiveLanes, webEnabled, lanes, runOptions);
+}
+
+function createRoomServerDispatcher(
+  state: RoomManagerState,
+  emit: EventSender,
+  services: LiveAppServices | undefined,
+  readLiveLanes: () => WebLanes,
+  webEnabled: boolean,
+  lanes: WebLanes,
+  runOptions: RoomServerRunOptions,
+): ToolDispatcher {
+  const base: RoomToolDispatcherOptions = {
+    webEnabled,
+    lanes,
+    routes: roomServerRoutes(state, services),
+    advisor: null,
+    runCancel: null,
+    sharedEffects: runOptions.sharedEffects ?? null,
+    privacyBypass: runOptions.privacyBypass ?? false,
+    activePolicy: realActivePolicy,
+    webThrottle: createWebThrottle(),
+    execDeps: roomServerExecDeps(state, emit, services),
+    workspace: roomServerWorkspace(state, runOptions),
   };
+  return withCatalogTelemetry(
+    new RoomToolDispatcher(liveLanesDispatcherOptions(base, readLiveLanes)),
+    null,
+  );
+}
+
+function roomServerRoutes(state: RoomManagerState, services: LiveAppServices | undefined) {
+  if (services === undefined) return [];
+  return liveMcpRoutes(state, services.mcp.manager);
+}
+
+function roomServerExecDeps(
+  state: RoomManagerState,
+  emit: EventSender,
+  services: LiveAppServices | undefined,
+) {
+  return liveExecToolDeps(state, emit, services === undefined ? {} : { services });
+}
+
+function roomServerWorkspace(
+  state: RoomManagerState,
+  runOptions: RoomServerRunOptions,
+): RoomToolDispatcherOptions["workspace"] {
+  if (runOptions.workspace !== undefined) return runOptions.workspace;
+  const room = state.room;
+  if (room === null) return null;
+  if (room.workspace === undefined) return null;
+  // The persistent bridge is read-only. Short-lived chat turns may opt in to
+  // controlled WorkspaceService writes; native harnesses instead pass their
+  // own baseline-protected workspace bridge above.
+  return createWorkspaceMcpBridge(
+    state,
+    runOptions.workspaceWriteEnabled === true && room.readOnly !== true,
+  );
 }
 
 // ============================================================================
@@ -377,6 +409,17 @@ export type SpawnRoomServerResult =
   | { kind: "stale-room" }
   | { kind: "started"; bridge: RunningBridge };
 
+interface RoomServerStartSnapshot {
+  enabled: boolean;
+  scope: ToolScope;
+  port: number | undefined;
+  token: string | undefined;
+  lanes: WebLanes;
+  webEnabled: boolean;
+  roomPath: string;
+  roomName: string;
+}
+
 /**
  * The awaitable core, ported step for step from `spawn_room_server_if_enabled`
  * (`rooms.rs` 254-308):
@@ -409,48 +452,74 @@ export async function spawnRoomServerIfEnabledCore(
   room: Room,
   deps: Pick<SetRoomServerDeps, "startBridge" | "writeDiscovery">
 ): Promise<SpawnRoomServerResult> {
-  const enabled = getSetting(room.conn, "room_server_enabled") === "1";
-  const scope = leashScope(getSetting(room.conn, "room_server_scope"), false);
+  const snapshot = roomServerStartSnapshot(room);
+  if (snapshot === null) return { kind: "disabled" };
+  if (!snapshot.enabled) return { kind: "disabled" };
+  if (state.roomServer !== null) return { kind: "already-running" };
 
-  let port: number | undefined;
-  let token: string | undefined;
-  if (scope.kind === "ExternalAgent") {
-    try {
-      ({ port, token } = leashIdentity(room.conn));
-    } catch {
-      return { kind: "disabled" };
-    }
-  }
-  const lanes = webLanesFromSettings(room.conn);
-  const webEnabled = webAccessEnabled(room.conn);
-  const roomPath = room.path;
-  const roomName = room.name;
-
-  if (!enabled) {
-    return { kind: "disabled" };
-  }
-  if (state.roomServer !== null) {
-    return { kind: "already-running" };
-  }
-
-  let bridge: RunningBridge;
-  try {
-    bridge = await deps.startBridge(webEnabled, scope, { port, token, lanes });
-  } catch {
-    return { kind: "start-failed" };
-  }
-
-  if (!storeBridgeIfCurrent(roomServerRoomSource(state), roomServerSlotOver(state), roomPath, bridge)) {
+  const bridge = await startRoomServerBridge(deps, snapshot);
+  if (bridge === null) return { kind: "start-failed" };
+  if (!storeBridgeIfCurrent(roomServerRoomSource(state), roomServerSlotOver(state), snapshot.roomPath, bridge)) {
     return { kind: "stale-room" };
   }
-  if (bridge.scope.kind === "ExternalAgent") {
-    try {
-      deps.writeDiscovery(bridge.port, bridge.token, scopeName(bridge.scope), roomName);
-    } catch {
-      // Best-effort, matching Rust's `let _ = write_discovery(...)`.
-    }
-  }
+  writeRoomServerDiscovery(deps, bridge, snapshot.roomName);
   return { kind: "started", bridge };
+}
+
+function roomServerStartSnapshot(room: Room): RoomServerStartSnapshot | null {
+  const enabled = getSetting(room.conn, "room_server_enabled") === "1";
+  const scope = leashScope(getSetting(room.conn, "room_server_scope"), false);
+  const identity = roomServerIdentity(room, scope);
+  if (identity === null) return null;
+  return {
+    enabled,
+    scope,
+    ...identity,
+    lanes: webLanesFromSettings(room.conn),
+    webEnabled: webAccessEnabled(room.conn),
+    roomPath: room.path,
+    roomName: room.name,
+  };
+}
+
+function roomServerIdentity(
+  room: Room,
+  scope: ToolScope,
+): { port: number | undefined; token: string | undefined } | null {
+  if (scope.kind !== "ExternalAgent") return { port: undefined, token: undefined };
+  try {
+    return leashIdentity(room.conn);
+  } catch {
+    return null;
+  }
+}
+
+async function startRoomServerBridge(
+  deps: Pick<SetRoomServerDeps, "startBridge">,
+  snapshot: RoomServerStartSnapshot,
+): Promise<RunningBridge | null> {
+  try {
+    return await deps.startBridge(snapshot.webEnabled, snapshot.scope, {
+      port: snapshot.port,
+      token: snapshot.token,
+      lanes: snapshot.lanes,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function writeRoomServerDiscovery(
+  deps: Pick<SetRoomServerDeps, "writeDiscovery">,
+  bridge: RunningBridge,
+  roomName: string,
+): void {
+  if (bridge.scope.kind !== "ExternalAgent") return;
+  try {
+    deps.writeDiscovery(bridge.port, bridge.token, scopeName(bridge.scope), roomName);
+  } catch {
+    // Best-effort, matching Rust's `let _ = write_discovery(...)`.
+  }
 }
 
 /**

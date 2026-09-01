@@ -130,6 +130,95 @@ describe("RestrictedLegacyCliRuntime", () => {
     }
   });
 
+  it("refuses an unverified exposure before spawning the restricted CLI", async () => {
+    const f = await fixture();
+    let spawned = false;
+    try {
+      const runtime = new RestrictedLegacyCliRuntime("codex", f.state, {
+        executable: "/fake/codex",
+        available: () => true,
+        spawn: () => {
+          spawned = true;
+          return fakeChild(codexAnswer("unexpected"));
+        },
+      });
+      await expect(runtime.startTurn({
+        runId: "unverified", roomId: f.created.descriptor.roomId, provider: "codex", model: "gpt-test",
+        workspacePath: f.roomPath, runtimePath: path.join(f.root, "runtime-unverified"), privacyMode: "cloud-direct",
+        writeEnabled: false, exposureVerified: false,
+      }, { text: "work" })).rejects.toThrow("Restricted CLI fallback refused an unverified runtime exposure.");
+      expect(spawned).toBe(false);
+    } finally {
+      f.created.db.close();
+    }
+  });
+
+  it("refuses a locked room and releases its bridge when spawning throws", async () => {
+    const f = await fixture();
+    let spawned = false;
+    try {
+      const context = {
+        runId: "startup", roomId: f.created.descriptor.roomId, provider: "codex" as const, model: "gpt-test",
+        workspacePath: f.roomPath, runtimePath: path.join(f.root, "runtime-startup"), privacyMode: "cloud-direct" as const,
+        writeEnabled: false, exposureVerified: true,
+      };
+      const runtime = new RestrictedLegacyCliRuntime("codex", f.state, {
+        executable: "/fake/codex",
+        available: () => true,
+        spawn: () => {
+          spawned = true;
+          throw new Error("sandbox launch failed");
+        },
+      });
+      f.state.room = null;
+      await expect(runtime.startTurn(context, { text: "work" }))
+        .rejects.toThrow("Restricted CLI fallback requires an unlocked workspace room.");
+      expect(spawned).toBe(false);
+
+      f.state.room = {
+        conn: f.created.db,
+        path: f.roomPath,
+        name: "Room",
+        password: "password",
+        descriptor: f.created.descriptor,
+        workspace: new WorkspaceService(f.created.db, f.roomPath),
+      };
+      await expect(runtime.startTurn(context, { text: "work" })).rejects.toThrow("sandbox launch failed");
+      expect(spawned).toBe(true);
+    } finally {
+      f.created.db.close();
+    }
+  });
+
+  it("refuses mismatched and unbaselined Cloud Privacy bridges before spawning", async () => {
+    const f = await fixture();
+    let spawned = false;
+    const mirror = path.join(f.root, "redacted-mirror");
+    await mkdir(mirror);
+    try {
+      const runtime = new RestrictedLegacyCliRuntime("codex", f.state, {
+        executable: "/fake/codex",
+        available: () => true,
+        spawn: () => {
+          spawned = true;
+          return fakeChild(codexAnswer("unexpected"));
+        },
+      });
+      const context = {
+        runId: "privacy", roomId: f.created.descriptor.roomId, provider: "codex" as const, model: "gpt-test",
+        workspacePath: mirror, runtimePath: path.join(f.root, "runtime-privacy"), privacyMode: "cloud-redacted" as const,
+        writeEnabled: true, exposureVerified: true,
+      };
+      await expect(runtime.startTurn({ ...context, roomId: "another-room" }, { text: "work" }))
+        .rejects.toThrow("The restricted Cloud Privacy bridge requires the matching room.");
+      await expect(runtime.startTurn(context, { text: "work" }))
+        .rejects.toThrow("The Cloud Privacy organization bridge cannot start before its rollback baseline is complete.");
+      expect(spawned).toBe(false);
+    } finally {
+      f.created.db.close();
+    }
+  });
+
   it.each(["codex", "claude"] as const)(
     "omits the default model alias for the restricted %s fallback",
     async (provider) => {
@@ -375,6 +464,44 @@ describe("RestrictedLegacyCliRuntime", () => {
     expect(await readFile(path.join(root, "occupied.txt"), "utf8")).toBe("keep me");
   });
 
+  it("lists, finds, reads, writes, edits, deletes, and rejects unknown mirror operations", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-mirror-operations-"));
+    roots.push(root);
+    await mkdir(path.join(root, "nested"));
+    await mkdir(path.join(root, ".arcelle"));
+    await writeFile(path.join(root, "nested", "notes.txt"), "first\nmatch here\nmatch again\n", "utf8");
+    await writeFile(path.join(root, ".arcelle", "private.txt"), "do not expose", "utf8");
+    await symlink(path.join(root, "nested", "notes.txt"), path.join(root, "shortcut.txt"));
+    const backend = createMirrorWorkspaceBackend(root, true);
+
+    expect(await backend.call("list", {})).toEqual({
+      entries: [{ path: "/nested/notes.txt", is_dir: false }],
+    });
+    expect(await backend.call("list", { path: "/nested/" })).toEqual({
+      entries: [{ path: "/nested/notes.txt", is_dir: false }],
+    });
+    expect(await backend.call("glob", { pattern: "**/*.txt" })).toEqual({ matches: ["/nested/notes.txt"] });
+    expect(await backend.call("grep", { pattern: "match" })).toEqual({
+      matches: [
+        { path: "/nested/notes.txt", line: 2, text: "match here" },
+        { path: "/nested/notes.txt", line: 3, text: "match again" },
+      ],
+    });
+    expect(await backend.call("read", { path: "/nested/notes.txt", start_line: 2, end_line: 2 })).toEqual({
+      path: "/nested/notes.txt", content: "match here", start_line: 2, end_line: 2,
+    });
+    expect(await backend.call("write", { path: "draft.txt", content: "old old" })).toEqual({ path: "/draft.txt" });
+    expect(await backend.call("edit", { path: "draft.txt", old_string: "missing", new_string: "new" }))
+      .toEqual({ error: "The old text was not found." });
+    expect(await backend.call("edit", { path: "draft.txt", old_string: "old", new_string: "new" }))
+      .toEqual({ error: "The old text is not unique." });
+    expect(await backend.call("edit", { path: "draft.txt", old_text: "old", new_text: "new", all: true }))
+      .toEqual({ path: "/draft.txt" });
+    expect(await readFile(path.join(root, "draft.txt"), "utf8")).toBe("new new");
+    expect(await backend.call("delete", { name: "draft.txt" })).toEqual({ path: "/draft.txt", deleted: true });
+    expect(await backend.call("unknown", { path: "draft.txt" })).toEqual({ error: "Unknown workspace operation: unknown" });
+  });
+
   it("blocks read-only, private, traversal, directory, and symlink mirror moves", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-mirror-safety-"));
     const outside = await mkdtemp(path.join(os.tmpdir(), "arcelle-mirror-outside-"));
@@ -447,6 +574,63 @@ describe("RestrictedLegacyCliRuntime", () => {
     expect(mirrorCalls.map(([operation]) => operation)).toContain("move");
     expect(JSON.stringify(await hybrid.call("standard_move", { name: "private.pdf", folder: "Archive" })))
       .not.toContain("must not escape");
+
+    const malformedTrash = createCloudPrivacyWorkspaceBackend(
+      { call: async () => ({}) },
+      { call: async () => ({ trashed: "not an array" }) },
+    );
+    await expect(malformedTrash.call("standard_trash", {})).resolves.toEqual({ trashed: [] });
+  });
+
+  it("dispatches ordinary workspace tools through the backend", async () => {
+    const dispatcher = new WorkspaceDispatcher(
+      { call: async (operation, args) => ({ operation, args }) },
+      new AsyncWriteGate(),
+    );
+    await expect(dispatcher.callTool({ kind: "CloudEngine" }, "workspace_read", { path: "notes.md" })).resolves.toEqual({
+      isError: false,
+      content: [{ type: "text", text: JSON.stringify({ operation: "read", args: { path: "notes.md" } }) }],
+    });
+  });
+
+  it("rejects unknown and write-only specialists through the live delegate bridge", async () => {
+    const f = await fixture();
+    let token = "";
+    let bridgeUrl = "";
+    const parent = controllableChild();
+    try {
+      const runtime = new RestrictedLegacyCliRuntime("codex", f.state, {
+        executable: "/fake/codex",
+        available: () => true,
+        spawn: (options, args) => {
+          token = options.env?.ARCELLE_ROOM_MCP_TOKEN ?? "";
+          bridgeUrl = args.find((arg) => arg.startsWith("mcp_servers.room.url="))?.match(/"(http[^"]+)"/)?.[1] ?? "";
+          return parent.child;
+        },
+      });
+      const run = await runtime.startTurn({
+        runId: "delegate-guards", roomId: f.created.descriptor.roomId, provider: "codex", model: "gpt-test",
+        workspacePath: f.roomPath, runtimePath: path.join(f.root, "runtime-delegate-guards"), privacyMode: "cloud-direct",
+        writeEnabled: false, exposureVerified: true,
+      }, { text: "work" });
+      const drain = (async () => { for await (const _event of run.events) { /* drain */ } })();
+      for (const agentId of ["not-an-agent", "files.read"]) {
+        const response = await fetch(bridgeUrl, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0", id: agentId, method: "tools/call",
+            params: { name: "arcelle_delegate", arguments: { agent_id: agentId, task: "work" } },
+          }),
+        });
+        const body = await response.json() as { result?: { isError?: boolean } };
+        expect(body.result?.isError).toBe(true);
+      }
+      await run.cancel();
+      await drain;
+    } finally {
+      f.created.db.close();
+    }
   });
 
   it("contains errors returned by the protected real organization backend", async () => {

@@ -16,7 +16,7 @@ interface Node {
   files: Entry[];
 }
 
-function buildTree(entries: Entry[]): Node {
+export function buildTree(entries: Entry[]): Node {
   const root: Node = { name: "", children: new Map(), files: [] };
   for (const e of entries) {
     const parts = e.path.split("/").filter(Boolean);
@@ -79,6 +79,92 @@ function Branch({ node, depth }: { node: Node; depth: number }) {
   );
 }
 
+type ArchiveListing = {
+  setEntries: (entries: Entry[]) => void;
+  setError: (message: string) => void;
+  stop: () => void;
+};
+
+type ArchiveReader = {
+  close(): Promise<void>;
+  hasEncryptedData(): Promise<boolean | null>;
+  getFilesArray(): Promise<Array<{ file?: { name?: string; size?: number }; path?: string }>>;
+};
+
+function archiveListing(bytes: Uint8Array, name: string | undefined, setEntries: (entries: Entry[] | null) => void, setError: (message: string) => void): () => void {
+  const listing = guardedListing(setEntries, setError);
+  setError("");
+  setEntries(null);
+  const close = isZip(name) ? listZip(bytes, listing) : listOtherArchive(bytes, name, listing);
+  return () => {
+    listing.stop();
+    close();
+  };
+}
+
+function guardedListing(setEntries: (entries: Entry[] | null) => void, setError: (message: string) => void): ArchiveListing {
+  let alive = true;
+  return {
+    setEntries: (entries) => { if (alive) setEntries(entries); },
+    setError: (message) => { if (alive) setError(message); },
+    stop: () => { alive = false; },
+  };
+}
+
+function isZip(name: string | undefined): boolean {
+  return (name?.toLocaleLowerCase() ?? "").endsWith(".zip");
+}
+
+function listZip(bytes: Uint8Array, listing: ArchiveListing): () => void {
+  const entries: Entry[] = [];
+  unzip(bytes, { filter: (file) => addZipEntry(entries, file.name, file.originalSize) }, (error) => {
+    if (error) return listing.setError(`This archive could not be read: ${error.message}`);
+    listing.setEntries(entries);
+  });
+  return () => {};
+}
+
+function addZipEntry(entries: Entry[], name: string, size: number): false {
+  if (!name.endsWith("/")) entries.push({ path: name, size });
+  return false;
+}
+
+function listOtherArchive(bytes: Uint8Array, name: string | undefined, listing: ArchiveListing): () => void {
+  let reader: ArchiveReader | null = null;
+  void readOtherArchive(bytes, name, listing, (next) => { reader = next; });
+  return () => { if (reader) void closeArchiveReader(reader); };
+}
+
+async function readOtherArchive(bytes: Uint8Array, name: string | undefined, listing: ArchiveListing, setReader: (reader: ArchiveReader) => void) {
+  let reader: ArchiveReader | null = null;
+  try {
+    const { Archive } = await import("libarchive.js");
+    Archive.init({ workerUrl: new URL("./libarchive/worker-bundle.js", window.location.href).toString() });
+    const archive = await Archive.open(new File([bytes], name || "archive"));
+    reader = archive;
+    setReader(archive);
+    if (await archive.hasEncryptedData()) throw new Error("This archive is password-protected. Arcelle does not ask for archive passwords.");
+    listing.setEntries(archiveEntries(await archive.getFilesArray()));
+  } catch (reason) {
+    listing.setError(archiveReadError(reason));
+  } finally {
+    if (reader) await closeArchiveReader(reader);
+  }
+}
+
+function archiveEntries(files: Array<{ file?: { name?: string; size?: number }; path?: string }>): Entry[] {
+  return files.map(({ file, path: folder }) => ({ path: `${folder ?? ""}${file?.name ?? ""}`.replace(/^\/+/, ""), size: Number(file?.size ?? 0) })).filter((entry) => entry.path && !entry.path.endsWith("/"));
+}
+
+function archiveReadError(reason: unknown): string {
+  if (reason instanceof Error && reason.message.startsWith("This archive")) return reason.message;
+  return `This archive could not be read: ${reason instanceof Error ? reason.message : String(reason)}`;
+}
+
+async function closeArchiveReader(reader: Pick<ArchiveReader, "close">) {
+  await reader.close().catch(() => {});
+}
+
 /**
  * What is inside a `.zip`, without unpacking it.
  *
@@ -104,77 +190,7 @@ export default function ArchiveView({
   const [entries, setEntries] = useState<Entry[] | null>(null);
   const [error, setError] = useState("");
 
-  useEffect(() => {
-    if (!bytes) return;
-    let alive = true;
-    setError("");
-    setEntries(null);
-    const extension = name?.toLocaleLowerCase() ?? "";
-    if (!extension.endsWith(".zip")) {
-      let reader: { close(): Promise<void> } | null = null;
-      void (async () => {
-        try {
-          const { Archive } = await import("libarchive.js");
-          Archive.init({ workerUrl: new URL("./libarchive/worker-bundle.js", window.location.href).toString() });
-          const archive = await Archive.open(new File([bytes], name || "archive"));
-          reader = archive;
-          if (await archive.hasEncryptedData()) {
-            throw new Error("This archive is password-protected. Arcelle does not ask for archive passwords.");
-          }
-          const files = await archive.getFilesArray() as Array<{
-            file?: { name?: string; size?: number };
-            path?: string;
-          }>;
-          const listed = files
-            .map(({ file, path: folder }) => ({
-              path: `${folder ?? ""}${file?.name ?? ""}`.replace(/^\/+/, ""),
-              size: Number(file?.size ?? 0),
-            }))
-            .filter((entry) => entry.path && !entry.path.endsWith("/"));
-          if (alive) setEntries(listed);
-        } catch (reason) {
-          if (alive) {
-            setError(reason instanceof Error && reason.message.startsWith("This archive")
-              ? reason.message
-              : `This archive could not be read: ${reason instanceof Error ? reason.message : String(reason)}`);
-          }
-        } finally {
-          if (reader) await reader.close().catch(() => {});
-        }
-      })();
-      return () => {
-        alive = false;
-        if (reader) void reader.close().catch(() => {});
-      };
-    }
-    // The filter runs once per central-directory record and reports the name
-    // and the unpacked size before anything is inflated. Returning false for
-    // every entry means a multi-gigabyte archive is listed without a single
-    // byte of it ever being decompressed into this renderer.
-    const listed: Entry[] = [];
-    unzip(
-      bytes,
-      {
-        filter: (f) => {
-          if (!f.name.endsWith("/")) {
-            listed.push({ path: f.name, size: f.originalSize });
-          }
-          return false;
-        },
-      },
-      (err) => {
-        if (!alive) return;
-        if (err) {
-          setError(`This archive could not be read: ${err.message}`);
-          return;
-        }
-        setEntries(listed);
-      },
-    );
-    return () => {
-      alive = false;
-    };
-  }, [bytes, name]);
+  useEffect(() => bytes ? archiveListing(bytes, name, setEntries, setError) : undefined, [bytes, name]);
 
   const tree = useMemo(() => (entries ? buildTree(entries) : null), [entries]);
   const total = useMemo(
@@ -182,11 +198,31 @@ export default function ArchiveView({
     [entries],
   );
 
-  if (loading) return <div className="empty-hint">Opening archive…</div>;
-  if (readError) return <div className="empty-hint">{readError}</div>;
-  if (error) return <div className="empty-hint">{error}</div>;
-  if (!tree || !entries) return <div className="empty-hint">Reading archive…</div>;
-  if (entries.length === 0) {
+  return archiveContent({ loading, readError, error, tree, entries, total });
+}
+
+function archiveContent({
+  loading,
+  readError,
+  error,
+  tree,
+  entries,
+  total,
+}: {
+  loading: boolean;
+  readError: string | null;
+  error: string;
+  tree: Node | null;
+  entries: Entry[] | null;
+  total: number;
+}) {
+  const status = archiveStatus(loading, readError, error);
+  if (status) return status;
+  const unavailable = archiveUnavailable(tree, entries);
+  if (unavailable) return unavailable;
+  const listed = entries as Entry[];
+  const archiveTree = tree as Node;
+  if (listed.length === 0) {
     // A zero-entry result from libarchive is not proof that the container is
     // empty. Several damaged 7z/RAR files return an empty listing instead of
     // an error, and calling those empty sends someone looking for lost files
@@ -203,13 +239,26 @@ export default function ArchiveView({
 
   return (
     <div className="zip-view">
-      <div className="viewer-status">
-        {entries.length.toLocaleString()} {entries.length === 1 ? "file" : "files"} ·{" "}
-        {formatSize(total)} unpacked
-      </div>
+      <ArchiveSummary entries={listed} total={total} />
       <div className="zip-tree">
-        <Branch node={tree} depth={0} />
+        <Branch node={archiveTree} depth={0} />
       </div>
     </div>
   );
+}
+
+function archiveStatus(loading: boolean, readError: string | null, error: string) {
+  if (loading) return <div className="empty-hint">Opening archive…</div>;
+  if (readError) return <div className="empty-hint">{readError}</div>;
+  if (error) return <div className="empty-hint">{error}</div>;
+  return null;
+}
+
+function archiveUnavailable(tree: Node | null, entries: Entry[] | null) {
+  if (!tree || !entries) return <div className="empty-hint">Reading archive…</div>;
+  return null;
+}
+
+function ArchiveSummary({ entries, total }: { entries: Entry[]; total: number }) {
+  return <div className="viewer-status">{entries.length.toLocaleString()} {entries.length === 1 ? "file" : "files"} · {formatSize(total)} unpacked</div>;
 }

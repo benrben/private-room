@@ -260,6 +260,55 @@ def test_mel_banks_slaney_area_normalization() -> None:
     assert areas_arr.std() < 0.1
 
 
+def test_mel_banks_keeps_empty_bank_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(diar, "inv_mel_slaney", lambda _mel: 0.1)
+
+    with pytest.raises(ValueError, match="empty mel bin"):
+        diar.mel_banks()
+
+
+def test_neural_embed_averages_fabricated_window_vectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    samples = np.arange(diar.EMB_WIN + diar.EMB_HOP, dtype=np.float32)
+    windows: list[tuple[int, int]] = []
+
+    def fake_titanet(_path: str, window: np.ndarray) -> np.ndarray:
+        windows.append((int(window[0]), len(window)))
+        vec = np.zeros(diar.EMB_DIM, dtype=np.float32)
+        vec[0 if window[0] == 0 else 1] = 1.0
+        return vec
+
+    monkeypatch.setattr(diar, "count_voiced", lambda _window: diar.EMB_WIN // diar.HOP)
+    monkeypatch.setattr(diar, "titanet_embed", fake_titanet)
+
+    embedding = diar.neural_embed("/fake/titanet.onnx", samples)
+
+    expected = np.zeros(diar.EMB_DIM, dtype=np.float32)
+    expected[:2] = 1.0 / math.sqrt(2.0)
+    assert embedding is not None
+    assert np.allclose(embedding, expected)
+    assert windows == [(0, diar.EMB_WIN), (diar.EMB_HOP, diar.EMB_WIN)]
+
+
+def test_neural_embed_falls_back_after_all_fabricated_windows_are_silent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    samples = np.zeros(diar.EMB_WIN + diar.EMB_HOP, dtype=np.float32)
+    calls: list[int] = []
+    fallback = np.full(diar.EMB_DIM, 1.0 / math.sqrt(diar.EMB_DIM), dtype=np.float32)
+
+    def fake_titanet(_path: str, window: np.ndarray) -> np.ndarray:
+        calls.append(len(window))
+        return fallback
+
+    monkeypatch.setattr(diar, "count_voiced", lambda _window: 0)
+    monkeypatch.setattr(diar, "titanet_embed", fake_titanet)
+
+    assert np.array_equal(diar.neural_embed("/fake/titanet.onnx", samples), fallback)
+    assert calls == [len(samples)]
+
+
 def test_rfft_matches_direct_dft_on_tiny_input() -> None:
     """numpy.fft.rfft cross-checked against a pure-Python O(N^2) direct DFT
     on a tiny synthetic input -- the empirical verification the porting
@@ -515,6 +564,16 @@ def test_count_voiced_matches_a_manual_reference_loop() -> None:
 
 def test_count_voiced_zero_for_silence() -> None:
     assert diar.count_voiced(np.zeros(20000, dtype=np.float32)) == 0
+
+
+def test_dsp_embed_ignores_quiet_frames() -> None:
+    quiet = np.full(diar.WIN * 2, diar.VOICED_RMS / 2, dtype=np.float32)
+
+    voice = diar.dsp_embed(quiet)
+
+    assert voice.voiced_frames == 0
+    assert voice.vec.shape == (diar.BANDS + 1,)
+    assert np.all(voice.vec == 0.0)
 
 
 # =============================================================================

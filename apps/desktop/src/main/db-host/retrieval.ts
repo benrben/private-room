@@ -55,8 +55,18 @@ import {
   recentChunks,
   searchChunksFtsRanked,
 } from "./embeddings.js";
-import { stripHebrewMarks } from "./files.js";
+import { ftsMatchExpr, questionTerms } from "./retrievalText.js";
 import { queryRows } from "./util.js";
+
+export {
+  ftsMatchExpr,
+  makeSnippet,
+  NOT_ALPHANUMERIC,
+  questionTerms,
+  STOPWORDS,
+  stripMarkupBlocks,
+} from "./retrievalText.js";
+export { compactHistory, selectMemories } from "./retrievalHistory.js";
 
 // ------------------------------------------------------------- constants
 
@@ -103,109 +113,6 @@ export interface ScoredChunk {
   score: number;
 }
 
-// ---------------------------------------------------------- markup / terms
-
-/** Remove fenced UI-markup payloads (```boxes, ```annotation) from message
- * content — they are viewer data, not conversation text. */
-export function stripMarkupBlocks(content: string): string {
-  let out = content;
-  for (const tag of ["```boxes", "```annotation"]) {
-    let start = out.indexOf(tag);
-    while (start !== -1) {
-      const after = out.slice(start + tag.length);
-      const end = after.indexOf("```");
-      out = (end !== -1 ? out.slice(0, start) + after.slice(end + 3) : out.slice(0, start)).trim();
-      start = out.indexOf(tag);
-    }
-  }
-  return out;
-}
-
-/** CHG-14: include common 2-letter function words so the >=2 length filter
- * can admit high-signal short terms (AI, EU, Q2, IP) without letting these
- * through.
- *
- * Exported (Rust's `retrieval.rs::STOPWORDS` is `pub(crate)`, reused by
- * `moonshot/graph.rs::index_terms` via `use super::*` — this is the same
- * crate-wide sharing, not a new seam) so {@link ../moonshotGraph.js}'s own
- * `indexTerms` filters against the identical list rather than a second,
- * driftable copy. */
-export const STOPWORDS: ReadonlySet<string> = new Set([
-  "is", "to", "of", "in", "on", "at", "it", "be", "as", "by", "an", "or", "if", "we", "do",
-  "so", "up", "my", "me", "no", "us", "am", "he",
-  "the", "and", "for", "are", "but", "not", "you", "all", "can", "her", "was", "one", "our",
-  "out", "get", "has", "him", "his", "how", "new", "now", "see", "two", "way", "who", "did",
-  "its", "let", "say", "she", "too", "use", "that", "with", "have", "this", "will", "your",
-  "from", "they", "know", "want", "been", "good", "much", "some", "time", "what", "when",
-  "which", "about", "would", "there", "their", "were", "them", "then", "than", "into", "also",
-  "just", "like", "over", "such", "only", "most", "make", "after", "where", "does", "please",
-  "could", "should", "tell",
-]);
-
-/** UTF-8 byte length — what Rust's `str::len()` measures, and therefore what
- * `question_terms`' `>= 2` filter and `compact_history`'s budget both count.
- * See the module comment. */
-function byteLen(s: string): number {
-  return Buffer.byteLength(s, "utf8");
-}
-
-/**
- * Rust splits the question on `!c.is_alphanumeric()`, which is
- * `is_alphabetic() || is_numeric()` — the derived ALPHABETIC property plus
- * general categories Nd/Nl/No. `\p{Alphabetic}` + `\p{N}` is that set exactly.
- *
- * Not `\p{L}`, which is the near-miss: `\p{L}` omits Other_Alphabetic
- * combining marks, so a Devanagari word ("किताב") splits at every matra into
- * single-consonant fragments — one question term per letter, none of which
- * the index contains — where Rust keeps the word whole. (It also omits Hebrew
- * points, which matters less here only because {@link stripHebrewMarks} has
- * already removed those by the time this runs — exactly as the Rust source
- * does, and for the same reason.)
- *
- * Exported for the same reason as {@link STOPWORDS} above: `moonshot/graph.rs`'s
- * `index_terms` splits on this exact same `!c.is_alphanumeric()` predicate. */
-export const NOT_ALPHANUMERIC = /[^\p{Alphabetic}\p{N}]+/u;
-
-/**
- * The search terms in a question: Hebrew marks stripped first (a pasted
- * pointed query must match the consonantal index), lowercased, split on runs
- * of non-alphanumeric characters, de-duplicated, stopwords and words under
- * 2 BYTES dropped, capped at 24.
- */
-export function questionTerms(question: string): string[] {
-  const stripped = stripHebrewMarks(question);
-  const words = stripped.toLowerCase().split(NOT_ALPHANUMERIC);
-  const terms: string[] = [];
-  for (const word of words) {
-    // CHG-14: >=2 so short high-signal terms (AI, EU, Q2, IP) survive; the
-    // 2-letter function words are filtered by STOPWORDS above.
-    if (byteLen(word) >= 2 && !STOPWORDS.has(word) && !terms.includes(word)) {
-      terms.push(word);
-    }
-    if (terms.length >= 24) {
-      break;
-    }
-  }
-  return terms;
-}
-
-/** Build an FTS5 MATCH expression from search terms: each term is
- * double-quoted (so punctuation or an FTS keyword like "or"/"near" is treated
- * as a literal) and the terms are OR-joined. `null` when there are no usable
- * terms. */
-export function ftsMatchExpr(terms: Iterable<string>): string | null {
-  const quoted: string[] = [];
-  for (const t of terms) {
-    // A quote inside a term would break out of the FTS string literal.
-    const q = `"${t.replaceAll('"', "")}"`;
-    if (q.length > 2) {
-      // drop the empty `""` a fully-stripped term leaves
-      quoted.push(q);
-    }
-  }
-  return quoted.length === 0 ? null : quoted.join(" OR ");
-}
-
 // -------------------------------------------------------------- retrieval
 
 /** HLT-3 + ADD-13: retrieve context by blending the FTS5 keyword score with
@@ -238,28 +145,42 @@ export function retrieveContext(
  * the remaining budget, then early chunks fill any space left. There is NO
  * recent-room fallback: if a named file has no extracted text, unrelated
  * content is worse than no context. */
-export function retrieveContextForFiles(
-  db: Database.Database,
-  question: string,
-  fileNames: readonly string[],
-  limit = MAX_CONTEXT_CHUNKS,
-): [ScoredChunk[], false] {
+type FileContextRow = [number, string, string];
+
+interface NamedFile {
+  readonly name: string;
+  readonly folded: string;
+}
+
+function normalizedNamedFile(raw: string): NamedFile | null {
+  const name = raw.normalize("NFC").trim();
+  return name === "" ? null : { name, folded: name.toLowerCase() };
+}
+
+function namedFiles(fileNames: readonly string[]): string[] {
   const names: string[] = [];
   const seenNames = new Set<string>();
   for (const raw of fileNames) {
-    const name = raw.normalize("NFC").trim();
-    const folded = name.toLowerCase();
-    if (name === "" || seenNames.has(folded)) continue;
-    seenNames.add(folded);
-    names.push(name);
+    const named = normalizedNamedFile(raw);
+    if (named === null || seenNames.has(named.folded)) continue;
+    seenNames.add(named.folded);
+    names.push(named.name);
     if (names.length >= 12) break;
   }
-  const cap = Math.max(0, Math.min(Math.trunc(limit), MAX_CONTEXT_CHUNKS));
-  if (names.length === 0 || cap === 0) return [[], false];
+  return names;
+}
 
-  const displayName = "CASE WHEN fo.name IS NOT NULL THEN fo.name || '/' || f.name ELSE f.name END";
-  type Row = [number, string, string];
-  const perFile = new Map<string, Row[]>();
+function contextLimit(limit: number): number {
+  return Math.max(0, Math.min(Math.trunc(limit), MAX_CONTEXT_CHUNKS));
+}
+
+function fileRowsByName(
+  db: Database.Database,
+  names: readonly string[],
+  cap: number,
+  displayName: string
+): Map<string, FileContextRow[]> {
+  const perFile = new Map<string, FileContextRow[]>();
   for (const name of names) {
     const rows = queryRows(
       db,
@@ -270,55 +191,125 @@ export function retrieveContextForFiles(
        WHERE f.trashed_at IS NULL AND ${displayName} = ?
        ORDER BY c.seq ASC LIMIT ?`,
       [name, cap],
-      (r): Row => [r[0] as number, r[1] as string, r[2] as string],
+      (row): FileContextRow => [row[0] as number, row[1] as string, row[2] as string],
     );
     perFile.set(name.toLowerCase(), rows);
   }
+  return perFile;
+}
 
-  let matches: Row[] = [];
+function matchingFileRows(
+  db: Database.Database,
+  question: string,
+  names: readonly string[],
+  cap: number,
+  displayName: string
+): FileContextRow[] {
   const expr = ftsMatchExpr(questionTerms(question));
-  if (expr !== null) {
-    const placeholders = names.map(() => "?").join(",");
-    matches = queryRows(
-      db,
-      `SELECT chunks_fts.rowid, ${displayName}, c.text
-       FROM chunks_fts
-       JOIN chunks c ON c.rowid = chunks_fts.rowid
-       JOIN files f ON f.id = c.file_id
-       LEFT JOIN folders fo ON fo.id = f.folder_id
-       WHERE chunks_fts MATCH ?
-         AND f.trashed_at IS NULL
-         AND ${displayName} IN (${placeholders})
-       ORDER BY bm25(chunks_fts) LIMIT ?`,
-      [expr, ...names, Math.max(cap * 4, cap)],
-      (r): Row => [r[0] as number, r[1] as string, r[2] as string],
-    );
+  if (expr === null) return [];
+  const placeholders = names.map(() => "?").join(",");
+  return queryRows(
+    db,
+    `SELECT chunks_fts.rowid, ${displayName}, c.text
+     FROM chunks_fts
+     JOIN chunks c ON c.rowid = chunks_fts.rowid
+     JOIN files f ON f.id = c.file_id
+     LEFT JOIN folders fo ON fo.id = f.folder_id
+     WHERE chunks_fts MATCH ?
+       AND f.trashed_at IS NULL
+       AND ${displayName} IN (${placeholders})
+     ORDER BY bm25(chunks_fts) LIMIT ?`,
+    [expr, ...names, Math.max(cap * 4, cap)],
+    (row): FileContextRow => [row[0] as number, row[1] as string, row[2] as string],
+  );
+}
+
+function canAddContextRow(
+  row: FileContextRow | undefined,
+  out: readonly ScoredChunk[],
+  seenRows: ReadonlySet<number>,
+  cap: number
+): row is FileContextRow {
+  return row !== undefined && out.length < cap && !seenRows.has(row[0]);
+}
+
+function addContextRow(
+  out: ScoredChunk[],
+  seenRows: Set<number>,
+  cap: number,
+  row: FileContextRow | undefined,
+  score: number
+): void {
+  if (!canAddContextRow(row, out, seenRows, cap)) return;
+  seenRows.add(row[0]);
+  out.push({ rowid: row[0], fileName: row[1], text: row[2], score });
+}
+
+function addNamedFileRows(
+  names: readonly string[],
+  matches: readonly FileContextRow[],
+  perFile: ReadonlyMap<string, FileContextRow[]>,
+  out: ScoredChunk[],
+  seenRows: Set<number>,
+  cap: number
+): void {
+  for (const name of names) {
+    const folded = name.toLowerCase();
+    const row = matches.find((candidate) => candidate[1].normalize("NFC").toLowerCase() === folded)
+      ?? perFile.get(folded)?.[0];
+    addContextRow(out, seenRows, cap, row, 1);
   }
+}
+
+function addMatchingRows(
+  matches: readonly FileContextRow[],
+  out: ScoredChunk[],
+  seenRows: Set<number>,
+  cap: number
+): void {
+  matches.forEach((row, rank) => addContextRow(out, seenRows, cap, row, 1 / (RRF_K + rank)));
+}
+
+function addEarlyFileRows(
+  names: readonly string[],
+  perFile: ReadonlyMap<string, FileContextRow[]>,
+  out: ScoredChunk[],
+  seenRows: Set<number>,
+  cap: number
+): void {
+  for (let sequence = 0; out.length < cap; sequence += 1) {
+    let found = false;
+    for (const name of names) {
+      const row = perFile.get(name.toLowerCase())?.[sequence];
+      found ||= row !== undefined;
+      addContextRow(out, seenRows, cap, row, 0);
+    }
+    if (!found) return;
+  }
+}
+
+export function retrieveContextForFiles(
+  db: Database.Database,
+  question: string,
+  fileNames: readonly string[],
+  limit = MAX_CONTEXT_CHUNKS,
+): [ScoredChunk[], false] {
+  const names = namedFiles(fileNames);
+  const cap = contextLimit(limit);
+  if (names.length === 0 || cap === 0) return [[], false];
+
+  const displayName = "CASE WHEN fo.name IS NOT NULL THEN fo.name || '/' || f.name ELSE f.name END";
+  const perFile = fileRowsByName(db, names, cap, displayName);
+  const matches = matchingFileRows(db, question, names, cap, displayName);
 
   const out: ScoredChunk[] = [];
   const seenRows = new Set<number>();
-  const add = (row: Row | undefined, score: number): void => {
-    if (row === undefined || out.length >= cap || seenRows.has(row[0])) return;
-    seenRows.add(row[0]);
-    out.push({ rowid: row[0], fileName: row[1], text: row[2], score });
-  };
 
   // One best matching (or first) chunk from every named file before one long
   // file can consume the whole prompt budget.
-  for (const name of names) {
-    const folded = name.toLowerCase();
-    add(matches.find((row) => row[1].normalize("NFC").toLowerCase() === folded) ?? perFile.get(folded)?.[0], 1);
-  }
-  matches.forEach((row, rank) => add(row, 1 / (RRF_K + rank)));
-  for (let seq = 0; out.length < cap; seq += 1) {
-    let found = false;
-    for (const name of names) {
-      const row = perFile.get(name.toLowerCase())?.[seq];
-      if (row !== undefined) found = true;
-      add(row, 0);
-    }
-    if (!found) break;
-  }
+  addNamedFileRows(names, matches, perFile, out, seenRows, cap);
+  addMatchingRows(matches, out, seenRows, cap);
+  addEarlyFileRows(names, perFile, out, seenRows, cap);
   return [out, false];
 }
 
@@ -341,6 +332,84 @@ interface Cand {
   text: string;
   kwRank: number | null;
   vecRank: number | null;
+}
+
+function retrievalCandidateCount(limit: number | null): number {
+  return limit === null ? MAX_VECTOR_CANDIDATES : Math.max(limit * 4, RETRIEVE_CANDIDATES);
+}
+
+function pooledCandidate(pool: Map<number, Cand>, rowid: number, fileName: string, text: string): Cand {
+  const existing = pool.get(rowid);
+  if (existing !== undefined) return existing;
+  const created = { fileName, text, kwRank: null, vecRank: null };
+  pool.set(rowid, created);
+  return created;
+}
+
+function addKeywordCandidates(db: Database.Database, question: string, candidates: number, pool: Map<number, Cand>): void {
+  const expression = ftsMatchExpr(questionTerms(question));
+  if (expression === null) return;
+  searchChunksFtsRanked(db, expression, candidates).forEach(([rowid, name, text], rank) => {
+    pooledCandidate(pool, rowid, name, text).kwRank = rank;
+  });
+}
+
+function vectorCandidates(
+  db: Database.Database,
+  questionEmbedding: readonly number[],
+  candidates: number,
+): Array<[number, number]> {
+  const scored: Array<[number, number]> = [];
+  forEachChunkEmbedding(db, (rowid, blob) => {
+    const cosine = cosineSimilarityBlob(questionEmbedding, blob);
+    if (cosine >= MIN_CHUNK_SIMILARITY) scored.push([rowid, cosine]);
+  });
+  scored.sort((left, right) => right[1] - left[1]);
+  return scored.slice(0, candidates);
+}
+
+function addVectorCandidates(
+  db: Database.Database,
+  questionEmbedding: readonly number[],
+  candidates: number,
+  pool: Map<number, Cand>,
+): void {
+  const ranked = vectorCandidates(db, questionEmbedding, candidates);
+  const rowids = ranked.map(([rowid]) => rowid).filter((rowid) => !pool.has(rowid));
+  const hydrated = new Map(chunksByRowids(db, rowids).map(([rowid, name, text]) => [rowid, [name, text] as const]));
+  ranked.forEach(([rowid], rank) => {
+    const entry = pool.get(rowid);
+    if (entry !== undefined) {
+      entry.vecRank = rank;
+      return;
+    }
+    const value = hydrated.get(rowid);
+    if (value !== undefined) pooledCandidate(pool, rowid, value[0], value[1]).vecRank = rank;
+  });
+}
+
+function reciprocalRank(candidate: Cand): number {
+  const keyword = candidate.kwRank === null ? 0 : 1 / (RRF_K + candidate.kwRank);
+  const vector = candidate.vecRank === null ? 0 : 1 / (RRF_K + candidate.vecRank);
+  return keyword + vector;
+}
+
+function rankedContext(pool: ReadonlyMap<number, Cand>, exclude: ReadonlySet<number>, limit: number | null): ScoredChunk[] {
+  const ranked: ScoredChunk[] = [];
+  for (const [rowid, candidate] of pool) {
+    if (!exclude.has(rowid)) {
+      ranked.push({ rowid, fileName: candidate.fileName, text: candidate.text, score: reciprocalRank(candidate) });
+    }
+  }
+  ranked.sort((left, right) => right.score - left.score);
+  return limit === null ? ranked : ranked.slice(0, limit);
+}
+
+function fallbackContext(db: Database.Database, limit: number | null): [ScoredChunk[], true] {
+  const recent = recentChunks(db, limit ?? MAX_CONTEXT_CHUNKS).map(
+    ([fileName, text]): ScoredChunk => ({ rowid: -1, fileName, text, score: 0 })
+  );
+  return [recent, true];
 }
 
 /**
@@ -366,58 +435,16 @@ export function retrieveContextLimited(
   // Rank enough candidates per signal to fill the requested result count; an
   // unlimited request pools everything the index can return, bounded by
   // MAX_VECTOR_CANDIDATES so hydration still fits SQLite's bind limit.
-  const candidates =
-    limit === null ? MAX_VECTOR_CANDIDATES : Math.max(limit * 4, RETRIEVE_CANDIDATES);
+  const candidates = retrievalCandidateCount(limit);
 
   const pool = new Map<number, Cand>();
-
-  // Keyword signal: chunks ranked best-first by bm25 -> RRF rank.
-  const expr = ftsMatchExpr(questionTerms(question));
-  if (expr !== null) {
-    const hits = searchChunksFtsRanked(db, expr, candidates);
-    hits.forEach(([rowid, name, text], rank) => {
-      let entry = pool.get(rowid);
-      if (entry === undefined) {
-        entry = { fileName: name, text, kwRank: null, vecRank: null };
-        pool.set(rowid, entry);
-      }
-      entry.kwRank = rank;
-    });
-  }
+  addKeywordCandidates(db, question, candidates, pool);
 
   // Vector signal: brute-force cosine over (rowid, blob) — no text shuttled.
   // Pool only chunks AT OR ABOVE THE FLOOR, ranked by cosine -> RRF rank;
   // hydrate text for the winners not already present from the keyword pass.
   if (questionEmbedding !== null) {
-    const scored: Array<[number, number]> = [];
-    forEachChunkEmbedding(db, (rowid, blob) => {
-      const cos = cosineSimilarityBlob(questionEmbedding, blob);
-      // A floor, not "any positive cosine" — see MIN_CHUNK_SIMILARITY's doc:
-      // every chunk scores somewhat above zero against any question, so
-      // pooling on `> 0` meant a question the room cannot answer still came
-      // back with its six least-unrelated chunks, presented as context.
-      if (cos >= MIN_CHUNK_SIMILARITY) {
-        scored.push([rowid, cos]);
-      }
-    });
-    scored.sort((a, b) => b[1] - a[1]);
-    const capped = scored.slice(0, candidates);
-    const needText = capped.map(([rowid]) => rowid).filter((rowid) => !pool.has(rowid));
-    const hydrated = new Map<number, [string, string]>();
-    for (const [rowid, name, text] of chunksByRowids(db, needText)) {
-      hydrated.set(rowid, [name, text]);
-    }
-    capped.forEach(([rowid], rank) => {
-      const entry = pool.get(rowid);
-      if (entry !== undefined) {
-        entry.vecRank = rank;
-      } else {
-        const h = hydrated.get(rowid);
-        if (h !== undefined) {
-          pool.set(rowid, { fileName: h[0], text: h[1], kwRank: null, vecRank: rank });
-        }
-      }
-    });
+    addVectorCandidates(db, questionEmbedding, candidates, pool);
   }
 
   // A real match means the pool was populated by keyword or above-floor
@@ -425,272 +452,12 @@ export function retrieveContextLimited(
   // no-match questions still fall back and CHG-10 keeps refusing to credit
   // filler as a source.
   if (pool.size > 0) {
-    let ranked: ScoredChunk[] = [];
-    for (const [rowid, c] of pool) {
-      if (exclude.has(rowid)) {
-        continue;
-      }
-      const rrf =
-        (c.kwRank !== null ? 1 / (RRF_K + c.kwRank) : 0) +
-        (c.vecRank !== null ? 1 / (RRF_K + c.vecRank) : 0);
-      ranked.push({ rowid, fileName: c.fileName, text: c.text, score: rrf });
-    }
-    ranked.sort((a, b) => b.score - a.score);
-    if (limit !== null) {
-      ranked = ranked.slice(0, limit);
-    }
     // Every RRF-pooled chunk scores > 0; empty only when exclusion removed
     // all of them — the caller distinguishes that from a true no-match.
-    return [ranked, false];
+    return [rankedContext(pool, exclude, limit), false];
   }
 
   // Generic questions ("summarize this") match nothing; fall back to the most
   // recently added content so the model still sees the room.
-  const recent = recentChunks(db, limit ?? MAX_CONTEXT_CHUNKS).map(
-    ([fileName, text]): ScoredChunk => ({ rowid: -1, fileName, text, score: 0 })
-  );
-  return [recent, true];
-}
-
-// ------------------------------------------------------------------- snippet
-
-/** Greek final sigma: `String.prototype.toLowerCase` picks ς at a word end
- * (as Rust's `str::to_lowercase` does) while lowering one character at a time
- * always gives σ. Folding both sides to σ keeps the per-char-lowered haystack
- * interchangeable with the needle's own whole-string lowering. */
-function fold(ch: string): string {
-  return ch === "ς" ? "σ" : ch;
-}
-
-function foldString(s: string): string {
-  return Array.from(s).map(fold).join("");
-}
-
-/** Rust's `str::split_whitespace()` semantics — `\p{White_Space}`, not `\s`;
- * see `messages.ts`'s own copy of this reasoning. */
-function splitWhitespace(s: string): string[] {
-  return s.split(/\p{White_Space}+/u).filter((t) => t !== "");
-}
-
-/** The last index `i` with `starts[i] <= at` — the TypeScript stand-in for
- * Rust's `starts.partition_point(|&s| s <= at).saturating_sub(1)`. `starts`
- * is strictly increasing (every char lowers to at least one unit), so a
- * binary search is exact. */
-function lastIndexAtOrBefore(starts: readonly number[], at: number): number {
-  let lo = 0;
-  let hi = starts.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >>> 1;
-    if ((starts[mid] as number) <= at) {
-      lo = mid + 1;
-    } else {
-      hi = mid;
-    }
-  }
-  return Math.max(0, lo - 1);
-}
-
-/**
- * ADD-6: extract a short snippet of `haystack` around the first occurrence of
- * `needle` (case-insensitive), with ellipses when clipped. Whitespace is
- * collapsed so multi-line file text reads as one line.
- *
- * The whole phrase is tried first; failing that, the most SELECTIVE word in
- * it. Word ORDER used to decide, so "the deposit" previewed the region around
- * "the" — in a lease that opens "The tenant shall…", the reader saw the first
- * sentence with "the" marked and never saw the word that made the file match.
- * {@link questionTerms} is the same stopword filter the search itself ranks
- * with; longest term first is the cheap stand-in for selectivity. Raw word
- * order still backstops it, so a query that is ALL stopwords ("the it")
- * centres exactly where it used to.
- *
- * Lowercasing is length-preserving in neither bytes NOR characters — Turkish
- * 'İ' (U+0130) lowercases to TWO characters — so an offset into the lowered
- * text says nothing about the original. `starts[i]` records where character
- * `i` landed in the lowered string, and a hit maps back through that. Counting
- * the characters of `lower[..hit]` instead (what the Rust source used to do)
- * drifts one per 'İ' and, once the drift passes `radius`, produces
- * `start > end` — a panic on any room holding a page of Turkish headings.
- */
-export function makeSnippet(haystack: string, needle: string, radius: number): string {
-  const normalized = splitWhitespace(haystack).join(" ");
-  const chars = Array.from(normalized);
-  let lower = "";
-  const starts: number[] = [];
-  for (const c of chars) {
-    starts.push(lower.length);
-    lower += foldString(c.toLowerCase());
-  }
-  const find = (n: string): number | null => {
-    const folded = foldString(n.trim().toLowerCase());
-    if (folded === "") {
-      return null;
-    }
-    const idx = lower.indexOf(folded);
-    return idx === -1 ? null : idx;
-  };
-
-  // `Array.prototype.sort` is stable (ES2019+), matching Rust's stable
-  // `sort_by_key`, so equal-length terms keep question order.
-  const selective = [...questionTerms(needle)].sort(
-    (a, b) => Array.from(b).length - Array.from(a).length
-  );
-
-  let at = find(needle);
-  if (at === null) {
-    for (const t of selective) {
-      at = find(t);
-      if (at !== null) {
-        break;
-      }
-    }
-  }
-  if (at === null) {
-    for (const w of splitWhitespace(needle)) {
-      at = find(w);
-      if (at !== null) {
-        break;
-      }
-    }
-  }
-
-  if (at === null) {
-    // No match to centre on: a clipped preview from the start.
-    let out = chars.slice(0, radius * 2).join("");
-    if (chars.length > radius * 2) {
-      out += "…";
-    }
-    return out;
-  }
-
-  const charPos = lastIndexAtOrBefore(starts, at);
-  const start = Math.max(0, charPos - radius);
-  const end = Math.min(charPos + radius, chars.length);
-  let out = "";
-  if (start > 0) {
-    out += "…";
-  }
-  out += chars.slice(start, end).join("");
-  if (end < chars.length) {
-    out += "…";
-  }
-  return out;
-}
-
-// -------------------------------------------------------- history / memory
-
-/** Largest UTF-8 BYTE index <= `max` that does not split a multi-byte
- * character — the `Buffer` equivalent of Rust's `floor_boundary`
- * (`commands/agent.rs`, itself a stable-Rust stand-in for the nightly
- * `str::floor_char_boundary`). A continuation byte matches `10xxxxxx`; back
- * up until landing on a byte that starts a character. */
-function floorBoundary(buf: Buffer, max: number): number {
-  if (max >= buf.length) {
-    return buf.length;
-  }
-  let cut = max;
-  while (cut > 0 && ((buf[cut] as number) & 0xc0) === 0x80) {
-    cut -= 1;
-  }
-  return cut;
-}
-
-/**
- * CHG-8: compact chat history under a single BYTE budget (Rust's
- * `String::len()`, and the budget's own unit — `HISTORY_HANDOFF_MAX` is
- * documented in bytes). `history` is oldest-first. We walk newest-first,
- * keeping whole turns until the budget is spent (recency-weighted), and drop
- * older turns entirely instead of cutting each to a fixed head.
- *
- * A turn that alone exceeds the budget is cut at the last paragraph boundary
- * NEAR the limit — or at the limit itself when the nearest one is far behind
- * it — with an explicit omitted-marker, so the model never sees a silently
- * unterminated prior turn. "Near" matters: one blank line early in a long
- * turn ("Here's the summary:\n\n" above a list written with single newlines)
- * is the last "\n\n" before a cut 40 KB later, and cutting there kept 19
- * characters and threw the rest of the allowance away.
- */
-export function compactHistory(
-  history: ReadonlyArray<readonly [string, string]>,
-  budget: number
-): Array<[string, string]> {
-  const kept: Array<[string, string]> = [];
-  let remaining = budget;
-  for (let i = history.length - 1; i >= 0; i--) {
-    const [role, raw] = history[i] as readonly [string, string];
-    // Viewer-markup payloads are UI data, not conversation.
-    const content = stripMarkupBlocks(raw);
-    if (content === "") {
-      continue;
-    }
-    const buf = Buffer.from(content, "utf8");
-    if (buf.length <= remaining) {
-      remaining -= buf.length;
-      kept.push([role, content]);
-      continue;
-    }
-    // Doesn't fully fit. If there is room for a useful fragment of the newest
-    // such turn, cut it at a paragraph boundary; otherwise stop.
-    if (remaining < 400) {
-      break;
-    }
-    const cut = floorBoundary(buf, Math.max(0, remaining - 40));
-    const floor = cut - Math.floor(cut / 5);
-    // The last "\n\n" wholly inside buf[0..cut) — i.e. starting at or before
-    // `cut - 2`. Both bytes are ASCII, so a plain byte search is exact.
-    let end = cut;
-    if (cut >= 2) {
-      const at = buf.lastIndexOf("\n\n", cut - 2);
-      if (at !== -1 && at >= floor) {
-        end = at;
-      }
-    }
-    const piece = `${buf.subarray(0, end).toString("utf8")}\n… [rest of this message omitted]`;
-    kept.push([role, piece]);
-    break;
-  }
-  kept.reverse();
-  return kept;
-}
-
-/**
- * CHG-7: choose which persistent memories to inject under a CHARACTER budget,
- * preferring ones whose text overlaps the question's keywords, then recency.
- * `memories` is oldest-first (listMemories order); returns the selected
- * memory strings in the order they should be shown.
- */
-export function selectMemories(
-  memories: readonly string[],
-  question: string,
-  budget: number
-): string[] {
-  const terms = questionTerms(question);
-  // Score = overlapping keyword count; recency breaks ties (higher index —
-  // later in the oldest-first input — is newer, and wins).
-  const scored = memories.map((m, idx) => {
-    const lower = m.toLowerCase();
-    const hits = terms.filter((t) => lower.includes(t)).length;
-    return { hits, idx, m };
-  });
-  scored.sort((a, b) => b.hits - a.hits || b.idx - a.idx);
-  const out: string[] = [];
-  let used = 0;
-  for (const { m } of scored) {
-    // CHARACTERS (code points via `Array.from`), matching the budget's own
-    // name (`MAX_MEMORY_INJECT_CHARS`). This charged `m.len()` — BYTES — so a
-    // note in Hebrew, Arabic, Greek or Cyrillic cost twice what the same note
-    // costs in English, and a room written in one of them got half the memory
-    // injected. Nothing about the budget's purpose is script-dependent; the
-    // counting was.
-    const cost = Array.from(m).length + 3; // "- " + "\n"
-    if (used + cost > budget) {
-      // CONTINUE, NOT BREAK, and a test is red on the difference: the list is
-      // relevance-ordered, so skipping one note that will not fit to take a
-      // later one that does spends budget that would otherwise sit empty.
-      continue;
-    }
-    used += cost;
-    out.push(m);
-  }
-  return out;
+  return fallbackContext(db, limit);
 }

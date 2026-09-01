@@ -542,8 +542,35 @@ describe("assembleCmdCtx", () => {
     expect(ctx.generate).toBe(generateReal);
     expect(ctx.layoutGraph).toBe(layoutGraphReal);
     expect(ctx.transcribeAudio).toBeUndefined();
+    expect(ctx.refs).toEqual([]);
+    expect(ctx.args).toBe("");
+    expect(ctx.history).toBe("");
+    expect(ctx.temperature).toBeNull();
     expect(ctx.rooms.current()?.path).toBe(state.room!.path);
     expect(ctx.rooms.current()?.db).toBe(state.room!.conn);
+  });
+
+  it("keeps supplied command values intact while the direct context is wired", () => {
+    const { state } = freshOpenRoom();
+    const turn = new TurnId(randomUUID(), randomUUID());
+    const refs = ["file-a", "file-b"];
+    const ctx = assembleCmdCtx(state, () => {}, {
+      model: "qwen3.5:4b",
+      turn,
+      refs,
+      args: "summarize the notes",
+      history: "Earlier message",
+      temperature: 0,
+    });
+
+    expect(ctx).toMatchObject({
+      model: "qwen3.5:4b",
+      refs,
+      args: "summarize the notes",
+      history: "Earlier message",
+      temperature: 0,
+      turn,
+    });
   });
 
   it("cancel prefers the already-registered flag for the turn's run id", () => {

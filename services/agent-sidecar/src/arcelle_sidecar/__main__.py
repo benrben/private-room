@@ -38,6 +38,20 @@ LOG_LEVELS = ("critical", "error", "warning", "info", "debug")
 LOG_LEVEL_ENV = "ARCELLE_SIDECAR_LOG_LEVEL"
 
 
+def _child_process_ids(parent_pid: int) -> list[int]:
+    """Return one parent's direct children, treating lookup failure as empty."""
+    try:
+        listed = subprocess.run(
+            ["/usr/bin/pgrep", "-P", str(parent_pid)],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [int(pid) for pid in listed.split() if pid.isdigit()]
+
+
 def _kill_descendants() -> None:
     """SIGKILL everything we spawned, deepest first.
 
@@ -54,16 +68,7 @@ def _kill_descendants() -> None:
     frontier = [os.getpid()]
     descendants: list[int] = []
     while frontier:
-        try:
-            listed = subprocess.run(
-                ["/usr/bin/pgrep", "-P", str(frontier.pop())],
-                capture_output=True,
-                text=True,
-                timeout=2.0,
-            ).stdout
-        except (OSError, subprocess.SubprocessError):
-            continue
-        children = [int(pid) for pid in listed.split() if pid.isdigit()]
+        children = _child_process_ids(frontier.pop())
         descendants.extend(children)
         frontier.extend(children)
     for pid in reversed(descendants):  # leaves before the shells that own them

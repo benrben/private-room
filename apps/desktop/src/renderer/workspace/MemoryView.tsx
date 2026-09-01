@@ -61,72 +61,60 @@ const EXAMPLE_MEMORIES: { text: string; category: string }[] = [
   { text: "The Q3 supplier review runs from September to mid-October.", category: "project" },
 ];
 
-/** The Memory & Scratch Pad area: durable, user-visible AI context with
- * add/edit/delete/categories (moved intact from the old sidebar panel),
- * kept clearly apart from the ordinary scratch-pad file. */
-export default function MemoryView({
-  s,
-  a,
-  info,
-}: {
+type MemoryViewProps = {
   s: WSState;
   a: WSActions;
   info: RoomInfo;
-}) {
-  // A long-lived room accumulates memories faster than a single ungrouped
-  // list can be read: filter, order, and take a copy out.
-  const [filter, setFilter] = useState("");
-  const [newestFirst, setNewestFirst] = useState(false);
-  const q = filter.trim().toLowerCase();
-  const matches = (m: Memory) =>
-    !q ||
-    m.content.toLowerCase().includes(q) ||
-    (m.category ?? "").toLowerCase().includes(q);
-  // The stored order is oldest-first; the toggle only ever reverses it, so
-  // "what the room returned" stays the resting state.
-  const shown: Memory[] = s.memories
-    .filter(matches)
-    .sort((x, y) =>
-      newestFirst
-        ? y.createdAt.localeCompare(x.createdAt)
-        : x.createdAt.localeCompare(y.createdAt),
+};
+
+function matchingMemories(
+  memories: Memory[],
+  filter: string,
+  newestFirst: boolean,
+): Memory[] {
+  const query = filter.trim().toLowerCase();
+  const matches = (memory: Memory) =>
+    !query ||
+    memory.content.toLowerCase().includes(query) ||
+    (memory.category ?? "").toLowerCase().includes(query);
+  return memories.filter(matches).sort((left, right) =>
+    newestFirst
+      ? right.createdAt.localeCompare(left.createdAt)
+      : left.createdAt.localeCompare(right.createdAt),
+  );
+}
+
+function memoryExportBody(memories: Memory[], roomName: string): string {
+  const lines = MEMORY_GROUPS.filter((group) =>
+    memories.some((memory) => groupKey(memory) === group.key),
+  ).flatMap((group) => [
+    `## ${group.label}`,
+    "",
+    ...memories
+      .filter((memory) => groupKey(memory) === group.key)
+      .map((memory) => `- ${memory.content}  _(added ${formatWhen(memory.createdAt)})_`),
+    "",
+  ]);
+  return [`# Memory — ${roomName}`, "", ...lines].join("\n");
+}
+
+async function saveMemoriesAsNote(s: WSState, info: RoomInfo) {
+  try {
+    const meta = await api.saveGeneratedFile(
+      uniqueFileName(
+        `Memory — ${info.name}.md`,
+        s.files.map((file) => file.name),
+      ),
+      memoryExportBody(s.memories, info.name),
     );
-
-  /** Write every memory into an ordinary room note — the readable copy the
-   * list itself can't be (and the thing an "Export a copy…" can then take out
-   * of the room, since exporting works on files). */
-  async function saveAsNote() {
-    const lines = MEMORY_GROUPS.filter((g) =>
-      s.memories.some((m) => groupKey(m) === g.key),
-    ).flatMap((g) => [
-      `## ${g.label}`,
-      "",
-      ...s.memories
-        .filter((m) => groupKey(m) === g.key)
-        .map((m) => `- ${m.content}  _(added ${formatWhen(m.createdAt)})_`),
-      "",
-    ]);
-    const body = [`# Memory — ${info.name}`, "", ...lines].join("\n");
-    try {
-      // Save the list twice and both notes are called the same thing — Rust
-      // never dedups, so the room would carry two rows nothing can tell apart.
-      const meta = await api.saveGeneratedFile(
-        uniqueFileName(
-          `Memory — ${info.name}.md`,
-          s.files.map((f) => f.name),
-        ),
-        body,
-      );
-      s.setFiles(await api.listFiles());
-      s.pushToast("success", `Saved "${meta.name}" into the room.`);
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
+    s.setFiles(await api.listFiles());
+    s.pushToast("success", `Saved "${meta.name}" into the room.`);
+  } catch (error) {
+    s.pushToast("error", String(error));
   }
+}
 
-  // Opening the area is the "I've seen it" moment for the first-run intro.
-  // The marker is a ROOM setting: keyed by the room's file name it came back
-  // after a rename, and two rooms with the same file name shared it.
+function useMemoryIntroSeen(s: WSState) {
   useEffect(() => {
     if (!s.showMemoryIntro) return;
     s.setShowMemoryIntro(false);
@@ -135,336 +123,476 @@ export default function MemoryView({
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+}
 
-  // Where the memories on this page GO, from the same source as the top-bar
-  // badge and the status-bar chip, so the three can never describe one room
-  // differently. `select_memories` appends the matching ones to every question
-  // (commands/agent.rs), which on a cloud route means they leave the Mac — the
-  // page that asks for standing notes about you has to say that.
-  const memRoute = {
+function memoryRoute(s: WSState): string {
+  return {
     good: "Memories are read on this Mac.",
     warn: "Memories relevant to a question are sent to the cloud model with it — private details are replaced first.",
     danger: "Memories relevant to a question are sent to the cloud model with it, exactly as written.",
   }[trustState(isCloudRoute(s.model, s.ai), s.privacyOn).tone];
+}
 
+function memoryMicLabel(s: WSState): string {
+  return s.dictOwner === "memory" && s.dictState === "recording"
+    ? "Stop recording"
+    : "Speak a memory";
+}
+
+function appendDictation(text: string, setMemoryDraft: WSState["setMemoryDraft"]) {
+  setMemoryDraft((draft) =>
+    draft.trim() ? `${draft.trimEnd()} ${text}` : text,
+  );
+}
+
+function MemoryMasthead({ count, route }: { count: number; route: string }) {
+  return (
+    <header className="mem-masthead">
+      <div className="mem-masthead-main">
+        <h1 className="mem-title">Memory</h1>
+        <p className="mem-lead">
+          Everything the AI remembers about you — visible, editable, and used
+          only when relevant. {route}
+        </p>
+      </div>
+      {count > 0 && <div className="mem-stamp">{count} saved</div>}
+    </header>
+  );
+}
+
+function MemoryNote() {
+  return (
+    <details className="mem-note">
+      <summary>How suggested memories are handled</summary>
+      <div className="mem-note-body">
+        <p>
+          Suggestions from conversations wait for your approval unless you turn
+          on auto-save in Settings → AI &amp; behavior.
+        </p>
+      </div>
+    </details>
+  );
+}
+
+function MemoryAdd({ s, a }: Pick<MemoryViewProps, "s" | "a">) {
+  const mic = a.micState("memory");
+  const label = memoryMicLabel(s);
+  return (
+    <div className="mem-add">
+      <input
+        placeholder="Something the AI should always remember…"
+        value={s.memoryDraft}
+        dir="auto"
+        aria-label="New memory"
+        onChange={(event) => s.setMemoryDraft(event.target.value)}
+        onKeyDown={(event) => event.key === "Enter" && a.addMemory()}
+      />
+      <button
+        className={`subtle btn-ic mic-btn ${mic.cls}`}
+        title={label}
+        aria-label={label}
+        disabled={mic.disabled}
+        onClick={() =>
+          a.dictateTo("memory", (text) => appendDictation(text, s.setMemoryDraft))
+        }
+      >
+        <MicIcon size={12} />
+      </button>
+      <select
+        className="memory-cat-select"
+        title="Category for the new memory"
+        aria-label="Category for the new memory"
+        value={s.memoryDraftCat}
+        onChange={(event) => s.setMemoryDraftCat(event.target.value)}
+      >
+        <option value="">no category</option>
+        {CATEGORY_OPTIONS.map((category) => (
+          <option key={category} value={category}>
+            {category}
+          </option>
+        ))}
+      </select>
+      <button className="primary" onClick={a.addMemory}>
+        Add
+      </button>
+    </div>
+  );
+}
+
+function MemoryTools({
+  filter,
+  newestFirst,
+  setFilter,
+  setNewestFirst,
+  onSave,
+}: {
+  filter: string;
+  newestFirst: boolean;
+  setFilter: (filter: string) => void;
+  setNewestFirst: (next: boolean | ((previous: boolean) => boolean)) => void;
+  onSave: () => void;
+}) {
+  return (
+    <div className="mem-tools">
+      <label className="search-field">
+        <SearchIcon size={14} />
+        <input
+          type="search"
+          placeholder="Filter memories"
+          aria-label="Filter memories"
+          value={filter}
+          onChange={(event) => setFilter(event.target.value)}
+        />
+        {filter && (
+          <button
+            className="side-search-clear"
+            title="Clear the filter"
+            aria-label="Clear the filter"
+            onClick={() => setFilter("")}
+          >
+            <CloseIcon size={12} />
+          </button>
+        )}
+      </label>
+      <button
+        className="subtle"
+        title="Reverse the order these were added in"
+        onClick={() => setNewestFirst((order) => !order)}
+      >
+        {newestFirst ? "Newest first" : "Oldest first"}
+      </button>
+      <button
+        className="subtle"
+        title="Write every memory into a Markdown note in this room"
+        onClick={onSave}
+      >
+        Save as a note
+      </button>
+    </div>
+  );
+}
+
+function EmptyMemoryExamples() {
+  return (
+    <figure className="mem-example">
+      <figcaption className="mem-example-cap">
+        <span className="nb-tape nb-sem-pending">Example</span>
+        <span>Not saved — this is what a good memory looks like.</span>
+      </figcaption>
+      <ul className="mem-example-list">
+        {EXAMPLE_MEMORIES.map((example) => (
+          <li
+            key={example.text}
+            className={`mem-card mem-example-card nb-card${catClass(example.category)}`}
+          >
+            <span className="mem-card-pin nb-ico nb-ico-pin" aria-hidden="true" />
+            <span className="mem-card-body">{example.text}</span>
+            <span className="mem-card-foot">
+              <span className="mem-cat">{example.category}</span>
+            </span>
+          </li>
+        ))}
+      </ul>
+    </figure>
+  );
+}
+
+function MemoryEmptyState({
+  total,
+  shown,
+  filter,
+}: {
+  total: number;
+  shown: number;
+  filter: string;
+}) {
+  if (total === 0) {
+    return (
+      <div className="mem-empty">
+        <p className="mem-empty-copy">
+          <MemoryIcon size={20} />
+          <span>
+            Nothing saved yet. Add a durable fact above, or accept a "Worth
+            remembering?" suggestion in Chat.
+          </span>
+        </p>
+        <EmptyMemoryExamples />
+      </div>
+    );
+  }
+  if (shown !== 0) return null;
+  return (
+    <div className="mem-empty">
+      <p className="mem-empty-copy">
+        <MemoryIcon size={20} />
+        <span>
+          No memory matches “{filter.trim()}”. {total} saved in total.
+        </span>
+      </p>
+    </div>
+  );
+}
+
+function MemoryGroups({
+  shown,
+  s,
+  a,
+}: {
+  shown: Memory[];
+  s: WSState;
+  a: WSActions;
+}) {
+  const groups = MEMORY_GROUPS.filter((group) =>
+    shown.some((memory) => groupKey(memory) === group.key),
+  );
+  return groups.map((group) => (
+    <MemoryGroup
+      key={group.key ?? "other"}
+      group={group}
+      rows={shown.filter((memory) => groupKey(memory) === group.key)}
+      hideHeading={groups.length === 1 && group.key === null}
+      s={s}
+      a={a}
+    />
+  ));
+}
+
+function MemoryGroup({
+  group,
+  rows,
+  hideHeading,
+  s,
+  a,
+}: {
+  group: (typeof MEMORY_GROUPS)[number];
+  rows: Memory[];
+  hideHeading: boolean;
+  s: WSState;
+  a: WSActions;
+}) {
+  return (
+    <section className="mem-group">
+      {!hideHeading && (
+        <div className="mem-group-head">
+          <h2>{group.label}</h2>
+          <span className="nb-circled">{rows.length}</span>
+        </div>
+      )}
+      <ul className="mem-list nb-frame-set">
+        <MemoryRows rows={rows} s={s} a={a} />
+      </ul>
+    </section>
+  );
+}
+
+function MemoryRows({
+  rows,
+  s,
+  a,
+}: {
+  rows: Memory[];
+  s: WSState;
+  a: WSActions;
+}) {
+  const editing = s.editingMemory;
+  return rows.map((memory) =>
+    editing?.id === memory.id ? (
+      <EditingMemoryRow
+        key={memory.id}
+        memory={memory}
+        editing={editing}
+        s={s}
+        a={a}
+      />
+    ) : (
+      <SavedMemoryRow key={memory.id} memory={memory} s={s} a={a} />
+    ),
+  );
+}
+
+function EditingMemoryRow({
+  memory,
+  editing,
+  s,
+  a,
+}: {
+  memory: Memory;
+  editing: NonNullable<WSState["editingMemory"]>;
+  s: WSState;
+  a: WSActions;
+}) {
+  return (
+    <li className="mem-card nb-card is-editing">
+      <input
+        className="mem-edit-input"
+        autoFocus
+        dir="auto"
+        aria-label="Edit this memory"
+        value={editing.content}
+        onChange={(event) =>
+          s.setEditingMemory({
+            id: memory.id,
+            content: event.target.value,
+            category: editing.category ?? null,
+          })
+        }
+        onKeyDown={(event) => {
+          if (event.key === "Enter") a.saveMemoryEdit();
+          if (event.key === "Escape") s.setEditingMemory(null);
+        }}
+      />
+      <select
+        className="memory-cat-select"
+        title="Category"
+        aria-label="Category"
+        value={editing.category ?? ""}
+        onChange={(event) =>
+          s.setEditingMemory({
+            id: memory.id,
+            content: editing.content ?? memory.content,
+            category: event.target.value || null,
+          })
+        }
+      >
+        <option value="">no category</option>
+        {CATEGORY_OPTIONS.map((category) => (
+          <option key={category} value={category}>
+            {category}
+          </option>
+        ))}
+      </select>
+      <span className="mem-actions">
+        <button className="chip-btn" title="Save" aria-label="Save" onClick={a.saveMemoryEdit}>
+          <CheckIcon size={14} />
+        </button>
+        <button
+          className="chip-btn"
+          title="Cancel"
+          aria-label="Cancel"
+          onClick={() => s.setEditingMemory(null)}
+        >
+          <CloseIcon size={14} />
+        </button>
+      </span>
+    </li>
+  );
+}
+
+async function forgetMemory(memory: Memory, s: WSState) {
+  try {
+    await api.deleteMemory(memory.id);
+  } catch (error) {
+    s.pushToast("error", `Could not forget that memory: ${String(error)}`);
+  }
+  try {
+    s.setMemories(await api.listMemories());
+  } catch (error) {
+    s.pushToast("error", String(error));
+  }
+}
+
+function SavedMemoryRow({
+  memory,
+  s,
+  a,
+}: {
+  memory: Memory;
+  s: WSState;
+  a: WSActions;
+}) {
+  return (
+    <li className={`mem-card nb-card${catClass(memory.category)}`}>
+      <span className="mem-card-pin nb-ico nb-ico-pin" aria-hidden="true" />
+      <span className="mem-card-body" dir="auto">
+        {memory.content}
+      </span>
+      <span className="mem-card-foot">
+        {memory.category && <span className="mem-cat">{memory.category}</span>}
+        <span className="mem-when">Added {formatWhen(memory.createdAt)}</span>
+      </span>
+      <span className="mem-actions">
+        <button
+          className="chip-btn"
+          title="Edit this memory"
+          aria-label="Edit this memory"
+          onClick={() =>
+            s.setEditingMemory({
+              id: memory.id,
+              content: memory.content,
+              category: memory.category ?? null,
+            })
+          }
+        >
+          <PencilIcon size={14} />
+        </button>
+        <DeleteControl
+          k={`mem:${memory.id}`}
+          trigger="×"
+          onConfirm={() => forgetMemory(memory, s)}
+          title="Forget this"
+          confirmDelete={s.confirmDelete}
+          askConfirm={a.askConfirm}
+          cancelConfirm={a.cancelConfirm}
+        />
+      </span>
+    </li>
+  );
+}
+
+function MemoryScratchPad({ a }: Pick<MemoryViewProps, "a">) {
+  return (
+    <>
+      <hr className="nb-rule-dash mem-fold" />
+      <section className="mem-scratch">
+        <div className="mem-scratch-head">
+          <h2>Scratch pad</h2>
+          <span className="mem-scratch-note">temporary — not memory</span>
+        </div>
+        <div className="mem-sheet">
+          <p className="mem-sheet-copy">
+            A shared working file — you and the AI both write{" "}
+            <strong>Scratch pad.md</strong>. It is ordinary room content and
+            never becomes memory automatically.
+          </p>
+          <button className="subtle btn-ic" onClick={() => void a.openScratchPad()}>
+            <PencilIcon size={14} /> Open the scratch pad
+          </button>
+        </div>
+      </section>
+    </>
+  );
+}
+
+/** The Memory & Scratch Pad area: durable, user-visible AI context with
+ * add/edit/delete/categories (moved intact from the old sidebar panel),
+ * kept clearly apart from the ordinary scratch-pad file. */
+export default function MemoryView({ s, a, info }: MemoryViewProps) {
+  const [filter, setFilter] = useState("");
+  const [newestFirst, setNewestFirst] = useState(false);
+  const shown = matchingMemories(s.memories, filter, newestFirst);
+  useMemoryIntroSeen(s);
   return (
     <div className="mem-view">
       <div className="mem-inner">
-        <header className="mem-masthead">
-          <div className="mem-masthead-main">
-            <h1 className="mem-title">Memory</h1>
-            {/* A privacy statement, so it stays in the sans and at reading
-                size. Only the second half — how suggestions are approved —
-                moves into the note below, because that is a setting's
-                behaviour rather than the promise this page opens with. */}
-            <p className="mem-lead">
-              Everything the AI remembers about you — visible, editable, and used
-              only when relevant. {memRoute}
-            </p>
-          </div>
-          {s.memories.length > 0 && (
-            <div className="mem-stamp">
-              {s.memories.length} saved
-            </div>
-          )}
-        </header>
-
-        <details className="mem-note">
-          <summary>How suggested memories are handled</summary>
-          <div className="mem-note-body">
-            <p>
-              Suggestions from conversations wait for your approval unless you
-              turn on auto-save in Settings → AI &amp; behavior.
-            </p>
-          </div>
-        </details>
-
-        <div className="mem-add">
-          <input
-            placeholder="Something the AI should always remember…"
-            value={s.memoryDraft}
-            dir="auto"
-            aria-label="New memory"
-            onChange={(e) => s.setMemoryDraft(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && a.addMemory()}
-          />
-          <button
-            className={`subtle btn-ic mic-btn ${a.micState("memory").cls}`}
-            title={
-              s.dictOwner === "memory" && s.dictState === "recording"
-                ? "Stop recording"
-                : "Speak a memory"
-            }
-            aria-label={
-              s.dictOwner === "memory" && s.dictState === "recording"
-                ? "Stop recording"
-                : "Speak a memory"
-            }
-            disabled={a.micState("memory").disabled}
-            onClick={() =>
-              a.dictateTo("memory", (text) =>
-                s.setMemoryDraft((d) => (d.trim() ? `${d.trimEnd()} ${text}` : text)),
-              )
-            }
-          >
-            <MicIcon size={12} />
-          </button>
-          <select
-            className="memory-cat-select"
-            title="Category for the new memory"
-            aria-label="Category for the new memory"
-            value={s.memoryDraftCat}
-            onChange={(e) => s.setMemoryDraftCat(e.target.value)}
-          >
-            <option value="">no category</option>
-            {CATEGORY_OPTIONS.map((c) => (
-              <option key={c} value={c}>
-                {c}
-              </option>
-            ))}
-          </select>
-          <button className="primary" onClick={a.addMemory}>
-            Add
-          </button>
-        </div>
-
+        <MemoryMasthead count={s.memories.length} route={memoryRoute(s)} />
+        <MemoryNote />
+        <MemoryAdd s={s} a={a} />
         {s.memories.length > 0 && (
-          <div className="mem-tools">
-            <label className="search-field">
-              <SearchIcon size={14} />
-              <input
-                type="search"
-                placeholder="Filter memories"
-                aria-label="Filter memories"
-                value={filter}
-                onChange={(e) => setFilter(e.target.value)}
-              />
-              {filter && (
-                <button
-                  className="side-search-clear"
-                  title="Clear the filter"
-                  aria-label="Clear the filter"
-                  onClick={() => setFilter("")}
-                >
-                  <CloseIcon size={12} />
-                </button>
-              )}
-            </label>
-            <button
-              className="subtle"
-              title="Reverse the order these were added in"
-              onClick={() => setNewestFirst((o) => !o)}
-            >
-              {newestFirst ? "Newest first" : "Oldest first"}
-            </button>
-            <button
-              className="subtle"
-              title="Write every memory into a Markdown note in this room"
-              onClick={() => void saveAsNote()}
-            >
-              Save as a note
-            </button>
-          </div>
+          <MemoryTools
+            filter={filter}
+            newestFirst={newestFirst}
+            setFilter={setFilter}
+            setNewestFirst={setNewestFirst}
+            onSave={() => void saveMemoriesAsNote(s, info)}
+          />
         )}
-
-        {s.memories.length === 0 && (
-          <div className="mem-empty">
-            <p className="mem-empty-copy">
-              <MemoryIcon size={20} />
-              <span>
-                Nothing saved yet. Add a durable fact above, or accept a
-                "Worth remembering?" suggestion in Chat.
-              </span>
-            </p>
-            <figure className="mem-example">
-              <figcaption className="mem-example-cap">
-                <span className="nb-tape nb-sem-pending">Example</span>
-                <span>Not saved — this is what a good memory looks like.</span>
-              </figcaption>
-              <ul className="mem-example-list">
-                {EXAMPLE_MEMORIES.map((ex) => (
-                  <li key={ex.text} className={`mem-card mem-example-card nb-card${catClass(ex.category)}`}>
-                    <span className="mem-card-pin nb-ico nb-ico-pin" aria-hidden="true" />
-                    <span className="mem-card-body">{ex.text}</span>
-                    <span className="mem-card-foot">
-                      <span className="mem-cat">{ex.category}</span>
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </figure>
-          </div>
-        )}
-        {s.memories.length > 0 && shown.length === 0 && (
-          <div className="mem-empty">
-            <p className="mem-empty-copy">
-              <MemoryIcon size={20} />
-              <span>
-                No memory matches “{filter.trim()}”. {s.memories.length} saved in
-                total.
-              </span>
-            </p>
-          </div>
-        )}
-
-        {MEMORY_GROUPS.filter((g) =>
-          shown.some((m) => groupKey(m) === g.key),
-        ).map((g, _, groups) => {
-          const rows = shown.filter((m) => groupKey(m) === g.key);
-          return (
-            <section key={g.key ?? "other"} className="mem-group">
-              {!(groups.length === 1 && g.key === null) && (
-                <div className="mem-group-head">
-                  <h2>{g.label}</h2>
-                  {/* A count is exactly what the handwriting is for, and the
-                      ring keeps it from reading as part of the label. */}
-                  <span className="nb-circled">{rows.length}</span>
-                </div>
-              )}
-              <ul className="mem-list nb-frame-set">
-                {rows.map((m) =>
-                  s.editingMemory?.id === m.id ? (
-                    <li key={m.id} className="mem-card nb-card is-editing">
-                      <input
-                        className="mem-edit-input"
-                        autoFocus
-                        dir="auto"
-                        aria-label="Edit this memory"
-                        value={s.editingMemory.content}
-                        onChange={(e) =>
-                          s.setEditingMemory({
-                            id: m.id,
-                            content: e.target.value,
-                            category: s.editingMemory?.category ?? null,
-                          })
-                        }
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") a.saveMemoryEdit();
-                          if (e.key === "Escape") s.setEditingMemory(null);
-                        }}
-                      />
-                      <select
-                        className="memory-cat-select"
-                        title="Category"
-                        aria-label="Category"
-                        value={s.editingMemory.category ?? ""}
-                        onChange={(e) =>
-                          s.setEditingMemory({
-                            id: m.id,
-                            content: s.editingMemory?.content ?? m.content,
-                            category: e.target.value || null,
-                          })
-                        }
-                      >
-                        <option value="">no category</option>
-                        {CATEGORY_OPTIONS.map((c) => (
-                          <option key={c} value={c}>
-                            {c}
-                          </option>
-                        ))}
-                      </select>
-                      <span className="mem-actions">
-                        <button className="chip-btn" title="Save" aria-label="Save" onClick={a.saveMemoryEdit}>
-                          <CheckIcon size={14} />
-                        </button>
-                        <button
-                          className="chip-btn"
-                          title="Cancel"
-                          aria-label="Cancel"
-                          onClick={() => s.setEditingMemory(null)}
-                        >
-                          <CloseIcon size={14} />
-                        </button>
-                      </span>
-                    </li>
-                  ) : (
-                    <li key={m.id} className={`mem-card nb-card${catClass(m.category)}`}>
-                      {/* Decoration: a pseudo-glyph, aria-hidden, and
-                          pointer-events:none via .nb-ico, so the pin is a mark
-                          on the page and never something to tab to. */}
-                      <span className="mem-card-pin nb-ico nb-ico-pin" aria-hidden="true" />
-                      <span className="mem-card-body" dir="auto">
-                        {m.content}
-                      </span>
-                      <span className="mem-card-foot">
-                        {m.category && <span className="mem-cat">{m.category}</span>}
-                        <span className="mem-when">Added {formatWhen(m.createdAt)}</span>
-                      </span>
-                      <span className="mem-actions">
-                        <button
-                          className="chip-btn"
-                          title="Edit this memory"
-                          aria-label="Edit this memory"
-                          onClick={() =>
-                            s.setEditingMemory({
-                              id: m.id,
-                              content: m.content,
-                              category: m.category ?? null,
-                            })
-                          }
-                        >
-                          <PencilIcon size={14} />
-                        </button>
-                        <DeleteControl
-                          k={`mem:${m.id}`}
-                          trigger="×"
-                          onConfirm={async () => {
-                            // The host REFUSES a delete it cannot make ("That
-                            // memory is not in this room") instead of no-oping,
-                            // precisely so a stale list is told. Dropping that
-                            // rejection left the row sitting there with nothing
-                            // said — the same words a file gets, then re-read
-                            // the list so the row that did go really goes.
-                            try {
-                              await api.deleteMemory(m.id);
-                            } catch (e) {
-                              s.pushToast(
-                                "error",
-                                `Could not forget that memory: ${String(e)}`,
-                              );
-                            }
-                            try {
-                              s.setMemories(await api.listMemories());
-                            } catch (e) {
-                              s.pushToast("error", String(e));
-                            }
-                          }}
-                          title="Forget this"
-                          confirmDelete={s.confirmDelete}
-                          askConfirm={a.askConfirm}
-                          cancelConfirm={a.cancelConfirm}
-                        />
-                      </span>
-                    </li>
-                  ),
-                )}
-              </ul>
-            </section>
-          );
-        })}
-
-        {/* A dashed pencil rule is the system's mark for a provisional
-            boundary, and it is doing real work here: above it is durable
-            memory the assistant may quote back at you, below it is a working
-            file that never becomes one. */}
-        <hr className="nb-rule-dash mem-fold" />
-
-        <section className="mem-scratch">
-          <div className="mem-scratch-head">
-            <h2>Scratch pad</h2>
-            <span className="mem-scratch-note">temporary — not memory</span>
-          </div>
-          <div className="mem-sheet">
-            <p className="mem-sheet-copy">
-              A shared working file — you and the AI both write{" "}
-              <strong>Scratch pad.md</strong>. It is ordinary room content and
-              never becomes memory automatically.
-            </p>
-            <button className="subtle btn-ic" onClick={() => void a.openScratchPad()}>
-              <PencilIcon size={14} /> Open the scratch pad
-            </button>
-          </div>
-        </section>
+        <MemoryEmptyState
+          total={s.memories.length}
+          shown={shown.length}
+          filter={filter}
+        />
+        <MemoryGroups shown={shown} s={s} a={a} />
+        <MemoryScratchPad a={a} />
       </div>
     </div>
   );

@@ -24,147 +24,167 @@ interface Props {
   DownloadIcon: IconComponent;
 }
 
-export default function HelpersSection({
-  ai,
-  visionInstalled,
-  groundingModel,
-  visionBlock,
-  recommended,
-  pullSpecial,
-  pullingSpecial,
-  pulling,
-  stopPull,
-  stoppingPull,
-  embedInstalled,
-  pullPercent,
-  pullStatus,
-  DownloadIcon,
-}: Props) {
+type DownloadProps = Pick<Props, "ai" | "recommended" | "pullSpecial" | "pulling" | "pullingSpecial" | "DownloadIcon">;
+
+export default function HelpersSection(props: Props) {
   return (
-    // HELPERS — vision (image marking) + embeddings (semantic search).
     <section id="set-helpers">
       <h3>AI helpers</h3>
-            <p className="settings-hint">
-              Two small local models that unlock extra features. Each downloads
-              once and runs entirely on this Mac.
-            </p>
-            {/* The Ollama gate sits on the DOWNLOAD offers, not on the whole
-                section. Whether this room can already see is answered without
-                Ollama (`groundingModelForRoom` is asked unconditionally), so a
-                room on a cloud vision engine with Ollama stopped must still be
-                told the name of the model that looks at its images rather than
-                being sent to start a daemon it does not need. */}
-            <label className="settings-label">Vision helper</label>
-                {/* "Installed" now means SOMETHING can mark an image for this
-                    room — which includes the room's own model. It used to mean
-                    "a local model whose name we recognise is present", so a room
-                    on a cloud vision model was told its vision helper was
-                    missing and offered a download it had no use for. Naming the
-                    model that will do the looking makes that checkable. */}
-                {visionInstalled ? (
-                  /* `is-ok`, not bare `active`: this row reports a FACT (a
-                     helper is present and working), and `active` alone is the
-                     pink selection wash. Same distinction the Model section
-                     draws — green means installed, pink means chosen. */
-                  <div className="model-row active is-ok">
-                    <span className="btn-ic">
-                      <CircleCheckIcon size={14} /> Ready — the AI can see and mark images
-                      {groundingModel ? <> (<code>{groundingModel}</code>)</> : null}.
-                    </span>
-                  </div>
-                ) : visionBlock ? (
-                  /* Something here CAN see — a download would fix nothing. The
-                     engine's declared record said what is actually in the way,
-                     so show that sentence instead of the Download button.
-                     Marked, because it is the reason a feature is off. */
-                  <p className="set-note set-note--flag nb-sem-pending">
-                    {visionBlock}
-                  </p>
-                ) : (
-                  <>
-                    <p className="settings-hint">
-                      Nothing can read or mark images for this room yet. Any
-                      model with the “vision” badge in the Model section does
-                      this — including a cloud one — or download a local helper
-                      {recommended ? ` (${recommended.vision})` : ""}.
-                    </p>
-                    {ai?.running ? (
-                      <button
-                        className="btn-ic"
-                        disabled={!!pullingSpecial || pulling}
-                        onClick={() =>
-                          recommended && pullSpecial(recommended.vision)
-                        }
-                      >
-                        <DownloadIcon size={14} /> Download a local vision helper
-                      </button>
-                    ) : (
-                      <p className="settings-hint">
-                        Ollama is not running — start it to download a local
-                        helper.
-                      </p>
-                    )}
-                  </>
-                )}
-
-                <label className="settings-label" style={{ marginTop: 12 }}>
-                  Semantic search
-                </label>
-                {embedInstalled ? (
-                  <div className="model-row active is-ok">
-                    <span className="btn-ic"><CircleCheckIcon size={14} /> On — search understands meaning, not just words.</span>
-                  </div>
-                ) : (
-                  <>
-                    <p className="settings-hint">
-                      Adds meaning-based search across your files
-                      {recommended ? ` (${recommended.embed})` : ""}. Turning it
-                      on indexes what's already here.
-                    </p>
-                    {/* This one really is a local pull — there is no cloud
-                        route to it, so the gate belongs here. */}
-                    {ai?.running ? (
-                      <button
-                        className="btn-ic"
-                        disabled={!!pullingSpecial || pulling}
-                        onClick={() => pullSpecial(recommended?.embed ?? "", true)}
-                      >
-                        <DownloadIcon size={14} /> Turn on semantic search
-                      </button>
-                    ) : (
-                      <p className="settings-hint">
-                        Ollama is not running — start it to turn this on.
-                      </p>
-                    )}
-                  </>
-                )}
-
-                {pullingSpecial && (
-                  <div className="pull-progress">
-                    {pullPercent != null && (
-                      <div className="pull-bar">
-                        <div
-                          className="pull-bar-fill"
-                          style={{ width: `${pullPercent}%` }}
-                        />
-                      </div>
-                    )}
-                    <span>
-                      {pullStatus}
-                      {pullPercent != null && ` — ${pullPercent.toFixed(0)}%`}
-                    </span>
-                    {/* Helpers are the multi-gigabyte ones (a vision model is
-                        ~3 GB), so this is the surface that most needed a way
-                        out. */}
-                    <button
-                      className="subtle"
-                      onClick={stopPull}
-                      disabled={stoppingPull}
-                    >
-                      {stoppingPull ? "Stopping…" : "Stop"}
-                    </button>
-                  </div>
-                )}
+      <p className="settings-hint">
+        Two small local models that unlock extra features. Each downloads once and runs entirely on this Mac.
+      </p>
+      <VisionHelper {...props} />
+      <SemanticSearchHelper {...props} />
+      <HelperPullProgress {...props} />
     </section>
+  );
+}
+
+function VisionHelper(props: Pick<Props, "groundingModel" | "visionBlock" | "visionInstalled"> & DownloadProps) {
+  return (
+    <>
+      <label className="settings-label">Vision helper</label>
+      <VisionHelperState {...props} />
+    </>
+  );
+}
+
+function VisionHelperState({
+  groundingModel,
+  visionBlock,
+  visionInstalled,
+  ...downloadProps
+}: Pick<Props, "groundingModel" | "visionBlock" | "visionInstalled"> & DownloadProps) {
+  if (visionInstalled) return <VisionReady groundingModel={groundingModel} />;
+  if (visionBlock) return <VisionBlocked message={visionBlock} />;
+  return <VisionDownloadOffer {...downloadProps} />;
+}
+
+function VisionReady({ groundingModel }: Pick<Props, "groundingModel">) {
+  return (
+    <div className="model-row active is-ok">
+      <span className="btn-ic">
+        <CircleCheckIcon size={14} /> Ready — the AI can see and mark images
+        {groundingModel ? <> (<code>{groundingModel}</code>)</> : null}.
+      </span>
+    </div>
+  );
+}
+
+function VisionBlocked({ message }: { message: string }) {
+  return <p className="set-note set-note--flag nb-sem-pending">{message}</p>;
+}
+
+function VisionDownloadOffer(props: DownloadProps) {
+  const { recommended } = props;
+  return (
+    <>
+      <p className="settings-hint">
+        Nothing can read or mark images for this room yet. Any model with the “vision” badge in the Model section does this — including a cloud one — or download a local helper
+        {recommended ? ` (${recommended.vision})` : ""}.
+      </p>
+      <VisionDownloadButton {...props} />
+    </>
+  );
+}
+
+function VisionDownloadButton({ ai, recommended, pullSpecial, pulling, pullingSpecial, DownloadIcon }: DownloadProps) {
+  if (!ai?.running) return <p className="settings-hint">Ollama is not running — start it to download a local helper.</p>;
+  return (
+    <button
+      className="btn-ic"
+      disabled={downloadIsBusy(pullingSpecial, pulling)}
+      onClick={() => requestVisionDownload(recommended, pullSpecial)}
+    >
+      <DownloadIcon size={14} /> Download a local vision helper
+    </button>
+  );
+}
+
+function requestVisionDownload(recommended: RecommendedModels | null, pullSpecial: Props["pullSpecial"]) {
+  if (recommended) pullSpecial(recommended.vision);
+}
+
+function SemanticSearchHelper(props: Pick<Props, "embedInstalled"> & DownloadProps) {
+  return (
+    <>
+      <label className="settings-label" style={{ marginTop: 12 }}>Semantic search</label>
+      <SemanticSearchState {...props} />
+    </>
+  );
+}
+
+function SemanticSearchState({ embedInstalled, ...downloadProps }: Pick<Props, "embedInstalled"> & DownloadProps) {
+  if (embedInstalled) return <SemanticSearchReady />;
+  return <SemanticSearchDownloadOffer {...downloadProps} />;
+}
+
+function SemanticSearchReady() {
+  return (
+    <div className="model-row active is-ok">
+      <span className="btn-ic"><CircleCheckIcon size={14} /> On — search understands meaning, not just words.</span>
+    </div>
+  );
+}
+
+function SemanticSearchDownloadOffer(props: DownloadProps) {
+  const { recommended } = props;
+  return (
+    <>
+      <p className="settings-hint">
+        Adds meaning-based search across your files
+        {recommended ? ` (${recommended.embed})` : ""}. Turning it on indexes what's already here.
+      </p>
+      <SemanticSearchDownloadButton {...props} />
+    </>
+  );
+}
+
+function SemanticSearchDownloadButton({ ai, recommended, pullSpecial, pulling, pullingSpecial, DownloadIcon }: DownloadProps) {
+  if (!ai?.running) return <p className="settings-hint">Ollama is not running — start it to turn this on.</p>;
+  return (
+    <button
+      className="btn-ic"
+      disabled={downloadIsBusy(pullingSpecial, pulling)}
+      onClick={() => pullSpecial(recommended?.embed ?? "", true)}
+    >
+      <DownloadIcon size={14} /> Turn on semantic search
+    </button>
+  );
+}
+
+function downloadIsBusy(pullingSpecial: string | null, pulling: boolean) {
+  return !!pullingSpecial || pulling;
+}
+
+function HelperPullProgress({ pullPercent, pullStatus, pullingSpecial, stopPull, stoppingPull }: Pick<Props, "pullPercent" | "pullStatus" | "pullingSpecial" | "stopPull" | "stoppingPull">) {
+  if (!pullingSpecial) return null;
+  return (
+    <div className="pull-progress">
+      <HelperPullBar percent={pullPercent} />
+      <HelperPullStatus percent={pullPercent} status={pullStatus} />
+      <HelperPullStop stopPull={stopPull} stoppingPull={stoppingPull} />
+    </div>
+  );
+}
+
+function HelperPullBar({ percent }: { percent: number | null }) {
+  if (percent == null) return null;
+  return (
+    <div className="pull-bar">
+      <div className="pull-bar-fill" style={{ width: `${percent}%` }} />
+    </div>
+  );
+}
+
+function HelperPullStatus({ percent, status }: { percent: number | null; status: string }) {
+  return <span>{status}{percent != null && ` — ${percent.toFixed(0)}%`}</span>;
+}
+
+function HelperPullStop({ stopPull, stoppingPull }: Pick<Props, "stopPull" | "stoppingPull">) {
+  return (
+    <button className="subtle" onClick={stopPull} disabled={stoppingPull}>
+      {stoppingPull ? "Stopping…" : "Stop"}
+    </button>
   );
 }

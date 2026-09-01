@@ -28,7 +28,7 @@ from arcelle_sidecar.server import create_app
 #: last test in this file is what stops the two from drifting.
 _HOST = (
     Path(__file__).resolve().parents[3]
-    / "apps" / "desktop" / "src" / "main" / "moonshotAiActions.ts"
+    / "apps" / "desktop" / "src" / "main" / "moonshotAiPrompts.ts"
 )
 
 
@@ -45,6 +45,8 @@ class FakeAsyncClient:
     def _run(self, name: str, **kwargs: Any) -> Any:
         type(self).calls[name] = kwargs
         val = type(self).script.get(name)
+        if isinstance(val, list):
+            val = val.pop(0)
         if isinstance(val, Exception):
             raise val
         return val
@@ -117,6 +119,12 @@ def test_catalog_matches_the_electron_host_menu_table() -> None:
         assert text["defaultPrompt"] == spec.default_prompt
         assert (flags["needsQuestion"] == "true") is spec.needs_question
         assert (flags["needsLanguage"] == "true") is spec.needs_language
+
+
+def test_instruction_uses_the_default_for_absent_or_blank_overrides() -> None:
+    assert ai_actions._instruction(None, "Use the default") == "Use the default"
+    assert ai_actions._instruction("  \t", "Use the default") == "Use the default"
+    assert ai_actions._instruction("  Use this instead  ", "Use the default") == "Use this instead"
 
 
 # --- /ai_action -------------------------------------------------------------
@@ -194,6 +202,28 @@ async def test_ai_action_research_folds_in_the_question(fake_client: type[FakeAs
         )
     user = fake_client.calls["chat"]["messages"][1]["content"]
     assert "\n\nQuestion: What is the budget?\n\n" in user
+
+
+async def test_ai_action_ignores_a_question_for_an_action_that_does_not_need_one(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    fake_client.script["chat"] = _reply('{"markdown": "summary"}')
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/ai_action",
+            json={
+                "model": "m",
+                "action": "summarize",
+                "text": "t",
+                "question": "This is not a follow-up question",
+                "base_url": "http://h:1",
+            },
+        )
+    assert resp.json() == {"markdown": "summary"}
+    user = fake_client.calls["chat"]["messages"][1]["content"]
+    assert "Question:" not in user
+    assert "Target language:" not in user
 
 
 async def test_ai_action_translate_uses_target_language(fake_client: type[FakeAsyncClient]) -> None:
@@ -319,6 +349,22 @@ async def test_ai_action_room_scope_empty_result_does_not_blame_a_file(
     }
 
 
+async def test_ai_action_retries_an_empty_envelope_as_plain_markdown(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    fake_client.script["chat"] = [
+        _reply('{"markdown": ""}'),
+        _reply("<think>retry reasoning</think>\n# Retry result"),
+    ]
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/ai_action",
+            json={"model": "m", "action": "summarize", "text": "t", "base_url": "http://h:1"},
+        )
+    assert resp.json() == {"markdown": "# Retry result"}
+
+
 async def test_ai_action_recovers_fenced_and_thinking_json(fake_client: type[FakeAsyncClient]) -> None:
     # A :cloud model ignores `format` and fence-wraps with a <think> preamble.
     fake_client.script["chat"] = _reply('<think>reasoning</think>\n```json\n{"markdown": "clean"}\n```')
@@ -429,6 +475,21 @@ async def test_suggest_file_meta_caps_tags_at_five(fake_client: type[FakeAsyncCl
             json={"model": "m", "current_name": "x.md", "text": "y" * 200, "base_url": "http://h:1"},
         )
     assert resp.json()["tags"] == ["a", "b", "c", "d", "e"]
+
+
+async def test_suggest_file_meta_ignores_a_non_array_tags_value(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    fake_client.script["chat"] = _reply(
+        '{"title": "Q3 Budget", "folder": "Finance", "tags": "budget, finance"}'
+    )
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post(
+            "/suggest_file_meta",
+            json={"model": "m", "current_name": "doc.pdf", "text": "x" * 200, "base_url": "http://h:1"},
+        )
+    assert resp.json() == {"title": "Q3 Budget", "folder": "Finance", "tags": []}
 
 
 async def test_suggest_file_meta_short_text_echoes_without_a_model_call(fake_client: type[FakeAsyncClient]) -> None:
@@ -544,6 +605,29 @@ async def test_generate_ui_text_model_missing_degrades_to_null(fake_client: type
         resp = await c.post("/generate_ui_text", json=_ui_text_body(model="x"))
     assert resp.status_code == 200
     assert resp.json() == {"text": None}
+
+
+async def test_generate_ui_text_unexpected_failure_degrades_to_null(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    fake_client.script["chat"] = RuntimeError("unexpected provider failure")
+    app = create_app()
+    async with client_for(app) as c:
+        resp = await c.post("/generate_ui_text", json=_ui_text_body())
+    assert resp.status_code == 200
+    assert resp.json() == {"text": None}
+
+
+async def test_generate_ui_text_direct_generate_failure_degrades_to_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def broken_generate(*_args: Any, **_kwargs: Any) -> str:
+        raise RuntimeError("unexpected generate failure")
+
+    monkeypatch.setattr(ai_actions.llm, "generate", broken_generate)
+    assert await ai_actions.generate_ui_text(
+        "dek", _UI_PROMPT, _FACTS, 20, "m", "http://h:1"
+    ) is None
 
 
 async def test_generate_ui_text_empty_reply_degrades_to_null(fake_client: type[FakeAsyncClient]) -> None:

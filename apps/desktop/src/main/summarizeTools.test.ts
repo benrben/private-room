@@ -404,6 +404,19 @@ describe("writeRoomSummary", () => {
     expect(emitted).toEqual([["room-files-changed", undefined]]);
   });
 
+  it("keeps a completed summary when the renderer notification throws", async () => {
+    const { db, path, name } = freshRoomDb("Notification failure");
+    const rooms = new OneRoom({ db, path, name });
+    insertFile(db, "a.txt", "text/plain", Buffer.from("x"), "x", "upload");
+
+    await expect(writeRoomSummary(rooms, "m", path, {
+      combineSummary: async () => ["Still complete.", []],
+      emit: () => {
+        throw new Error("fabricated renderer listener failure");
+      },
+    })).resolves.toMatchObject({ name: SUMMARY_FILE_NAME });
+  });
+
   it("an empty purpose falls back to the default sentence, and no questions omits the section", async () => {
     const { db, path, name } = freshRoomDb();
     const rooms = new OneRoom({ db, path, name });
@@ -451,6 +464,39 @@ describe("writeRoomSummary", () => {
     expect(row.trashed_at).not.toBeNull();
     expect(row.trashed_by).toBe("app");
     expect(row.trashed_by_id).toBe("summarize_room");
+  });
+
+  it("trashes the legacy Markdown summary through the workspace service", async () => {
+    const parent = mkdtempSync(path.join(os.tmpdir(), "summary-legacy-workspace-"));
+    tmpDirs.push(parent);
+    const root = path.join(parent, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Workspace");
+    openDbs.push(db);
+    const workspace = new WorkspaceService(db, root);
+    await workspace.createFile("notes.md", Readable.from(["facts"]), "upload");
+    const legacy = await workspace.createFile("Room summary.md", Readable.from(["old"]), "generated");
+    const rooms = new OneRoom({ db, path: root, name: "Workspace", workspace });
+
+    await writeRoomSummary(rooms, "m", root, { combineSummary: async () => ["P", []] });
+
+    const row = db.prepare("SELECT trashed_at FROM files WHERE id = ?").get(legacy.fileId) as { trashed_at: string | null };
+    expect(row.trashed_at).not.toBeNull();
+  });
+
+  it("keeps the new HTML summary when another action already trashed the legacy file", async () => {
+    const { db, path, name } = freshRoomDb();
+    const rooms = new OneRoom({ db, path, name });
+    insertFile(db, "a.txt", "text/plain", Buffer.from("x"), "x", "upload");
+    const legacy = insertFile(db, "Room summary.md", "text/markdown", Buffer.from("old"), "old", "generated");
+
+    const meta = await writeRoomSummary(rooms, "m", path, {
+      combineSummary: async () => {
+        trashFile(db, legacy.id, { kind: "user" });
+        return ["P", []];
+      },
+    });
+
+    expect(meta.name).toBe(SUMMARY_FILE_NAME);
   });
 
   it("caps the reduce context and the per-file summary work at MAX_SUMMARY_FILES, listing the rest by name only", async () => {

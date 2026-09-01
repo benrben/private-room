@@ -423,10 +423,11 @@ describe("parseOpenrouterModels (edge cases)", () => {
       data: [
         { id: "a", name: "zebra" },
         { id: "b", name: "Apple" },
+        { id: "d", name: "APPLE" },
         { id: "c", name: "mango" },
       ],
     });
-    expect(models.map((m) => m.label)).toEqual(["Apple", "mango", "zebra"]);
+    expect(models.map((m) => m.label)).toEqual(["Apple", "APPLE", "mango", "zebra"]);
   });
 
   it("reads context_length only when it really is an unsigned integer, like Rust's as_u64", () => {
@@ -448,6 +449,17 @@ describe("parseOpenrouterModels (edge cases)", () => {
 // ===========================================================================
 
 describe("probeOpenrouterModelSelection", () => {
+  it("returns local guidance before reading a key or making a provider request", async () => {
+    await expect(probeOpenrouterModelSelection("   ", forbiddenDeps())).resolves.toEqual({
+      ok: false,
+      detail: "Choose a specific OpenRouter model first.",
+    });
+    await expect(probeOpenrouterModelSelection("vendor/model", forbiddenDeps())).resolves.toEqual({
+      ok: false,
+      detail: "No OpenRouter API key is saved on this Mac.",
+    });
+  });
+
   it("posts the exact provider ID with a one-token budget", async () => {
     type RequestInit = Parameters<ProviderDeps["fetchJson"]>[1];
     let seenUrl = "";
@@ -478,6 +490,36 @@ describe("probeOpenrouterModelSelection", () => {
     }))).resolves.toEqual({
       ok: false,
       detail: "OpenRouter HTTP 400: invalid model name",
+    });
+  });
+
+  it("preserves a 401 even when its response body cannot be read", async () => {
+    const unreadable = {
+      ok: false,
+      status: 401,
+      json: async (): Promise<unknown> => {
+        throw new Error("broken response body");
+      },
+    } satisfies HttpJsonResponseLike;
+    await expect(probeOpenrouterModelSelection("vendor/rejected", forbiddenDeps({
+      readKey: () => "test-key",
+      fetchJson: async () => unreadable,
+    }))).resolves.toEqual({
+      ok: false,
+      detail: "OpenRouter HTTP 401: the provider rejected this model",
+    });
+    expect(keyRejected(OPENROUTER_ID)).toBe(true);
+  });
+
+  it("returns a model-specific error when the mocked request itself fails", async () => {
+    await expect(probeOpenrouterModelSelection("vendor/offline", forbiddenDeps({
+      readKey: () => "test-key",
+      fetchJson: async () => {
+        throw new Error("offline");
+      },
+    }))).resolves.toEqual({
+      ok: false,
+      detail: "Could not validate OpenRouter model “vendor/offline”: offline",
     });
   });
 });

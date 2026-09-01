@@ -525,6 +525,21 @@ async def test_shape_text_runs_translate_and_shape_as_two_ordered_passes() -> No
     assert result.notes == []
 
 
+async def test_shape_text_translate_only_keeps_the_translated_text() -> None:
+    """Translate-only mode does not add a cleanup pass or discard its output."""
+    calls: list[str] = []
+
+    async def generate(model, messages, *, temperature=None, keep_alive=None):
+        calls.append(messages[0]["content"])
+        return "In English now."
+
+    result = await shape_text("bonjour", True, "off", _hooks(generate))
+
+    assert result.text == "In English now."
+    assert result.notes == []
+    assert calls == [f"{DICT_TRANSLATE}\n\n{DICT_TAIL}\n\nINPUT TEXT:\nbonjour"]
+
+
 async def test_shape_text_raw_mode_is_cleanup_only() -> None:
     result = await shape_text("um so", False, "raw", _echo_hooks())
     assert result.text == "[shaped]um so"

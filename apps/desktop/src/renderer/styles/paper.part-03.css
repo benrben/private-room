@@ -1,0 +1,142 @@
+
+/* ----- bookmark flag -----
+   The saved marker on a list row or card. Pink is "saved" across the whole
+   product, and the glyph carries the meaning so the colour never has to. */
+.nb-bookmark {
+  display: inline-block;
+  flex: none;
+  width: var(--nb-ico-size, 14px);
+  height: var(--nb-ico-size, 14px);
+  color: var(--mk-ink, var(--sem-saved));
+  --nb-glyph: var(--nb-glyph-bookmark);
+}
+
+/* ----- category label -----
+   The small marker-washed label over a group of cards. Sans, not the hand:
+   it is a structural label, and the hand is reserved for asides.
+
+   The word is written in --ink, not in the marker's own ink. A hue's ink on
+   a wash of the same hue is the one combination in this palette that fails:
+   dark-mode green ink on a 28% green wash measures 4.43:1, just under the
+   floor. Ink on the wash is 10:1 in every hue, and the meaning was never
+   coming from the letter colour anyway — it comes from the word plus the
+   marker behind it. */
+.nb-cat {
+  display: inline-block;
+  padding: 1px 7px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+  background-image: linear-gradient(
+    99deg,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 30%, transparent) 0%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 22%, transparent) 58%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 28%, transparent) 100%
+  );
+  border-radius: 4px 6px 3px 5px / 5px 3px 6px 4px;
+}
+
+/* ==========================================================================
+   8. TOOLTIP
+   Structured and clean, per the spec — no hand-drawn wobble on the thing
+   that has to be read fast. It floats, so it is opaque (section 9's rule).
+   ========================================================================== */
+
+.nb-tip {
+  background: var(--raised);
+  color: var(--text);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+  padding: 6px 9px;
+  font-size: var(--fs-micro);
+  box-shadow: 0 6px 18px var(--shadow-lift);
+}
+
+/* ==========================================================================
+   9. FLOATING SURFACES
+   The ONLY opaque things in the system. A popover, menu, modal or toast has
+   to occlude what is under it; everything else stays a frame on the sheet.
+   ========================================================================== */
+
+.nb-float {
+  background: var(--raised);
+  color: var(--text);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  box-shadow:
+    0 12px 30px var(--shadow),
+    0 2px 6px var(--shadow-lift);
+}
+
+/* ----- paper lift -----
+   Cards rise 2-4px, as though lifted off the sheet. */
+.nb-lift {
+  transition:
+    transform var(--dur-fast) var(--ease-pen),
+    box-shadow var(--dur-fast) var(--ease-pen);
+}
+.nb-lift:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 18px var(--shadow-lift);
+}
+
+/* ==========================================================================
+   10. MOTION
+   160-260ms, --ease-pen, and each animation is a pen doing one thing once.
+   No bounce, no glow, no loop, no parallax. Motion here marks a state change;
+   nothing in this library animates for decoration.
+   ========================================================================== */
+
+/* The underline swipes in from where the pen touched down. Kept as a keyframe
+   only: shell.css, viewer.css and markdowneditor.css animate their own ::after
+   with it, and each carries its own reduced-motion escape. */
+@keyframes nb-draw {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+/* A floating surface arriving: a short rise and fade, no scale, no bounce. */
+@keyframes nb-float-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+}
+.nb-float-draw {
+  animation: nb-float-in var(--dur-fast) var(--ease-pen);
+}
+
+/* ----- reduced motion -----
+   Every drawn-in mark becomes an instant state, and every hover treatment
+   still happens — it just stops travelling. Nothing above animates INTO its
+   resting state from a value the element does not otherwise have, so
+   switching the animations off lands on the finished frame rather than on a
+   half-drawn one. */
+@media (prefers-reduced-motion: reduce) {
+  .nb-float-draw {
+    animation: none;
+  }
+  .nb-lift,
+  .nb-card,
+  .nb-btn,
+  .nb-btn-go::after,
+  .nb-chip-btn,
+  .nb-field {
+    transition: none;
+  }
+  .nb-lift:hover {
+    transform: none;
+  }
+  .nb-btn:active:not(:disabled),
+  .nb-chip-btn:active {
+    transform: none;
+  }
+  .nb-btn-go:hover:not(:disabled)::after {
+    transform: none;
+  }
+}

@@ -10,6 +10,7 @@
  * actual Electron process with this file as its real preload script.
  */
 
+import Module from "node:module";
 import { describe, expect, it, vi } from "vitest";
 import {
   createArcelleApi,
@@ -222,6 +223,49 @@ describe("installArcelleBridge", () => {
     ]);
     expect(Object.keys(api.shell).sort()).toEqual(["openPath", "openUrl", "revealItemInDir"]);
   });
+
+  it("the guarded preload entrypoint exposes native file paths through webUtils", async () => {
+    const exposed = new Map<string, unknown>();
+    const getPathForFile = vi.fn((file: unknown) => `/native/${String(file)}`);
+    const fakeElectron = {
+      contextBridge: { exposeInMainWorld: (key: string, api: unknown) => exposed.set(key, api) },
+      ipcRenderer: fakeIpcRenderer(),
+      webUtils: { getPathForFile },
+    };
+    const moduleLoader = Module as unknown as {
+      _load(request: string, parent: unknown, isMain: boolean): unknown;
+    };
+    const originalLoad = moduleLoader._load;
+    const originalElectronVersion = process.versions.electron;
+    moduleLoader._load = (request, parent, isMain) =>
+      request === "electron" ? fakeElectron : originalLoad(request, parent, isMain);
+    Object.defineProperty(process.versions, "electron", {
+      configurable: true,
+      value: "test-electron",
+    });
+
+    try {
+      vi.resetModules();
+      await import("./index.js");
+      const api = exposed.get("arcelle") as { files: { paths(files: readonly unknown[]): string[] } };
+      expect(api.files.paths(["one.txt", "two.txt"])).toEqual([
+        "/native/one.txt",
+        "/native/two.txt",
+      ]);
+      expect(getPathForFile).toHaveBeenCalledTimes(2);
+    } finally {
+      moduleLoader._load = originalLoad;
+      if (originalElectronVersion === undefined) {
+        delete (process.versions as { electron?: string }).electron;
+      } else {
+        Object.defineProperty(process.versions, "electron", {
+          configurable: true,
+          value: originalElectronVersion,
+        });
+      }
+      vi.resetModules();
+    }
+  });
 });
 
 // ============================================================================
@@ -279,6 +323,24 @@ describe("arcelle.dialog", () => {
     const no = createArcelleApi(messageAnswering("No"));
     expect(await yes.dialog.ask("Sure?")).toBe(true);
     expect(await no.dialog.ask("Sure?")).toBe(false);
+  });
+
+  it("ask keeps Yes as the affirmative label when only its cancel label is customized", async () => {
+    const ipcRenderer = messageAnswering("Yes");
+    const api = createArcelleApi(ipcRenderer);
+    expect(await api.dialog.ask("Continue?", { cancelLabel: "Not now" })).toBe(true);
+    expect(ipcRenderer.calls.invoke[0]?.[1]).toMatchObject({
+      buttons: { ok: "Yes", cancel: "Not now" },
+    });
+  });
+
+  it("ask supplies the default No label when only its affirmative label is customized", async () => {
+    const ipcRenderer = messageAnswering("Proceed");
+    const api = createArcelleApi(ipcRenderer);
+    expect(await api.dialog.ask("Continue?", { okLabel: "Proceed" })).toBe(true);
+    expect(ipcRenderer.calls.invoke[0]?.[1]).toMatchObject({
+      buttons: { ok: "Proceed", cancel: "No" },
+    });
   });
 
   it("confirm defaults to OkCancel and is true only for Ok", async () => {

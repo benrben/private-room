@@ -71,6 +71,65 @@ export function chipClass(status: AgentNodeStatus | undefined): string {
   return "done";
 }
 
+function activeStepNumbers(active: AskActiveAgent | null): Set<number> {
+  if (!active) return new Set();
+  return new Set(active.active_steps?.length ? active.active_steps : [active.step]);
+}
+
+function fallbackStatus(
+  activeSteps: Set<number>,
+  active: AskActiveAgent | null,
+  step: number,
+): AgentNodeStatus {
+  if (activeSteps.has(step)) return "running";
+  if (active && step < active.step) return "done";
+  return "pending";
+}
+
+function nodeKey(entry: AskPlanStep, index: number, isMain: boolean): string {
+  if (entry.key) return entry.key;
+  return isMain ? MAIN_KEY : `${entry.agent}#${index}`;
+}
+
+function nodeBatch(entry: AskPlanStep, isMain: boolean): number | null {
+  return entry.batch ?? (isMain ? null : 0);
+}
+
+function nodeStatus(
+  entry: AskPlanStep,
+  activeSteps: Set<number>,
+  active: AskActiveAgent | null,
+  step: number,
+  live: boolean,
+): AgentNodeStatus {
+  const status = entry.status ?? fallbackStatus(activeSteps, active, step);
+  return live ? status : settled(status, entry.agent === HUB_AGENT_ID);
+}
+
+function toNode(
+  entry: AskPlanStep,
+  index: number,
+  planLength: number,
+  activeSteps: Set<number>,
+  active: AskActiveAgent | null,
+  live: boolean,
+): GraphNode {
+  const isMain = index === planLength - 1;
+  return {
+    key: nodeKey(entry, index, isMain),
+    agent: entry.agent,
+    label: entry.label,
+    instruction: entry.instruction,
+    // `isMain` is a POSITION (the root slot is last) and `settled` needs to
+    // know WHO is in it — on a tagged turn that root is a specialist, and
+    // "it composed the answer, so it finished" is not true of one.
+    status: nodeStatus(entry, activeSteps, active, index + 1, live),
+    // Without backend batching every child reads as one group, which is the
+    // honest degradation: "these were dispatched, grouping unknown".
+    batch: nodeBatch(entry, isMain),
+  };
+}
+
 /** Roster + active marker -> nodes.
  *
  * `status` normally comes straight off the entry, because every `ask-plan` is a
@@ -86,31 +145,8 @@ export function toNodes(
   active: AskActiveAgent | null,
   live = true,
 ): GraphNode[] {
-  const activeSteps = new Set(
-    active?.active_steps?.length ? active.active_steps : active ? [active.step] : [],
-  );
-  return plan.map((entry, i) => {
-    const isMain = i === plan.length - 1;
-    const fallback: AgentNodeStatus = activeSteps.has(i + 1)
-      ? "running"
-      : active && i + 1 < active.step
-        ? "done"
-        : "pending";
-    const status = entry.status ?? fallback;
-    return {
-      key: entry.key ?? (isMain ? MAIN_KEY : `${entry.agent}#${i}`),
-      agent: entry.agent,
-      label: entry.label,
-      instruction: entry.instruction,
-      // `isMain` is a POSITION (the root slot is last) and `settled` needs to
-      // know WHO is in it — on a tagged turn that root is a specialist, and
-      // "it composed the answer, so it finished" is not true of one.
-      status: live ? status : settled(status, entry.agent === HUB_AGENT_ID),
-      // Without backend batching every child reads as one group, which is the
-      // honest degradation: "these were dispatched, grouping unknown".
-      batch: entry.batch ?? (isMain ? null : 0),
-    };
-  });
+  const activeSteps = activeStepNumbers(active);
+  return plan.map((entry, index) => toNode(entry, index, plan.length, activeSteps, active, live));
 }
 
 /** Consecutive children sharing a batch, in roster (call) order. */

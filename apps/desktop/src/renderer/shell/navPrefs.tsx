@@ -96,6 +96,42 @@ export function defaultPrefs(): NavPrefs {
   return { pinned: DEFAULT_PINNED.slice(), order: CANONICAL.slice() };
 }
 
+function storedPreferenceValue(): string | null {
+  try {
+    return localStorage.getItem(KEY);
+  } catch {
+    return null;
+  }
+}
+
+function parseStoredPrefs(raw: string | null): unknown {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function isPrefsRecord(value: unknown): value is Partial<NavPrefs> {
+  return typeof value === "object" && value !== null;
+}
+
+function validStoredOrder(prefs: Partial<NavPrefs>): NavArea[] {
+  if (!Array.isArray(prefs.order)) return [];
+  return prefs.order.filter(isArea);
+}
+
+function orderWithNewAreas(order: NavArea[]): NavArea[] {
+  const seen = new Set(order);
+  return order.concat(CANONICAL.filter((key) => !seen.has(key)));
+}
+
+function storedPinned(prefs: Partial<NavPrefs>): NavArea[] {
+  if (!Array.isArray(prefs.pinned)) return DEFAULT_PINNED.slice();
+  return prefs.pinned.filter(isArea);
+}
+
 /** Read the stored preferences, reconciled against the areas this BUILD has.
  *
  * A sidebar preference outlives the build that wrote it, in both directions:
@@ -110,33 +146,13 @@ export function defaultPrefs(): NavPrefs {
  * tripping them would mean the reconciliation could never tell a
  * not-yet-known area from a long-dead one. */
 export function loadPrefs(): NavPrefs {
-  let raw: string | null = null;
-  try {
-    raw = localStorage.getItem(KEY);
-  } catch {
-    return defaultPrefs(); // private mode etc.
-  }
-  if (!raw) return defaultPrefs();
-
-  let parsed: Partial<NavPrefs>;
-  try {
-    parsed = JSON.parse(raw) as Partial<NavPrefs>;
-  } catch {
-    return defaultPrefs();
-  }
-  if (typeof parsed !== "object" || parsed === null) return defaultPrefs();
-
-  const storedOrder = Array.isArray(parsed.order) ? parsed.order.filter(isArea) : [];
-  const seen = new Set(storedOrder);
-  const order = storedOrder.concat(CANONICAL.filter((k) => !seen.has(k)));
+  const parsed = parseStoredPrefs(storedPreferenceValue());
+  if (!isPrefsRecord(parsed)) return defaultPrefs();
+  const order = orderWithNewAreas(validStoredOrder(parsed));
 
   // An absent `pinned` means "never customized" — take the defaults. An EMPTY
   // one is a real choice (every tool under More tools) and is honoured.
-  const pinned = Array.isArray(parsed.pinned)
-    ? parsed.pinned.filter(isArea)
-    : DEFAULT_PINNED.slice();
-
-  return { pinned, order };
+  return { pinned: storedPinned(parsed), order };
 }
 
 function writePrefs(next: NavPrefs): void {

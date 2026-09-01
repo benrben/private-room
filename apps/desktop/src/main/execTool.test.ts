@@ -360,6 +360,17 @@ describe("add_memory (real, against a live room)", () => {
     }
   });
 
+  it("normalizes every remaining supported memory category", async () => {
+    const db = freshRoom();
+    for (const [content, category] of [["P", " Preference "], ["R", "PROJECT"], ["I", "instruction"]]) {
+      await execTool("add_memory", { content, category }, effects(), deps({ db }));
+    }
+    const listing = await execTool("list_memories", {}, effects(), deps({ db }));
+    expect(listing.ok && listing.text).toContain("[preference] P");
+    expect(listing.ok && listing.text).toContain("[project] R");
+    expect(listing.ok && listing.text).toContain("[instruction] I");
+  });
+
   it("emits memories-changed on success", async () => {
     const db = freshRoom();
     const emitted: Array<[string, unknown]> = [];
@@ -410,6 +421,14 @@ describe("list_memories (real)", () => {
     if (outcome.ok) {
       expect(outcome.text).toBe("- first\n- [project] second");
     }
+  });
+
+  it("caps the rendered list and reports how many additional memories exist", async () => {
+    const db = freshRoom();
+    for (let i = 0; i < 55; i++) addMemory(db, `memory ${i}`, null);
+    const outcome = await execTool("list_memories", {}, effects(), deps({ db }));
+    expect(outcome.ok && outcome.text).toContain("…and 5 more memories");
+    expect(outcome.ok && outcome.text).not.toContain("memory 54");
   });
 });
 
@@ -462,6 +481,15 @@ describe("update_memory / delete_memory (real)", () => {
     await execTool("update_memory", { find: "preference note", content: "an updated preference note" }, effects(), deps({ db }));
     const listing = await execTool("list_memories", {}, effects(), deps({ db }));
     expect(listing.ok && listing.text).toBe("- [preference] an updated preference note");
+  });
+
+  it("refuses an over-limit corrected memory without changing the stored note", async () => {
+    const db = freshRoom();
+    addMemory(db, "short original", null);
+    const outcome = await execTool("update_memory", { find: "short original", content: "x".repeat(501) }, effects(), deps({ db }));
+    expect(outcome.ok && outcome.text).toContain("Memory too long");
+    const listing = await execTool("list_memories", {}, effects(), deps({ db }));
+    expect(listing.ok && listing.text).toBe("- short original");
   });
 });
 
@@ -1154,6 +1182,18 @@ describe("write_skill_resource / delete_skill_resource", () => {
 // ================================================= REAL consult_advisor arm
 
 describe("consult_advisor", () => {
+  it("refuses an empty advisor question before spending the turn budget", async () => {
+    const e = effects();
+    const runAdvisorCli = vi.fn();
+    const outcome = await execTool("consult_advisor", { question: "   " }, e, deps({ runAdvisorCli }));
+    expect(outcome).toEqual({
+      ok: false,
+      error: "question is required — Complete, self-contained task with all context the advisor needs.. Nothing was done — call consult_advisor again with question set.",
+    });
+    expect(e.advisorCalls).toBe(0);
+    expect(runAdvisorCli).not.toHaveBeenCalled();
+  });
+
   it("refuses rather than fabricating an advisor's answer when no CLI seam is injected — and does NOT spend the budget", async () => {
     const e = effects();
     const outcome = await execTool("consult_advisor", { question: "what now?" }, e, deps());

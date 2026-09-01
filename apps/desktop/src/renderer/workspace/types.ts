@@ -114,6 +114,15 @@ export function isWorkArea(value: string): value is WorkArea {
   return (WORK_AREAS as readonly string[]).includes(value);
 }
 
+const UNIVERSAL_FILE_AREAS: readonly WorkArea[] = ["files", "home", "map"];
+
+function holdsClassifiedFile(area: WorkArea, file: FileMeta): boolean {
+  if (area === "recordings") return isRecordingFile(file);
+  if (area === "sketch") return isSketchFile(file);
+  if (area === "create") return isCreationFile(file);
+  return false;
+}
+
 /** Whether `area` actually CONTAINS the open file.
  *
  * An open file always wins the centre pane — that is deliberate, so a citation
@@ -140,13 +149,11 @@ export function areaHoldsFile(
   files: FileMeta[],
   scripts: ScriptInfo[],
 ): boolean {
-  if (area === "files" || area === "home" || area === "map") return true;
-  const meta = files.find((f) => f.id === fileId);
-  if (area === "recordings") return meta != null && isRecordingFile(meta);
+  if (UNIVERSAL_FILE_AREAS.includes(area)) return true;
   if (area === "scripts") return scripts.some((sc) => sc.fileId === fileId);
-  if (area === "sketch") return meta != null && isSketchFile(meta);
-  if (area === "create") return meta != null && isCreationFile(meta);
-  return false;
+  const file = files.find((candidate) => candidate.id === fileId);
+  if (!file) return false;
+  return holdsClassifiedFile(area, file);
 }
 
 /** A drawing. The extension is the format's own marker (`commands/sketch.rs`

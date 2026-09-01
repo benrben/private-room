@@ -14,6 +14,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createRoom } from "./db-host/open.js";
@@ -36,6 +37,7 @@ import {
   NO_LONGER_WAITING,
   REPLACE_ALL_PREVIEW_THRESHOLD,
   applyWithStaleness,
+  applyWorkspaceWithStaleness,
   approvalNeeded,
   buildPreview,
   decisionFromStr,
@@ -54,6 +56,8 @@ import {
 } from "./editGate.js";
 import type { EditDecision } from "./roomManager.js";
 import type { ToolEffects } from "./execTool.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 
 /** Every temp dir this file made, so a test that opens TWO rooms (the
  * room-switch adversarial case below) still cleans both up. */
@@ -70,6 +74,42 @@ function freshRoom(): Database.Database {
   tmpDirs.push(tmpDir);
   const roomPath = path.join(tmpDir, `pr-test-${randomUUID()}.roomai`);
   return createRoom(roomPath, "correct horse battery staple", "Test Room");
+}
+
+function freshWorkspace(): { db: Database.Database; workspace: WorkspaceService } {
+  const parent = mkdtempSync(path.join(os.tmpdir(), "edit-gate-workspace-"));
+  tmpDirs.push(parent);
+  const root = path.join(parent, "Room");
+  const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Test Room");
+  return { db, workspace: new WorkspaceService(db, root) };
+}
+
+function workspacePlan(
+  fileId: string,
+  realName: string,
+  before: Buffer,
+  newBytes: Buffer | null,
+  renameTo: string | null = null,
+  staleness: Buffer | null = hashBytes(before),
+): PlannedWrite {
+  return {
+    fileId,
+    realName,
+    newBytes,
+    renameTo,
+    method: "exact",
+    count: 1,
+    staleness,
+    before: before.toString("utf8"),
+    after: newBytes?.toString("utf8") ?? before.toString("utf8"),
+    clipped: false,
+  };
+}
+
+function workspaceVersionCount(db: Database.Database, fileId: string): number {
+  return (db.prepare("SELECT count(*) AS count FROM file_versions WHERE file_id = ?").get(fileId) as {
+    count: number;
+  }).count;
 }
 
 /** Matches the Rust test module's own `seed_text_file`. */
@@ -269,6 +309,129 @@ describe("applyWithStaleness (ported from edit_gate.rs's stale_apply_refuses_and
   });
 });
 
+describe("applyWorkspaceWithStaleness", () => {
+  it("preflights, versions, writes, and renames real workspace files before committing them", async () => {
+    const { db, workspace } = freshWorkspace();
+    const textBefore = Buffer.from("before binary");
+    const invalidBefore = Buffer.from([0xc3, 0x28]);
+    const renameBefore = Buffer.from("rename only");
+    const text = await workspace.createFile("folder/note.bin", Readable.from([textBefore]), "upload");
+    const invalid = await workspace.createFile("bad.bin", Readable.from([invalidBefore]), "upload");
+    const renameOnly = await workspace.createFile("move.txt", Readable.from([renameBefore]), "upload");
+    const textAfter = Buffer.from("after binary");
+    const invalidAfter = Buffer.from([0xc3, 0x28]);
+
+    await applyWorkspaceWithStaleness(db, workspace, [
+      workspacePlan(text.fileId, "note.bin", textBefore, textAfter, "archived.bin"),
+      workspacePlan(invalid.fileId, "bad.bin", invalidBefore, invalidAfter),
+      workspacePlan(renameOnly.fileId, "move.txt", renameBefore, null, "moved.txt", null),
+    ], "AI edit");
+
+    await expect(workspace.readBuffer(text.fileId)).resolves.toEqual(textAfter);
+    await expect(workspace.readBuffer(invalid.fileId)).resolves.toEqual(invalidAfter);
+    expect(db.prepare("SELECT name, relative_path FROM files WHERE id = ?").get(text.fileId)).toEqual({
+      name: "archived.bin",
+      relative_path: "folder/archived.bin",
+    });
+    expect(db.prepare("SELECT name FROM files WHERE id = ?").get(renameOnly.fileId)).toEqual({ name: "moved.txt" });
+    expect(workspaceVersionCount(db, text.fileId)).toBe(1);
+    expect(workspaceVersionCount(db, invalid.fileId)).toBe(1);
+    expect(workspaceVersionCount(db, renameOnly.fileId)).toBe(0);
+    expect(db.prepare("SELECT extracted_text FROM files WHERE id = ?").get(text.fileId)).toEqual({
+      extracted_text: "after binary",
+    });
+    expect(db.prepare("SELECT extracted_text FROM files WHERE id = ?").get(invalid.fileId)).toEqual({
+      extracted_text: "",
+    });
+  });
+
+  it("rejects stale workspace identity before snapshotting or changing any file", async () => {
+    const { db, workspace } = freshWorkspace();
+    const before = Buffer.from("before");
+    const entry = await workspace.createFile("note.md", Readable.from([before]), "upload");
+    db.prepare("UPDATE files SET name = 'renamed.md' WHERE id = ?").run(entry.fileId);
+
+    await expect(applyWorkspaceWithStaleness(
+      db,
+      workspace,
+      [workspacePlan(entry.fileId, "note.md", before, Buffer.from("after"))],
+      "AI edit",
+    )).rejects.toMatchObject({ outcome: "stale" });
+    expect(workspaceVersionCount(db, entry.fileId)).toBe(0);
+  });
+
+  it("rejects stale workspace bytes before snapshotting or changing any file", async () => {
+    const { db, workspace } = freshWorkspace();
+    const before = Buffer.from("before");
+    const touched = Buffer.from("touched elsewhere");
+    const entry = await workspace.createFile("note.md", Readable.from([before]), "upload");
+    await workspace.writeAtomic(entry.fileId, Readable.from([touched]), hashBytes(before).toString("hex"));
+
+    await expect(applyWorkspaceWithStaleness(
+      db,
+      workspace,
+      [workspacePlan(entry.fileId, "note.md", before, Buffer.from("after"))],
+      "AI edit",
+    )).rejects.toMatchObject({ outcome: "stale" });
+    await expect(workspace.readBuffer(entry.fileId)).resolves.toEqual(touched);
+    expect(workspaceVersionCount(db, entry.fileId)).toBe(0);
+  });
+
+  it("rolls back earlier workspace writes and moves when a later plan fails", async () => {
+    const { db, workspace } = freshWorkspace();
+    const firstBefore = Buffer.from("first before");
+    const renameBefore = Buffer.from("rename before");
+    const failingBefore = Buffer.from("failing before");
+    const first = await workspace.createFile("first.md", Readable.from([firstBefore]), "upload");
+    const renameOnly = await workspace.createFile("move.md", Readable.from([renameBefore]), "upload");
+    const failing = await workspace.createFile("failing.md", Readable.from([failingBefore]), "upload");
+    db.prepare("UPDATE files SET extracted_text = 'indexed before' WHERE id = ?").run(first.fileId);
+    const realWrite = workspace.writeAtomic.bind(workspace);
+    vi.spyOn(workspace, "writeAtomic").mockImplementation(async (fileId, content, expectedHash, agentRunId) => {
+      if (fileId === failing.fileId) throw new Error("later workspace write failed");
+      return realWrite(fileId, content, expectedHash, agentRunId);
+    });
+    vi.spyOn(workspace, "deleteVersion").mockRejectedValue(new Error("transient cleanup failed"));
+
+    await expect(applyWorkspaceWithStaleness(db, workspace, [
+      workspacePlan(first.fileId, "first.md", firstBefore, Buffer.from("first after"), "first-renamed.md"),
+      workspacePlan(renameOnly.fileId, "move.md", renameBefore, null, "moved.md", null),
+      workspacePlan(failing.fileId, "failing.md", failingBefore, Buffer.from("failing after")),
+    ], "AI edit")).rejects.toThrow("later workspace write failed");
+
+    await expect(workspace.readBuffer(first.fileId)).resolves.toEqual(firstBefore);
+    expect(db.prepare("SELECT name, extracted_text FROM files WHERE id = ?").get(first.fileId)).toEqual({
+      name: "first.md",
+      extracted_text: "indexed before",
+    });
+    expect(db.prepare("SELECT name FROM files WHERE id = ?").get(renameOnly.fileId)).toEqual({ name: "move.md" });
+    expect(workspaceVersionCount(db, first.fileId)).toBe(1);
+    expect(workspaceVersionCount(db, failing.fileId)).toBe(1);
+  });
+
+  it("reports incomplete rollback when a saved workspace version cannot be restored", async () => {
+    const { db, workspace } = freshWorkspace();
+    const firstBefore = Buffer.from("first before");
+    const failingBefore = Buffer.from("failing before");
+    const first = await workspace.createFile("first.md", Readable.from([firstBefore]), "upload");
+    const failing = await workspace.createFile("failing.md", Readable.from([failingBefore]), "upload");
+    const realWrite = workspace.writeAtomic.bind(workspace);
+    vi.spyOn(workspace, "writeAtomic").mockImplementation(async (fileId, content, expectedHash, agentRunId) => {
+      if (fileId === failing.fileId) throw new Error("later workspace write failed");
+      return realWrite(fileId, content, expectedHash, agentRunId);
+    });
+    vi.spyOn(workspace, "versionSnapshot").mockRejectedValue(new Error("snapshot vanished"));
+
+    await expect(applyWorkspaceWithStaleness(db, workspace, [
+      workspacePlan(first.fileId, "first.md", firstBefore, Buffer.from("first after")),
+      workspacePlan(failing.fileId, "failing.md", failingBefore, Buffer.from("failing after")),
+    ], "AI edit")).rejects.toMatchObject({
+      outcome: "error",
+      message: expect.stringContaining("could not safely restore"),
+    });
+  });
+});
+
 describe(
   "applyWithStaleness — rename-only plans (ported from edit_gate.rs's " +
     "an_approved_rename_refuses_once_the_file_is_no_longer_that_file)",
@@ -390,6 +553,19 @@ describe("gatedWrite — gate off (default), byte-identical to the pre-Wave-2 pa
     );
   });
 
+  it("returns a structured error when the immediate database commit fails", async () => {
+    const db = freshRoom();
+    const deps = depsFor(toggleableRoomSource(db));
+    const effects = fullEffects();
+    const impossible = workspacePlan("missing-file-id", "missing.md", Buffer.from("before"), Buffer.from("after"));
+
+    const outcome = await gatedWrite("write_file", "AI rewrite", deps, effects, () => [impossible]);
+
+    expect(outcome).toEqual({ kind: "error", error: expect.any(EditError) });
+    expect(effects.wrote).toBe(false);
+    expect(deps.emitted).toEqual([]);
+  });
+
   it("still forces a preview when a single call is a mass replace (A2), even with the gate off", () => {
     const db = freshRoom();
     const id = seedTextFile(db, "n.md", "old");
@@ -439,6 +615,26 @@ describe('gatedWrite — cadence "edit": every call prompts', () => {
     const outcome = await outcomePromise;
     expect(outcome.kind).toBe("applied");
     expect(getFileBytes(db, id)!.toString("utf8")).toBe("cost is 7.");
+  });
+
+  it("applies an approved write through the workspace storage adapter", async () => {
+    const { db, workspace } = freshWorkspace();
+    const before = Buffer.from("workspace before");
+    const entry = await workspace.createFile("note.md", Readable.from([before]), "upload");
+    setSetting(db, "edit_approval", "edit");
+    const deps = depsFor({ currentRoom: () => ({ db, path: workspace.root, workspace }) });
+    const effects = fullEffects();
+    const after = Buffer.from("workspace after");
+
+    const pending = gatedWrite("write_file", "AI rewrite", deps, effects, () => [
+      workspacePlan(entry.fileId, "note.md", before, after),
+    ]);
+    const [approvalId] = [...deps.editPending.keys()];
+    resolveEditApproval(deps.editPending, approvalId!, "once");
+
+    await expect(pending).resolves.toMatchObject({ kind: "applied" });
+    await expect(workspace.readBuffer(entry.fileId)).resolves.toEqual(after);
+    expect(effects.wrote).toBe(true);
   });
 
   it("refuses when the file changed while the card was open, and leaves it untouched", async () => {

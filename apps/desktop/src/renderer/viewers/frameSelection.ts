@@ -60,6 +60,31 @@ export function withSelectionReporter(html: string): string {
   return html + REPORTER;
 }
 
+function recordOf(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null) return null;
+  return value as Record<string, unknown>;
+}
+
+function reportedText(message: Record<string, unknown>): string | null {
+  if (message.mark !== MARK) return null;
+  if (typeof message.text !== "string") return null;
+  return message.text.slice(0, MAX_REPORT_CHARS);
+}
+
+function finiteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function reportedRect(value: unknown): FrameSelection["rect"] {
+  const record = recordOf(value);
+  if (!record) return null;
+  const { top, left, width } = record;
+  if (!finiteNumber(top)) return null;
+  if (!finiteNumber(left)) return null;
+  if (!finiteNumber(width)) return null;
+  return { top, left, width };
+}
+
 /**
  * A selection report, if this message is one.
  *
@@ -69,23 +94,9 @@ export function withSelectionReporter(html: string): string {
  * the document — this only says the message is the right shape.
  */
 export function frameSelectionOf(data: unknown): FrameSelection | null {
-  if (typeof data !== "object" || data === null) return null;
-  const m = data as Record<string, unknown>;
-  if (m.mark !== MARK) return null;
-  if (typeof m.text !== "string") return null;
-  const text = m.text.slice(0, MAX_REPORT_CHARS);
-
-  let rect: FrameSelection["rect"] = null;
-  const r = m.rect;
-  if (typeof r === "object" && r !== null) {
-    const { top, left, width } = r as Record<string, unknown>;
-    if (
-      typeof top === "number" && Number.isFinite(top) &&
-      typeof left === "number" && Number.isFinite(left) &&
-      typeof width === "number" && Number.isFinite(width)
-    ) {
-      rect = { top, left, width };
-    }
-  }
-  return { text, rect };
+  const message = recordOf(data);
+  if (!message) return null;
+  const text = reportedText(message);
+  if (text === null) return null;
+  return { text, rect: reportedRect(message.rect) };
 }

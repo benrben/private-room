@@ -1,5 +1,6 @@
 import json
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -62,6 +63,100 @@ async def test_stream_reassembles_openai_tool_calls_and_usage(monkeypatch) -> No
     assert calls[0].raw["function"]["arguments"] == '{"q":"lease"}'
     assert usage.input_tokens == 123
     assert usage.max_context == 200_000
+
+
+@pytest.mark.asyncio
+async def test_stream_keeps_unfinished_private_placeholder_until_the_tail(monkeypatch) -> None:
+    """The final partial placeholder is restored/flushed after the SSE closes."""
+    event = {
+        "choices": [
+            {
+                "delta": {
+                    "content": "[Per",
+                    "tool_calls": [
+                        {
+                            "id": "private_lookup",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": '{"who":"[Person A]"}',
+                            },
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+    body = f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        provider_api.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+    deltas: list[str] = []
+
+    async def on_delta(value: str) -> None:
+        deltas.append(value)
+
+    model = provider_api.OpenAICompatibleChatModel("openrouter::vendor/model", config())
+    model.privacy = provider_api.PrivacyPolicy(
+        active=True, rules=[("Person A", "[Person A]")]
+    )
+    text, calls, usage = await model.stream(
+        [{"role": "user", "content": "tell Person A"}], [], on_delta
+    )
+
+    assert text == "[Per"
+    assert deltas == ["[Per"]
+    assert [(call.name, call.arguments) for call in calls] == [("lookup", {"who": "Person A"})]
+    assert usage.input_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_stream_keeps_non_string_arguments_and_discards_incomplete_calls(monkeypatch) -> None:
+    event = {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {"function": {"name": "structured", "arguments": {"limit": 2}}},
+                        {"index": 1, "id": "unused", "function": {"arguments": "{}"}},
+                        {"index": 2, "function": {"name": "fallback", "arguments": "{"}},
+                    ]
+                }
+            }
+        ]
+    }
+    body = f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        provider_api.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+
+    async def on_delta(_value: str) -> None:
+        pass
+
+    model = provider_api.OpenAICompatibleChatModel("openrouter::vendor/model", config())
+    _text, calls, _usage = await model.stream(
+        [{"role": "user", "content": "hello"}], [], on_delta
+    )
+
+    assert [(call.name, call.arguments, call.id) for call in calls] == [
+        ("structured", {"limit": 2}, "call_0"),
+        ("fallback", {}, "call_2"),
+    ]
 
 
 def test_message_conversion_preserves_images_and_stringifies_tool_arguments() -> None:
@@ -333,6 +428,8 @@ def test_repeated_streamed_tool_name_is_not_duplicated() -> None:
     current = provider_api._merge_stream_piece("", "write_file")
     current = provider_api._merge_stream_piece(current, "write_file")
     assert current == "write_file"
+    assert provider_api._merge_stream_piece(current, "file") == "write_file"
+    assert provider_api._merge_stream_piece(current, "") == "write_file"
 
 
 def test_an_unknown_context_window_still_gets_a_budget() -> None:
@@ -410,6 +507,21 @@ def test_a_moderation_refusal_names_the_categories() -> None:
     assert "violence" in text and "self-harm" in text
 
 
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        ({"raw": {"error": {"message": "mapping reason"}}}, "mapping reason"),
+        ({"raw": json.dumps({"error": "  backend said no  "})}, "backend said no"),
+        ({"raw": json.dumps({"message": "envelope reason"})}, "envelope reason"),
+        ({"raw": json.dumps(["not", "an", "envelope"])}, '["not", "an", "envelope"]'),
+        ({"raw": "", "reasons": []}, ""),
+        (None, ""),
+    ],
+)
+def test_upstream_reason_preserves_raw_error_shapes(metadata, expected) -> None:
+    assert provider_api._upstream_reason(metadata) == expected
+
+
 def test_an_error_with_no_metadata_at_least_gains_its_status_code() -> None:
     # Nothing can be recovered here, but "(HTTP 401)" still separates a rejected
     # key from a rate limit from a dead endpoint — the bare message did not.
@@ -439,6 +551,34 @@ def test_a_giant_upstream_error_is_clipped_for_the_failure_box() -> None:
     text = provider_api._error_message(httpx.Response(400, json=payload))
     assert len(text) <= provider_api.MAX_ERROR_DETAIL_CHARS
     assert text.endswith("…")
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "expected"),
+    [
+        (None, None, "the provider returned an error with no detail"),
+        ("server overloaded", 503, "server overloaded (HTTP 503)"),
+        ({"message": "", "code": 503}, None, "provider returned HTTP 503"),
+        ({"message": "provider returned HTTP 503", "code": 503}, None, "provider returned HTTP 503"),
+        (
+            {"message": "request failed", "metadata": {"provider_name": "OpenAI"}},
+            None,
+            "request failed — upstream provider: OpenAI",
+        ),
+        (
+            {"message": "OpenAI request failed", "metadata": {"provider_name": "OpenAI"}},
+            None,
+            "OpenAI request failed",
+        ),
+        (
+            {"message": "", "metadata": {"provider_name": "OpenAI"}},
+            None,
+            "OpenAI",
+        ),
+    ],
+)
+def test_describe_error_preserves_status_and_provider_fallbacks(error, status, expected) -> None:
+    assert provider_api._describe_error(error, status) == expected
 
 
 @pytest.mark.asyncio
@@ -637,6 +777,32 @@ def test_a_tool_call_left_unanswered_is_given_a_reply() -> None:
     filler = next(m for m in converted if m.get("tool_call_id") == "call_6_1")
     assert filler["content"] == provider_api.UNANSWERED_TOOL_NOTE
     assert filler["name"] == "browse_read", "named, so the model knows which tool"
+
+
+def test_structured_tool_arguments_are_encoded_as_compact_json() -> None:
+    converted = provider_api._messages_for_api(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_json",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": {"query": "עברית", "limit": 2}},
+                    },
+                    {
+                        "id": "call_string",
+                        "type": "function",
+                        "function": {"name": "open", "arguments": "{\"path\":\"a\"}"},
+                    },
+                ],
+            }
+        ]
+    )
+    calls = converted[0]["tool_calls"]
+    assert calls[0]["function"]["arguments"] == '{"query":"עברית","limit":2}'
+    assert calls[1]["function"]["arguments"] == '{"path":"a"}'
 
 
 def test_the_exact_live_failure_shape_no_result_at_all() -> None:
@@ -859,3 +1025,77 @@ async def test_a_one_shot_call_that_already_fits_is_sent_untouched(monkeypatch) 
     await model.generate([{"role": "user", "content": "who signed the lease?"}])
 
     assert posted["messages"] == [{"role": "user", "content": "who signed the lease?"}]
+
+
+@pytest.mark.asyncio
+async def test_one_shot_retries_rejected_schema_and_flattens_typed_text(monkeypatch) -> None:
+    """A schema-only 400 retries once without dropping any message content."""
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return httpx.Response(400, json={"error": {"message": "schema unsupported"}})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": [
+                                {"type": "text", "text": "first "},
+                                {"type": "image_url", "image_url": {"url": "ignored"}},
+                                "drifted block",
+                                {"type": "text", "text": "second"},
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        provider_api.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+    model = provider_api.OpenAICompatibleChatModel("openrouter::vendor/model", config())
+
+    answer = await model.generate(
+        [{"role": "user", "content": "write a title"}],
+        format={"type": "object", "properties": {"title": {"type": "string"}}},
+    )
+
+    assert answer == "first second"
+    assert "response_format" in requests[0]
+    assert "response_format" not in requests[1]
+    assert requests[1]["messages"] == [{"role": "user", "content": "write a title"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (429, {"error": {"message": "rate limited"}}, "rate limited"),
+        (200, {"choices": []}, "provider returned no completion"),
+    ],
+)
+async def test_one_shot_preserves_provider_and_empty_completion_errors(
+    monkeypatch, status: int, body: dict[str, Any], expected: str
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json=body)
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        provider_api.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+    model = provider_api.OpenAICompatibleChatModel("openrouter::vendor/model", config())
+
+    with pytest.raises(provider_api.ProviderApiError, match=expected):
+        await model.generate([{"role": "user", "content": "status"}])

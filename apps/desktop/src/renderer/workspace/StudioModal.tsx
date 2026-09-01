@@ -28,12 +28,7 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
   }, [open, s.studioAc]);
   if (!s.studioPrompt) return null;
   const studioPrompt = s.studioPrompt;
-  const label =
-    studioPrompt.kind === "flashcards"
-      ? "Flashcards"
-      : studioPrompt.kind === "mindmap"
-        ? "Mind map"
-        : "Podcast script";
+  const label = studioLabel(studioPrompt.kind);
   return (
     <div
       className="studio-prompt-backdrop"
@@ -55,31 +50,7 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
           whole {studioPrompt.scope ? "file" : "room"} is used.
         </p>
         <div className="studio-prompt-field">
-          {s.studioAc && a.studioAcItems().length > 0 && (
-            <div className="ac-popover studio-ac-popover">
-              <div className="ac-hint ac-hint-row">
-                <span>{a.studioAcItems().length} files &amp; folders</span>
-                <span className="ac-keys">↑↓ choose · Enter add · Esc close</span>
-              </div>
-              {a.studioAcItems().map((it, i) => (
-                <button
-                  key={it.key}
-                  className={`ac-item ${i === s.studioAc!.index ? "active" : ""}`}
-                  ref={(el) => {
-                    if (i === s.studioAc!.index)
-                      el?.scrollIntoView({ block: "nearest" });
-                  }}
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    a.acceptMention(it.insert, s.studioPrompt, s.setStudioPrompt);
-                  }}
-                >
-                  <span className="ac-label">{it.label}</span>
-                  <span className="ac-desc">{it.hint}</span>
-                </button>
-              ))}
-            </div>
-          )}
+          <StudioAutocomplete autocomplete={s.studioAc} items={a.studioAcItems()} prompt={s.studioPrompt} setPrompt={s.setStudioPrompt} acceptMention={a.acceptMention} />
           <textarea
             ref={s.studioPromptRef}
             className="studio-prompt-input"
@@ -98,46 +69,7 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
                   : null,
               );
             }}
-            onKeyDown={(e) => {
-              const items = a.studioAcItems();
-              if (s.studioAc && items.length > 0) {
-                if (e.key === "ArrowDown") {
-                  e.preventDefault();
-                  s.setStudioAc({
-                    ...s.studioAc,
-                    index: (s.studioAc.index + 1) % items.length,
-                  });
-                  return;
-                }
-                if (e.key === "ArrowUp") {
-                  e.preventDefault();
-                  s.setStudioAc({
-                    ...s.studioAc,
-                    index:
-                      (s.studioAc.index - 1 + items.length) % items.length,
-                  });
-                  return;
-                }
-                if (e.key === "Enter" || e.key === "Tab") {
-                  e.preventDefault();
-                  a.acceptMention(
-                    items[Math.min(s.studioAc.index, items.length - 1)].insert,
-                    s.studioPrompt,
-                    s.setStudioPrompt,
-                  );
-                  return;
-                }
-                if (e.key === "Escape") {
-                  e.preventDefault();
-                  s.setStudioAc(null);
-                  return;
-                }
-              }
-              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                e.preventDefault();
-                void a.runStudioFromModal();
-              }
-            }}
+            onKeyDown={(event) => handleStudioPromptKey(event, s, a)}
           />
         </div>
         <div className="studio-prompt-actions">
@@ -155,4 +87,84 @@ export default function StudioModal({ s, a }: { s: WSState; a: WSActions }) {
       </div>
     </div>
   );
+}
+
+function studioLabel(kind: string): string {
+  if (kind === "flashcards") return "Flashcards";
+  if (kind === "mindmap") return "Mind map";
+  return "Podcast script";
+}
+
+function StudioAutocomplete({
+  autocomplete,
+  items,
+  prompt,
+  setPrompt,
+  acceptMention,
+}: {
+  autocomplete: WSState["studioAc"];
+  items: ReturnType<WSActions["studioAcItems"]>;
+  prompt: WSState["studioPrompt"];
+  setPrompt: WSState["setStudioPrompt"];
+  acceptMention: WSActions["acceptMention"];
+}) {
+  if (!autocomplete || items.length === 0) return null;
+  return <div className="ac-popover studio-ac-popover"><div className="ac-hint ac-hint-row"><span>{items.length} files &amp; folders</span><span className="ac-keys">↑↓ choose · Enter add · Esc close</span></div>{items.map((item, index) => <StudioAutocompleteItem key={item.key} item={item} active={index === autocomplete.index} prompt={prompt} setPrompt={setPrompt} acceptMention={acceptMention} />)}</div>;
+}
+
+function StudioAutocompleteItem({
+  item,
+  active,
+  prompt,
+  setPrompt,
+  acceptMention,
+}: {
+  item: ReturnType<WSActions["studioAcItems"]>[number];
+  active: boolean;
+  prompt: WSState["studioPrompt"];
+  setPrompt: WSState["setStudioPrompt"];
+  acceptMention: WSActions["acceptMention"];
+}) {
+  return <button className={`ac-item ${active ? "active" : ""}`} ref={(element) => scrollActiveItem(element, active)} onMouseDown={(event) => { event.preventDefault(); acceptMention(item.insert, prompt, setPrompt); }}><span className="ac-label">{item.label}</span><span className="ac-desc">{item.hint}</span></button>;
+}
+
+function scrollActiveItem(element: HTMLButtonElement | null, active: boolean) {
+  if (!active) return;
+  element?.scrollIntoView({ block: "nearest" });
+}
+
+function handleStudioPromptKey(event: React.KeyboardEvent<HTMLTextAreaElement>, s: WSState, a: WSActions) {
+  if (handleAutocompleteKey(event, s, a)) return;
+  if (!isStudioRunShortcut(event)) return;
+  event.preventDefault();
+  void a.runStudioFromModal();
+}
+
+function handleAutocompleteKey(event: React.KeyboardEvent<HTMLTextAreaElement>, s: WSState, a: WSActions): boolean {
+  const autocomplete = s.studioAc;
+  const items = a.studioAcItems();
+  const action = autocompleteAction(event.key);
+  if (!autocomplete || items.length === 0 || !action) return false;
+  event.preventDefault();
+  applyAutocompleteAction(action, autocomplete, items, s, a);
+  return true;
+}
+
+function autocompleteAction(key: string): "next" | "previous" | "accept" | "dismiss" | null {
+  if (key === "ArrowDown") return "next";
+  if (key === "ArrowUp") return "previous";
+  if (["Enter", "Tab"].includes(key)) return "accept";
+  if (key === "Escape") return "dismiss";
+  return null;
+}
+
+function applyAutocompleteAction(action: Exclude<ReturnType<typeof autocompleteAction>, null>, autocomplete: NonNullable<WSState["studioAc"]>, items: ReturnType<WSActions["studioAcItems"]>, s: WSState, a: WSActions) {
+  if (action === "next") return s.setStudioAc({ ...autocomplete, index: (autocomplete.index + 1) % items.length });
+  if (action === "previous") return s.setStudioAc({ ...autocomplete, index: (autocomplete.index - 1 + items.length) % items.length });
+  if (action === "dismiss") return s.setStudioAc(null);
+  return a.acceptMention(items[Math.min(autocomplete.index, items.length - 1)].insert, s.studioPrompt, s.setStudioPrompt);
+}
+
+function isStudioRunShortcut(event: React.KeyboardEvent<HTMLTextAreaElement>): boolean {
+  return event.key === "Enter" && (event.metaKey || event.ctrlKey);
 }

@@ -62,25 +62,40 @@ def _ascii_lower(s: str) -> str:
     return "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in s)
 
 
+def _is_safe_preview_entry(name: str) -> bool:
+    """Whether ``name`` can be considered as an iWork preview path."""
+    return all(
+        (
+            bool(name),
+            "\x00" not in name,
+            "\\" not in name,
+            not name.startswith("/"),
+            ".." not in name.split("/"),
+        )
+    )
+
+
+def _safe_preview_entries(names: list[str]) -> list[str]:
+    return list(filter(_is_safe_preview_entry, names))
+
+
+def _is_pdf_preview_entry(name: str) -> bool:
+    return _ascii_lower(name).endswith("quicklook/preview.pdf")
+
+
+def _is_jpg_preview_entry(name: str) -> bool:
+    parts = [part for part in _ascii_lower(name).split("/") if part]
+    return len(parts) <= 2 and parts[-1:] == ["preview.jpg"]
+
+
 def iwork_preview_entry(names: list[str]) -> str | None:
     """The preferred safe preview entry. A full PDF wins over a JPEG because
     PDF text can be extracted. `preview.jpg` is accepted only at archive root
     or one package-folder deep. `None` if no entry qualifies.
     """
-    safe_names = [
-        name
-        for name in names
-        if name and "\x00" not in name and "\\" not in name
-        and not name.startswith("/") and ".." not in name.split("/")
-    ]
-    for name in safe_names:
-        if _ascii_lower(name).endswith("quicklook/preview.pdf"):
-            return name
-    for name in safe_names:
-        parts = [part for part in _ascii_lower(name).split("/") if part]
-        if len(parts) <= 2 and parts[-1:] == ["preview.jpg"]:
-            return name
-    return None
+    safe_names = _safe_preview_entries(names)
+    pdf_entry = next(filter(_is_pdf_preview_entry, safe_names), None)
+    return pdf_entry or next(filter(_is_jpg_preview_entry, safe_names), None)
 
 
 def extract_iwork(data: bytes) -> str | None:
@@ -93,17 +108,33 @@ def extract_iwork(data: bytes) -> str | None:
     preview is deliberately returned as `None`: it improves visual previewing
     in Electron but contains no document text for this extractor.
     """
-    names = zip_entry_names(data)
-    entry = iwork_preview_entry(names)
+    entry = _iwork_pdf_preview_entry(data)
     if entry is None:
         return None
-    if _ascii_lower(entry).endswith(".jpg"):
+    archive = _iwork_archive(data)
+    if archive is None:
         return None
+    pdf = _iwork_preview_bytes(archive, entry)
+    if pdf is None:
+        return None
+    return extract_pdf(pdf)
 
+
+def _iwork_pdf_preview_entry(data: bytes) -> str | None:
+    entry = iwork_preview_entry(zip_entry_names(data))
+    if entry is None or _ascii_lower(entry).endswith(".jpg"):
+        return None
+    return entry
+
+
+def _iwork_archive(data: bytes) -> zipfile.ZipFile | None:
     try:
-        archive = zipfile.ZipFile(io.BytesIO(data))
+        return zipfile.ZipFile(io.BytesIO(data))
     except _ZIP_READ_ERRORS:
         return None
+
+
+def _iwork_preview_bytes(archive: zipfile.ZipFile, entry: str) -> bytes | None:
     try:
         info = archive.getinfo(entry)
     except KeyError:
@@ -120,7 +151,7 @@ def extract_iwork(data: bytes) -> str | None:
         return None
     if len(pdf) > MAX_ZIP_ENTRY_BYTES:
         return None
-    return extract_pdf(pdf)
+    return pdf
 
 
 __all__ = ["iwork_preview_entry", "extract_iwork"]

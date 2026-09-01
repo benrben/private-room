@@ -62,3 +62,10 @@ def test_main_without_any_closing_tag_passes_through_unmodified() -> None:
     assert "before" in out, f"got {out!r}"
     assert "body text without a closer" in out, f"got {out!r}"
     assert "keep me" in out, f"got {out!r}"
+
+
+def test_unclosed_chrome_element_is_left_for_tag_stripping() -> None:
+    """Keep the old malformed-markup fallback instead of deleting a suffix."""
+    out = strip_html("<script>unclosed script text<p>keep me</p>")
+    assert "unclosed script text" in out, f"got {out!r}"
+    assert "keep me" in out, f"got {out!r}"

@@ -40,6 +40,7 @@ from arcelle_sidecar.agents import (
     normalize_domain_key,
     reachable_domain_keys,
 )
+from arcelle_sidecar.prompts import MAIN_PROMPT_NO_SPECIALISTS, MAIN_PROMPT_TEMPLATE, WEB_OFF_NOTE
 
 # --------------------------------------------------------------------------- #
 # the tiers, as the Rust bridge actually serves them (room_mcp::ToolScope)
@@ -234,6 +235,27 @@ def test_main_prompt_survives_a_file_only_room() -> None:
     assert "no other specialists" in prompt
     # The structural clauses the hub depends on are still there.
     assert "DID / FOUND / MISSING" in prompt
+
+
+@pytest.mark.parametrize(
+    ("web_off", "expected"),
+    [
+        pytest.param(False, MAIN_PROMPT_NO_SPECIALISTS, id="normal"),
+        pytest.param(True, MAIN_PROMPT_NO_SPECIALISTS + WEB_OFF_NOTE, id="web-off"),
+    ],
+)
+def test_main_prompt_without_specialists_preserves_its_exact_fallback(
+    web_off: bool, expected: str
+) -> None:
+    assert main_prompt([], web_off=web_off) == expected
+
+
+def test_main_prompt_preserves_the_template_order_and_web_off_suffix() -> None:
+    expected = MAIN_PROMPT_TEMPLATE.format(
+        other_areas=DOMAIN_BLURBS["web"],
+        all_areas=f"{DOMAIN_BLURBS['file']} and {DOMAIN_BLURBS['web']}",
+    ) + WEB_OFF_NOTE
+    assert main_prompt(["web", "file"], web_off=True) == expected
 
 
 # --------------------------------------------------------------------------- #

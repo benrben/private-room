@@ -534,18 +534,15 @@ CREATE TABLE IF NOT EXISTS voice_rejects (
   PRIMARY KEY (name, emb)
 );
 -- The room's CAST: the people a story is about.
---
 -- Room-level, not per-story, because a cast is reused — the same hero appears
 -- in every scene, and re-describing them per shot is exactly what makes a
 -- character look different in every picture.
---
 -- `face_file_id` is the load-bearing column, and it is a FILE not a prompt.
 -- Character consistency does not come from words: "a woman with red hair"
 -- is re-imagined from scratch on every call. It comes from handing the model
 -- the SAME picture each time, which is what `input_references` is for. The
 -- description and backstory are for the prompt and for the user's own memory;
 -- the picture is what actually holds a face together across shots.
---
 -- ON DELETE SET NULL, not CASCADE: trashing a hero's portrait must not delete
 -- the hero. Their description and story are the user's writing.
 CREATE TABLE IF NOT EXISTS story_cast (
@@ -567,7 +564,6 @@ CREATE TABLE IF NOT EXISTS story_cast (
 -- change shape halfway through is a mistake, never an intention. It is also
 -- load-bearing — a shot's still becomes its clip's literal first frame, so a
 -- 1:1 picture handed to a 16:9 clip is pinned to a frame the wrong shape.
---
 -- Size is per medium because the two endpoints publish different vocabularies
 -- for it: `/images/models` says "1K"/"2K", `/videos/models` says
 -- "720p"/"1080p"/"4K". One column would have to mean both.
@@ -582,7 +578,6 @@ CREATE TABLE IF NOT EXISTS story_lists (
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 -- One shot: what happens, who is in it, how long, and what came back.
---
 -- `still_file_id` and `clip_file_id` are the chain. A shot is made in two
 -- steps — draw the frame, then animate it — and keeping both means the still
 -- can be re-animated (a different length, a different model) without paying

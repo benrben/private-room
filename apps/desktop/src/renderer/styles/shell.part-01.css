@@ -1,0 +1,499 @@
+/* ---------- shell ----------
+   The full-window application frame: 38px top bar / activity rail / resizable
+   three-pane grid / 26px status bar. Loaded last so it wins ties with legacy
+   section files during the migration.
+
+   FRAMES ON ONE SHEET. The chrome here is deliberately transparent: the
+   dotted paper laid down by paper.css on `body` runs edge to edge, and the
+   top bar, rail, panes, splitters and status bar are separated by drawn
+   rules rather than by filled backgrounds butted against each other. A
+   region earns its identity from its border, not from a fill. Only things
+   that genuinely float — popovers, menus, modals, toasts, tooltips — take
+   an opaque surface, because they have to occlude what is beneath them.
+
+   ONE NAVIGATION. The rail names the PLACES in a room and the tab strip holds
+   the DOCUMENTS you have open; before this pass both listed the same nine
+   areas, in two different visual languages, so the strip filled with places
+   and the file you were reading had nowhere to be seen. shell/ActivityRail.tsx
+   carries the reasoning. The consequences here are that the rail is sized for
+   a readable label rather than for a glyph, and that a tab is a title.
+
+   TOP AND BOTTOM ARE QUIET. Both bars lost weight in this pass — the top by
+   dropping two settings-grade buttons and a duplicate app name, the bottom by
+   dropping its cell borders and its fills. Neither lost TYPE: 10px status text
+   was under the design system's 12px floor, and a bar earns its lightness from
+   restraint, not from being too small to read. */
+
+.workspace {
+  width: 100%;
+  height: 100dvh;
+  max-width: none;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  display: grid;
+  /* 26px, not the old 23: every status readout is a hit target and the spec's
+     floor for one is 24px. The bar reads lighter than it did all the same. */
+  grid-template-rows: 38px minmax(0, 1fr) 26px;
+  background: transparent;
+  animation: room-in 0.45s ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .workspace {
+    animation: none;
+  }
+}
+
+/* ----- top bar ----- */
+
+.pr-topbar {
+  display: grid;
+  /* The brand cell is only as wide as the seal now — the rule that used to box
+     it in has gone with the second app name beside it. */
+  grid-template-columns: 38px minmax(0, auto) minmax(140px, 1fr) minmax(0, auto);
+  align-items: center;
+  min-width: 0;
+  background: transparent;
+  border-bottom: 1px solid var(--line);
+  position: relative;
+  z-index: 20;
+  /* Toolbar, not a document (P0-3): the room name still opens for editing
+     via `.room-name-input`, an <input> — base.css opts inputs back into
+     `text` regardless of this. */
+  user-select: none;
+}
+
+.pr-brandmark {
+  height: 38px;
+  display: grid;
+  place-items: center;
+}
+
+.room-identity {
+  min-width: 0;
+  padding: 0 10px 0 6px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  height: 100%;
+  text-align: left;
+  cursor: default;
+}
+.room-identity-text {
+  min-width: 0;
+}
+/* One line, and it is the ROOM's name — the kicker above it said "Arcelle"
+   next to a seal that already does. */
+.room-name {
+  color: var(--text-strong);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The name is a rename affordance, but it must still read as the room's
+   identity rather than a button — no chrome until it is hovered. */
+.room-name-btn {
+  max-width: 100%;
+  min-height: 24px;
+  padding: 1px 5px;
+  margin-left: -5px;
+  border: 1px solid transparent;
+  border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
+  background: none;
+  font-family: inherit;
+  text-align: left;
+  cursor: text;
+}
+.room-name-btn:hover {
+  border-color: var(--rule-strong);
+}
+.room-name-input {
+  max-width: 100%;
+  min-height: 24px;
+  padding: 1px 5px;
+  margin-left: -5px;
+  border: 1px solid var(--accent);
+  border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
+  background: var(--raised);
+  color: var(--text-strong);
+  font-family: inherit;
+  font-size: var(--fs-meta);
+  font-weight: 600;
+}
+
+.command-wrap {
+  min-width: 0;
+  padding: 0 var(--sp-3);
+  display: flex;
+}
+/* The one control in the bar that grew: ⌘K is the way into everything, and
+   after this pass it is also the only launcher (the rail's magnifier now opens
+   the Find AREA instead). Drawn as a written-on line rather than a filled
+   field — a bare rule under the words, the way a form is filled in by hand. */
+.command-button {
+  width: min(100%, 520px);
+  height: 28px;
+  margin: auto;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px 999px 999px 999px / 15px 13px 15px 13px;
+  font-size: var(--fs-meta);
+  transition: border-color var(--dur-fast) var(--ease-pen),
+    color var(--dur-fast) var(--ease-pen);
+}
+.command-button:hover {
+  border-color: var(--accent);
+  color: var(--text);
+  background: var(--accent-ghost);
+}
+.command-button > span {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.command-button kbd {
+  margin-left: auto;
+  /* --faint is tuned against the paper; on the hover wash this dropped to
+     4.15:1, so the shortcut hint takes the secondary ink instead. */
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 4px 2px 5px 3px / 3px 5px 2px 4px;
+  font: 500 var(--fs-micro) / 1 var(--mono);
+  padding: 2px 5px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .command-button {
+    transition: none;
+  }
+}
+
+.top-actions {
+  min-width: 0;
+  padding: 0 var(--sp-2);
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-1);
+}
+
+/* Truthful data-route badge — the same three trust tones as the status-bar
+   trust chip (workspace/markup.ts trustState): good (local) / warn (protected
+   cloud) / danger (raw cloud). One vocabulary, one colour system, everywhere
+   this room states whether content leaves the Mac. */
+.privacy-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 26px;
+  padding: 0 9px;
+  margin-right: 2px;
+  /* A boundary that MEANS something clears 3:1 on its own rather than being
+     mixed down into the rule colour: this badge is how the room states where
+     its content goes, and a hairline nobody can see is not a statement. */
+  border: 1px solid var(--green);
+  border-radius: var(--radius-xs);
+  color: var(--green);
+  background: transparent;
+  font-size: var(--fs-micro);
+  white-space: nowrap;
+}
+.privacy-badge.warn {
+  border-color: var(--amber);
+  color: var(--amber);
+  background: color-mix(in srgb, var(--mk-yellow) 10%, transparent);
+}
+/* Raw cloud is the one state that is allowed to interrupt: the marker fill
+   behind the words is the difference between a label and a warning. */
+.privacy-badge.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--mk-red) 14%, transparent);
+}
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 12%, transparent);
+  flex: 0 0 auto;
+}
+.privacy-badge.warn .status-dot {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--amber) 12%, transparent);
+}
+.privacy-badge.danger .status-dot {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+/* Compact engine pill in the top bar (popover unchanged). */
+.model-pill {
+  min-width: 0;
+  max-width: 210px;
+  height: 26px;
+  padding: 0 var(--sp-2);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xs);
+  white-space: nowrap;
+  font-size: var(--fs-micro);
+}
+.model-pill:hover {
+  color: var(--text);
+  background: var(--hover);
+  border-color: var(--rule-strong);
+}
+.model-pill-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+.model-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--faint);
+}
+.model-dot.ok {
+  background: var(--green);
+}
+.model-dot.warn {
+  background: var(--amber);
+}
+.model-dot.down {
+  background: var(--red);
+}
+.model-pill-caret {
+  color: var(--faint);
+}
+
+/* Quiet square icon buttons (top bar + pane headers). 28px, which is above the
+   24px minimum target with room for the ring to land inside the bar. */
+.icon-btn {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
+  color: var(--muted);
+}
+.pane-icon-btn {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  width: 27px;
+  height: 27px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
+  color: var(--muted);
+}
+.icon-btn:hover,
+.pane-icon-btn:hover {
+  color: var(--text);
+  background: var(--hover);
+  border-color: transparent;
+}
+.icon-btn[aria-pressed="true"] {
+  color: var(--accent-2);
+  background: color-mix(in srgb, var(--accent) 11%, transparent);
+}
+
+.lock-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  margin-left: 3px;
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-xs);
+  color: var(--text);
+  font-size: var(--fs-micro);
+  transition: background var(--dur-fast) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen);
+}
+.lock-btn:hover {
+  background: var(--hover);
+  border-color: var(--sketch);
+}
+/* Pressed controls move down, they do not light up. */
+.lock-btn:active {
+  transform: translateY(1px);
+}
+@media (prefers-reduced-motion: reduce) {
+  .lock-btn {
+    transition: none;
+  }
+}
+
+/* The live-recording chip (`.rec-indicator`, rendered by TopBar) is styled in
+   recording.css, which owns the whole `.rec-*` family — including the `.rec-dot`
+   inside this chip and its reduced-motion escape.
+
+   There WAS a second full definition of it here. shell.css loads last, so at
+   equal (0,1,0) specificity this file won every shared property, and the one it
+   won that mattered was `color: var(--sem-urgent)` — red ink on the red wash,
+   which measures 4.34:1 on ivory at --fs-micro and misses 4.5:1. recording.css
+   deliberately sets the words in --text and lets the dot and the edge carry the
+   red; that fix was dead on arrival until this block was deleted. The chip's
+   :hover/:focus-visible/.paused states were already only in recording.css, so
+   the chip was rendering half from each file.
+
+   Don't restore a base rule here. If the top bar needs the chip to sit
+   differently among its neighbours, change it in recording.css. */
+
+/* ----- main region: rail + pane grid ----- */
+
+.pr-main {
+  min-height: 0;
+  min-width: 0;
+  display: grid;
+  /* The rail width is a variable so it can expand to full labels. Collapsed is
+     84px, not the old 74: the pane toggles and Focus/Settings still carry a
+     word under their glyph at this width, at 12px — the design system's
+     floor — rather than the 9.5px it used to be shrunk to in order to fit.
+     The destination buttons (Map/Scripts/Memory/…) dropped their word
+     entirely at this width instead (P1-7) — a shrunken, renamed abbreviation
+     ("Connect") was worse than no visible word at all, so they fall back to
+     a native `title` tooltip and 84px is now just resting width, not a fit
+     constraint for them. */
+  grid-template-columns: var(--rail-w, 84px) minmax(0, 1fr);
+  transition: grid-template-columns var(--dur-fast) var(--ease-pen);
+}
+/* 192px: wide enough for the longest destination in the list ("Memory &
+   scratch pad" at the metadata size, ~128px) beside its icon, and no wider —
+   every pixel here comes out of the workspace. */
+.pr-main:has(.activity-rail.is-expanded) {
+  --rail-w: 192px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pr-main {
+    transition: none;
+  }
+}
+
+.activity-rail {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  /* P1-7: 20px at the bottom, not 8 — the collapsed strip's own scroll
+     content (buttons + dividers, four groups' worth once .is-expanded's
+     `padding` shorthand below stops overriding it) used to run flush to the
+     rail's edge, right against the 26px status bar's hairline underneath.
+     `.activity-rail.is-expanded` replaces this whole `padding` shorthand
+     with its own, so the extra room here is collapsed-only by construction,
+     not by a second rule. */
+  padding: var(--sp-2) 6px 20px;
+  background: transparent;
+  border-right: 1px solid var(--line);
+  position: relative;
+  /* Furniture, not content: ⌘A used to run the browser default and paint
+     the whole rail's icon labels blue along with every other pane's chrome
+     (P0-3). The rail never holds anything a person typed or would copy. */
+  user-select: none;
+  z-index: 15;
+  overflow: hidden auto;
+}
+.rail-spacer {
+  flex: 1;
+  min-height: 12px;
+}
+.rail-divider {
+  width: 26px;
+  height: 1px;
+  margin: 2px 0 6px;
+  /* A pencil rule that fades at both ends, like one drawn with a straight edge
+     and lifted early — the same taper paper.css's .nb-rule makes. */
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--rule) 22%,
+    var(--rule) 78%,
+    transparent 100%
+  );
+  flex: 0 0 auto;
+}
+/* The group's name, in the expanded rail only: the two halves of this column
+   do different jobs — one shows and hides columns, the other goes somewhere —
+   and a reader should not have to work that out from the icons. */
+.rail-group-label {
+  display: none;
+}
+.rail-button {
+  width: 72px;
+  min-height: 50px;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-1);
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius);
+  padding: 6px 3px;
+  position: relative;
+  transition: color var(--dur-fast) var(--ease-pen),
+    background var(--dur-fast) var(--ease-pen);
+}
+/* The persistent text label under a rail icon. Only the pane toggles
+   (Library/Workspace/AI) and Focus/Settings still render one at every rail
+   width — the destination buttons (Map/Scripts/Memory/Connectors/…) drop it
+   entirely once the rail collapses (P1-7: ActivityRail.tsx only renders the
+   `.rail-label` span when `wide`, falling back to a native `title` tooltip
+   instead of a second, shrunken, renamed copy of the same word). Inherits
+   the button colour, so it brightens with the active/pressed state. Wraps
+   onto a 2nd line rather than ellipsis-truncating: a silently clipped word
+   ("Connec…") is worse than a 2-line label, and `.rail-button`'s min-height
+   (not a fixed height) lets the button grow to fit it. */
+.rail-label {
+  font-size: var(--fs-micro);
+  line-height: 1.2;
+  letter-spacing: 0.01em;
+  max-width: 100%;
+  color: inherit;
+  text-align: center;
+  white-space: normal;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.rail-button:hover {
+  color: var(--text);
+  background: var(--hover);
+  border-color: transparent;
+}
+.rail-button:active {
+  transform: translateY(1px);
+}

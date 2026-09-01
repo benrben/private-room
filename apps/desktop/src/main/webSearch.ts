@@ -131,47 +131,58 @@ export type SidecarPostFn = (
   timeoutMs?: number
 ) => Promise<SidecarPostOutcome>;
 
+function searchRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
+}
+
+function nonemptyHitText(hit: Record<string, unknown>, key: string): string | null {
+  const value = hit[key];
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  return text === "" ? null : text;
+}
+
+function rawNonemptyHitString(hit: Record<string, unknown>, key: string): string | null {
+  const value = hit[key];
+  return typeof value === "string" && value !== "" ? value : null;
+}
+
+function hitEngines(hit: Record<string, unknown>): string[] {
+  const engines = Array.isArray(hit.engines)
+    ? hit.engines.filter((engine): engine is string => typeof engine === "string")
+    : [];
+  if (engines.length > 0) return engines;
+  const source = rawNonemptyHitString(hit, "source");
+  return source === null ? [] : [source];
+}
+
+function parsedHit(value: unknown): WebHit | null {
+  const hit = searchRecord(value);
+  if (hit === null) return null;
+  const url = rawNonemptyHitString(hit, "url");
+  if (url === null) return null;
+  const title = nonemptyHitText(hit, "title") ?? "(untitled)";
+  return {
+    title,
+    url,
+    engines: hitEngines(hit),
+    date: nonemptyHitText(hit, "date"),
+    snippet: nonemptyHitText(hit, "snippet"),
+    score: typeof hit.score === "number" ? hit.score : 0,
+  };
+}
+
 /** Map the sidecar's fused hits onto `WebHit`. Tolerant by design: a missing
  * `engines` list falls back to the legacy single `source` key, so a host
  * running an older sidecar degrades to one-engine hits instead of erroring.
  * Ported from `parse_hits`. */
 function parseHits(value: unknown): WebHit[] {
-  const record = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
-  const rawHits = Array.isArray(record.hits) ? record.hits : [];
+  const record = searchRecord(value);
+  const rawHits = record !== null && Array.isArray(record.hits) ? record.hits : [];
   const out: WebHit[] = [];
   for (const rawHit of rawHits) {
-    if (typeof rawHit !== "object" || rawHit === null) {
-      continue;
-    }
-    const hit = rawHit as Record<string, unknown>;
-    const url = typeof hit.url === "string" ? hit.url : "";
-    if (url === "") {
-      continue;
-    }
-    const text = (key: string): string | null => {
-      const v = hit[key];
-      if (typeof v !== "string") {
-        return null;
-      }
-      const trimmed = v.trim();
-      return trimmed === "" ? null : trimmed;
-    };
-    let engines: string[] = Array.isArray(hit.engines)
-      ? hit.engines.filter((e): e is string => typeof e === "string")
-      : [];
-    if (engines.length === 0) {
-      const source = typeof hit.source === "string" && hit.source !== "" ? hit.source : null;
-      engines = source !== null ? [source] : [];
-    }
-    const rawTitle = typeof hit.title === "string" ? hit.title.trim() : "";
-    out.push({
-      title: rawTitle === "" ? "(untitled)" : rawTitle,
-      url,
-      engines,
-      date: text("date"),
-      snippet: text("snippet"),
-      score: typeof hit.score === "number" ? hit.score : 0,
-    });
+    const hit = parsedHit(rawHit);
+    if (hit !== null) out.push(hit);
   }
   return out;
 }
@@ -184,6 +195,33 @@ function webSearchErrorMessage(e: SidecarError): string {
   return e.code === "OLLAMA_DOWN"
     ? "The local AI engine isn't running, so web search is unavailable."
     : `Web search failed: ${e.error}`;
+}
+
+function searchResultRecord(value: unknown): Record<string, unknown> {
+  return searchRecord(value) ?? {};
+}
+
+function numericSearchResult(record: Record<string, unknown>, key: "merged" | "tookMs"): number {
+  const value = record[key];
+  return typeof value === "number" ? value : 0;
+}
+
+function failedSearchEngines(record: Record<string, unknown>): string[] {
+  if (!Array.isArray(record.failed)) {
+    return [];
+  }
+  return record.failed.filter((name): name is string => typeof name === "string");
+}
+
+function searchPageResult(value: unknown): SearchPage {
+  const record = searchResultRecord(value);
+  return {
+    hits: parseHits(record),
+    merged: numericSearchResult(record, "merged"),
+    tookMs: numericSearchResult(record, "tookMs"),
+    cached: false,
+    failed: failedSearchEngines(record),
+  };
 }
 
 /** {@link searchWeb} keeping the fusion's own bookkeeping — how many raw hits
@@ -204,16 +242,7 @@ export async function searchPage(
   if (outcome.kind === "error") {
     throw new Error(webSearchErrorMessage(outcome.error));
   }
-  const value = typeof outcome.value === "object" && outcome.value !== null
-    ? (outcome.value as Record<string, unknown>)
-    : {};
-  return {
-    hits: parseHits(value),
-    merged: typeof value.merged === "number" ? value.merged : 0,
-    tookMs: typeof value.tookMs === "number" ? value.tookMs : 0,
-    cached: false,
-    failed: Array.isArray(value.failed) ? value.failed.filter((n): n is string => typeof n === "string") : [],
-  };
+  return searchPageResult(outcome.value);
 }
 
 /**

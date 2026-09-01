@@ -211,6 +211,8 @@ MAP_CASES = [
     ("three subtasks", ['{"subtasks":["a","b","c"]}', "ra", "rb", "rc", "final"], 8),
     ("no subtasks falls back to a direct answer", ['{"subtasks":[]}', "direct"], 4),
     ("an unparseable plan falls back to direct", ["garbage", "direct"], 4),
+    ("a non-object plan falls back to direct", ["[]", "direct"], 4),
+    ("a non-list subtask field falls back to direct", ['{"subtasks":"a"}', "direct"], 4),
     ("width clamps how many subtasks are taken", ['{"subtasks":["a","b","c","d"]}', "r1", "r2", "f"], 2),
     (
         "blank and non-string subtasks are dropped",
@@ -465,6 +467,16 @@ def test_route_label_pick_is_robust() -> None:
     # Nothing matches -> the FIRST label. A route always takes some branch;
     # returning nothing would strand the DAG with no edge to prune to.
     assert wf_nodes.pick_route_label("uh, dunno", labels) == "action"
+
+
+def test_route_label_rejects_invalid_structured_replies_and_empty_labels() -> None:
+    labels = ["action", "reference"]
+    # A valid JSON value that is not an object cannot supply a structured label.
+    assert wf_nodes.pick_route_label('["reference"]', labels) == "reference"
+    # A non-string structured value is also ignored before the prose fallback.
+    assert wf_nodes.pick_route_label('{"label":7} reference', labels) == "reference"
+    # Empty palettes still yield the route's documented empty fallback.
+    assert wf_nodes.pick_route_label("no route", []) == ""
 
 
 def test_extract_schema_requires_each_field() -> None:

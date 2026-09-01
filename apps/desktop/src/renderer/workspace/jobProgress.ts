@@ -41,7 +41,28 @@ export function jobMeter(
 ): JobMeter {
   const total = live?.total ?? jobTotal;
   const done = live?.done ?? cursor;
+  const known = total > 0;
 
+  if (isIndeterminate(status, live, known)) return indeterminateMeter();
+  if (!known) return unknownTotalMeter();
+  return knownTotalMeter(done, total);
+}
+
+function isIndeterminate(status: string, live: LiveProgress | undefined, known: boolean): boolean {
+  if (status !== "running") return false;
+  if (!live) return true;
+  return !known;
+}
+
+function indeterminateMeter(): JobMeter {
+  return { indeterminate: true, figure: null, percent: 0 };
+}
+
+function unknownTotalMeter(): JobMeter {
+  return { indeterminate: false, figure: null, percent: 0 };
+}
+
+function knownTotalMeter(done: number, total: number): JobMeter {
   /* A total of zero is not a total of one.
    *
    * The bar's width arithmetic needs a non-zero denominator, and clamping with
@@ -50,11 +71,6 @@ export function jobMeter(
    * step, none of them done, both invented, printed beside the word
    * "Starting…". A missing total has to travel as missing all the way to the
    * decision, and only then be replaced for the arithmetic. */
-  const known = total > 0;
-  const indeterminate = status === "running" && (!live || !known);
-  if (indeterminate) return { indeterminate: true, figure: null, percent: 0 };
-
-  if (!known) return { indeterminate: false, figure: null, percent: 0 };
   // A backend that over-counts must not be able to say "13 of 12".
   const shown = Math.min(done, total);
   return {

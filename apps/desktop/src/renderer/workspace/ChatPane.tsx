@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { RoomInfo } from "../api";
 import type { AskActiveAgent, AskPlanStep } from "../apiTypes";
 import {
@@ -45,6 +45,19 @@ import DeleteControl from "./DeleteControl";
 import Composer from "./ComposerPane";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
+import {
+  autoSpeakTitle,
+  editTailFor,
+  finishedTurnNote,
+  handsFreeTitle,
+  hasHiddenPrivacy,
+  localReachFor,
+  privacyConfirmationText,
+  privacySummary,
+  privacyValveTitle,
+  renameDisabled,
+  routeNoteFor,
+} from "./chatPaneRules";
 
 /** One finished turn's agent diagram, kept so it can be read after the answer
  * lands: which helpers ran, what each did, and how long it took. */
@@ -102,6 +115,422 @@ function HandNote({ text }: { text: string }) {
   );
 }
 
+function ChatHeader({ s, a }: { s: WSState; a: WSActions }) {
+  return <div className="chat-head"><ChatSelector s={s} a={a} /><ChatHeaderActions s={s} a={a} /><ChatHeaderToggles s={s} a={a} />{s.activeChatId && <DeleteControl k={`chat:${s.activeChatId}`} trigger={<TrashIcon size={14} />} onConfirm={() => a.removeChat(s.activeChatId!)} title="Delete this chat session" confirmDelete={s.confirmDelete} askConfirm={a.askConfirm} cancelConfirm={a.cancelConfirm} />}</div>;
+}
+
+function ChatSelector({ s, a }: { s: WSState; a: WSActions }) {
+  if (s.renaming) return <RenameChat s={s} onCommit={a.commitRename} />;
+  return <select className="chat-select" value={s.activeChatId ?? ""} dir="auto" onChange={(event) => s.setActiveChatId(event.target.value)}>{s.chats.map((chat) => <option key={chat.id} value={chat.id}>{chat.title}</option>)}</select>;
+}
+
+function RenameChat({ s, onCommit }: { s: WSState; onCommit: () => void }) {
+  return <input className="chat-select chat-rename" autoFocus dir="auto" value={s.renameDraft} onChange={(event) => s.setRenameDraft(event.target.value)} onBlur={onCommit} onKeyDown={(event) => renameKey(event.key, onCommit, () => s.setRenaming(false))} />;
+}
+
+function renameKey(key: string, onCommit: () => void, onCancel: () => void) {
+  if (key === "Enter") onCommit();
+  if (key === "Escape") onCancel();
+}
+
+function ChatHeaderActions({ s, a }: { s: WSState; a: WSActions }) {
+  return <><button className="subtle btn-ic" title="Rename this chat" aria-label="Rename this chat" disabled={renameDisabled(s)} onClick={a.startRename}><PencilIcon size={14} /></button><button className="subtle" title="New chat ⌘N" onClick={a.newChat}>＋ New</button><button className="subtle" title="Copy this whole conversation as text" disabled={s.messages.length === 0} onClick={a.copyConversation}>Copy chat</button></>;
+}
+
+function ChatHeaderToggles({ s, a }: { s: WSState; a: WSActions }) {
+  return <><ToggleChatSpeech active={s.autoSpeak} title={autoSpeakTitle(s.autoSpeak)} label="Read answers aloud" onClick={a.toggleAutoSpeak} icon={<SpeakerIcon size={14} />} /><ToggleChatSpeech active={s.handsFree} title={handsFreeTitle(s.handsFree)} label="Hands-free — re-arm the mic after each answer" onClick={a.toggleHandsFree} icon={<HandsFreeIcon size={14} />} /></>;
+}
+
+function ToggleChatSpeech({ active, title, label, onClick, icon }: { active: boolean; title: string; label: string; onClick: () => void; icon: ReactNode }) {
+  return <button className={`subtle btn-ic${active ? " accent" : ""}`} title={title} aria-label={label} aria-pressed={active} onClick={onClick}>{icon}</button>;
+}
+
+function ChatBanners({ s, a, model, modelReady }: { s: WSState; a: WSActions; model: string; modelReady: boolean }) {
+  return <>
+    {s.showSyncWarn && <SyncWarning onDismiss={a.dismissSyncWarn} />}
+    {isCloudRoute(model, s.ai) && s.privacyOn === false && <PrivacyOffWarning />}
+    <AiOnboarding s={s} a={a} model={model} modelReady={modelReady} />
+  </>;
+}
+
+function SyncWarning({ onDismiss }: { onDismiss: () => void }) {
+  return <div className="banner notice"><span className="banner-kicker">Note</span>This room lives in a synced folder. Never open it on two computers at the same time — the file can be damaged. Lock it before switching machines.{" "}<button className="subtle" onClick={onDismiss}>Dismiss</button></div>;
+}
+
+function PrivacyOffWarning() {
+  return <div className="banner privacy-off-banner" role="alert"><span className="banner-kicker">Heads up</span>Privacy is off — cloud models can see everything in this room, names and all. Turn it back on in Settings → Cloud privacy.</div>;
+}
+
+function AiOnboarding({ s, a, model, modelReady }: { s: WSState; a: WSActions; model: string; modelReady: boolean }) {
+  if (!s.ai || s.ai.running) return <ModelDownload s={s} a={a} model={model} modelReady={modelReady} />;
+  return s.ai.installed ? <AiNotRunning onOpen={a.openOllamaApp} /> : <AiNotInstalled onGet={a.getOllama} onRefresh={a.refreshAi} />;
+}
+
+function AiNotInstalled({ onGet, onRefresh }: { onGet: () => void; onRefresh: () => void }) {
+  return <div className="banner onboard"><span>This room's AI runs on <strong>Ollama</strong>, a free app.</span><span className="onboard-actions"><button className="subtle" onClick={onGet}>Get Ollama</button><button className="subtle" onClick={onRefresh}>I installed it — check again</button></span></div>;
+}
+
+function AiNotRunning({ onOpen }: { onOpen: () => void }) {
+  return <div className="banner onboard"><span><strong>Ollama</strong> is installed but not running.</span><span className="onboard-actions"><button className="subtle" onClick={onOpen}>Open Ollama</button></span></div>;
+}
+
+function ModelDownload({ s, a, model, modelReady }: { s: WSState; a: WSActions; model: string; modelReady: boolean }) {
+  if (!s.ai?.running || modelReady) return null;
+  return <div className="banner onboard"><ModelDownloadBody s={s} a={a} model={model} />{s.pullError && <div className="banner-error">{s.pullError}</div>}</div>;
+}
+
+function ModelDownloadBody({ s, a, model }: { s: WSState; a: WSActions; model: string }) {
+  return s.pullingModel ? <PullProgress s={s} onStop={() => void a.stopModelPull()} model={model} /> : <ModelPicker onPick={a.pickAndDownload} />;
+}
+
+function PullProgress({ s, onStop, model }: { s: WSState; onStop: () => void; model: string }) {
+  return <span className="banner-pull"><span className="banner-pull-label">Downloading <strong>{model}</strong>…</span><span className="pull-bar"><span className="pull-bar-fill" style={{ width: `${s.pullPercent ?? 0}%` }} /></span><span className="banner-pull-status">{s.pullStatus}{s.pullPercent != null && ` — ${s.pullPercent.toFixed(0)}%`}</span><button className="subtle" onClick={onStop}>Stop</button></span>;
+}
+
+function ModelPicker({ onPick }: { onPick: (model: string) => void }) {
+  return <div className="model-pick"><div className="model-pick-head"><strong>Pick a model to download</strong><span className="model-pick-sub">It runs entirely on your Mac. You can switch or add more anytime in Settings.</span></div><div className="model-pick-grid">{RECOMMENDED_MODELS.map((m) => <ModelCard key={m.name} model={m} onPick={onPick} />)}</div></div>;
+}
+
+function ModelCard({ model, onPick }: { model: (typeof RECOMMENDED_MODELS)[number]; onPick: (model: string) => void }) {
+  return <div className="model-pick-card">{model.tag && <span className="model-pick-tag">{model.tag}</span>}<div className="model-pick-name">{model.name}</div><div className="model-pick-meta">{model.label} · {model.size}</div><div className="model-pick-blurb">{model.blurb}</div><button className="subtle btn-ic model-pick-get" onClick={() => onPick(model.name)}><DownloadIcon size={14} /> Download</button></div>;
+}
+
+type ChatMessage = WSState["messages"][number];
+type EditDraft = { id: string; text: string } | null;
+type MessageView = ReturnType<typeof messageView>;
+
+function ChatTranscript({ s, a, info, shownMessages, hiddenOlder, onShowOlder, lastAssistantId, graphByMsg, editDraft, onStartEdit, onChangeEdit, onSubmitEdit, onCancelEdit, editTail, liveTimings, model, localReach, confirmReal, setConfirmReal, turnNote }: {
+  s: WSState; a: WSActions; info: RoomInfo; shownMessages: ChatMessage[]; hiddenOlder: number; onShowOlder: () => void; lastAssistantId: string | undefined; graphByMsg: Record<string, PastGraph>; editDraft: EditDraft; onStartEdit: (message: ChatMessage) => void; onChangeEdit: (id: string, text: string) => void; onSubmitEdit: () => void; onCancelEdit: () => void; editTail: number; liveTimings: { current: Record<string, AgentTiming> }; model: string; localReach: string; confirmReal: boolean; setConfirmReal: (value: boolean) => void; turnNote: string;
+}) {
+  return <div className="messages" ref={s.chatRef}>
+    <TranscriptIntro messages={s.messages} s={s} info={info} />
+    <EarlierMessageControl count={hiddenOlder} onShow={onShowOlder} />
+    <MessageList s={s} a={a} messages={shownMessages} lastAssistantId={lastAssistantId} graphByMsg={graphByMsg} editDraft={editDraft} onStartEdit={onStartEdit} onChangeEdit={onChangeEdit} onSubmitEdit={onSubmitEdit} onCancelEdit={onCancelEdit} editTail={editTail} />
+    <TranscriptStatus s={s} a={a} model={model} localReach={localReach} timings={liveTimings} confirmReal={confirmReal} setConfirmReal={setConfirmReal} />
+    <p className="agraph-sr" role="status">{turnNote}</p>
+  </div>;
+}
+
+function TranscriptIntro({ messages, s, info }: { messages: ChatMessage[]; s: WSState; info: RoomInfo }) {
+  return messages.length === 0 ? <ChatHero s={s} info={info} /> : null;
+}
+
+function EarlierMessageControl({ count, onShow }: { count: number; onShow: () => void }) {
+  return count > 0 ? <OlderMessages count={count} onShow={onShow} /> : null;
+}
+
+function TranscriptStatus({ s, a, model, localReach, timings, confirmReal, setConfirmReal }: { s: WSState; a: WSActions; model: string; localReach: string; timings: { current: Record<string, AgentTiming> }; confirmReal: boolean; setConfirmReal: (value: boolean) => void }) {
+  return <><ActiveTurn asking={s.asking} s={s} model={model} localReach={localReach} timings={timings} /><FinishedPrivacy asking={s.asking} s={s} a={a} confirmReal={confirmReal} setConfirmReal={setConfirmReal} /><MemoryCard suggestion={s.memSuggestion} s={s} a={a} /></>;
+}
+
+function ActiveTurn({ asking, s, model, localReach, timings }: { asking: boolean; s: WSState; model: string; localReach: string; timings: { current: Record<string, AgentTiming> } }) {
+  return asking ? <StreamingTurn s={s} model={model} localReach={localReach} timings={timings} /> : null;
+}
+
+function FinishedPrivacy({ asking, s, a, confirmReal, setConfirmReal }: { asking: boolean; s: WSState; a: WSActions; confirmReal: boolean; setConfirmReal: (value: boolean) => void }) {
+  return !asking && s.askPrivacy ? <PrivacyReceipt s={s} a={a} confirmReal={confirmReal} setConfirmReal={setConfirmReal} /> : null;
+}
+
+function MemoryCard({ suggestion, s, a }: { suggestion: WSState["memSuggestion"]; s: WSState; a: WSActions }) {
+  return suggestion ? <MemorySuggestion s={s} a={a} /> : null;
+}
+
+function ChatHero({ s, info }: { s: WSState; info: RoomInfo }) {
+  const ask = (text: string) => { s.setQuestion(text); s.composerRef.current?.focus(); };
+  return <div className="chat-hero"><div className="chat-hero-icon"><EmptyChatArt /></div><h2>Ask your room</h2><p>I can work across everything inside {info.path.split("/").pop()}, using only the context you attach or make available.</p><div className="prompt-chips">{["Summarize what's in this room", "What are the key points across my files?", "What did I add recently?", "Draft a short memo from these files"].map((prompt) => <button key={prompt} className="prompt-chip" onClick={() => ask(prompt)}>{prompt}</button>)}</div>{s.commands.length > 0 && <CommandHints commands={s.commands} ask={ask} />}</div>;
+}
+
+function CommandHints({ commands, ask }: { commands: WSState["commands"]; ask: (text: string) => void }) {
+  return <div className="cmd-hints"><span className="cmd-hints-label">Or run a command:</span>{[...commands, HELP_COMMAND].map((command) => <button key={command.name} className="cmd-hint-chip" title={`${command.summary} — ${command.usage}`} onClick={() => ask(`#${command.name} `)}>#{command.name}</button>)}</div>;
+}
+
+function OlderMessages({ count, onShow }: { count: number; onShow: () => void }) {
+  return <button className="subtle chat-load-older" onClick={onShow} title="These are already loaded — this only draws them">Show earlier messages ({count} older)</button>;
+}
+
+function MessageList({ s, a, messages, lastAssistantId, graphByMsg, editDraft, onStartEdit, onChangeEdit, onSubmitEdit, onCancelEdit, editTail }: { s: WSState; a: WSActions; messages: ChatMessage[]; lastAssistantId: string | undefined; graphByMsg: Record<string, PastGraph>; editDraft: EditDraft; onStartEdit: (message: ChatMessage) => void; onChangeEdit: (id: string, text: string) => void; onSubmitEdit: () => void; onCancelEdit: () => void; editTail: number }) {
+  return <>{messages.map((message) => message.kind === "handoff" ? <HandoffMarker key={message.id} message={message} /> : <ChatMessageRow key={message.id} s={s} a={a} message={message} lastAssistantId={lastAssistantId} graph={graphByMsg[message.id]} editDraft={editDraft} onStartEdit={onStartEdit} onChangeEdit={onChangeEdit} onSubmitEdit={onSubmitEdit} onCancelEdit={onCancelEdit} editTail={editTail} />)}</>;
+}
+
+function ChatMessageRow({ s, a, message, lastAssistantId, graph, editDraft, onStartEdit, onChangeEdit, onSubmitEdit, onCancelEdit, editTail }: { s: WSState; a: WSActions; message: ChatMessage; lastAssistantId: string | undefined; graph: PastGraph | undefined; editDraft: EditDraft; onStartEdit: (message: ChatMessage) => void; onChangeEdit: (id: string, text: string) => void; onSubmitEdit: () => void; onCancelEdit: () => void; editTail: number }) {
+  const view = messageView(message);
+  return <div id={`msg-${message.id}`} className={messageClass(message, view.hand, lastAssistantId)}><MessageLabel message={message} clock={view.clock} /><MessageGraph message={message} graph={graph} /><MessageContent message={message} view={view} editDraft={editDraft} onChangeEdit={onChangeEdit} onSubmitEdit={onSubmitEdit} onCancelEdit={onCancelEdit} editTail={editTail} a={a} /><MessageActions s={s} a={a} message={message} view={view} lastAssistantId={lastAssistantId} editDraft={editDraft} onStartEdit={onStartEdit} /></div>;
+}
+
+function messageView(message: ChatMessage) {
+  const content = messageContent(message);
+  const lostReply = message.role === "assistant" ? lostReplyNotice(message.content) : null;
+  return { ...content, lostReply, hand: lostReply === null && isHandwritten(content.text), clock: messageClock(message.createdAt) };
+}
+
+function messageContent(message: ChatMessage) {
+  if (message.role !== "assistant") return { text: message.content, boxes: undefined, annotation: undefined };
+  if (!hasViewerEffect(message)) return splitMarkupBlocks(message.content);
+  return { text: message.content, boxes: message.effects!.boxes, annotation: message.effects!.annotation };
+}
+
+function hasViewerEffect(message: ChatMessage): boolean {
+  return !!(message.effects && (message.effects.boxes || message.effects.annotation));
+}
+
+function messageClass(message: ChatMessage, hand: boolean, lastAssistantId: string | undefined): string {
+  return `msg ${message.role}${message.kind === "turn_error" ? " is-turn-error" : ""}${hand ? " is-hand" : ""}${message.id === lastAssistantId ? " is-latest" : ""}`;
+}
+
+function MessageLabel({ message, clock }: { message: ChatMessage; clock: string | null }) {
+  return <div className="msg-label"><span className="msg-avatar" aria-hidden>{message.role === "assistant" ? <SparkIcon size={12} /> : "•"}</span><span className="msg-who">{speakerName(message.role)}</span>{clock && <time className="msg-when" dateTime={message.createdAt}>{clock}</time>}</div>;
+}
+
+function MessageGraph({ message, graph }: { message: ChatMessage; graph: PastGraph | undefined }) {
+  if (message.role !== "assistant") return null;
+  return graph ? <AgentGraph plan={graph.plan} active={graph.active} agentSteps={graph.agentSteps} agentReports={graph.agentReports} steps={graph.steps} lane={graph.lane} timings={graph.timings} live={false} /> : <SavedAgentStrip agents={message.effects?.agents} />;
+}
+
+function SavedAgentStrip({ agents }: { agents: AskPlanStep[] | undefined }) {
+  if (!agents || agents.length === 0) return null;
+  return <div className="agent-strip past" aria-label="Agents that handled this request"><span className="agent-strip-caption">{agents.length > 1 ? "Agents" : "Agent"}</span>{agents.map((agent, index) => <span key={index} className="agent-pipe">{index > 0 && <span className="agent-arrow" aria-hidden>→</span>}<span className={`agent-chip past${agent.status === "failed" ? " failed" : ""}`} title={agent.instruction}>{agent.status === "failed" && <span role="img" aria-label="failed">⚠</span>}{agent.label}</span></span>)}</div>;
+}
+
+function MessageContent({ message, view, editDraft, onChangeEdit, onSubmitEdit, onCancelEdit, editTail, a }: { message: ChatMessage; view: MessageView; editDraft: EditDraft; onChangeEdit: (id: string, text: string) => void; onSubmitEdit: () => void; onCancelEdit: () => void; editTail: number; a: WSActions }) {
+  if (message.role === "assistant") return <AssistantContent view={view} a={a} />;
+  if (editDraft?.id === message.id) return <UserEditForm draft={editDraft} onChange={(text) => onChangeEdit(message.id, text)} onSubmit={onSubmitEdit} onCancel={onCancelEdit} editTail={editTail} />;
+  return <div className="msg-content" dir="auto">{view.hand ? <HandNote text={view.text} /> : view.text}</div>;
+}
+
+function AssistantContent({ view, a }: { view: MessageView; a: WSActions }) {
+  return <div className="msg-content" dir="auto"><MarkdownView text={view.text} />{view.boxes && <ChatAnnotatedImage fileId={view.boxes.fileId} boxes={view.boxes.boxes} />}{view.annotation && <AnnotationChip annotation={view.annotation} a={a} />}</div>;
+}
+
+function AnnotationChip({ annotation, a }: { annotation: NonNullable<MessageView["annotation"]>; a: WSActions }) {
+  const verified = !!annotation.quote && !annotation.approx;
+  return <div className="annot-chip-wrap msg-annot"><span className="nb-arrow-curve nb-arrow-curve--nw msg-tie" aria-hidden /><AnnotationLink annotation={annotation} verified={verified} onView={() => a.viewFile(annotation.fileId, annotationTarget(annotation))} />{verified && annotation.quote && <button className="subtle" title="Copy this quote as a citation (quote · file · page)" onClick={() => a.copyReceipt(annotation)}>Copy as receipt</button>}</div>;
+}
+
+function AnnotationLink({ annotation, verified, onView }: { annotation: NonNullable<MessageView["annotation"]>; verified: boolean; onView: () => void }) {
+  return <button className={`annot-chip${verified ? " receipt-verified" : ""}`} title="Show the highlight in the viewer" onClick={onView}><AnnotationIcon verified={verified} /> {annotationLabel(annotation)} — {annotation.name}<AnnotationVerified verified={verified} /><AnnotationApproximate approximate={annotation.approx} /></button>;
+}
+
+function AnnotationIcon({ verified }: { verified: boolean }) {
+  return verified ? <CheckIcon size={14} /> : <EyeIcon size={14} />;
+}
+
+function annotationLabel(annotation: NonNullable<MessageView["annotation"]>): string {
+  return annotation.note || annotation.quote || annotation.range || "";
+}
+
+function AnnotationVerified({ verified }: { verified: boolean }) {
+  return verified ? <span className="receipt-badge"><CheckIcon size={12} /> Verified</span> : null;
+}
+
+function AnnotationApproximate({ approximate }: { approximate: boolean | undefined }) {
+  return approximate ? <span className="annot-approx" title="The exact quote wasn't found — the closest passage was highlighted"> · ≈ closest match</span> : null;
+}
+
+function UserEditForm({ draft, onChange, onSubmit, onCancel, editTail }: { draft: Exclude<EditDraft, null>; onChange: (text: string) => void; onSubmit: () => void; onCancel: () => void; editTail: number }) {
+  return <div className="msg-content" dir="auto"><div className="composer-card"><textarea className="composer-input" value={draft.text} autoFocus rows={3} dir="auto" onChange={(event) => onChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); onSubmit(); } if (event.key === "Escape") { event.stopPropagation(); onCancel(); } }} /><span className="save-form"><button className="subtle" onClick={onSubmit}>{editTail === 0 ? "Send again" : `Send again — deletes the ${editTail} message${editTail === 1 ? "" : "s"} below`}</button><button className="subtle" onClick={onCancel}>Cancel</button></span></div></div>;
+}
+
+function MessageActions({ s, a, message, view, lastAssistantId, editDraft, onStartEdit }: { s: WSState; a: WSActions; message: ChatMessage; view: MessageView; lastAssistantId: string | undefined; editDraft: EditDraft; onStartEdit: (message: ChatMessage) => void }) {
+  if (message.role === "assistant") return <><LostReplyRecovery s={s} a={a} message={message} lostReply={view.lostReply} lastAssistantId={lastAssistantId} /><AssistantMessageFooter s={s} a={a} message={message} lastAssistantId={lastAssistantId} /></>;
+  return !editDraft && !message.id.startsWith("pending-") ? <UserMessageActions s={s} a={a} message={message} onStartEdit={onStartEdit} /> : null;
+}
+
+function UserMessageActions({ s, a, message, onStartEdit }: { s: WSState; a: WSActions; message: ChatMessage; onStartEdit: (message: ChatMessage) => void }) {
+  return <div className="msg-footer"><button className="subtle" title="Copy this message" onClick={() => a.copyMessage(message)}>Copy</button><button className="subtle" title="Change this question and ask again — everything after it is removed" disabled={s.asking} onClick={() => onStartEdit(message)}>Edit & resend</button></div>;
+}
+
+function LostReplyRecovery({ s, a, message, lostReply, lastAssistantId }: { s: WSState; a: WSActions; message: ChatMessage; lostReply: MessageView["lostReply"]; lastAssistantId: string | undefined }) {
+  if (message.id !== lastAssistantId || lostReply === null) return null;
+  return <div className="msg-recover"><span>{lostReplyAdvice(lostReply)}</span><button className="subtle" title="Delete this notice and run the same question again" disabled={s.asking} onClick={() => a.regenerate(message.id)}>Try again</button></div>;
+}
+
+function AssistantMessageFooter({ s, a, message, lastAssistantId }: { s: WSState; a: WSActions; message: ChatMessage; lastAssistantId: string | undefined }) {
+  return <div className="msg-footer"><MessageSources sources={message.sources} onOpen={a.openSource} /><LandedEditReport effects={message.effects} /><SpeakControl active={s.speakingMsgId === message.id} onSpeak={() => a.speakMessage(message)} /><button className="subtle" title="Copy this answer" disabled={s.asking} onClick={() => a.copyMessage(message)}>Copy</button><UndoControl edits={s.undoByMsg[message.id]} disabled={s.asking} onUndo={() => a.undoEdits(message.id)} />{message.id === lastAssistantId && <button className="subtle" title="Delete this answer and ask again (the original attachments are not re-sent)" disabled={s.asking} onClick={() => a.regenerate(message.id)}>Regenerate</button>}<AssistantSave s={s} a={a} message={message} /></div>;
+}
+
+function MessageSources({ sources, onOpen }: { sources: string[]; onOpen: (source: string) => void }) {
+  return sources.length > 0 ? <span className="msg-sources"><span className="nb-arrow-curve nb-arrow-curve--nw msg-tie" aria-hidden /><span className="msg-sources-kicker">Sources</span>{sources.map((source) => <button key={source} className="source-chip" title={`Open ${source}`} onClick={() => onOpen(source)}>{source}</button>)}</span> : null;
+}
+
+function LandedEditReport({ effects }: { effects: ChatMessage["effects"] }) {
+  const landed = (effects?.edits ?? []).filter((edit) => LANDED_EDIT_OUTCOMES.has(edit.outcome));
+  if (landed.length === 0) return null;
+  const files = landed.reduce((count, edit) => count + (edit.files ?? 1), 0);
+  return <span className="msg-edits" title="Each change is in that file's History and can be undone there.">Made {files} file change{files === 1 ? "" : "s"} in this room</span>;
+}
+
+function SpeakControl({ active, onSpeak }: { active: boolean; onSpeak: () => void }) {
+  return <button className="subtle btn-ic" title={active ? "Stop speaking" : "Read this answer aloud"} onClick={onSpeak}>{active ? <><StopIcon size={12} /> Stop</> : <><PlayIcon size={12} /> Play</>}</button>;
+}
+
+function UndoControl({ edits, disabled, onUndo }: { edits: unknown[] | undefined; disabled: boolean; onUndo: () => void }) {
+  return edits ? <button className="subtle undo-edit" title="Undo the file change this answer made (reversible via version history)" disabled={disabled} onClick={onUndo}><UndoIcon size={14} /> Undo {edits.length > 1 ? `${edits.length} edits` : "edit"}</button> : null;
+}
+
+function AssistantSave({ s, a, message }: { s: WSState; a: WSActions; message: ChatMessage }) {
+  if (s.saveDraft?.id === message.id) return <span className="save-form"><input value={s.saveDraft.name} autoFocus onChange={(event) => s.setSaveDraft({ id: message.id, name: event.target.value })} onKeyDown={(event) => event.key === "Enter" && a.saveToRoom(message)} /><button className="subtle" onClick={() => a.saveToRoom(message)}>Save</button><button className="subtle" onClick={() => s.setSaveDraft(null)}>Cancel</button></span>;
+  return <button className="subtle" onClick={() => s.setSaveDraft({ id: message.id, name: uniqueFileName("AI note.md", s.files.map((file) => file.name)) })}>Save to room</button>;
+}
+
+function StreamingTurn({ s, model, localReach, timings }: { s: WSState; model: string; localReach: string; timings: { current: Record<string, AgentTiming> } }) {
+  return <div className={`msg assistant is-streaming ${s.streamText ? "" : "thinking"}`} aria-busy><div className="msg-label"><span className="msg-avatar" aria-hidden><SparkIcon size={12} /></span><span className="msg-who">{speakerName("assistant")}</span></div>{s.agentPlan && s.agentPlan.length > 0 && <AgentGraph plan={s.agentPlan} active={s.activeAgent} agentSteps={s.agentSteps} agentReports={s.agentReports} steps={s.steps} lane={s.lane} timings={timings} />}<StreamingSteps steps={s.steps} lane={s.lane} /><div className="msg-content" dir="auto"><StreamingBody text={s.streamText} model={model} ai={s.ai} localReach={localReach} /></div></div>;
+}
+
+function StreamingSteps({ steps, lane }: { steps: WSState["steps"]; lane: string }) {
+  const shown = steps.slice(-6);
+  const earlier = steps.length - shown.length;
+  if (!lane && shown.length === 0) return null;
+  return <div className="step-chips">{lane && <span className="lane-chip">{lane}</span>}{earlier > 0 && <span className="step-chip" title="Earlier steps in this turn">+{earlier} earlier</span>}{shown.map((step, index) => <span key={earlier + index} className={`step-chip${step.ok ? "" : " failed"}`} title={step.ok ? undefined : "This step didn't succeed"}>{step.ok ? "" : "⚠ "}{step.label}</span>)}</div>;
+}
+
+function StreamingBody({ text, model, ai, localReach }: { text: string; model: string; ai: WSState["ai"]; localReach: string }) {
+  if (text) return <><MarkdownView text={patchStreamFences(text)} /><span className="stream-cursor" aria-hidden>▍</span></>;
+  return <StreamingRoute cloud={isCloudRoute(model, ai)} localReach={localReach} />;
+}
+
+function StreamingRoute({ cloud, localReach }: { cloud: boolean; localReach: string }) {
+  if (cloud) return <span className="chat-route chat-route-cloud">Asking your cloud AI — content leaves this Mac…</span>;
+  return localReach ? <span className="chat-route chat-route-cloud">Thinking on this Mac — {localReach} can send parts of this out…</span> : <span className="chat-route">Thinking locally…</span>;
+}
+
+function PrivacyReceipt({ s, a, confirmReal, setConfirmReal }: { s: WSState; a: WSActions; confirmReal: boolean; setConfirmReal: (value: boolean) => void }) {
+  const privacy = s.askPrivacy;
+  if (!privacy) return null;
+  return <div className="privacy-receipt" role="status"><PrivacyReceiptText privacy={privacy} />{!privacy.bypassed && <PrivacyValve privacy={privacy} confirm={confirmReal} onConfirm={() => { setConfirmReal(false); void a.askAgainWithRealDetails(); }} onOpen={() => setConfirmReal(true)} onCancel={() => setConfirmReal(false)} />}</div>;
+}
+
+function PrivacyReceiptText({ privacy }: { privacy: NonNullable<WSState["askPrivacy"]> }) {
+  if (privacy.bypassed) return <span className="privacy-receipt-chip bypassed">Real details were shared this once</span>;
+  return <span className="privacy-receipt-chip">{privacySummary(privacy)}{privacy.images_blocked && ` · ${privacy.images_blocked} image${privacy.images_blocked === 1 ? "" : "s"} kept on this Mac`}</span>;
+}
+
+function PrivacyValve({ privacy, confirm, onConfirm, onOpen, onCancel }: { privacy: NonNullable<WSState["askPrivacy"]>; confirm: boolean; onConfirm: () => void; onOpen: () => void; onCancel: () => void }) {
+  if (!hasHiddenPrivacy(privacy)) return null;
+  return confirm ? <PrivacyConfirmation privacy={privacy} onConfirm={onConfirm} onCancel={onCancel} /> : <button className="subtle privacy-valve" data-agent-blocked title={privacyValveTitle(privacy)} onClick={onOpen}>{privacy.images_blocked ? "Ask again sharing blocked images…" : "Ask again with real details…"}</button>;
+}
+
+function PrivacyConfirmation({ privacy, onConfirm, onCancel }: { privacy: NonNullable<WSState["askPrivacy"]>; onConfirm: () => void; onCancel: () => void }) {
+  return <span className="privacy-valve-confirm" data-agent-blocked>{privacyConfirmationText(privacy)}<button className="subtle danger" onClick={onConfirm}>Yes, this once</button><button className="subtle" onClick={onCancel}>Cancel</button></span>;
+}
+
+function MemorySuggestion({ s, a }: { s: WSState; a: WSActions }) {
+  return <div className="memory-suggestion" data-agent-blocked><div className="memory-suggestion-head"><MemoryIcon size={14} /> Worth remembering?</div><div className="memory-suggestion-fact">{s.memSuggestion?.fact}</div><div className="memory-suggestion-actions"><button type="button" className="primary" onClick={a.saveSuggestedMemory}>Save to memory</button><button type="button" className="subtle" onClick={() => s.setMemSuggestion(null)}>Ignore</button><button type="button" className="subtle" title="Save this and every future suggestion automatically (turn off in Settings → Behavior)" onClick={a.enableMemoryAutoSave}>Always save</button></div></div>;
+}
+
+type LastGraph = { chatId: string | null; graph: Omit<PastGraph, "timings"> } | null;
+type GraphRef = { current: LastGraph };
+
+function useChatPaging(s: WSState, lastGraph: GraphRef) {
+  const [shownCount, setShownCount] = useState(CHAT_PAGE);
+  const shownChat = useRef(s.activeChatId);
+  useEffect(() => {
+    if (shownChat.current === s.activeChatId) return;
+    shownChat.current = s.activeChatId;
+    s.setMemSuggestion(null);
+    lastGraph.current = null;
+    setShownCount(CHAT_PAGE);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [s.activeChatId]);
+  const revealSeen = useRef<unknown>(null);
+  useEffect(() => revealPagedMessage(s, revealSeen, setShownCount), [s.revealMsgId, s.messages]);
+  return { ...chatPageSlice(s.messages, shownCount), setShownCount };
+}
+
+function revealPagedMessage(s: WSState, revealSeen: { current: unknown }, setShownCount: (next: (count: number) => number) => void) {
+  const id = s.revealMsgId;
+  if (!id) { revealSeen.current = null; return; }
+  if (revealSeen.current === null) revealSeen.current = s.messages;
+  const index = s.messages.findIndex((message) => message.id === id);
+  if (index >= 0) { setShownCount((count) => Math.max(count, chatPageToReveal(s.messages.length, index))); s.setRevealMsgId(null); return; }
+  if (s.messages !== revealSeen.current) s.setRevealMsgId(null);
+}
+
+function useGraphHistory(s: WSState, lastAssistantId: string | undefined) {
+  const liveTimings = useRef<Record<string, AgentTiming>>({});
+  const lastGraph = useRef<LastGraph>(null);
+  const wasAsking = useRef(false);
+  const askingChat = useRef<string | null>(null);
+  const [graphByMsg, setGraphByMsg] = useState<Record<string, PastGraph>>({});
+  useEffect(() => rememberDelegatedGraph(s, lastGraph), [s.agentPlan, s.activeAgent, s.agentSteps, s.agentReports, s.steps, s.lane]);
+  useEffect(() => updateGraphHistory(s, lastAssistantId, graphByMsg, liveTimings, lastGraph, wasAsking, askingChat, setGraphByMsg), [s.asking, s.activeChatId, lastAssistantId, graphByMsg]);
+  return { liveTimings, lastGraph, graphByMsg };
+}
+
+function rememberDelegatedGraph(s: WSState, lastGraph: GraphRef) {
+  if (!s.agentPlan || s.agentPlan.length <= 1) return;
+  lastGraph.current = { chatId: s.activeChatId, graph: { plan: s.agentPlan, active: s.activeAgent, agentSteps: s.agentSteps, agentReports: s.agentReports, steps: s.steps, lane: s.lane } };
+}
+
+function updateGraphHistory(s: WSState, lastAssistantId: string | undefined, graphByMsg: Record<string, PastGraph>, liveTimings: { current: Record<string, AgentTiming> }, lastGraph: GraphRef, wasAsking: { current: boolean }, askingChat: { current: string | null }, setGraphByMsg: (update: (current: Record<string, PastGraph>) => Record<string, PastGraph>) => void) {
+  const { was, sameChat } = previousAskingState(s, wasAsking, askingChat);
+  if (s.asking) { if (!was) liveTimings.current = {}; return; }
+  if (!sameChat) return;
+  const graph = takeCurrentGraph(lastGraph, s.activeChatId);
+  if (!canStoreGraph(was, graph, lastAssistantId, graphByMsg)) return;
+  storeGraph(lastAssistantId!, graph!, liveTimings, setGraphByMsg);
+}
+
+function previousAskingState(s: WSState, wasAsking: { current: boolean }, askingChat: { current: string | null }): { was: boolean; sameChat: boolean } {
+  const sameChat = askingChat.current === s.activeChatId;
+  const was = sameChat && wasAsking.current;
+  wasAsking.current = s.asking;
+  askingChat.current = s.activeChatId;
+  return { was, sameChat };
+}
+
+function takeCurrentGraph(lastGraph: GraphRef, chatId: string | null): Omit<PastGraph, "timings"> | null {
+  const kept = lastGraph.current;
+  const graph = kept?.chatId === chatId ? kept.graph : null;
+  if (graph) lastGraph.current = null;
+  return graph;
+}
+
+function canStoreGraph(was: boolean, graph: Omit<PastGraph, "timings"> | null, lastAssistantId: string | undefined, graphByMsg: Record<string, PastGraph>): boolean {
+  return was && graph !== null && lastAssistantId !== undefined && !graphByMsg[lastAssistantId];
+}
+
+function storeGraph(id: string, graph: Omit<PastGraph, "timings">, liveTimings: { current: Record<string, AgentTiming> }, setGraphByMsg: (update: (current: Record<string, PastGraph>) => Record<string, PastGraph>) => void) {
+  const frozen = freezeTimings(liveTimings.current);
+  liveTimings.current = {};
+  setGraphByMsg((current) => ({ ...current, [id]: { ...graph, timings: { current: frozen } } }));
+}
+
+function freezeTimings(timings: Record<string, AgentTiming>): Record<string, AgentTiming> {
+  const now = performance.now();
+  return Object.fromEntries(Object.entries(timings).map(([key, timing]) => [key, { start: timing.start, end: timing.end ?? now }]));
+}
+
+function useTurnAnnouncement(s: WSState, model: string, lastAssistant: ChatMessage | undefined, lastAssistantId: string | undefined) {
+  const [turnNote, setTurnNote] = useState("");
+  const turnRunning = useRef(false);
+  const turnChat = useRef<string | null>(null);
+  const turnStartId = useRef<string | undefined>(undefined);
+  const localReach = localReachFor(s);
+  const routeNote = routeNoteFor(model, s.ai, localReach);
+  useEffect(() => updateTurnAnnouncement(s, lastAssistant, lastAssistantId, routeNote, turnRunning, turnChat, turnStartId, setTurnNote), [s.asking, s.activeChatId, lastAssistantId, routeNote]);
+  return { turnNote, localReach };
+}
+
+function updateTurnAnnouncement(s: WSState, lastAssistant: ChatMessage | undefined, lastAssistantId: string | undefined, routeNote: string, turnRunning: { current: boolean }, turnChat: { current: string | null }, turnStartId: { current: string | undefined }, setTurnNote: (note: string) => void) {
+  if (s.asking) { startTurnAnnouncement(s.activeChatId, lastAssistantId, routeNote, turnRunning, turnChat, turnStartId, setTurnNote); return; }
+  finishTurnAnnouncement(s.activeChatId, lastAssistant, lastAssistantId, turnRunning, turnChat, turnStartId, setTurnNote);
+}
+
+function startTurnAnnouncement(chatId: string | null, lastAssistantId: string | undefined, routeNote: string, turnRunning: { current: boolean }, turnChat: { current: string | null }, turnStartId: { current: string | undefined }, setTurnNote: (note: string) => void) {
+  if (turnRunning.current && turnChat.current === chatId) return;
+  turnRunning.current = true;
+  turnChat.current = chatId;
+  turnStartId.current = lastAssistantId;
+  setTurnNote(routeNote);
+}
+
+function finishTurnAnnouncement(chatId: string | null, lastAssistant: ChatMessage | undefined, lastAssistantId: string | undefined, turnRunning: { current: boolean }, turnChat: { current: string | null }, turnStartId: { current: string | undefined }, setTurnNote: (note: string) => void) {
+  if (!turnRunning.current) return;
+  turnRunning.current = false;
+  if (turnChat.current !== chatId) { setTurnNote(""); return; }
+  setTurnNote(finishedTurnNote(lastAssistant, lastAssistantId, turnStartId.current));
+}
+
 /** Pane 3: the chat header, onboarding banners, the message transcript (with
  * receipts/undo/regenerate/save), the streaming placeholder, the "worth
  * remembering?" card, and the composer. Extracted verbatim. */
@@ -127,1106 +556,43 @@ export default function ChatPane({
     .find((m) => m.role === "assistant");
   const lastAssistantId = lastAssistant?.id;
 
-  // The privacy receipt and the "worth remembering?" card describe the turn
-  // that just finished IN THIS conversation. They belong to the window, so
-  // switching conversations used to carry them along and pin a claim about one
-  // chat under another. A remount (the AI pane's tabs) must NOT clear them,
-  // hence the ref rather than a bare [activeChatId] effect.
-  const shownChat = useRef(s.activeChatId);
-  useEffect(() => {
-    if (shownChat.current === s.activeChatId) return;
-    shownChat.current = s.activeChatId;
-    // The privacy receipt is per chat now (owner replacement #4), so it needs
-    // no clearing — it is simply read from the conversation on screen. The
-    // memory-suggestion card is still window-wide and does.
-    s.setMemSuggestion(null);
-    // So does the PENDING roster below. It is filed against an answer only when
-    // a turn ends in the chat that produced it, so leaving that chat mid-answer
-    // strands it — and the next NON-delegating turn in that same chat writes no
-    // roster of its own, so it would inherit this one: a diagram of specialists
-    // that never ran, with their steps and reports, under an answer they had
-    // nothing to do with. Diagrams already filed (`graphByMsg`) are untouched.
-    lastGraph.current = null;
-    // A conversation opens on its newest page — see `shownCount`.
-    setShownCount(CHAT_PAGE);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.activeChatId]);
-
-  /** How many of `messages` are actually PAINTED, newest-last.
-   *
-   * There was no limit: switching to a months-old chat mounted every row at
-   * once — hundreds of long answers, each with its own Markdown parse, plus
-   * inline images and agent diagrams — which stalls the pane and holds all of
-   * it in memory for as long as the chat is open, and gets worse the more you
-   * use that chat. Only the render is bounded here; the backend still hands
-   * over the whole conversation, so nothing is lost and "Show earlier
-   * messages" is instant.
-   *
-   * Deliberately NOT a scroll-triggered auto-load: this pane auto-scrolls to
-   * the bottom on every new token, and a top-of-list trigger fights that. */
-  const [shownCount, setShownCount] = useState(CHAT_PAGE);
-  const { hidden: hiddenOlder, visible: shownMessages } = chatPageSlice(
-    messages,
-    shownCount,
-  );
-
-  /* Jumping to a search hit has to survive the page above. `revealMessage`
-   * (miscActions) scrolls to `#msg-<id>` and polls for it, which worked only
-   * because every message used to be mounted; with a tail page, a hit older
-   * than CHAT_PAGE has no element, the poll expires and the search result
-   * silently does nothing. Widen the page far enough to include the row —
-   * the messages are already in memory, so this costs a render, not a load.
-   * Cleared once the row is reachable (or once the loaded conversation is
-   * known not to contain it) so this cannot latch on. */
-  const revealSeen = useRef<unknown>(null);
-  useEffect(() => {
-    const id = s.revealMsgId;
-    if (!id) {
-      revealSeen.current = null;
-      return;
-    }
-    // A hit picked from another conversation arrives in the SAME commit as the
-    // chat switch, so `messages` here is still the old chat's. Remember which
-    // list the request arrived with and only give up once a different one has
-    // been loaded and still does not contain the message.
-    if (revealSeen.current === null) revealSeen.current = messages;
-    const idx = messages.findIndex((m) => m.id === id);
-    if (idx >= 0) {
-      setShownCount((n) => Math.max(n, chatPageToReveal(messages.length, idx)));
-      s.setRevealMsgId(null);
-    } else if (messages !== revealSeen.current) {
-      s.setRevealMsgId(null);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.revealMsgId, messages]);
-
-  // The agent diagram is the only record of which helpers ran and for how
-  // long, and it used to exist only while the answer was being written.
-  // Keep the last roster and its clocks, and re-attach them to the answer.
-  const liveTimings = useRef<Record<string, AgentTiming>>({});
-  // The kept roster and the "was a turn running?" reading are both facts about
-  // ONE conversation (owner replacement #4): `s.asking` is per chat now, so
-  // walking away from a running chat also flips it false, and without the chat
-  // id beside them the diagram from the chat being LEFT was filed against the
-  // new chat's last answer.
-  const lastGraph = useRef<
-    { chatId: string | null; graph: Omit<PastGraph, "timings"> } | null
-  >(null);
-  const wasAsking = useRef(false);
-  const askingChat = useRef<string | null>(null);
-  const [graphByMsg, setGraphByMsg] = useState<Record<string, PastGraph>>({});
-  useEffect(() => {
-    // Only a turn that DELEGATED has a diagram worth keeping; a lone Main
-    // agent draws a single chip, which the finished message already shows.
-    if (s.agentPlan && s.agentPlan.length > 1) {
-      lastGraph.current = {
-        chatId: s.activeChatId,
-        graph: {
-          plan: s.agentPlan,
-          active: s.activeAgent,
-          agentSteps: s.agentSteps,
-          agentReports: s.agentReports,
-          steps: s.steps,
-          lane: s.lane,
-        },
-      };
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.agentPlan, s.activeAgent, s.agentSteps, s.agentReports, s.steps, s.lane]);
-  useEffect(() => {
-    // A turn ENDED here only if the chat this reading describes is still the
-    // one on screen; otherwise the user simply switched away and nothing
-    // finished.
-    const sameChat = askingChat.current === s.activeChatId;
-    const was = sameChat && wasAsking.current;
-    wasAsking.current = s.asking;
-    askingChat.current = s.activeChatId;
-    if (s.asking) {
-      if (!was) liveTimings.current = {};
-      return;
-    }
-    if (!sameChat) return;
-    const kept = lastGraph.current;
-    const graph = kept && kept.chatId === s.activeChatId ? kept.graph : null;
-    if (graph) lastGraph.current = null;
-    // Only a turn that just ENDED files a graph, and only against an answer
-    // that has none — a stopped turn must not overwrite the previous answer's.
-    if (!was || !graph || !lastAssistantId || graphByMsg[lastAssistantId]) return;
-    const now = performance.now();
-    const frozen: Record<string, AgentTiming> = {};
-    for (const [key, t] of Object.entries(liveTimings.current)) {
-      frozen[key] = { start: t.start, end: t.end ?? now };
-    }
-    liveTimings.current = {};
-    setGraphByMsg((g) => ({
-      ...g,
-      [lastAssistantId]: { ...graph, timings: { current: frozen } },
-    }));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.asking, s.activeChatId, lastAssistantId, graphByMsg]);
-
+  const { liveTimings, lastGraph, graphByMsg } = useGraphHistory(s, lastAssistantId);
+  const { hidden: hiddenOlder, visible: shownMessages, setShownCount } = useChatPaging(s, lastGraph);
+  const { turnNote, localReach } = useTurnAnnouncement(s, model, lastAssistant, lastAssistantId);
   const submitEdit = () => {
-    const draft = editDraft;
-    if (!draft) return;
+    if (editDraft === null) return;
     setEditDraft(null);
-    void a.editAndResend(draft.id, draft.text);
+    void a.editAndResend(editDraft.id, editDraft.text);
   };
-
-  // `editAndResend` deletes everything after the edited question. That count
-  // belongs on the control that does it: the only warning was a title on the
-  // button that OPENS the editor, i.e. gone by the time anyone presses Send.
-  const editIdx = editDraft
-    ? messages.findIndex((m) => m.id === editDraft.id)
-    : -1;
-  const editTail = editIdx < 0 ? 0 : messages.length - editIdx - 1;
-
-  /* A turn was silent to a screen reader: the route line and the stream cursor
-   * are plain spans, and the cursor is deliberately aria-hidden. ONE polite
-   * region carrying one sentence per turn — announcing the stream itself,
-   * token by token, would be unusable. Only ever the turn belonging to the
-   * conversation on screen; walking away from a running chat also flips
-   * `s.asking`, and that is not an answer arriving. */
-  // A local model keeps its OWN reasoning on this Mac, but the room's internet
-  // switch and its connected tools still carry the question — or text derived
-  // from it — out. Named once so the line on screen and the line a reader hears
-  // cannot say different things, and so it never names a reach the room has not
-  // got.
-  const localReach = [
-    s.webOn ? "online search" : null,
-    s.mcpTools.length > 0 ? "connected tools" : null,
-  ]
-    .filter(Boolean)
-    .join(" and ");
-  const routeNote = isCloudRoute(model, s.ai)
-    ? "Asking your cloud AI — content leaves this Mac."
-    : localReach
-      ? `Thinking on this Mac — ${localReach} can send parts of this out.`
-      : "Thinking locally.";
-  const [turnNote, setTurnNote] = useState("");
-  const turnRunning = useRef(false);
-  const turnChat = useRef<string | null>(null);
-  const turnStartId = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    if (s.asking) {
-      if (turnRunning.current && turnChat.current === s.activeChatId) return;
-      turnRunning.current = true;
-      turnChat.current = s.activeChatId;
-      turnStartId.current = lastAssistantId;
-      setTurnNote(routeNote);
-      return;
-    }
-    if (!turnRunning.current) return;
-    turnRunning.current = false;
-    if (turnChat.current !== s.activeChatId) {
-      setTurnNote("");
-      return;
-    }
-    // The stored answer lands before the run is de-registered, so by the time
-    // `asking` falls a new id means an answer really arrived.
-    if (lastAssistantId === turnStartId.current) {
-      setTurnNote("The turn ended with no answer.");
-      return;
-    }
-    const notice = lastAssistant ? lostReplyNotice(lastAssistant.content) : null;
-    setTurnNote(notice !== null ? lostReplyAdvice(notice) : "The answer is ready.");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.asking, s.activeChatId, lastAssistantId, routeNote]);
+  const editTail = editTailFor(messages, editDraft);
 
   return (
     <div className="chat" aria-label="Chat">
-      <div className="chat-head">
-        {s.renaming ? (
-          <input
-            className="chat-select chat-rename"
-            autoFocus
-            dir="auto"
-            value={s.renameDraft}
-            onChange={(e) => s.setRenameDraft(e.target.value)}
-            onBlur={a.commitRename}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") a.commitRename();
-              if (e.key === "Escape") s.setRenaming(false);
-            }}
-          />
-        ) : (
-          <select
-            className="chat-select"
-            value={s.activeChatId ?? ""}
-            dir="auto"
-            onChange={(e) => s.setActiveChatId(e.target.value)}
-          >
-            {s.chats.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.title}
-              </option>
-            ))}
-          </select>
-        )}
-        <button
-          className="subtle btn-ic"
-          title="Rename this chat"
-          aria-label="Rename this chat"
-          disabled={s.asking || !s.activeChatId || s.renaming}
-          onClick={a.startRename}
-        >
-          <PencilIcon size={14} />
-        </button>
-        <button className="subtle" title="New chat ⌘N" onClick={a.newChat}>
-          ＋ New
-        </button>
-        <button
-          className="subtle"
-          title="Copy this whole conversation as text"
-          disabled={messages.length === 0}
-          onClick={a.copyConversation}
-        >
-          Copy chat
-        </button>
-        <button
-          className={`subtle btn-ic${s.autoSpeak ? " accent" : ""}`}
-          title={
-            s.autoSpeak
-              ? "Auto-speak is on — answers are read aloud (voice: Settings → Spoken voice)"
-              : "Speak answers aloud as they stream"
-          }
-          aria-label="Read answers aloud"
-          aria-pressed={s.autoSpeak}
-          onClick={a.toggleAutoSpeak}
-        >
-          <SpeakerIcon size={14} />
-        </button>
-        <button
-          className={`subtle btn-ic${s.handsFree ? " accent" : ""}`}
-          title={
-            s.handsFree
-              ? "Hands-free is on — the mic re-arms after each answer"
-              : "Hands-free: re-arm the mic after each answer to keep talking"
-          }
-          aria-label="Hands-free — re-arm the mic after each answer"
-          aria-pressed={s.handsFree}
-          onClick={a.toggleHandsFree}
-        >
-          <HandsFreeIcon size={14} />
-        </button>
-        {s.activeChatId && (
-          <DeleteControl
-            k={`chat:${s.activeChatId}`}
-            trigger={<TrashIcon size={14} />}
-            onConfirm={() => a.removeChat(s.activeChatId!)}
-            title="Delete this chat session"
-            confirmDelete={s.confirmDelete}
-            askConfirm={a.askConfirm}
-            cancelConfirm={a.cancelConfirm}
-          />
-        )}
-      </div>
+      <ChatHeader s={s} a={a} />
 
-      {/* The kicker is the one handwritten word on a notice, and the rule
-          behind that split is worth stating once: the LABEL is an aside, so it
-          takes the hand; the CONSEQUENCE is an instruction about what leaves
-          this Mac, so it stays in the interface sans at reading size. A
-          privacy warning set in a handwriting face would be decoration
-          wearing the clothes of the product's core promise. */}
-      {s.showSyncWarn && (
-        <div className="banner notice">
-          <span className="banner-kicker">Note</span>
-          This room lives in a synced folder. Never open it on two computers
-          at the same time — the file can be damaged. Lock it before
-          switching machines.{" "}
-          <button className="subtle" onClick={a.dismissSyncWarn}>
-            Dismiss
-          </button>
-        </div>
-      )}
-      {/* PRIV-1: OFF must be loud — a room talking to a cloud model with the
-          door open says so persistently, not in a setting nobody reopens. */}
-      {isCloudRoute(model, s.ai) && s.privacyOn === false && (
-        <div className="banner privacy-off-banner" role="alert">
-          <span className="banner-kicker">Heads up</span>
-          Privacy is off — cloud models can see everything in this room,
-          names and all. Turn it back on in Settings → Cloud privacy.
-        </div>
-      )}
-      {ai && !ai.running && !ai.installed && (
-        <div className="banner onboard">
-          <span>
-            This room's AI runs on <strong>Ollama</strong>, a free app.
-          </span>
-          <span className="onboard-actions">
-            <button className="subtle" onClick={a.getOllama}>
-              Get Ollama
-            </button>
-            <button className="subtle" onClick={a.refreshAi}>
-              I installed it — check again
-            </button>
-          </span>
-        </div>
-      )}
-      {ai && !ai.running && ai.installed && (
-        <div className="banner onboard">
-          <span>
-            <strong>Ollama</strong> is installed but not running.
-          </span>
-          <span className="onboard-actions">
-            <button className="subtle" onClick={a.openOllamaApp}>
-              Open Ollama
-            </button>
-          </span>
-        </div>
-      )}
-      {ai?.running && !modelReady && (
-        <div className="banner onboard">
-          {s.pullingModel ? (
-            <span className="banner-pull">
-              <span className="banner-pull-label">
-                Downloading <strong>{model}</strong>…
-              </span>
-              <span className="pull-bar">
-                <span
-                  className="pull-bar-fill"
-                  style={{ width: `${s.pullPercent ?? 0}%` }}
-                />
-              </span>
-              <span className="banner-pull-status">
-                {s.pullStatus}
-                {s.pullPercent != null && ` — ${s.pullPercent.toFixed(0)}%`}
-              </span>
-              {/* A multi-gigabyte download started here could only be escaped by
-                  quitting the app: the Rust half has been cancellable all along
-                  (`pull:<model>` in the same registry chat's Stop uses) with no
-                  surface calling it. */}
-              <button className="subtle" onClick={() => void a.stopModelPull()}>
-                Stop
-              </button>
-            </span>
-          ) : (
-            <div className="model-pick">
-              <div className="model-pick-head">
-                <strong>Pick a model to download</strong>
-                <span className="model-pick-sub">
-                  It runs entirely on your Mac. You can switch or add more
-                  anytime in Settings.
-                </span>
-              </div>
-              <div className="model-pick-grid">
-                {RECOMMENDED_MODELS.map((m) => (
-                  <div className="model-pick-card" key={m.name}>
-                    {m.tag && (
-                      <span className="model-pick-tag">{m.tag}</span>
-                    )}
-                    <div className="model-pick-name">{m.name}</div>
-                    <div className="model-pick-meta">
-                      {m.label} · {m.size}
-                    </div>
-                    <div className="model-pick-blurb">{m.blurb}</div>
-                    <button
-                      className="subtle btn-ic model-pick-get"
-                      onClick={() => a.pickAndDownload(m.name)}
-                    >
-                      <DownloadIcon size={14} /> Download
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-          {s.pullError && <div className="banner-error">{s.pullError}</div>}
-        </div>
-      )}
-      <div className="messages" ref={s.chatRef}>
-        {messages.length === 0 && (
-          <div className="chat-hero">
-            <div className="chat-hero-icon">
-              <EmptyChatArt />
-            </div>
-            <h2>Ask your room</h2>
-            <p>
-              I can work across everything inside{" "}
-              {info.path.split("/").pop()}, using only the context you attach
-              or make available.
-            </p>
-            <div className="prompt-chips">
-              {[
-                "Summarize what's in this room",
-                "What are the key points across my files?",
-                "What did I add recently?",
-                "Draft a short memo from these files",
-              ].map((p) => (
-                <button
-                  key={p}
-                  className="prompt-chip"
-                  onClick={() => {
-                    s.setQuestion(p);
-                    s.composerRef.current?.focus();
-                  }}
-                >
-                  {p}
-                </button>
-              ))}
-            </div>
-            {s.commands.length > 0 && (
-              <div className="cmd-hints">
-                <span className="cmd-hints-label">Or run a command:</span>
-                {[...s.commands, HELP_COMMAND].map((c) => (
-                  <button
-                    key={c.name}
-                    className="cmd-hint-chip"
-                    title={`${c.summary} — ${c.usage}`}
-                    onClick={() => {
-                      s.setQuestion(`#${c.name} `);
-                      s.composerRef.current?.focus();
-                    }}
-                  >
-                    #{c.name}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-        {hiddenOlder > 0 && (
-          // A COUNT, not a vague "more": the number is the honest thing to say,
-          // and it is what tells you whether one press is enough.
-          <button
-            className="subtle chat-load-older"
-            onClick={() => setShownCount((n) => n + CHAT_PAGE)}
-            title="These are already loaded — this only draws them"
-          >
-            Show earlier messages ({hiddenOlder} older)
-          </button>
-        )}
-        {shownMessages.map((m) => {
-          // Context handoff: a divider, not a participant turn — render it
-          // before any of the ordinary assistant/user branches below (`role`
-          // stays `"assistant"` on a marker row, so those checks alone would
-          // render it as a normal reply).
-          if (m.kind === "handoff") {
-            return <HandoffMarker key={m.id} message={m} />;
-          }
-          // ADD-23: structured effects ride on the message row; the content is
-          // plain prose. Legacy rooms (effects: null) still carry fenced
-          // ```boxes/```annotation blocks inside the text — split those out.
-          // Wave 2 (Idea 4): key off the two VIEWER keys, NOT effects-null — an
-          // edit turn now writes an "edits"-only effects object, and a message
-          // with no boxes/annotation must still run splitMarkupBlocks so a
-          // hallucinated fenced block is stripped rather than shown raw.
-          const hasViewerEffect = !!(m.effects && (m.effects.boxes || m.effects.annotation));
-          const { text, boxes, annotation } =
-            m.role === "assistant"
-              ? hasViewerEffect
-                ? {
-                    text: m.content,
-                    boxes: m.effects!.boxes,
-                    annotation: m.effects!.annotation,
-                  }
-                : splitMarkupBlocks(m.content)
-              : { text: m.content, boxes: undefined, annotation: undefined };
-          const annotVerified = !!annotation?.quote && !annotation?.approx;
-          // Is this row one of Arcelle's own "no answer" notices rather than a
-          // reply? Only then does the recovery strip below appear.
-          const lostReply =
-            m.role === "assistant" ? lostReplyNotice(m.content) : null;
-          // The hand is a function of LENGTH and KIND, never of who is
-          // speaking (see `isHandwritten`) — with one carve-out: Arcelle's own
-          // "the reply was lost" notice is a consequence the reader has to act
-          // on, and the system reserves the sans for those. It is short enough
-          // to pass the hand test, so it is excluded by name rather than by
-          // length.
-          const hand = lostReply === null && isHandwritten(text);
-          const clock = messageClock(m.createdAt);
-          return (
-          <div
-            key={m.id}
-            id={`msg-${m.id}`}
-            className={`msg ${m.role}${m.kind === "turn_error" ? " is-turn-error" : ""}${hand ? " is-hand" : ""}${m.id === lastAssistantId ? " is-latest" : ""}`}
-          >
-            <div className="msg-label">
-              <span className="msg-avatar" aria-hidden>
-                {m.role === "assistant" ? <SparkIcon size={12} /> : "•"}
-              </span>
-              <span className="msg-who">{speakerName(m.role)}</span>
-              {/* The margin time of a notebook log line. Real stored data, in
-                  the mono face with the rest of the technical metadata — the
-                  page never derives a SHAPE from the clock, so a given
-                  conversation still draws identically on every render. */}
-              {clock && (
-                <time className="msg-when" dateTime={m.createdAt}>
-                  {clock}
-                </time>
-              )}
-            </div>
-            {/* The turn's own diagram when this session drew one (helpers,
-                their steps and their clocks stay readable afterwards); the
-                flat strip persisted on the message otherwise — that is all a
-                room reopened later still has. */}
-            {m.role === "assistant" && graphByMsg[m.id] ? (
-              <AgentGraph
-                plan={graphByMsg[m.id].plan}
-                active={graphByMsg[m.id].active}
-                agentSteps={graphByMsg[m.id].agentSteps}
-                agentReports={graphByMsg[m.id].agentReports}
-                steps={graphByMsg[m.id].steps}
-                lane={graphByMsg[m.id].lane}
-                timings={graphByMsg[m.id].timings}
-                live={false}
-              />
-            ) : (
-              m.role === "assistant" &&
-              !!m.effects?.agents?.length && (
-                <div
-                  className="agent-strip past"
-                  aria-label="Agents that handled this request"
-                >
-                  <span className="agent-strip-caption">
-                    {m.effects.agents.length > 1 ? "Agents" : "Agent"}
-                  </span>
-                  {m.effects.agents.map((p, i) => (
-                    <span key={i} className="agent-pipe">
-                      {i > 0 && <span className="agent-arrow" aria-hidden>→</span>}
-                      {/* The status was recorded, sent and stored; only this
-                          renderer dropped it, so a specialist that errored out
-                          read exactly like one that finished. Failure only:
-                          the persisted strip is deliberately quiet, and
-                          never state by colour alone — the glyph carries it
-                          too, as the diagram's nodes do. */}
-                      <span
-                        className={`agent-chip past${p.status === "failed" ? " failed" : ""}`}
-                        title={p.instruction}
-                      >
-                        {p.status === "failed" && (
-                          <span role="img" aria-label="failed">
-                            ⚠
-                          </span>
-                        )}
-                        {p.label}
-                      </span>
-                    </span>
-                  ))}
-                </div>
-              )
-            )}
-            <div className="msg-content" dir="auto">
-              {m.role === "assistant" ? (
-                <>
-                  <MarkdownView text={text} />
-                  {boxes && (
-                    <ChatAnnotatedImage
-                      fileId={boxes.fileId}
-                      boxes={boxes.boxes}
-                    />
-                  )}
-                  {annotation && (
-                    // The one honest margin annotation on an answer: the model
-                    // located a passage and said so, so the note beside the
-                    // answer is the model's OWN output, tied back to the
-                    // paragraph it came from with a drawn arrow. Nothing here
-                    // is written by the interface — an annotation Arcelle
-                    // invented ("good point", "check this") would be the UI
-                    // manufacturing an opinion and attributing it to nobody,
-                    // which is why the decorative reading of the brief is not
-                    // implemented anywhere in this pane.
-                    // The arrow is an aria-hidden, pointer-events:none masked
-                    // span from paper.css, and it is a FLEX ITEM rather than an
-                    // absolutely positioned mark, so it lands on the correct
-                    // side of an RTL answer without a single hard `left`.
-                    <div className="annot-chip-wrap msg-annot">
-                      <span
-                        className="nb-arrow-curve nb-arrow-curve--nw msg-tie"
-                        aria-hidden
-                      />
-                      <button
-                        className={`annot-chip${annotVerified ? " receipt-verified" : ""}`}
-                        title="Show the highlight in the viewer"
-                        onClick={() =>
-                          a.viewFile(
-                            annotation.fileId,
-                            annotationTarget(annotation),
-                          )
-                        }
-                      >
-                        {annotVerified ? (
-                          <CheckIcon size={14} />
-                        ) : (
-                          <EyeIcon size={14} />
-                        )}{" "}
-                        {annotation.note ||
-                          annotation.quote ||
-                          annotation.range}{" "}
-                        — {annotation.name}
-                        {annotVerified && (
-                          <span className="receipt-badge">
-                            <CheckIcon size={12} /> Verified
-                          </span>
-                        )}
-                        {annotation.approx && (
-                          <span
-                            className="annot-approx"
-                            title="The exact quote wasn't found — the closest passage was highlighted"
-                          >
-                            {" "}
-                            · ≈ closest match
-                          </span>
-                        )}
-                      </button>
-                      {annotVerified && annotation.quote && (
-                        <button
-                          className="subtle"
-                          title="Copy this quote as a citation (quote · file · page)"
-                          onClick={() => a.copyReceipt(annotation)}
-                        >
-                          Copy as receipt
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </>
-              ) : editDraft?.id === m.id ? (
-                <div className="composer-card">
-                  <textarea
-                    className="composer-input"
-                    value={editDraft.text}
-                    autoFocus
-                    rows={3}
-                    dir="auto"
-                    onChange={(e) =>
-                      setEditDraft({ id: m.id, text: e.target.value })
-                    }
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && !e.shiftKey) {
-                        e.preventDefault();
-                        submitEdit();
-                      }
-                      if (e.key === "Escape") {
-                        e.stopPropagation();
-                        setEditDraft(null);
-                      }
-                    }}
-                  />
-                  <span className="save-form">
-                    <button className="subtle" onClick={submitEdit}>
-                      {editTail === 0
-                        ? "Send again"
-                        : `Send again — deletes the ${editTail} message${
-                            editTail === 1 ? "" : "s"
-                          } below`}
-                    </button>
-                    <button
-                      className="subtle"
-                      onClick={() => setEditDraft(null)}
-                    >
-                      Cancel
-                    </button>
-                  </span>
-                </div>
-              ) : hand ? (
-                <HandNote text={text} />
-              ) : (
-                text
-              )}
-            </div>
-            {/* Your own messages were the only rows in the app with no
-                actions at all — a sent question could not be copied, let
-                alone corrected. */}
-            {m.role === "user" && !editDraft && !m.id.startsWith("pending-") && (
-              <div className="msg-footer">
-                <button
-                  className="subtle"
-                  title="Copy this message"
-                  onClick={() => a.copyMessage(m)}
-                >
-                  Copy
-                </button>
-                <button
-                  className="subtle"
-                  title="Change this question and ask again — everything after it is removed"
-                  disabled={s.asking}
-                  onClick={() => setEditDraft({ id: m.id, text: m.content })}
-                >
-                  Edit & resend
-                </button>
-              </div>
-            )}
-            {/* A turn that produced no answer used to be a dead end: the
-                notice said "Please try again" and left the user to retype the
-                question. Regenerate could always do it, but it sits unlabelled
-                among Copy/Play/Save and its title reads "Delete this answer
-                and ask again", which is not what someone whose reply was lost
-                is looking for. Offer the action where the failure is, and say
-                first what is actually true of this turn — a write that landed
-                or a job still running makes asking again NOT free.
-                There is no Resume: a run keeps no durable state to resume
-                from (the sidecar releases its registry entry when the stream
-                ends, and the host's delta mirror is a local in `stream_run`),
-                so only Try again is offered rather than a button that would
-                restart the turn while calling itself a resume. */}
-            {m.role === "assistant" &&
-              m.id === lastAssistantId &&
-              lostReply !== null && (
-                <div className="msg-recover">
-                  <span>{lostReplyAdvice(lostReply)}</span>
-                  <button
-                    className="subtle"
-                    title="Delete this notice and run the same question again"
-                    disabled={s.asking}
-                    onClick={() => a.regenerate(m.id)}
-                  >
-                    Try again
-                  </button>
-                </div>
-              )}
-            {m.role === "assistant" && (
-              <div className="msg-footer">
-                {m.sources.length > 0 && (
-                  // Citations are load-bearing, so they lead the action group
-                  // on their own line instead of sitting among the buttons —
-                  // and they are the one thing in this footer that never
-                  // fades: an answer's evidence is content, not an action.
-                  // The kicker labels a group that had no label at all, and
-                  // the drawn arrow ties it back to the answer above it.
-                  <span className="msg-sources">
-                    <span
-                      className="nb-arrow-curve nb-arrow-curve--nw msg-tie"
-                      aria-hidden
-                    />
-                    <span className="msg-sources-kicker">Sources</span>
-                    {m.sources.map((src) => (
-                      <button
-                        key={src}
-                        className="source-chip"
-                        title={`Open ${src}`}
-                        onClick={() => a.openSource(src)}
-                      >
-                        {src}
-                      </button>
-                    ))}
-                  </span>
-                )}
-                {/* "Ask before AI edits files" is off by owner decision, so
-                    the transcript is where a person discovers that an answer
-                    changed the room — and the only sign of it was the Undo
-                    button, which is session state and gone after a restart.
-                    A report rather than an action, so it is a span: the
-                    footer's fade rule is `> button` only, and this stays lit.
-                    Landed writes only, and counted as CHANGES not as distinct
-                    files: the records are content-free, so two edits to one
-                    file are indistinguishable from one edit to each of two. */}
-                {(() => {
-                  const landed = (m.effects?.edits ?? []).filter((e) =>
-                    LANDED_EDIT_OUTCOMES.has(e.outcome),
-                  );
-                  if (landed.length === 0) return null;
-                  const files = landed.reduce((n, e) => n + (e.files ?? 1), 0);
-                  return (
-                    <span
-                      className="msg-edits"
-                      title="Each change is in that file's History and can be undone there."
-                    >
-                      Made {files} file change{files === 1 ? "" : "s"} in this
-                      room
-                    </span>
-                  );
-                })()}
-                <button
-                  className="subtle btn-ic"
-                  title={
-                    s.speakingMsgId === m.id
-                      ? "Stop speaking"
-                      : "Read this answer aloud"
-                  }
-                  onClick={() => a.speakMessage(m)}
-                >
-                  {s.speakingMsgId === m.id ? (
-                    <><StopIcon size={12} /> Stop</>
-                  ) : (
-                    <><PlayIcon size={12} /> Play</>
-                  )}
-                </button>
-                <button
-                  className="subtle"
-                  title="Copy this answer"
-                  disabled={s.asking}
-                  onClick={() => a.copyMessage(m)}
-                >
-                  Copy
-                </button>
-                {s.undoByMsg[m.id] && (
-                  <button
-                    className="subtle undo-edit"
-                    title="Undo the file change this answer made (reversible via version history)"
-                    disabled={s.asking}
-                    onClick={() => a.undoEdits(m.id)}
-                  >
-                    <UndoIcon size={14} /> Undo{" "}
-                    {s.undoByMsg[m.id].length > 1 ? `${s.undoByMsg[m.id].length} edits` : "edit"}
-                  </button>
-                )}
-                {m.id === lastAssistantId && (
-                  <button
-                    className="subtle"
-                    title="Delete this answer and ask again (the original attachments are not re-sent)"
-                    disabled={s.asking}
-                    onClick={() => a.regenerate(m.id)}
-                  >
-                    Regenerate
-                  </button>
-                )}
-                {s.saveDraft?.id === m.id ? (
-                  <span className="save-form">
-                    <input
-                      value={s.saveDraft.name}
-                      autoFocus
-                      onChange={(e) =>
-                        s.setSaveDraft({ id: m.id, name: e.target.value })
-                      }
-                      onKeyDown={(e) => e.key === "Enter" && a.saveToRoom(m)}
-                    />
-                    <button className="subtle" onClick={() => a.saveToRoom(m)}>
-                      Save
-                    </button>
-                    <button className="subtle" onClick={() => s.setSaveDraft(null)}>
-                      Cancel
-                    </button>
-                  </span>
-                ) : (
-                  <button
-                    className="subtle"
-                    // A name no file is using yet: "AI note.md", "AI note 2.md"
-                    // … Three answers called the same thing left the source
-                    // chip able to open only the newest of them.
-                    onClick={() =>
-                      s.setSaveDraft({
-                        id: m.id,
-                        name: uniqueFileName(
-                          "AI note.md",
-                          s.files.map((f) => f.name),
-                        ),
-                      })
-                    }
-                  >
-                    Save to room
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
-          );
-        })}
-        {s.asking && (
-          // The live turn is ALWAYS set in the sans, whatever it ends up
-          // saying. The voice is a property of a finished message, and
-          // re-deciding it as tokens arrive would swap the face — and relayout
-          // the whole block — several times per answer. It settles into the
-          // hand, if it earns it, when the stored message replaces this row.
-          <div
-            className={`msg assistant is-streaming ${s.streamText ? "" : "thinking"}`}
-            // So a reader is not handed a half-written bubble as finished text.
-            aria-busy
-          >
-            <div className="msg-label">
-              <span className="msg-avatar" aria-hidden>
-                <SparkIcon size={12} />
-              </span>
-              <span className="msg-who">{speakerName("assistant")}</span>
-            </div>
-            {/* The live roster as a hub-and-spoke graph. A turn where nothing
-                was delegated has no graph to draw, and AgentGraph falls back to
-                the single flat chip this used to be. */}
-            {s.agentPlan && s.agentPlan.length > 0 && (
-              <AgentGraph
-                plan={s.agentPlan}
-                active={s.activeAgent}
-                agentSteps={s.agentSteps}
-                agentReports={s.agentReports}
-                steps={s.steps}
-                lane={s.lane}
-                // The LIVE graph is the only thing that ever measures, so it
-                // has to stamp into the store this pane freezes onto the
-                // finished answer. Left to its own internal ref, every clock
-                // died with the streaming bubble and every archived diagram
-                // was handed an empty store — roster, nodes and steps, but
-                // never a single duration.
-                timings={liveTimings}
-              />
-            )}
-            {/* Capped at the last few so one long tool loop cannot push the
-                answer off the bottom of the pane. Kept on a delegating turn
-                too: only steps that arrive WITH a node are filed into the
-                diagram, every non-sidecar emitter sends none, and the hub's
-                inspector falls back to this list only when the hub itself ran
-                nothing — so hiding the row would take those steps out of the
-                UI entirely. */}
-            {(() => {
-              const shown = s.steps.slice(-6);
-              const earlier = s.steps.length - shown.length;
-              if (!s.lane && shown.length === 0) return null;
-              return (
-                <div className="step-chips">
-                  {s.lane && <span className="lane-chip">{s.lane}</span>}
-                  {earlier > 0 && (
-                    <span
-                      className="step-chip"
-                      title="Earlier steps in this turn"
-                    >
-                      +{earlier} earlier
-                    </span>
-                  )}
-                  {shown.map((st, i) => (
-                    <span
-                      key={earlier + i}
-                      className={`step-chip${st.ok ? "" : " failed"}`}
-                      title={st.ok ? undefined : "This step didn't succeed"}
-                    >
-                      {st.ok ? "" : "⚠ "}
-                      {st.label}
-                    </span>
-                  ))}
-                </div>
-              );
-            })()}
-            <div className="msg-content" dir="auto">
-              {s.streamText ? (
-                <>
-                  <MarkdownView text={patchStreamFences(s.streamText)} />
-                  {/* The nib. Decorative and repeating, so it is kept out of
-                      assistive technology entirely — a screen reader following
-                      a streaming answer must not be handed a block glyph after
-                      every delta. */}
-                  <span className="stream-cursor" aria-hidden>
-                    ▍
-                  </span>
-                </>
-              ) : isCloudRoute(model, s.ai) ? (
-                // Where this question is going is a privacy consequence, so it
-                // is a taped note in the sans at reading size — never the hand,
-                // and never quieter than the local line beside it.
-                <span className="chat-route chat-route-cloud">
-                  Asking your cloud AI — content leaves this Mac…
-                </span>
-              ) : (
-                // Same reach the composer's badge names, and never quieter
-                // than the cloud line above.
-                localReach ? (
-                  <span className="chat-route chat-route-cloud">
-                    Thinking on this Mac — {localReach} can send parts of this
-                    out…
-                  </span>
-                ) : (
-                  <span className="chat-route">Thinking locally…</span>
-                )
-              )}
-            </div>
-          </div>
-        )}
-        {!s.asking && s.askPrivacy && (
-          <div className="privacy-receipt" role="status">
-            {s.askPrivacy.bypassed ? (
-              <span className="privacy-receipt-chip bypassed">
-                Real details were shared this once
-              </span>
-            ) : (
-              <span className="privacy-receipt-chip">
-                {(s.askPrivacy.entities_hidden ?? 0) > 0
-                  ? `${s.askPrivacy.entities_hidden} private detail${
-                      (s.askPrivacy.entities_hidden ?? 0) === 1 ? "" : "s"
-                    } hidden from the cloud model`
-                  : (s.askPrivacy.images_blocked ?? 0) > 0
-                    ? "Shielded — no private text needed hiding"
-                  : "Shielded — nothing private needed hiding"}
-                {(s.askPrivacy.images_blocked ?? 0) > 0 &&
-                  ` · ${s.askPrivacy.images_blocked} image${
-                    (s.askPrivacy.images_blocked ?? 0) === 1 ? "" : "s"
-                  } kept on this Mac`}
-              </span>
-            )}
-            {/* The valve: only offered when something was actually hidden, and
-                only through a human click — the agent driver is fenced out. */}
-            {!s.askPrivacy.bypassed &&
-              ((s.askPrivacy.entities_hidden ?? 0) > 0 ||
-                (s.askPrivacy.images_blocked ?? 0) > 0) &&
-              (confirmReal ? (
-                <span className="privacy-valve-confirm" data-agent-blocked>
-                  {(s.askPrivacy.entities_hidden ?? 0) > 0 &&
-                  (s.askPrivacy.images_blocked ?? 0) > 0
-                    ? "Send this question again with the real details and blocked images?"
-                    : (s.askPrivacy.images_blocked ?? 0) > 0
-                      ? "Send this question again with the blocked images?"
-                      : "Send this question again with the real details?"}
-                  <button
-                    className="subtle danger"
-                    onClick={() => {
-                      setConfirmReal(false);
-                      void a.askAgainWithRealDetails();
-                    }}
-                  >
-                    Yes, this once
-                  </button>
-                  <button className="subtle" onClick={() => setConfirmReal(false)}>
-                    Cancel
-                  </button>
-                </span>
-              ) : (
-                <button
-                  className="subtle privacy-valve"
-                  data-agent-blocked
-                  title={
-                    (s.askPrivacy.images_blocked ?? 0) > 0
-                      ? "The cloud model could not see the blocked images. Re-ask sharing them for this one question only."
-                      : "The hidden details made this answer vague? Re-ask sharing the real values — for this one question only."
-                  }
-                  onClick={() => setConfirmReal(true)}
-                >
-                  {(s.askPrivacy.images_blocked ?? 0) > 0
-                    ? "Ask again sharing blocked images…"
-                    : "Ask again with real details…"}
-                </button>
-              ))}
-          </div>
-        )}
-        {s.memSuggestion && (
-          // ADD-25: saving a memory is the user's explicit choice — the agent
-          // driver must not be able to click "Save to memory" for them.
-          <div className="memory-suggestion" data-agent-blocked>
-            <div className="memory-suggestion-head">
-              <MemoryIcon size={14} /> Worth remembering?
-            </div>
-            <div className="memory-suggestion-fact">
-              {s.memSuggestion.fact}
-            </div>
-            <div className="memory-suggestion-actions">
-              <button type="button" className="primary" onClick={a.saveSuggestedMemory}>
-                Save to memory
-              </button>
-              <button
-                type="button"
-                className="subtle"
-                // GH #19: Ignore dismisses only this optional memory card. It
-                // never submits the composer, deletes messages, or regenerates
-                // the already-persisted answer above it.
-                onClick={() => s.setMemSuggestion(null)}
-              >
-                Ignore
-              </button>
-              {/* Wave 1b (idea 5): opt into auto-save. The click is the
-                  consent; the agent driver still can't press it (the chip is
-                  data-agent-blocked). Off-switch: Settings → Behavior. */}
-              <button
-                type="button"
-                className="subtle"
-                title="Save this and every future suggestion automatically (turn off in Settings → Behavior)"
-                onClick={a.enableMemoryAutoSave}
-              >
-                Always save
-              </button>
-            </div>
-          </div>
-        )}
-        {/* The whole turn's account for a screen reader, in the app's existing
-            visually-hidden live-region class. Always mounted so the first
-            sentence of a turn is announced rather than swallowed. */}
-        <p className="agraph-sr" role="status">
-          {turnNote}
-        </p>
-      </div>
+      <ChatBanners s={s} a={a} model={model} modelReady={modelReady} />
+      <ChatTranscript
+        s={s}
+        a={a}
+        info={info}
+        shownMessages={shownMessages}
+        hiddenOlder={hiddenOlder}
+        onShowOlder={() => setShownCount((count) => count + CHAT_PAGE)}
+        lastAssistantId={lastAssistantId}
+        graphByMsg={graphByMsg}
+        editDraft={editDraft}
+        onStartEdit={(message) => setEditDraft({ id: message.id, text: message.content })}
+        onChangeEdit={(id, text) => setEditDraft({ id, text })}
+        onSubmitEdit={submitEdit}
+        onCancelEdit={() => setEditDraft(null)}
+        editTail={editTail}
+        liveTimings={liveTimings}
+        model={model}
+        localReach={localReach}
+        confirmReal={confirmReal}
+        setConfirmReal={setConfirmReal}
+        turnNote={turnNote}
+      />
 
       <Composer s={s} a={a} />
     </div>

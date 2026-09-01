@@ -200,6 +200,26 @@ function asUsize(n: number): number {
   return Number.isNaN(n) ? 0 : Math.max(0, n);
 }
 
+function areaCappedScale(pageW: number, pageH: number): number {
+  const pixels = pageW * pageH * PDF_RENDER_SCALE * PDF_RENDER_SCALE;
+  if (pixels <= MAX_PAGE_PIXELS) return PDF_RENDER_SCALE;
+  return PDF_RENDER_SCALE * Math.sqrt(MAX_PAGE_PIXELS / pixels);
+}
+
+function edgeCappedScale(scale: number, edge: number): number {
+  if (edge * scale <= MAX_PAGE_EDGE) return scale;
+  return MAX_PAGE_EDGE / edge;
+}
+
+function rasterEdge(edge: number, scale: number): number {
+  return Math.min(asUsize(Math.ceil(edge * scale)), MAX_PAGE_EDGE);
+}
+
+function validRasterSize(width: number, height: number, scale: number): PageRasterSize | null {
+  if (!Number.isFinite(scale) || scale <= 0 || width === 0 || height === 0) return null;
+  return { width, height, scale };
+}
+
 /**
  * Bitmap size (and the scale that produced it) for one page's media box, or
  * `null` when there is nothing drawable. Pure, so both caps are testable
@@ -211,32 +231,20 @@ function asUsize(n: number): number {
  * independently.
  */
 export function pageRasterSize(pageW: number, pageH: number): PageRasterSize | null {
-  let scale = PDF_RENDER_SCALE;
-  const pixels = pageW * pageH * scale * scale;
-  if (pixels > MAX_PAGE_PIXELS) {
-    scale *= Math.sqrt(MAX_PAGE_PIXELS / pixels);
-  }
+  let scale = areaCappedScale(pageW, pageH);
   // Then clamp each edge on its own, so a degenerate media box can't slip an
   // enormous single dimension past the area cap.
   for (const edge of [pageW, pageH]) {
-    if (edge * scale > MAX_PAGE_EDGE) {
-      scale = MAX_PAGE_EDGE / edge;
-    }
-  }
-  if (!Number.isFinite(scale) || scale <= 0) {
-    return null;
+    scale = edgeCappedScale(scale, edge);
   }
   // `Math.min` rather than a bare check: rounding up can leave the product a
   // hair over the clamp, and clipping a sub-pixel is better than refusing a
   // legitimately poster-sized page. {@link asUsize} reproduces Rust's
   // saturating `as usize`, without which the zero check below cannot catch a
   // NaN or negative media-box edge.
-  const width = Math.min(asUsize(Math.ceil(pageW * scale)), MAX_PAGE_EDGE);
-  const height = Math.min(asUsize(Math.ceil(pageH * scale)), MAX_PAGE_EDGE);
-  if (width === 0 || height === 0) {
-    return null;
-  }
-  return { width, height, scale };
+  const width = rasterEdge(pageW, scale);
+  const height = rasterEdge(pageH, scale);
+  return validRasterSize(width, height, scale);
 }
 
 /**

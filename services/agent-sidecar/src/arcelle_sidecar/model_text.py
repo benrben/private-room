@@ -79,11 +79,26 @@ def recover_json(text: str) -> str:
     same way it would have on the raw reply.
     """
     s = strip_think_spans(text.strip()).strip()
-    a = next((i for i, c in enumerate(s) if c in "{["), None)
-    b = next((i for i in range(len(s) - 1, -1, -1) if s[i] in "}]"), None)
-    if a is not None and b is not None and b >= a:
-        return s[a : b + 1]
+    start, end = _json_bounds(s)
+    if _has_json_payload_bounds(start, end):
+        return s[start : end + 1]
     return s
+
+
+def _json_bounds(text: str) -> tuple[int | None, int | None]:
+    return _first_json_bracket(text), _last_json_bracket(text)
+
+
+def _first_json_bracket(text: str) -> int | None:
+    return next((index for index, char in enumerate(text) if char in "{" "["), None)
+
+
+def _last_json_bracket(text: str) -> int | None:
+    return next((index for index in range(len(text) - 1, -1, -1) if text[index] in "}" "]"), None)
+
+
+def _has_json_payload_bounds(start: int | None, end: int | None) -> bool:
+    return start is not None and end is not None and end >= start
 
 
 def prime_schema(messages: list[Message], schema: dict[str, Any]) -> list[Message]:

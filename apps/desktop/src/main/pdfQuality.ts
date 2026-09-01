@@ -116,26 +116,22 @@ export function shouldRereadWithOcr(text: string): boolean {
  * with nothing.
  */
 export function choose(extracted: string | null, ocr: string | null): string | null {
-  if (extracted !== null && ocr !== null) {
-    if (faultIn(extracted) === null) {
-      return extracted;
-    }
-    if (faultIn(ocr) === null) {
-      return ocr;
-    }
-    // Both are poor: keep whichever has more readable content, so a partial
-    // reading still beats nothing. Rust weighs that with `str::len()`, which
-    // is UTF-8 BYTES — so a Hebrew reading counts double against an ASCII one
-    // and `.length` (UTF-16 code units) would flip the winner outright.
-    return utf8Length(rustTrim(ocr)) > utf8Length(rustTrim(extracted)) ? ocr : extracted;
-  }
-  if (extracted !== null) {
-    return extracted;
-  }
-  if (ocr !== null) {
-    return ocr;
-  }
-  return null;
+  if (extracted !== null && ocr !== null) return chooseBetweenReadings(extracted, ocr);
+  return extracted ?? ocr;
+}
+
+function chooseBetweenReadings(extracted: string, ocr: string): string {
+  if (faultIn(extracted) === null) return extracted;
+  if (faultIn(ocr) === null) return ocr;
+  return longerFaultyReading(extracted, ocr);
+}
+
+function longerFaultyReading(extracted: string, ocr: string): string {
+  // Both are poor: keep whichever has more readable content, so a partial
+  // reading still beats nothing. Rust weighs that with `str::len()`, which
+  // is UTF-8 BYTES — so a Hebrew reading counts double against an ASCII one
+  // and `.length` (UTF-16 code units) would flip the winner outright.
+  return utf8Length(rustTrim(ocr)) > utf8Length(rustTrim(extracted)) ? ocr : extracted;
 }
 
 // ------------------------------------------------------------- char classes

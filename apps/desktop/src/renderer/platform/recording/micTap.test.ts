@@ -237,4 +237,15 @@ describe("defaultMicTapDeps — the real production wiring", () => {
     expect(await defaultMicTapDeps().getUserMedia({ audio: true })).toBe(stream);
     expect(real).toHaveBeenCalledWith({ audio: true });
   });
+
+  it("constructs and adapts the browser AudioContext lazily", () => {
+    const context = fakeAudioContext();
+    const AudioContext = vi.fn(() => context);
+    vi.stubGlobal("AudioContext", AudioContext);
+
+    const adapted = defaultMicTapDeps().createAudioContext();
+
+    expect(AudioContext).toHaveBeenCalledOnce();
+    expect(adapted.sampleRate).toBe(context.sampleRate);
+  });
 });

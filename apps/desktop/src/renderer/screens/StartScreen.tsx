@@ -40,6 +40,108 @@ type StartScreenProps = {
   onClearRecent: () => void;
 };
 
+function RecentOpenedTime({ openedAt }: Pick<RecentRoom, "openedAt">) {
+  if (!relativeTime(openedAt)) return null;
+  return <span className="recent-when">Opened {relativeTime(openedAt)}</span>;
+}
+
+function RecentRoomDetails({ room, place }: { room: RecentRoom; place: ReturnType<typeof roomPlace> }) {
+  if (room.missing) {
+    return (
+      <span className="recent-meta">
+        <span className="recent-when recent-missing">
+          Room not found — moved, deleted, or on a drive that isn't connected
+        </span>
+      </span>
+    );
+  }
+  return (
+    <span className="recent-meta">
+      <RecentOpenedTime openedAt={room.openedAt} />
+      {/* Marker states, each one paired with its word so the colour is never
+          the signal on its own. In a workspace, normal files are intentionally
+          plain; chats, history and other private state are the encrypted part. */}
+      <span className="nb-tape nb-sem-done">
+        <span className="nb-ico nb-ico-check" aria-hidden="true" />
+        Private state encrypted
+      </span>
+      {place && <span className={`nb-tape ${place.sem}`}>{place.label}</span>}
+    </span>
+  );
+}
+
+function RecentRoomActions({
+  room,
+  onRemoveRecent,
+  onTrashRoom,
+}: Pick<StartScreenProps, "onRemoveRecent" | "onTrashRoom"> & { room: RecentRoom }) {
+  const forget = (
+    <button
+      className="recent-remove"
+      title="Forget this shortcut"
+      aria-label="Forget this shortcut"
+      onClick={() => onRemoveRecent(room.path)}
+    >
+      <CloseIcon size={14} />
+    </button>
+  );
+  if (room.missing) return forget;
+  return (
+    <>
+      {forget}
+      <button
+        className="recent-remove"
+        title="Move room to Trash"
+        aria-label={`Move ${room.name} to Trash`}
+        onClick={() => onTrashRoom(room)}
+      >
+        <TrashIcon size={14} />
+      </button>
+    </>
+  );
+}
+
+function RecentRoomRow({
+  room,
+  onOpenRecent,
+  onRemoveRecent,
+  onTrashRoom,
+}: Pick<StartScreenProps, "onOpenRecent" | "onRemoveRecent" | "onTrashRoom"> & { room: RecentRoom }) {
+  const place = roomPlace(room.path);
+  const openTitle = room.missing
+    ? "This room is not at that location any more — opens the room picker"
+    : undefined;
+  return (
+    <li className={`recent-row${room.missing ? " missing" : ""}`}>
+      <button
+        className="recent-open"
+        onClick={() => onOpenRecent(room.path)}
+        /* A room whose file is gone still OPENS — but through the file picker,
+           which is what can be told where it moved to, rather than through a
+           password form for a file that isn't there. App.tsx routes it. */
+        title={openTitle}
+      >
+        <span className="recent-name">{room.name}</span>
+        {/* The row truncates a long path from the LEFT, so the file name always
+            survives; `direction: rtl` on the span is what moves the ellipsis
+            to the start. That alone reordered the path's own neutral characters
+            — "/Users/ben/x.arcelle" rendered as "Users/ben/x.arcelle/" — so
+            the path is isolated in a <bdi dir="ltr">: the ellipsis stays at
+            the start and the text reads the way it does in Finder. */}
+        <span className="recent-path">
+          <bdi dir="ltr">{room.path}</bdi>
+        </span>
+        <RecentRoomDetails room={room} place={place} />
+      </button>
+      <RecentRoomActions
+        room={room}
+        onRemoveRecent={onRemoveRecent}
+        onTrashRoom={onTrashRoom}
+      />
+    </li>
+  );
+}
+
 export function StartScreen({
   recent,
   onCreate,
@@ -101,93 +203,15 @@ export function StartScreen({
         <div className="recent">
           <div className="recent-label nb-subtitle">Recent</div>
           <ul className="recent-list">
-            {recent.map((room) => {
-              const place = roomPlace(room.path);
-              return (
-                <li
-                  key={room.path}
-                  className={`recent-row${room.missing ? " missing" : ""}`}
-                >
-                  <button
-                    className="recent-open"
-                    onClick={() => onOpenRecent(room.path)}
-                    /* A room whose file is gone still OPENS — but through the
-                       file picker, which is what can be told where it moved
-                       to, rather than through a password form for a file that
-                       isn't there. App.tsx routes it. */
-                    title={
-                      room.missing
-                        ? "This room is not at that location any more — opens the room picker"
-                        : undefined
-                    }
-                  >
-                    <span className="recent-name">{room.name}</span>
-                    {/* The row truncates a long path from the LEFT, so the
-                        file name always survives; `direction: rtl` on the
-                        span is what moves the ellipsis to the start. That
-                        alone reordered the path's own neutral characters —
-                        "/Users/ben/x.arcelle" rendered as
-                        "Users/ben/x.arcelle/" — so the path is isolated in a
-                        <bdi dir="ltr">: the ellipsis stays at the start and
-                        the text reads the way it does in Finder. */}
-                    <span className="recent-path">
-                      <bdi dir="ltr">{room.path}</bdi>
-                    </span>
-                    <span className="recent-meta">
-                      {room.missing ? (
-                        <span className="recent-when recent-missing">
-                          Room not found — moved, deleted, or on a drive that
-                          isn't connected
-                        </span>
-                      ) : (
-                        <>
-                          {relativeTime(room.openedAt) && (
-                            <span className="recent-when">
-                              Opened {relativeTime(room.openedAt)}
-                            </span>
-                          )}
-                          {/* Marker states, each one paired with its word so
-                              the colour is never the signal on its own. In a
-                              workspace, normal files are intentionally plain;
-                              chats, history and other private state are the
-                              encrypted part. */}
-                          <span className="nb-tape nb-sem-done">
-                            <span
-                              className="nb-ico nb-ico-check"
-                              aria-hidden="true"
-                            />
-                            Private state encrypted
-                          </span>
-                          {place && (
-                            <span className={`nb-tape ${place.sem}`}>
-                              {place.label}
-                            </span>
-                          )}
-                        </>
-                      )}
-                    </span>
-                  </button>
-                  <button
-                    className="recent-remove"
-                    title="Forget this shortcut"
-                    aria-label="Forget this shortcut"
-                    onClick={() => onRemoveRecent(room.path)}
-                  >
-                    <CloseIcon size={14} />
-                  </button>
-                  {!room.missing && (
-                    <button
-                      className="recent-remove"
-                      title="Move room to Trash"
-                      aria-label={`Move ${room.name} to Trash`}
-                      onClick={() => onTrashRoom(room)}
-                    >
-                      <TrashIcon size={14} />
-                    </button>
-                  )}
-                </li>
-              );
-            })}
+            {recent.map((room) => (
+              <RecentRoomRow
+                key={room.path}
+                room={room}
+                onOpenRecent={onOpenRecent}
+                onRemoveRecent={onRemoveRecent}
+                onTrashRoom={onTrashRoom}
+              />
+            ))}
           </ul>
           <button className="recent-clear" onClick={onClearRecent}>
             Clear list

@@ -141,7 +141,6 @@
  */
 
 import os from "node:os";
-import sharp from "sharp";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { CancelFlag } from "./cancel.js";
@@ -172,309 +171,17 @@ import type { SidecarChatMessage } from "./sidecar.js";
 import { bestDefault, type PreparedImage } from "./turnContext.js";
 import type { OpenRoom } from "./turnEngine.js";
 import type { ImageBox } from "../shared/apiTypes.js";
+import {
+  boxesSchema,
+  groundingPrompt,
+  isPlainObject,
+  ownValue,
+  parseBoxes,
+} from "./visionImageGrounding.js";
 
 export type { ImageBox, PreparedImage };
+export * from "./visionImageGrounding.js";
 
-// ============================================================================
-// constants + pure formatting (vision.rs top of file)
-// ============================================================================
-
-/** Ported verbatim from `vision::VISION_SQUARE`. The square canvas every
- * image is fitted to before grounding — see {@link prepareImage}'s doc for
- * why a square (rather than the image's own aspect ratio) is what keeps a
- * small vision model's box coordinates from drifting downward. */
-export const VISION_SQUARE = 1000;
-
-/**
- * The grounding prompt Qwen-VL models were trained on. Ported verbatim from
- * `grounding_prompt` (the Rust source's backslash-newline string
- * continuations collapse to a single space-preserving string — reproduced
- * here as plain concatenation so the wire text matches exactly).
- */
-export function groundingPrompt(query: string, w: number, h: number): string {
-  return (
-    `Outline the position of each instance of the following in this ${w.toFixed(0)}x${h.toFixed(0)} ` +
-    `pixel image: ${query}\n` +
-    `Output ONLY a JSON array, no other text, in the format ` +
-    `[{"bbox_2d": [x1, y1, x2, y2], "label": "<short name>"}]. ` +
-    `One element per match, each with a distinct descriptive label. ` +
-    `If it is not in the image, output [].`
-  );
-}
-
-/** ADD-22: JSON schema handed to Ollama `format` for the grounding pass, so a
- * small vision model can only ever emit a well-formed box array. Ported
- * verbatim from `boxes_schema`. */
-export function boxesSchema(): unknown {
-  return {
-    type: "array",
-    items: {
-      type: "object",
-      properties: {
-        bbox_2d: { type: "array", items: { type: "number" }, minItems: 4, maxItems: 4 },
-        label: { type: "string" },
-      },
-      required: ["bbox_2d", "label"],
-    },
-  };
-}
-
-// ============================================================================
-// parse_boxes / boxes_from_items
-// ============================================================================
-
-function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-/** An OWN-property read — the guard this file's sibling modules
- * (`privacy.ts`'s `ownValue`, `ollamaGenerate.ts`'s `ownValue`) already use
- * for exactly the same reason: a model-controlled JSON object must never be
- * allowed to answer through an INHERITED `Object.prototype` entry. */
-function ownValue(obj: Record<string, unknown>, key: string): unknown {
-  return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
-}
-
-/**
- * The index one past the JSON value that STARTS at `s[open]` (which must be
- * `"["` or `"{"`), found by walking bracket depth while respecting string
- * quoting/escaping — or `null` if the brackets never balance before the
- * string ends.
- *
- * This is the structural half of what Rust's
- * `serde_json::Deserializer::from_str(&cleaned[start..]).into_iter::<Value>().next()`
- * does: a streaming deserializer parses exactly ONE balanced JSON value
- * starting at a position and stops, ignoring any trailing prose — it does
- * NOT require the rest of the string to be valid JSON, or even present. A
- * bracket-depth walk that respects quoting finds the same boundary, because
- * JSON's grammar is exactly "balanced brackets/braces, with quoting inside
- * strings" — so slicing `s[open..=end]` and handing it to a strict
- * `JSON.parse` reproduces the streaming parser's own value boundary.
- */
-function matchingBracketEnd(s: string, open: number): number | null {
-  const close = s[open] === "[" ? "]" : "}";
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = open; i < s.length; i++) {
-    const c = s[i];
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (c === "\\") {
-        escaped = true;
-      } else if (c === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (c === '"') {
-      inString = true;
-    } else if (c === "[" || c === "{") {
-      depth++;
-    } else if (c === "]" || c === "}") {
-      depth--;
-      if (depth === 0) {
-        return c === close ? i : null;
-      }
-    }
-  }
-  return null;
-}
-
-/**
- * Requested `"bbox_2d"` is absolute pixels (Qwen-VL's native grounding
- * format), `"bbox"` an alias for it. `"box_2d"` is Google-style
- * `[ymin, xmin, ymax, xmax]` 0-1000. `"box"` is the same axis order as
- * `bbox_2d` but not treated as pixels. Ported verbatim from
- * `boxes_from_items`.
- */
-export function boxesFromItems(items: readonly unknown[], imgW: number, imgH: number): ImageBox[] {
-  const boxes: ImageBox[] = [];
-  for (const raw of items) {
-    const item = isPlainObject(raw) ? raw : {};
-    const labelRaw = ownValue(item, "label");
-    const nameRaw = ownValue(item, "name");
-    const label = typeof labelRaw === "string" ? labelRaw : typeof nameRaw === "string" ? nameRaw : "match";
-
-    const bbox2d = ownValue(item, "bbox_2d");
-    const bboxAlias = ownValue(item, "bbox");
-    const box2d = ownValue(item, "box_2d");
-    const boxAlias = ownValue(item, "box");
-    let coords: unknown[];
-    let yFirst: boolean;
-    let pixels: boolean;
-    if (Array.isArray(bbox2d)) {
-      coords = bbox2d;
-      yFirst = false;
-      pixels = true;
-    } else if (Array.isArray(bboxAlias)) {
-      coords = bboxAlias;
-      yFirst = false;
-      pixels = true;
-    } else if (Array.isArray(box2d)) {
-      coords = box2d;
-      yFirst = true;
-      pixels = false;
-    } else if (Array.isArray(boxAlias)) {
-      coords = boxAlias;
-      yFirst = false;
-      pixels = false;
-    } else {
-      continue;
-    }
-    if (coords.length !== 4) {
-      continue;
-    }
-    // `vals.len() != 4` after `filter_map(as_f64)` — every one of the 4 must
-    // be a genuine JSON number, or the whole element is skipped.
-    if (coords.some((c) => typeof c !== "number" || !Number.isFinite(c))) {
-      continue;
-    }
-    const vals = coords as number[];
-
-    let a: number;
-    let b: number;
-    let c: number;
-    let d: number;
-    if (yFirst) {
-      [a, b, c, d] = [vals[1]!, vals[0]!, vals[3]!, vals[2]!];
-    } else {
-      [a, b, c, d] = [vals[0]!, vals[1]!, vals[2]!, vals[3]!];
-    }
-
-    // Scale to 0..1. Pixel keys use the image dims — unless the values
-    // overshoot them, which means the model answered in its own
-    // 0-1000-normalized space (qwen2.5vl does this on small images).
-    const max = Math.max(...vals);
-    const outOfRange = Math.max(a, c) > imgW * 1.05 || Math.max(b, d) > imgH * 1.05;
-    let sx: number;
-    let sy: number;
-    if (max <= 1.0) {
-      sx = 1.0;
-      sy = 1.0;
-    } else if (pixels && !outOfRange) {
-      sx = Math.max(imgW, 1.0);
-      sy = Math.max(imgH, 1.0);
-    } else {
-      sx = 1000.0;
-      sy = 1000.0;
-    }
-    a /= sx;
-    c /= sx;
-    b /= sy;
-    d /= sy;
-    if (a > c) {
-      [a, c] = [c, a];
-    }
-    if (b > d) {
-      [b, d] = [d, b];
-    }
-    const clamp = (v: number): number => Math.min(Math.max(v, 0), 1);
-    a = clamp(a);
-    b = clamp(b);
-    c = clamp(c);
-    d = clamp(d);
-    if (c - a < 0.001 || d - b < 0.001) {
-      continue;
-    }
-    boxes.push({ label, x1: a, y1: b, x2: c, y2: d });
-  }
-  return boxes;
-}
-
-/**
- * CHG-21: drop any `<think>…</think>` spans some models leak, then scan each
- * `'['` as a candidate JSON array (up to 8, matching Rust's `.take(8)`),
- * returning the first array that yields at least one box. Robust to
- * leading/trailing prose containing brackets, unlike a single
- * first-`[`-to-last-`]` slice. Ported verbatim from `parse_boxes`.
- *
- * `strip_think_spans` is `ollama::strip_think_spans` — `vision.rs` itself
- * re-exports it with `pub(crate) use crate::ollama::strip_think_spans;`
- * rather than defining its own copy, and this port does the same by
- * importing `engineRouting.ts`'s already-real {@link stripThinkSpans}.
- */
-export function parseBoxes(raw: string, imgW: number, imgH: number): ImageBox[] {
-  const cleaned = stripThinkSpans(raw);
-  const positions: number[] = [];
-  for (let i = 0; i < cleaned.length && positions.length < 8; i++) {
-    if (cleaned[i] === "[") {
-      positions.push(i);
-    }
-  }
-  for (const start of positions) {
-    const end = matchingBracketEnd(cleaned, start);
-    if (end === null) {
-      continue;
-    }
-    let value: unknown;
-    try {
-      value = JSON.parse(cleaned.slice(start, end + 1));
-    } catch {
-      continue;
-    }
-    if (!Array.isArray(value)) {
-      continue;
-    }
-    const boxes = boxesFromItems(value, imgW, imgH);
-    if (boxes.length > 0) {
-      return boxes;
-    }
-  }
-  return [];
-}
-
-// ============================================================================
-// prepare_image — REAL, via sharp (see module doc)
-// ============================================================================
-
-/**
- * Normalize an image for the model: transcode to PNG and fit it onto a fixed
- * `VISION_SQUARE`×`VISION_SQUARE` canvas. Returns the {@link PreparedImage}
- * shape `turnContext.ts` already declares for this exact seam.
- *
- * STRETCHED to a square rather than kept at its own aspect ratio — Rust's own
- * "Marking fix" comment explains why: this removes both the pixel-vs-0..1000
- * scale ambiguity (on a 1000×1000 image both conventions normalize
- * identically) and the vision model's own internal square-padding, which
- * otherwise squeezes a non-square image toward the middle and drags boxes
- * down. Boxes are drawn back over the ORIGINAL image using NORMALIZED
- * coordinates, so the per-axis stretch cancels out exactly.
- *
- * `fit: "fill"` is `resize_exact` (stretch, discard aspect ratio); `kernel:
- * "linear"` is the closest published match to `FilterType::Triangle` (the
- * `image` crate's own docs describe `Triangle` as "linear filter" — both are
- * the bilinear/tent kernel). Falls back to `sharp(bytes).metadata()` — a
- * header-only read, the same operation `imagesize::blob_size` performs, for
- * bytes `sharp` cannot fully decode but can still identify — and only then
- * to a flat `VISION_SQUARE`×`VISION_SQUARE` guess, mirroring Rust's own
- * two-step fallback exactly.
- */
-export async function prepareImage(bytes: Buffer): Promise<PreparedImage> {
-  const square = VISION_SQUARE;
-  try {
-    const out = await sharp(bytes)
-      .resize(VISION_SQUARE, VISION_SQUARE, { fit: "fill", kernel: "linear" })
-      .png()
-      .toBuffer();
-    return { bytes: out, width: square, height: square };
-  } catch {
-    try {
-      const meta = await sharp(bytes).metadata();
-      if (typeof meta.width === "number" && typeof meta.height === "number") {
-        return { bytes, width: meta.width, height: meta.height };
-      }
-    } catch {
-      // Genuinely unreadable — fall through to the flat guess below, exactly
-      // as Rust's `unwrap_or((square, square))` does.
-    }
-    return { bytes, width: square, height: square };
-  }
-}
-
-// ============================================================================
-// models.rs duplication — see module doc's "ONE DUPLICATION" section
 // ============================================================================
 
 /** HLT-5: keep the chat model resident this long so follow-up questions are
@@ -508,6 +215,30 @@ export interface GroundingPickDeps extends VisionSupportDeps {
   privacyDoorActive(): boolean;
 }
 
+async function chatModelCanGround(
+  chatModel: string,
+  deps: GroundingPickDeps,
+): Promise<boolean> {
+  if (!imageReachesModel(chatModel, deps.privacyDoorActive)) return false;
+  return isYes(await visionSupport(chatModel, deps));
+}
+
+function installedFallbackCanGround(model: string, chatModel: string): boolean {
+  return model !== chatModel && runsOnThisMac(model);
+}
+
+async function visionFallback(
+  models: readonly string[],
+  chatModel: string,
+  deps: GroundingPickDeps,
+): Promise<string | null> {
+  for (const model of models) {
+    if (!installedFallbackCanGround(model, chatModel)) continue;
+    if (isYes(await visionSupport(model, deps))) return model;
+  }
+  return null;
+}
+
 /**
  * Which model draws the boxes for this room's image — ASKED, not guessed.
  * Ported verbatim from `models::grounding_pick`. See module doc for why this
@@ -524,18 +255,8 @@ export async function groundingPick(
   chatModel: string,
   deps: GroundingPickDeps
 ): Promise<string | null> {
-  if (imageReachesModel(chatModel, deps.privacyDoorActive) && isYes(await visionSupport(chatModel, deps))) {
-    return chatModel;
-  }
-  for (const m of models) {
-    if (m === chatModel || !runsOnThisMac(m)) {
-      continue;
-    }
-    if (isYes(await visionSupport(m, deps))) {
-      return m;
-    }
-  }
-  return null;
+  if (await chatModelCanGround(chatModel, deps)) return chatModel;
+  return visionFallback(models, chatModel, deps);
 }
 
 // ============================================================================
@@ -665,23 +386,41 @@ export interface LocateInImageDeps {
  * own comment, reproduced on {@link locateInImage}): a shape drift across the
  * language boundary must surface as an error, never as a silent empty
  * answer that reads as a fact about the user's picture. */
+function numericImageBoxField(item: Record<string, unknown>, field: string): number | null {
+  const value = item[field];
+  return typeof value === "number" ? value : null;
+}
+
+function imageBoxCoordinates(item: Record<string, unknown>): [number, number, number, number] | null {
+  const x1 = numericImageBoxField(item, "x1");
+  if (x1 === null) return null;
+  const y1 = numericImageBoxField(item, "y1");
+  if (y1 === null) return null;
+  const x2 = numericImageBoxField(item, "x2");
+  if (x2 === null) return null;
+  const y2 = numericImageBoxField(item, "y2");
+  return y2 === null ? null : [x1, y1, x2, y2];
+}
+
+function decodedImageBox(raw: unknown): ImageBox | null {
+  if (!isPlainObject(raw) || typeof raw.label !== "string") return null;
+  const coordinates = imageBoxCoordinates(raw);
+  if (coordinates === null) return null;
+  const [x1, y1, x2, y2] = coordinates;
+  return { label: raw.label, x1, y1, x2, y2 };
+}
+
 function decodeImageBoxes(raw: unknown): ImageBox[] {
   if (!Array.isArray(raw)) {
     throw new Error('The vision pass returned an unreadable result: "boxes" was not an array');
   }
   const out: ImageBox[] = [];
   for (const item of raw) {
-    if (
-      !isPlainObject(item) ||
-      typeof item.label !== "string" ||
-      typeof item.x1 !== "number" ||
-      typeof item.y1 !== "number" ||
-      typeof item.x2 !== "number" ||
-      typeof item.y2 !== "number"
-    ) {
+    const box = decodedImageBox(item);
+    if (box === null) {
       throw new Error("The vision pass returned an unreadable result: a box was missing a field");
     }
-    out.push({ label: item.label, x1: item.x1, y1: item.y1, x2: item.x2, y2: item.y2 });
+    out.push(box);
   }
   return out;
 }
@@ -712,57 +451,83 @@ export async function locateInImage(
   return locateBytes(db, bytes, query, deps);
 }
 
-async function locateBytes(
-  db: Database.Database,
-  bytes: Buffer,
-  query: string,
-  deps: LocateInImageDeps,
-): Promise<ImageBox[]> {
-  const explicit = modelSetting(db);
+interface LocateModelChoice {
+  chatModel: string;
+  visionModel: string | null;
+}
 
+async function locateModelChoice(
+  db: Database.Database,
+  deps: LocateInImageDeps,
+): Promise<LocateModelChoice> {
+  const explicit = modelSetting(db);
   const listModels = deps.listModels ?? listModelsReal;
   const models = await listModels();
   const chatModel = explicit ?? bestDefault(models);
-
   const groundingDeps = deps.groundingDeps ?? realGroundingPickDeps;
-  const vmodel = await groundingPick(models, chatModel, groundingDeps);
-  if (vmodel === null) {
-    // PREFLIGHT: nothing could be picked. `NO_VISION_MODEL` says only "download
-    // a vision helper" — the right advice for exactly one of the reasons a pick
-    // fails. Ask the declared record for the more specific reason (a capable
-    // engine the privacy door would blind) and fall back to the sentinel only
-    // when "nothing here can see images" really is the whole story.
-    const capabilitiesDeps = deps.capabilitiesDeps ?? realCapabilitiesForDeps;
-    const caps = await capabilitiesFor(chatModel, capabilitiesDeps);
-    throw new Error(visionDoorBlock(caps) ?? NO_VISION_MODEL);
-  }
+  const visionModel = await groundingPick(models, chatModel, groundingDeps);
+  return { chatModel, visionModel };
+}
 
-  // HLT-5: release the vision model quickly on low-RAM machines.
-  const keep = visionKeepAlive(totalRamBytes(), vmodel, chatModel);
-  const body = {
-    model: vmodel,
+async function requiredVisionModel(
+  choice: LocateModelChoice,
+  deps: LocateInImageDeps,
+): Promise<string> {
+  if (choice.visionModel !== null) return choice.visionModel;
+  const capabilitiesDeps = deps.capabilitiesDeps ?? realCapabilitiesForDeps;
+  const caps = await capabilitiesFor(choice.chatModel, capabilitiesDeps);
+  throw new Error(visionDoorBlock(caps) ?? NO_VISION_MODEL);
+}
+
+function visionLocateBody(
+  bytes: Buffer,
+  query: string,
+  visionModel: string,
+  chatModel: string,
+) {
+  const keep = visionKeepAlive(totalRamBytes(), visionModel, chatModel);
+  return {
+    model: visionModel,
     image_b64: bytes.toString("base64"),
     query,
     base_url: resolvedBaseUrl(),
     temperature: 0.0,
     keep_alive: keep,
   };
+}
+
+async function visionLocateValue(
+  body: ReturnType<typeof visionLocateBody>,
+  visionModel: string,
+  deps: LocateInImageDeps,
+): Promise<unknown> {
   const post = deps.post ?? sidecarJsonCancellable;
   const outcome = await post("/vision_locate", body, new CancelFlag());
   if (outcome.kind === "stopped") {
-    // Unreachable in production — the flag passed above is never triggered by
-    // anything (`vision.rs`'s own command threads no cancel token through
-    // this call either) — but the union is handled exhaustively rather than
-    // asserted away, matching `webSearch.ts`'s `searchPage` for the same
-    // never-cancelled call shape.
     throw new Error("The vision pass was stopped.");
   }
   if (outcome.kind === "error") {
-    throw new Error(sidecarErrorSentinel(outcome.error, vmodel));
+    throw new Error(sidecarErrorSentinel(outcome.error, visionModel));
   }
-  const value = outcome.value;
+  return outcome.value;
+}
+
+function decodedLocateBoxes(value: unknown): ImageBox[] {
   const boxesRaw = isPlainObject(value) ? ownValue(value, "boxes") : undefined;
   return decodeImageBoxes(boxesRaw);
+}
+
+async function locateBytes(
+  db: Database.Database,
+  bytes: Buffer,
+  query: string,
+  deps: LocateInImageDeps,
+): Promise<ImageBox[]> {
+  const choice = await locateModelChoice(db, deps);
+  const visionModel = await requiredVisionModel(choice, deps);
+  const body = visionLocateBody(bytes, query, visionModel, choice.chatModel);
+  const value = await visionLocateValue(body, visionModel, deps);
+  return decodedLocateBoxes(value);
 }
 
 export async function locateInImageInRoom(

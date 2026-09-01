@@ -85,24 +85,160 @@ node, so the differences stay testable.
 
 from __future__ import annotations
 
-import re
-from typing import Any, Callable
+from typing import Any
 
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import StateGraph
 
-from .agents import MAIN_AGENT_ID, REGISTRY, get_agent
-from .config import AGENT_ROUND_BACKSTOP
+from .agents import MAIN_AGENT_ID, REGISTRY, Flow, get_agent
 from .graph import (
     AgentState,
-    call_model,
-    execute_tools,
-    prepare,
-    route_after_model,
-    route_after_tools,
-    synthesize,
 )
-from .messages import Message, ToolCall
-from .prompts import with_read_result
+from .graph_shapes import _BUILDERS
+from . import graphs_probe as _probe_nodes
+from . import graphs_receipts as _receipt_nodes
+from . import graphs_route as _route_nodes
+from . import graphs_verify as _verify_nodes
+WRITE_TOOLS = _verify_nodes.WRITE_TOOLS
+CLAIM_UNSUPPORTED = _verify_nodes.CLAIM_UNSUPPORTED
+STUDIO_TOOLS = _verify_nodes.STUDIO_TOOLS
+ARTIFACT_READ_REQUIRED = _verify_nodes.ARTIFACT_READ_REQUIRED
+_produced_artifact_names = _verify_nodes._produced_artifact_names
+_event_name = _verify_nodes._event_name
+_latest_studio_commit = _verify_nodes._latest_studio_commit
+_opens_any_artifact = _verify_nodes._opens_any_artifact
+_opened_after_commit = _verify_nodes._opened_after_commit
+_opened_produced_artifact = _verify_nodes._opened_produced_artifact
+STAGE_MISSED_NOTE = _verify_nodes.STAGE_MISSED_NOTE
+_live_corrections = _verify_nodes._live_corrections
+_without_tool_orders = _verify_nodes._without_tool_orders
+narrowed = _verify_nodes.narrowed
+_CONTRACT_LABEL = _verify_nodes._CONTRACT_LABEL
+_EMPTY_VALUES = _verify_nodes._EMPTY_VALUES
+_ACK_ONLY = _verify_nodes._ACK_ONLY
+NO_REPORT = _verify_nodes.NO_REPORT
+REPORT_SILENT = _verify_nodes.REPORT_SILENT
+REPORT_IDLE = _verify_nodes.REPORT_IDLE
+ARTIFACTS_NOTE = _verify_nodes.ARTIFACTS_NOTE
+report_substance = _verify_nodes.report_substance
+report_failure = _verify_nodes.report_failure
+worker_report = _verify_nodes.worker_report
+unreported_artifacts = _verify_nodes.unreported_artifacts
+_produced_artifact_label = _verify_nodes._produced_artifact_label
+_unread_artifact_result = _verify_nodes._unread_artifact_result
+_completed_verification_result = _verify_nodes._completed_verification_result
+_correction_update = _verify_nodes._correction_update
+_needs_studio_readback = _verify_nodes._needs_studio_readback
+_initial_verification_result = _verify_nodes._initial_verification_result
+verify_claims = _verify_nodes.verify_claims
+route_after_verify = _verify_nodes.route_after_verify
+_tool_is_served = _probe_nodes._tool_is_served
+_probe_precondition_is_met = _probe_nodes._probe_precondition_is_met
+_last_tool_text = _probe_nodes._last_tool_text
+_probe_precondition_failed = _probe_nodes._probe_precondition_failed
+_probe_is_ready = _probe_nodes._probe_is_ready
+probe = _probe_nodes.probe
+route_after_probe_fired = _probe_nodes.route_after_probe_fired
+_probe_is_blocked = _probe_nodes._probe_is_blocked
+route_after_probe = _probe_nodes.route_after_probe
+probe_answer = _probe_nodes.probe_answer
+stage_catalog = _probe_nodes.stage_catalog
+_stage_catalog_box = _probe_nodes._stage_catalog_box
+def _completed_stage_catalog(
+    state: AgentState, flow: Flow, box: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Re-offer one skipped stage, or restore the complete catalog to answer."""
+    missed = _missing_stage_names(flow, state)
+    if not missed or state.get("stage_retried", False):
+        return {"full_tools": box}
+    want_again = missed[0]
+    if want_again not in _catalog_tool_names(box):
+        return {"full_tools": box, "stage_retried": True}
+    return {
+        "tools": narrowed(state, _stage_tools(flow, want_again, box)),
+        "full_tools": box,
+        "stage_retried": True,
+        "corrections": [
+            *_live_corrections(state),
+            STAGE_MISSED_NOTE.format(tool=want_again),
+        ],
+    }
+_missing_stage_names = _probe_nodes._missing_stage_names
+_catalog_tool_names = _probe_nodes._catalog_tool_names
+def _next_stage_catalog(
+    state: AgentState, flow: Flow, idx: int, box: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Offer the next staged verb while retaining this flow's side tools."""
+    want = flow.stages[idx]
+    if want not in _catalog_tool_names(box):
+        return {"stage": idx + 1, "full_tools": box}
+    return {
+        "tools": narrowed(state, _stage_tools(flow, want, box)),
+        "stage": idx + 1,
+        "full_tools": box,
+    }
+_stage_tools = _probe_nodes._stage_tools
+_stage_re_offer_due = _probe_nodes._stage_re_offer_due
+route_after_stage_model = _probe_nodes.route_after_stage_model
+route_after_stage_tools = _probe_nodes.route_after_stage_tools
+check_result = _probe_nodes.check_result
+_needs_transcription_terminal_check = _receipt_nodes._needs_transcription_terminal_check
+_receipt_check_result = _receipt_nodes._receipt_check_result
+_receipt_check_due = _receipt_nodes._receipt_check_due
+_latest_receipt_mutation = _receipt_nodes._latest_receipt_mutation
+_receipt_is_valid = _receipt_nodes._receipt_is_valid
+_receipt_identities = _receipt_nodes._receipt_identities
+_add_receipt_identity = _receipt_nodes._add_receipt_identity
+_has_matching_receipt = _receipt_nodes._has_matching_receipt
+_receipt_matches_mutation = _receipt_nodes._receipt_matches_mutation
+_receipt_names_mutation = _receipt_nodes._receipt_names_mutation
+_missing_receipt_result = _receipt_nodes._missing_receipt_result
+_offered_tool_names = _receipt_nodes._offered_tool_names
+_receipt_repair_available = _receipt_nodes._receipt_repair_available
+_failure_check_result = _receipt_nodes._failure_check_result
+_last_tool_has_failure_marker = _receipt_nodes._last_tool_has_failure_marker
+_last_tool_content = _receipt_nodes._last_tool_content
+_failure_repair_result = _receipt_nodes._failure_repair_result
+_TRANSCRIPTION_TERMINAL_RE = _receipt_nodes._TRANSCRIPTION_TERMINAL_RE
+_TRANSCRIPTION_JOB_RE = _receipt_nodes._TRANSCRIPTION_JOB_RE
+_check_transcription_terminal = _receipt_nodes._check_transcription_terminal
+_transcription_terminal_receipt = _receipt_nodes._transcription_terminal_receipt
+_latest_transcription_action = _receipt_nodes._latest_transcription_action
+_transcription_target = _receipt_nodes._transcription_target
+_transcription_job_id = _receipt_nodes._transcription_job_id
+_is_terminal_transcription_result = _receipt_nodes._is_terminal_transcription_result
+_has_terminal_transcription_status = _receipt_nodes._has_terminal_transcription_status
+_transcription_identities = _receipt_nodes._transcription_identities
+_status_is_terminal_for_transcription = _receipt_nodes._status_is_terminal_for_transcription
+_transcription_status_names_action = _receipt_nodes._transcription_status_names_action
+_pending_transcription_result = _receipt_nodes._pending_transcription_result
+_transcription_identity = _receipt_nodes._transcription_identity
+_transcription_repair_available = _receipt_nodes._transcription_repair_available
+route_after_check = _receipt_nodes.route_after_check
+STALE_IMAGE = _route_nodes.STALE_IMAGE
+trim_images = _route_nodes.trim_images
+route_after_perceive = _route_nodes.route_after_perceive
+_action_scores = _route_nodes._action_scores
+_hint_score = _route_nodes._hint_score
+_unambiguous_winner = _route_nodes._unambiguous_winner
+_tool_name = _route_nodes._tool_name
+_routed_catalog = _route_nodes._routed_catalog
+_catalog_contains = _route_nodes._catalog_contains
+async def route_action(state: AgentState) -> dict[str, Any]:
+    """Narrow an action flow only when its routing vocabulary has one winner."""
+    spec = get_agent(state.get("agent_id", ""))
+    actions = spec.flow.actions
+    if not actions:
+        return {}
+    ask = (state.get("question", "") or "").lower()
+    target = _unambiguous_winner(_action_scores(actions, ask))
+    if not target:
+        return {}
+    keep = set(spec.flow.keep) | {target}
+    routed = _routed_catalog(state.get("tools", []), keep)
+    if not _catalog_contains(routed, target):
+        return {}
+    return {"tools": narrowed(state, routed), "routed": target}
+route_after_react_prepare = _route_nodes.route_after_react_prepare
 
 #: Every shape a registered agent may declare. `AgentSpec.template` is
 #: validated against this at import time, so a typo is a startup error rather
@@ -146,1271 +282,6 @@ TEMPLATES: tuple[str, ...] = (
 #: Tools whose whole purpose is to leave an artifact behind. If one of these
 #: ran and the referent baton recorded nothing, the model is about to describe
 #: a write that did not land.
-WRITE_TOOLS: frozenset[str] = frozenset(
-    {
-        "create_file",
-        "edit_file",
-        "edit_files",
-        "write_file",
-        "set_cells",
-        "rename_file",
-        "move_file",
-        # A drawing is a versioned write to a room file, so "I drew it" is
-        # audited exactly like "I saved it".
-        "draw",
-        "studio_flashcards",
-        "studio_mindmap",
-        "generate_podcast_script",
-        # OUTBOUND effects, 2026-07-27. `run_mcp_tool` is how the Connector
-        # agent sends email and Slack messages — the least reversible thing any
-        # agent here does — and it ran under plain `react` with no gate of any
-        # kind, so a send that FAILED was reported to the user as sent. It
-        # belongs to the same predicate as a file write for the same reason: the
-        # claim "I sent it" must be backed by evidence that something happened,
-        # and `graph._referent_names` records the tool id on success only.
-        "run_mcp_tool",
-    }
-)
-
-CLAIM_UNSUPPORTED = (
-    "write tools ran but no file or artifact was recorded — the write did not "
-    "land, so do not tell the user anything was saved or changed."
-)
-
-STUDIO_TOOLS: frozenset[str] = frozenset(
-    {"studio_flashcards", "studio_mindmap", "generate_podcast_script"}
-)
-ARTIFACT_READ_REQUIRED = (
-    "the generator returned a commit receipt, but the new artifact has not been "
-    "read back yet. Call open_file on the recorded artifact before claiming it "
-    "was saved."
-)
-
-
-def _opened_produced_artifact(state: AgentState) -> bool:
-    """Whether a successful ``open_file`` followed the latest Studio commit."""
-    names = {
-        str(entry).split(": ", 1)[-1]
-        for entry in state.get("produced", [])
-        if str(entry).split(": ", 1)[-1]
-    }
-    if not names:
-        return False
-    events = list(state.get("tool_events", []))
-    latest_commit = next(
-        (
-            index
-            for index, event in reversed(list(enumerate(events)))
-            if str(event.get("name") or "") in STUDIO_TOOLS
-        ),
-        None,
-    )
-    if latest_commit is None:
-        return False
-    return any(
-        str(event.get("name") or "") == "open_file"
-        and str((event.get("arguments") or {}).get("name") or "") in names
-        for event in events[latest_commit + 1 :]
-    )
-
-#: The re-offer note `stage_catalog` leaves when the model skipped a stage.
-#:
-#: Unlike `CLAIM_UNSUPPORTED` — a fact about the turn, which stays true — this
-#: one is an ORDER TO CALL A TOOL, and nothing in `corrections` expires on its
-#: own: `graph.call_model` re-injects the whole list every round. So the chain's
-#: closing round, which offers ZERO tools by design, still carried "call
-#: fetch_page now", and a 4B answered "I will now fetch the page" instead of
-#: writing the answer. One template, so the retirement below can recognise it.
-STAGE_MISSED_NOTE = (
-    "You have not called {tool} yet, and this task is not finished without it. "
-    "Call it now, then answer from what it returns."
-)
-
-
-def _live_corrections(state: AgentState) -> list[str]:
-    """The corrections still true — i.e. minus the tool orders already obeyed.
-
-    Only :data:`STAGE_MISSED_NOTE` retires: it is the one correction that tells
-    the model to CALL something, so calling it is what makes the note false. A
-    ground-truth correction about what the tools DID stays in the list, because
-    it stays true — the model has to restate its answer, not run anything.
-    """
-    obeyed = {STAGE_MISSED_NOTE.format(tool=t) for t in state.get("attempted", set())}
-    return [c for c in state.get("corrections", []) if c not in obeyed]
-
-
-def _without_tool_orders(state: AgentState) -> list[str]:
-    """The corrections minus EVERY order to call something, obeyed or not.
-
-    `_live_corrections` retires an order once the tool has been called, which is
-    the right predicate while there are still tools to call. It is the wrong one
-    for the tool-less round: the note exists precisely BECAUSE the tool was not
-    called, so the single case that round has to be rid of is the one that
-    survives that filter. Here the round itself makes every such order
-    impossible, so all of them go — and only they do, because a ground-truth
-    correction stays true with or without a catalog.
-
-    The candidate set is exact: `stage_catalog` is the only writer of
-    `STAGE_MISSED_NOTE` and only ever formats it with one of this agent's own
-    stages.
-    """
-    stages = get_agent(state.get("agent_id", "")).flow.stages
-    orders = {STAGE_MISSED_NOTE.format(tool=s) for s in stages}
-    return [c for c in state.get("corrections", []) if c not in orders]
-
-
-def narrowed(state: AgentState, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """A narrowed catalog that still reads back what this loop parked.
-
-    Every node here that returns a ``tools`` key goes through this. A shape that
-    narrows rebuilds the catalog from the agent's box, and the spill reader is
-    in no box — ``execute_tools`` mints it the moment a tool result is parked
-    (:mod:`.results`). So a stage that narrowed after a spill retired the only
-    route back to that text and left the model holding a head it could not
-    extend. ``test_graphs.py`` pins the set of nodes that must call this.
-    """
-    return with_read_result(tools, list(state.get("spills", [])))
-
-
-# --------------------------------------------------------------------------- #
-# the report rubric — a worker's own state judging its own report
-# --------------------------------------------------------------------------- #
-
-#: A report the contract's own scaffolding empties out. `delegation_note` asks
-#: for three fixed lines and tells the worker to write "nothing" where it has
-#: nothing, so "DID: nothing / FOUND: nothing / MISSING: nothing" is a
-#: well-formed report carrying zero information — and any check that measured
-#: LENGTH would wave it through.
-_CONTRACT_LABEL = re.compile(r"^(?:did|found|missing)\s*:\s*", re.IGNORECASE)
-
-#: Values the contract itself supplies for "I have none of this".
-_EMPTY_VALUES = frozenset({"nothing", "none", "n/a", "na", "-", "—", "null"})
-
-#: An acknowledgement is not a report, however confidently it is worded. Matched
-#: WHOLE rather than by length: a real one-line answer ("Whisper is installed")
-#: is short too, and accusing that one would make every terse specialist look
-#: failed — which is the failure mode this rubric is supposed to remove, not add.
-_ACK_ONLY = re.compile(
-    r"^(?:done|ok|okay|complete|completed|finished|sure|got it|"
-    r"task\s+complete[d]?|all\s+done)[\s.!…]*$",
-    re.IGNORECASE,
-)
-
-#: The three ways a finished worker can hand back nothing usable. Each is a
-#: sentence completing "The <specialist> …", because that is how `_run_worker`
-#: puts it into the Main agent's thread.
-NO_REPORT = "finished but returned no report."
-#: Names the tools, because the alternative is harsher than the evidence. A
-#: worker that searched and genuinely found nothing writes the same empty
-#: report as one that lost its results — and the Main agent, which decides
-#: whether to re-dispatch, is the one that needs to tell them apart.
-REPORT_SILENT = (
-    "ran {tools} but reported nothing about what they returned — treat this "
-    "step as unfinished."
-)
-REPORT_IDLE = (
-    "neither called a tool nor answered from what it knows — treat this step as "
-    "unfinished."
-)
-
-#: Prefix for the artifacts a worker created but never mentioned.
-ARTIFACTS_NOTE = "Artifacts this step produced: "
-
-
-def report_substance(text: str) -> str:
-    """What a worker's report actually carries, contract scaffolding removed."""
-    kept = []
-    for line in text.splitlines():
-        body = _CONTRACT_LABEL.sub("", line.strip()).strip()
-        if not body or _ACK_ONLY.match(body) or body.lower().strip(".!") in _EMPTY_VALUES:
-            continue
-        kept.append(body)
-    return " ".join(kept)
-
-
-def report_failure(final: AgentState) -> str:
-    """Why this finished worker's report carries nothing — ``""`` when it does.
-
-    The rubric ``ok = bool(report_text)`` already was, generalised. It costs zero
-    model calls for the same reason :func:`verify_claims` does: the worker's own
-    final state records what actually ran, so nothing has to be asked.
-
-    Deliberately NOT a correction round. `verify_claims` can afford one because
-    it costs a single tool-less model call; re-running a specialist costs a whole
-    child loop, and the Main agent — which is told the truth here and keeps its
-    own catalog of specialists — is better placed to decide whether that is worth
-    paying for than a rule that always pays.
-    """
-    said = str(final.get("final_text") or "")
-    if report_substance(said):
-        return ""
-    if not said.strip():
-        return NO_REPORT
-    attempted = sorted(final.get("attempted", set()))
-    if attempted:
-        return REPORT_SILENT.format(tools=", ".join(attempted))
-    return REPORT_IDLE
-
-
-def worker_report(label: str, final: AgentState) -> tuple[str, bool]:
-    """What one finished specialist hands the Main agent, and whether it counts.
-
-    The text and the verdict are one decision: a report that failed the rubric
-    is REPLACED (there was nothing in it to keep), while one that merely
-    under-reported is kept and extended. Composed here rather than in
-    `graph._run_worker` so every wording the hub can read sits beside the
-    predicates that choose it.
-    """
-    failure = report_failure(final)
-    if failure:
-        return f"The {label} {failure}", False
-    body = str(final.get("final_text") or "").strip()
-    unnamed = unreported_artifacts(final)
-    if unnamed:
-        body = f"{body}\n{ARTIFACTS_NOTE}{', '.join(unnamed)}"
-    return f"Report from the {label}:\n{body}", True
-
-
-def unreported_artifacts(final: AgentState) -> list[str]:
-    """Artifacts this worker created that its own report never names.
-
-    The baton records ``create_file: notes.md`` on success only, so a report
-    that never says ``notes.md`` is about to have the Main agent write the user
-    an answer that contradicts what the room now holds. Appending the names is
-    cheaper and truer than sending the worker back for a round — and it is the
-    same evidence :func:`verify_claims` gates on, pointed the other way.
-    """
-    said = str(final.get("final_text") or "")
-    names = (str(entry).split(": ", 1)[-1] for entry in final.get("produced", []))
-    return [name for name in dict.fromkeys(names) if name and name not in said]
-
-
-async def verify_claims(state: AgentState) -> dict[str, Any]:
-    """Ground-truth gate for agents that mutate the user's room.
-
-    A small model will happily report "I saved the summary to notes.md" after a
-    write that errored. The referent baton already records what a tool actually
-    produced, so the check costs zero model calls.
-
-    It ROUTES; it does not annotate. The first draft returned ``{"progress":
-    [...]}``, and `progress` has exactly one reader — ``call_model``'s ephemeral
-    re-injection, gated on ``small_model`` — which by construction cannot run
-    after this node, because ``verify`` sits between the loop's exit and
-    ``synthesize``. So the finding was written into state and discarded: never
-    sent to a model, never emitted, never in the transcript. The File agent's
-    write-claim check did nothing at all. Self-RAG's "not supported" edge is the
-    documented shape: a grounding failure is a routing decision.
-
-    Termination is structural, not a counter. First visit sets ``verified`` and,
-    on a finding, forces ONE tool-less round (``route_after_verify`` sends it
-    back to ``call_model``). That round's only exit is back here, where
-    ``verified`` is already set, so it marks ``corrected`` and falls through to
-    ``synthesize``. At most one extra model call, and only when the check fires.
-    """
-    if state.get("verified", False):
-        if ARTIFACT_READ_REQUIRED in state.get("corrections", []):
-            if _opened_produced_artifact(state):
-                return {"corrected": True}
-            names = ", ".join(
-                dict.fromkeys(
-                    str(entry).split(": ", 1)[-1]
-                    for entry in state.get("produced", [])
-                )
-            ) or "the generated artifact"
-            return {
-                "corrected": True,
-                "final_text": (
-                    f"MISSING: Arcelle received a commit receipt for {names}, but "
-                    "could not read the artifact back, so I cannot confirm that it "
-                    "was saved."
-                ),
-            }
-        # Second visit: the model has had its correction round. Let it answer.
-        return {"corrected": True}
-
-    # PRODUCED, not `referents`. `referents` is the baton, and a delegated
-    # worker is SEEDED with the Main agent's — so reading it here meant the gate
-    # passed automatically for every delegation after the first, i.e. it was
-    # disabled on exactly the multi-step asks it exists for ("summarize the
-    # lease, THEN save the notes": the writing step is the unchecked one).
-    # `produced` is seeded empty per loop, like `attempted`.
-    produced: list[str] = list(state.get("produced", []))
-    # ATTEMPTED, not `seen`. `seen` holds only SUCCESSFUL calls by design, so a
-    # write that errored is absent from it — which made the first version of
-    # this predicate unable to detect the exact case it was written for. A
-    # `test_an_unsupported_write_claim_is_sent_back_for_restatement` failure is
-    # what surfaced it.
-    attempted: set[str] = set(state.get("attempted", set()))
-    if attempted & STUDIO_TOOLS and produced and not _opened_produced_artifact(state):
-        progress: list[str] = list(state.get("progress", []))
-        progress.append(f"[check] {ARTIFACT_READ_REQUIRED}")
-        return {
-            "verified": True,
-            "corrections": [ARTIFACT_READ_REQUIRED],
-            "progress": progress,
-            # Unlike an unsupported write, this correction needs open_file.
-            "force_synthesis": False,
-        }
-    if not (attempted & WRITE_TOOLS) or produced:
-        return {"verified": True}
-
-    # Keep the action log truthful too — it is what a resumed/inspected turn
-    # reads — but the load-bearing half is `corrections`, which call_model
-    # re-injects on EVERY engine.
-    progress: list[str] = list(state.get("progress", []))
-    progress.append(f"[check] {CLAIM_UNSUPPORTED}")
-    return {
-        "verified": True,
-        "corrections": [CLAIM_UNSUPPORTED],
-        "progress": progress,
-        # The correction round offers zero tools: this is an answer to restate,
-        # not a write to retry. Retrying the write is the user's call.
-        "force_synthesis": True,
-    }
-
-
-def route_after_verify(state: AgentState) -> str:
-    """A finding sends the answer back for ONE tool-less restatement."""
-    if state.get("cancelled", False):
-        return "synthesize"
-    if state.get("corrections") and not state.get("corrected", False):
-        return "call_model"
-    return "synthesize"
-
-
-async def probe(state: AgentState) -> dict[str, Any]:
-    """Fire this agent's opening tool call WITHOUT spending a model round.
-
-    ``execute_tools`` runs whatever is in ``state["calls"]``; it does not care
-    whether a model produced them. So a plain Python node can fire a real
-    bridge call for zero model cost and still get the full SPEC §3.2 treatment
-    — step/step_status events, cancellation between calls, successful-only
-    memoisation, the progress log, the referent baton.
-
-    This is worth a node because for some agents the first move is a CONSTANT.
-    ``TRANSCRIBE_PROMPT`` says "stt_status tells you whether the speech model is
-    installed — check it before promising anything", so the model was paying a
-    whole round to rediscover something the graph already knows.
-    """
-    spec = get_agent(state.get("agent_id", ""))
-    name = spec.flow.probe
-    if not name:
-        return {}
-    # Only if the bridge actually served it this run.
-    if not any(
-        (t.get("function") or {}).get("name") == name for t in state.get("tools", [])
-    ):
-        return {}
-    # ...and only once the probe's PRECONDITION has been met. `chat.browse`
-    # cannot snapshot a page before `browse_open` has made one; firing anyway
-    # spent a guaranteed failure — journalled where the user reads it — as the
-    # opening move of every browse task. See `Flow.probe_after`.
-    after = spec.flow.probe_after
-    if after and after not in set(state.get("attempted", set())):
-        return {}
-    # ...and not when that tool ran WITHOUT establishing the precondition.
-    # `browse_open` with plain words searches instead of navigating, so it is
-    # "attempted" with no page behind it. See `Flow.probe_unless`.
-    if spec.flow.probe_unless:
-        last = ""
-        for msg in reversed(state.get("messages", [])):
-            if msg.get("role") == "tool":
-                last = (msg.get("content") or "").lower()
-                break
-        if any(marker.lower() in last for marker in spec.flow.probe_unless):
-            return {}
-    probe_call = ToolCall(name=name, arguments={})
-    # A re-capture is the GRAPH's decision, not the model looping, so it must be
-    # exempt from duplicate suppression. `ui_snapshot` takes no arguments, so
-    # every capture has an identical `key()`; left in `seen`, the second
-    # perceive is swallowed by the `key in seen` guard, `all_dup` stays true and
-    # the turn is forced into synthesis after ONE action — the UI agent clicks
-    # once and stops. Dropping just this key keeps the guard intact for every
-    # call the MODEL makes, which is the behaviour it exists to catch.
-    seen: set[str] = set(state.get("seen", set())) - {probe_call.key()}
-    # NOTE: only keys declared on AgentState survive. Verified against langgraph
-    # 1.2.9: a node returning an undeclared key has it silently DROPPED — no
-    # exception, no warning. A stray `"probed": True` here read as if it
-    # recorded something and recorded nothing.
-    return {"calls": [probe_call], "seen": seen, "synth": True}
-
-
-def route_after_probe_fired(state: AgentState) -> str:
-    """Skip the tool node when the probe ABSTAINED.
-
-    A probe abstains when the bridge did not serve its tool this run (web off,
-    a capability the host does not expose). Running `execute_tools` on an empty
-    call list is not a no-op: `all_dup` starts True and nothing clears it, so
-    the node sets `force_synthesis` and the very next model round is offered
-    ZERO tools. The agent would silently lose its whole catalog because an
-    optional prefetch was unavailable.
-    """
-    return "tools" if state.get("calls") else "skip"
-
-
-def route_after_probe(state: AgentState) -> str:
-    """Read the probe's answer in Python and decide whether acting is possible.
-
-    The gate is a pure predicate over the tool result the probe just produced.
-    When the probe says the capability is missing, the honest answer is a fixed
-    sentence — so the blocked path costs ZERO model calls where it costs two
-    today.
-
-    Fails OPEN. The blocker strings are matched against Rust-authored result
-    text; if that wording drifts, the predicate must fall through to the normal
-    path, so the worst case is exactly today's behaviour rather than an agent
-    that refuses work it could do.
-    """
-    if state.get("cancelled", False):
-        return "synthesize"
-    spec = get_agent(state.get("agent_id", ""))
-    blockers = spec.flow.blockers
-    if not blockers:
-        return "call_model"
-    last = ""
-    for msg in reversed(state.get("messages", [])):
-        if msg.get("role") == "tool":
-            last = (msg.get("content") or "").lower()
-            break
-    return "blocked" if any(b.lower() in last for b in blockers) else "call_model"
-
-
-async def probe_answer(state: AgentState) -> dict[str, Any]:
-    """The blocked answer, composed in code. No model call at all."""
-    spec = get_agent(state.get("agent_id", ""))
-    return {"final_text": spec.flow.blocked_answer, "stop": True}
-
-
-async def stage_catalog(state: AgentState) -> dict[str, Any]:
-    """Offer exactly the ONE tool this stage is for, then advance the stage.
-
-    Prompt chaining, with the chain expressed as wiring instead of as English.
-    ``WEB_PROMPT`` already dictates the order — "web_search to find pages, then
-    fetch_page on the most promising result — a search snippet is not a source"
-    — so by the docs' own definition this is a workflow, not an agent: the
-    model does not choose the order, it only fills each step's arguments.
-
-    Today the same order is a plea the model may ignore, and a 4B routinely
-    answers from the search snippet without ever fetching. Staging the catalog
-    makes the fetch structural.
-    """
-    spec = get_agent(state.get("agent_id", ""))
-    stages = spec.flow.stages
-    idx = state.get("stage", 0)
-    # Narrow from the FULL box, never from the previous stage's narrowed view.
-    # Reading `tools` here instead cost stage 2 its own verb: stage 1 had
-    # already reduced the catalog to {web_search, …}, so `fetch_page` was gone
-    # and the chain silently degraded into repeating its first stage.
-    box: list[dict[str, Any]] = list(
-        state.get("full_tools") or state.get("tools", [])
-    )
-    if idx >= len(stages):
-        # Every stage was offered but the model SKIPPED one and tried to answer
-        # (`route_after_stage_model` sent it back). Re-offer the missed verb and
-        # say why — once, guarded by `stage_retried`. Without this the chain was
-        # opt-out: chat.web answered from a search snippet, which its own prompt
-        # calls "not a source", and nothing said otherwise.
-        missed = [s for s in stages if s not in set(state.get("attempted", set()))]
-        if not missed or state.get("stage_retried", False):
-            return {"full_tools": box}
-        want_again = missed[0]
-        served_now = {(t.get("function") or {}).get("name") for t in box}
-        if want_again not in served_now:
-            return {"full_tools": box, "stage_retried": True}
-        keep_again = set(spec.flow.keep) | {want_again}
-        return {
-            "tools": narrowed(
-                state,
-                [t for t in box if (t.get("function") or {}).get("name") in keep_again],
-            ),
-            "full_tools": box,
-            "stage_retried": True,
-            "corrections": [
-                *_live_corrections(state),
-                STAGE_MISSED_NOTE.format(tool=want_again),
-            ],
-        }
-    want = stages[idx]
-    served = {(t.get("function") or {}).get("name") for t in box}
-    # Abstain rather than narrow to nothing — web tools are absent entirely
-    # when the room has web disabled, and an empty catalog is a dead round.
-    if want not in served:
-        return {"stage": idx + 1, "full_tools": box}
-    keep = set(spec.flow.keep) | {want}
-    this_stage = [t for t in box if (t.get("function") or {}).get("name") in keep]
-    return {"tools": narrowed(state, this_stage), "stage": idx + 1, "full_tools": box}
-
-
-def _stage_re_offer_due(state: AgentState) -> bool:
-    """A staged verb was never actually called, and the one re-offer is unspent.
-
-    Read by BOTH stage routers, which is the point. `stage` counts stages
-    OFFERED, and ANY tool call advances the chain: `chat.web` keeps
-    `search_room` and the download verbs offered alongside every stage
-    (`flow.keep`), so a round that searched the ROOM consumed the "search the
-    web" stage — the chain moved on to `fetch_page`, `web_search` was never
-    offered again, and the Web agent could finish a web task having never
-    touched the web. Only the declined-stage exit checked for that, and the exit
-    taken after a tool ran is the one that case takes.
-    """
-    stages = get_agent(state.get("agent_id", "")).flow.stages
-    attempted: set[str] = set(state.get("attempted", set()))
-    return any(s not in attempted for s in stages) and not state.get(
-        "stage_retried", False
-    )
-
-
-def route_after_stage_model(state: AgentState) -> str:
-    """A DECLINED stage must not end the chain.
-
-    `route_after_model` sends any round with no tool calls straight to
-    `synthesize`, and `call_model` sets `stop` whenever the model emitted no
-    calls. On this shape that made the chain opt-out: chat.web could answer from
-    a `web_search` snippet — which WEB_PROMPT itself calls "not a source" — by
-    simply not calling `fetch_page` when stage 2 offered it. `stage_catalog`'s
-    docstring says "staging the catalog makes the fetch structural"; until
-    2026-07-27 the wiring made it a plea the model could ignore.
-
-    Bounded by construction: `stage_catalog` increments `stage` on every visit
-    (including when it abstains because the verb is not served), so a model that
-    declines every stage walks the chain once and lands on synthesize.
-    """
-    if state.get("cancelled", False):
-        return "synthesize"
-    if state.get("calls"):
-        return "execute_tools"
-    if state.get("force_synthesis", False):
-        # The forced tool-less answer round. Not a declined stage.
-        return "synthesize"
-    # Stages the model has not been OFFERED yet.
-    if state.get("stage", 0) < len(get_agent(state.get("agent_id", "")).flow.stages):
-        return "stage_catalog"
-    # Every stage was offered, and the model answered without calling one of
-    # them. That is the skip this shape exists to prevent, so re-offer the
-    # missed verb ONCE — bounded by `stage_retried`, so a model that declines
-    # twice gets to answer rather than looping.
-    if _stage_re_offer_due(state):
-        return "stage_catalog"
-    return "synthesize"
-
-
-def route_after_stage_tools(state: AgentState) -> str:
-    """Advance to the next stage, or close the chain with the answer round."""
-    if state.get("cancelled", False):
-        return "synthesize"
-    # The shared runaway backstop, NOT 0. Defaulting to 0 made this router fail
-    # CLOSED on any state without `max_rounds` — one tool round and out — while
-    # `graph.route_after_tools` defaults to the backstop and fails open. Two
-    # routers disagreeing about the same missing key is a bug generator.
-    if state.get("round", 0) >= state.get("max_rounds", AGENT_ROUND_BACKSTOP):
-        return "synthesize"
-    spec = get_agent(state.get("agent_id", ""))
-    if state.get("stage", 0) < len(spec.flow.stages):
-        return "stage_catalog"
-    # Every stage was OFFERED, but a side tool spent one of them: `stage` counts
-    # offers, and a `flow.keep` verb advances the chain exactly as the staged one
-    # does. Same single re-offer the declined-stage exit gets
-    # (`_stage_re_offer_due`) — without it the chain could close with its own
-    # verb never called.
-    if _stage_re_offer_due(state):
-        return "stage_catalog"
-    return "force_final"
-
-
-async def check_result(state: AgentState) -> dict[str, Any]:
-    """Read the last tool result for a failure the model should be shown.
-
-    The code-assistant tutorial's own A/B is the reason this is a predicate and
-    not a reflection call: feeding the RAW error back beat asking a model to
-    reflect on it first, which is why the shipped default there is
-    "do not reflect". So this node adds no model call — it decides whether the
-    NEXT one is worth spending.
-
-    `verify_claims` asks "did a write land?"; this asks "did the thing we ran
-    actually work?" — a script whose traceback is sitting in the transcript
-    while the agent reports success is the failure mode.
-    """
-    spec = get_agent(state.get("agent_id", ""))
-    flow = spec.flow
-    attempted = set(state.get("attempted", set()))
-    if spec.id == "media.transcribe" and "retranscribe_file" in attempted:
-        return _check_transcription_terminal(state)
-    if flow.receipt_after and attempted & set(flow.receipt_after):
-        events = list(state.get("tool_events", []))
-        latest_mutation = next(
-            (
-                (index, event)
-                for index, event in reversed(list(enumerate(events)))
-                if str(event.get("name") or "") in set(flow.receipt_after)
-            ),
-            None,
-        )
-        receipt_valid = False
-        if latest_mutation is not None:
-            mutation_index, mutation = latest_mutation
-            mutation_args = mutation.get("arguments") or {}
-            # save_workflow identifies the new draft by `name`; update_workflow
-            # addresses it by `name_or_id` and may also rename it.  A successful
-            # test may use either the old id/name or the new name, but must name
-            # this workflow and must occur AFTER the latest mutation.
-            identities = {
-                str(mutation_args.get(key) or "").strip().casefold()
-                for key in ("name", "name_or_id")
-                if str(mutation_args.get(key) or "").strip()
-            }
-            for event in events[mutation_index + 1 :]:
-                if str(event.get("name") or "") != flow.receipt_tool:
-                    continue
-                args = event.get("arguments") or {}
-                tested = str(args.get("name_or_id") or "").strip().casefold()
-                if (
-                    tested
-                    and tested in identities
-                    and flow.receipt_marker in str(event.get("result") or "")
-                ):
-                    receipt_valid = True
-                    break
-        if not receipt_valid:
-            repairs = state.get("repairs", 0)
-            offered = {
-                (tool.get("function") or {}).get("name")
-                for tool in state.get("tools", [])
-            }
-            if flow.receipt_tool in offered and repairs < flow.repair_cap:
-                return {
-                    "repair_needed": True,
-                    "repairs": repairs + 1,
-                    "corrections": [
-                        *state.get("corrections", []),
-                        flow.receipt_missing,
-                    ],
-                }
-            # The validation tool was unavailable, declined twice, or returned
-            # only VALIDATED:no.  Replace any model-authored success claim with
-            # a deterministic status derived from the missing receipt.
-            return {
-                "repair_needed": False,
-                "final_text": (
-                    "DID: the workflow may have been saved as a draft. "
-                    f"MISSING: {flow.receipt_missing}"
-                ),
-            }
-    markers = flow.failure_markers
-    cap = flow.repair_cap
-    if not markers or cap <= 0:
-        return {"repair_needed": False}
-
-    last = ""
-    for msg in reversed(state.get("messages", [])):
-        if msg.get("role") == "tool":
-            last = (msg.get("content") or "").lower()
-            break
-    if not any(m.lower() in last for m in markers):
-        # The latest attempt came back clean — whatever earlier passes cost, the
-        # thing works now, so stop.
-        return {"repair_needed": False}
-
-    # A failure marker is still present. Spend a pass if one is left.
-    #
-    # This used to latch instead of count: the first line of the node was
-    # `if state.get("checked"): return {"repaired": True}`, and the router
-    # required `not repaired` — so the SECOND visit ended the gate no matter
-    # what `repair_cap` said. Verified before the fix: scripts.run (cap 1),
-    # skills.author (cap 2) and jobs.workflows (cap 2) produced byte-identical
-    # runs. Two agents declared a budget of two and were silently given one.
-    #
-    # `checked` and `repaired` went on being written on every branch after the
-    # counter replaced the latch, and nothing anywhere read either one (removed
-    # 2026-08-01). `repairs` is the whole gate: it bounds the loop, and it is
-    # what the visit count is measured against.
-    repairs = state.get("repairs", 0)
-    if repairs >= cap:
-        # Out of passes. Report the failure honestly rather than loop — looping
-        # a 4B on a broken script is how it starts inventing output.
-        return {"repair_needed": False}
-    return {"repair_needed": True, "repairs": repairs + 1}
-
-
-_TRANSCRIPTION_TERMINAL_RE = re.compile(
-    r"(?i)(?:\bcompleted?\b|\bterminal\b|\btranscript\s*:|\bno[ -]speech\b|"
-    r"\bfailed?\b|\bfailure\b|\berror\b)"
-)
-_TRANSCRIPTION_JOB_RE = re.compile(
-    r"(?i)\b(?:job(?:[_ -]?id)?|id)\s*[:=#]?\s*([A-Za-z0-9][A-Za-z0-9._:-]{2,127})"
-)
-
-
-def _check_transcription_terminal(state: AgentState) -> dict[str, Any]:
-    """ARC-027: queued/running is not a completed re-transcription.
-
-    ``retranscribe_file`` may return a terminal transcript itself, or enqueue a
-    durable job. In the latter case the same worker now owns ``job_status`` and
-    must inspect it. The gate is receipt-driven: model wording is not evidence,
-    and an unknown bridge response fails closed as pending.
-    """
-    events = list(state.get("tool_events", []))
-    latest = next(
-        (
-            (index, event)
-            for index, event in reversed(list(enumerate(events)))
-            if str(event.get("name") or "") == "retranscribe_file"
-        ),
-        None,
-    )
-    target = "the requested recording"
-    job_id = ""
-    terminal = False
-    if latest is not None:
-        action_index, action = latest
-        args = action.get("arguments") or {}
-        target = str(args.get("name") or target).strip() or target
-        action_result = str(action.get("result") or "")
-        terminal = bool(_TRANSCRIPTION_TERMINAL_RE.search(action_result))
-        match = _TRANSCRIPTION_JOB_RE.search(action_result)
-        if match:
-            job_id = match.group(1).rstrip(".,;)")
-
-        if not terminal:
-            identities = {target.casefold()}
-            if job_id:
-                identities.add(job_id.casefold())
-            for event in events[action_index + 1 :]:
-                if str(event.get("name") or "") != "job_status":
-                    continue
-                status = str(event.get("result") or "")
-                folded = status.casefold()
-                # A room-wide status receipt must name the job/file whose
-                # action is being verified. Otherwise an unrelated completed
-                # job could satisfy this turn.
-                if any(identity in folded for identity in identities) and (
-                    _TRANSCRIPTION_TERMINAL_RE.search(status)
-                ):
-                    terminal = True
-                    break
-    if terminal:
-        return {"repair_needed": False}
-
-    flow = get_agent("media.transcribe").flow
-    repairs = state.get("repairs", 0)
-    offered = {
-        (tool.get("function") or {}).get("name") for tool in state.get("tools", [])
-    }
-    if "job_status" in offered and repairs < flow.repair_cap:
-        identity = f"job {job_id}" if job_id else target
-        return {
-            "repair_needed": True,
-            "repairs": repairs + 1,
-            "corrections": [
-                *state.get("corrections", []),
-                f"Re-transcription for {identity} has no terminal receipt yet. "
-                "Call job_status now; queued/running is not completion.",
-            ],
-        }
-
-    identity = f"job {job_id}" if job_id else target
-    return {
-        "repair_needed": False,
-        "final_text": (
-            f"MISSING: re-transcription for {identity} is still pending; no "
-            "completed transcript, no-speech result, or terminal failure receipt "
-            "was returned."
-        ),
-    }
-
-
-def route_after_check(state: AgentState) -> str:
-    """Repair while the result is still failing and passes remain.
-
-    Reads ONE flag, set by `check_result`, which owns the whole decision — the
-    router used to re-derive it from `repairs`/`repaired` and the two disagreed.
-    """
-    if state.get("cancelled", False):
-        return "synthesize"
-    return "call_model" if state.get("repair_needed", False) else "synthesize"
-
-
-#: The note left where a screenshot's pixels used to be. Keeping the TURN but
-#: dropping the payload preserves the conversation's shape — the model still
-#: sees that it looked, and when — without re-paying for a stale view.
-STALE_IMAGE = "[earlier screenshot — superseded by the current one below]"
-
-
-async def trim_images(state: AgentState) -> dict[str, Any]:
-    """Keep ONE live screenshot in context; strip the pixels from the rest.
-
-    WebVoyager's shipped answer to the same problem. Every capture lands as a
-    user message carrying base64 pixels (``IMAGE_HANDOFF``), and under a plain
-    tool-calling loop they ACCUMULATE — one per action — inside a
-    payload-fitted ``num_ctx``. That is the context-shift failure class already
-    diagnosed in this repo on 2026-07-23 (the Ollama 4k default window: big
-    turns silently truncated, producing "Done." and fabrications).
-
-    A stale screenshot is also actively misleading: it shows a UI state that no
-    longer exists, and the model cannot tell which one is current from pixels
-    alone. So the fix is not only cheaper, it is more correct.
-    """
-    messages: list[Message] = list(state.get("messages", []))
-    bearing = [i for i, m in enumerate(messages) if m.get("images")]
-    if len(bearing) <= 1:
-        return {}
-    trimmed = list(messages)
-    for i in bearing[:-1]:
-        stale = dict(trimmed[i])
-        stale.pop("images", None)
-        stale["content"] = STALE_IMAGE
-        trimmed[i] = stale
-    return {"messages": trimmed}
-
-
-def route_after_perceive(state: AgentState) -> str:
-    """Cancellation is checked here too — a perceive round is still a round."""
-    if state.get("cancelled", False):
-        return "synthesize"
-    # The shared backstop, NOT 0 — see route_after_stage_tools. Failing closed
-    # on a missing key ended a UI task after its first capture.
-    if state.get("round", 0) >= state.get("max_rounds", AGENT_ROUND_BACKSTOP):
-        return "synthesize"
-    return "trim_images"
-
-
-async def route_action(state: AgentState) -> dict[str, Any]:
-    """Pick the one terminal verb this ask wants, in plain Python.
-
-    LangGraph's Router pattern is explicitly "a single LLM call **or
-    rule-based logic**", and rule-based is the reliable arm here: a
-    deterministic pick is 100% reproducible where a 4B's is roughly 22% on a
-    multi-turn agency round. Studio's three generators and the Jobs agent's two
-    verbs are mutually exclusive, and the vocabulary that separates them is
-    already written — it is the ``Action.hints`` tuple.
-
-    Narrowing the catalog to ONE verb turns the round from "choose among ~21
-    tools, then fill arguments" into "fill arguments", which is the single
-    regime small models are measured frontier-grade at.
-
-    Deliberately abstains. On a tie, or a zero score, it returns ``{}`` and the
-    model sees the full box exactly as it does today. A router that guessed
-    would be worse than no router: the other verbs are no longer in the catalog,
-    so a wrong narrow is unrecoverable. Narrow only when it is unambiguous.
-    """
-    spec = get_agent(state.get("agent_id", ""))
-    actions = spec.flow.actions
-    if not actions:
-        return {}
-
-    ask = (state.get("question", "") or "").lower()
-    scores = {a.tool: sum(1 for h in a.hints if h in ask) for a in actions}
-    best = max(scores.values(), default=0)
-    if best == 0:
-        return {}
-    winners = [t for t, n in scores.items() if n == best]
-    if len(winners) != 1:
-        return {}
-
-    keep = set(spec.flow.keep) | {winners[0]}
-    routed = [
-        t
-        for t in state.get("tools", [])
-        if (t.get("function") or {}).get("name") in keep
-    ]
-    # Never narrow to nothing: if the bridge did not serve the routed verb this
-    # run, the full box is strictly better than an empty catalog.
-    if not any((t.get("function") or {}).get("name") == winners[0] for t in routed):
-        return {}
-    return {"tools": narrowed(state, routed), "routed": winners[0]}
-
-
-# --------------------------------------------------------------------------- #
-# shape builders
-# --------------------------------------------------------------------------- #
-
-
-def route_after_react_prepare(state: AgentState) -> str:
-    """Run a deterministic delegation prepared by Arcelle before any model.
-
-    Ordinary react/supervisor turns still enter ``call_model``.  The one
-    prepared-call case is Main's high-confidence visual-video delegation; it
-    goes through the normal ``execute_tools`` hub path, so privacy refusal,
-    roster accounting and the media.video child remain identical to a model-
-    authored ``ask_file_agent`` call.
-    """
-    return "execute_tools" if state.get("calls") else "call_model"
-
-
-def _react(g: StateGraph) -> StateGraph:
-    """The tool-calling cycle shared by most workers."""
-    g.add_node("prepare", prepare)
-    g.add_node("call_model", call_model)
-    g.add_node("execute_tools", execute_tools)
-    g.add_node("synthesize", synthesize)
-    g.add_edge(START, "prepare")
-    g.add_conditional_edges(
-        "prepare",
-        route_after_react_prepare,
-        {"execute_tools": "execute_tools", "call_model": "call_model"},
-    )
-    g.add_conditional_edges(
-        "call_model",
-        route_after_model,
-        {"execute_tools": "execute_tools", "synthesize": "synthesize"},
-    )
-    g.add_conditional_edges(
-        "execute_tools",
-        route_after_tools,
-        {"call_model": "call_model", "synthesize": "synthesize"},
-    )
-    g.add_edge("synthesize", END)
-    return g
-
-
-async def _force_final(state: AgentState) -> dict[str, Any]:
-    """End the tool phase: the next model round is the tool-less one.
-
-    ...and retire EVERY correction that ORDERED a tool call, because that round
-    has no tools to obey it with. This node is the ONLY door from the chain's
-    tool phase into its answer round, which is what makes it the right place:
-    `stage_catalog` is not visited again once every stage has been offered.
-
-    It used to filter with `_live_corrections`, which drops an order only once
-    the tool HAS been called — and the order is raised only because it was NOT,
-    so it survived in exactly the case this is here to fix: the model spends the
-    re-offer round on a `flow.keep` side tool, `route_after_stage_tools` sends
-    it here, and the tool-less answer round is still told "call web_search now".
-    A 4B answers "I will now search the web" instead of writing the answer.
-
-    `state` was formerly unread and kept only because LangGraph passes it
-    positionally (a zero-argument node raises ``TypeError: takes 0 positional
-    arguments but 1 was given`` at invoke time, verified against langgraph
-    1.2.9). It is read now.
-    """
-    return {"force_synthesis": True, "corrections": _without_tool_orders(state)}
-
-
-# `_oneshot` lived here and is DELETED (2026-07-25). It allowed EXACTLY ONE
-# tool round, which was structurally wrong for two of its three users:
-#
-# * media.transcribe — TRANSCRIBE_PROMPT says "stt_status ... check it before
-#   promising anything", so an agent that OBEYED its own prompt spent its only
-#   round on the probe and could never reach retranscribe_file. The prompt and
-#   the template contradicted each other.
-# * jobs.run — same trap latent: open with job_status and the pass never starts.
-# * creator.studio — not broken, but `route_act` does the job with the same
-#   call count, a 3-tool catalog instead of ~21, and a free classifier.
-#
-# Its one good idea survives: `_force_final`, which closes the tool phase by
-# making the NEXT model round tool-less rather than skipping the answer. The
-# regression its docstring recorded (execute_tools wired straight to synthesize,
-# dropping the round that turns tool RESULTS into a report) is still pinned, now
-# against the shapes that inherit the pattern.
-
-
-def _react_verify(g: StateGraph) -> StateGraph:
-    """The cycle, plus a ground-truth check before the answer."""
-    g.add_node("prepare", prepare)
-    g.add_node("call_model", call_model)
-    g.add_node("execute_tools", execute_tools)
-    g.add_node("verify", verify_claims)
-    g.add_node("synthesize", synthesize)
-    g.add_edge(START, "prepare")
-    g.add_edge("prepare", "call_model")
-    g.add_conditional_edges(
-        "call_model",
-        route_after_model,
-        {"execute_tools": "execute_tools", "synthesize": "verify"},
-    )
-    g.add_conditional_edges(
-        "execute_tools",
-        route_after_tools,
-        {"call_model": "call_model", "synthesize": "verify"},
-    )
-    g.add_conditional_edges(
-        "verify",
-        route_after_verify,
-        {"call_model": "call_model", "synthesize": "synthesize"},
-    )
-    g.add_edge("synthesize", END)
-    return g
-
-
-def _route_act(g: StateGraph) -> StateGraph:
-    """Deterministic verb pick, then a BOUNDED cycle to fill its arguments.
-
-    A cycle, not `oneshot`'s single round: the routed verb usually needs a real
-    filename, and "the contract" is not one. `flow.keep` leaves the resolvers
-    (list_room_files / search_room) in the narrowed catalog so the model can
-    look one up, which needs a round it can come back from. What stops it is
-    the duplicate guard and the tool-less final round, not a round budget.
-    """
-    g.add_node("prepare", prepare)
-    g.add_node("route_action", route_action)
-    g.add_node("call_model", call_model)
-    g.add_node("execute_tools", execute_tools)
-    g.add_node("verify", verify_claims)
-    g.add_node("synthesize", synthesize)
-    g.add_edge(START, "prepare")
-    g.add_edge("prepare", "route_action")
-    g.add_edge("route_action", "call_model")
-    g.add_conditional_edges(
-        "call_model",
-        route_after_model,
-        {"execute_tools": "execute_tools", "synthesize": "verify"},
-    )
-    g.add_conditional_edges(
-        "execute_tools",
-        route_after_tools,
-        {"call_model": "call_model", "synthesize": "verify"},
-    )
-    g.add_conditional_edges(
-        "verify",
-        route_after_verify,
-        {"call_model": "call_model", "synthesize": "synthesize"},
-    )
-    g.add_edge("synthesize", END)
-    return g
-
-
-def _probe_gate_act(g: StateGraph) -> StateGraph:
-    """Probe deterministically, gate on the answer, then act.
-
-    Prompt chaining with a deterministic gate — the docs' generate ->
-    check -> {Pass/Fail} wiring, where the gate is plain Python. Replaces
-    `oneshot` for media.transcribe, which under `oneshot` could not do its job:
-    its prompt tells it to check `stt_status` first, and that consumed the only
-    tool round it had.
-
-    The gate is the PROBE and nothing else. This shape used to ALSO cap the act
-    phase at one model-driven tool round (`force_final` on the execute_tools
-    back-edge), which reintroduced `oneshot`'s bug one level up — see the
-    comment on that edge. The act phase is now an ordinary bounded cycle.
-
-    Costs ONE FEWER model call than `react` on the happy path (the probe is
-    free) and TWO fewer on the blocked path, which reaches no model at all.
-    """
-    g.add_node("prepare", prepare)
-    g.add_node("probe", probe)
-    g.add_node("probe_tools", execute_tools)
-    g.add_node("probe_answer", probe_answer)
-    g.add_node("call_model", call_model)
-    g.add_node("execute_tools", execute_tools)
-    g.add_node("check", check_result)
-    g.add_node("synthesize", synthesize)
-
-    g.add_edge(START, "prepare")
-    g.add_edge("prepare", "probe")
-    g.add_conditional_edges(
-        "probe",
-        route_after_probe_fired,
-        {"tools": "probe_tools", "skip": "call_model"},
-    )
-    g.add_conditional_edges(
-        "probe_tools",
-        route_after_probe,
-        {
-            "call_model": "call_model",
-            "blocked": "probe_answer",
-            "synthesize": "synthesize",
-        },
-    )
-    g.add_edge("probe_answer", "synthesize")
-    g.add_conditional_edges(
-        "call_model",
-        route_after_model,
-        {"execute_tools": "execute_tools", "synthesize": "check"},
-    )
-    # The gate is the PROBE, not the round count. `force_final` used to sit on
-    # this edge and made every model-driven tool round the last one, which
-    # recreated the exact contradiction `oneshot` was deleted for, one level up:
-    # media.transcribe's prompt tells it to resolve a file name first, so a run
-    # that opened with `list_room_files` spent its only round looking and ended
-    # with the file FOUND and never transcribed — reported to the user as done.
-    # It also made `request_tools` unreachable in this shape, since unlocking a
-    # lane costs the round that would have used it. The ordinary react back-edge
-    # still guarantees a model round after tools (pinned structurally by
-    # test_a_tool_round_is_always_followed_by_a_model_round), so nothing that
-    # `force_final` was defending here is lost.
-    g.add_conditional_edges(
-        "execute_tools",
-        route_after_tools,
-        {"call_model": "call_model", "synthesize": "check"},
-    )
-    g.add_conditional_edges(
-        "check",
-        route_after_check,
-        {"call_model": "call_model", "synthesize": "synthesize"},
-    )
-    g.add_edge("synthesize", END)
-    return g
-
-
-def _perceive_act(g: StateGraph) -> StateGraph:
-    """See, then act — the WebVoyager loop, for the agent that drives the app.
-
-    The biggest structural win in the roster. Today a UI task costs TWO model
-    rounds per action: one to ask for `ui_snapshot`, one to decide what to
-    click. But the snapshot is not a decision — UI_PROMPT already says "Take a
-    fresh ui_snapshot before each ui_act", so the order is prescribed and the
-    model was paying to rediscover it. Firing the capture deterministically
-    halves the rounds, and `trim_images` keeps exactly one live screenshot in
-    context instead of one per action.
-
-    The critic is the next screenshot (the CUA doctrine), which is why this
-    shape has no `verify` node: for a pixel agent the following capture IS the
-    verification, and it is free.
-    """
-    g.add_node("prepare", prepare)
-    g.add_node("perceive", probe)
-    g.add_node("perceive_tools", execute_tools)
-    g.add_node("trim_images", trim_images)
-    g.add_node("call_model", call_model)
-    g.add_node("execute_tools", execute_tools)
-    g.add_node("synthesize", synthesize)
-
-    g.add_edge(START, "prepare")
-    g.add_edge("prepare", "perceive")
-    g.add_conditional_edges(
-        "perceive",
-        route_after_probe_fired,
-        {"tools": "perceive_tools", "skip": "call_model"},
-    )
-    g.add_conditional_edges(
-        "perceive_tools",
-        route_after_perceive,
-        {"trim_images": "trim_images", "synthesize": "synthesize"},
-    )
-    g.add_edge("trim_images", "call_model")
-    g.add_conditional_edges(
-        "call_model",
-        route_after_model,
-        {"execute_tools": "execute_tools", "synthesize": "synthesize"},
-    )
-    # ...and back around to a FRESH capture, not straight to the model: acting
-    # without re-perceiving is how a UI agent clicks a control that moved.
-    g.add_conditional_edges(
-        "execute_tools",
-        route_after_tools,
-        {"call_model": "perceive", "synthesize": "synthesize"},
-    )
-    g.add_edge("synthesize", END)
-    return g
-
-
-def _chain_stage(g: StateGraph) -> StateGraph:
-    """A fixed chain of one-tool stages, then the grounded answer.
-
-    Each stage offers ONE verb, so the round is "fill arguments" rather than
-    "choose among ~20 tools, then fill arguments" — the single regime a 4B is
-    measured frontier-grade at. Bounded by construction: the number of stages,
-    plus the tool-less answer round.
-    """
-    g.add_node("prepare", prepare)
-    g.add_node("stage_catalog", stage_catalog)
-    g.add_node("call_model", call_model)
-    g.add_node("execute_tools", execute_tools)
-    g.add_node("force_final", _force_final)
-    g.add_node("synthesize", synthesize)
-
-    g.add_edge(START, "prepare")
-    g.add_edge("prepare", "stage_catalog")
-    g.add_edge("stage_catalog", "call_model")
-    # NOT `route_after_model`: skipping a stage must re-offer the next verb, not
-    # exit the chain. See `route_after_stage_model`.
-    g.add_conditional_edges(
-        "call_model",
-        route_after_stage_model,
-        {
-            "execute_tools": "execute_tools",
-            "stage_catalog": "stage_catalog",
-            "synthesize": "synthesize",
-        },
-    )
-    g.add_conditional_edges(
-        "execute_tools",
-        route_after_stage_tools,
-        {
-            "stage_catalog": "stage_catalog",
-            "force_final": "force_final",
-            "synthesize": "synthesize",
-        },
-    )
-    g.add_edge("force_final", "call_model")
-    g.add_edge("synthesize", END)
-    return g
-
-
-def _recall_act_check(g: StateGraph) -> StateGraph:
-    """Load this agent's own prior art for free, act, check the result, repair.
-
-    Episodic-memory retrieval (USACO) in front of the loop, plus a bounded
-    generate -> check -> retry. The retrieval half is the cheap win: for all
-    four users the FIRST move is an index call — `list_scripts`, `list_skills`,
-    `list_workflows` — which is a constant, so paying a model round to
-    rediscover it is waste. Firing it deterministically also doubles as the
-    few-shot: existing skills and workflows are worked examples, which small
-    models follow far better than schema prose.
-
-    The check half is bounded by `flow.repair_cap`, and is DATA per agent:
-    `skills.use` gets 0 (a skill that fails is the author's problem, and
-    looping a 4B on someone else's script invents output), while
-    `skills.author` gets a real budget because repairing its own draft is the
-    job.
-    """
-    g.add_node("prepare", prepare)
-    g.add_node("recall", probe)
-    g.add_node("recall_tools", execute_tools)
-    g.add_node("call_model", call_model)
-    g.add_node("execute_tools", execute_tools)
-    g.add_node("check", check_result)
-    g.add_node("synthesize", synthesize)
-
-    g.add_edge(START, "prepare")
-    g.add_edge("prepare", "recall")
-    g.add_conditional_edges(
-        "recall",
-        route_after_probe_fired,
-        {"tools": "recall_tools", "skip": "call_model"},
-    )
-    g.add_edge("recall_tools", "call_model")
-    # BOTH exits from the loop go through `check`, exactly as `_react_verify`
-    # routes both of its exits through `verify`. Sending only `execute_tools`'s
-    # exit there left the gate unreachable on the ordinary path — a model that
-    # answers with no further calls leaves via `call_model`, which is what
-    # happens on every successful run — so the gate ran only when the round
-    # budget was exhausted or the turn was cancelled.
-    g.add_conditional_edges(
-        "call_model",
-        route_after_model,
-        {"execute_tools": "execute_tools", "synthesize": "check"},
-    )
-    g.add_conditional_edges(
-        "execute_tools",
-        route_after_tools,
-        {"call_model": "call_model", "synthesize": "check"},
-    )
-    g.add_conditional_edges(
-        "check",
-        route_after_check,
-        {"call_model": "call_model", "synthesize": "synthesize"},
-    )
-    g.add_edge("synthesize", END)
-    return g
-
-
-#: shape name -> builder. `supervisor` shares `react`'s wiring: the Main agent's
-#: difference is its CATALOG (specialists, not room tools) and the hub guard in
-#: `execute_tools`, both of which are already keyed off `agent_id`. Kept as a
-#: separate name so the roster reads truthfully and so the two can diverge
-#: without touching every worker.
-_BUILDERS: dict[str, Callable[[StateGraph], StateGraph]] = {
-    "react": _react,
-    "supervisor": _react,
-    "route_act": _route_act,
-    "probe_gate_act": _probe_gate_act,
-    "perceive_act": _perceive_act,
-    "chain_stage": _chain_stage,
-    "recall_act_check": _recall_act_check,
-    "react_verify": _react_verify,
-}
-
-
 def build_agent_graph(template: str) -> Any:
     """Compile one shape. Pure: no model, no bridge, no I/O bound in.
 

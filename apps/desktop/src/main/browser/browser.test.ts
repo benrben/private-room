@@ -34,6 +34,7 @@ import type { BrowseJournalRow } from "../../shared/apiTypes.js";
 import { Browser, type BrowserDeps } from "./browser.js";
 import { MAX_TABS, PARKED, type Bounds } from "./tabs.js";
 import { registerWebRequestFunnel } from "./webRequestFunnel.js";
+import type { DownloadGatingDeps } from "./downloadGating.js";
 import type { CreatePageDeps, LivePage, WindowContentView } from "./webviewManager.js";
 
 type WebRequestListener = (
@@ -63,6 +64,7 @@ interface FakePage {
   removedFromWindow: number;
   bounds: Bounds[];
   blockingAttaches: number;
+  downloadGating: DownloadGatingDeps;
   /** The listener the LAST `onBeforeRequest` registration captured — real
    *  requests never reach this fake session, so a test drives it by hand to
    *  prove browser.ts's own funnel-deps wiring, not the funnel's policy
@@ -136,6 +138,7 @@ function harness(): Harness {
       removedFromWindow: 0,
       bounds: [],
       blockingAttaches: 0,
+      downloadGating: pageDeps.downloadGating,
       webRequestListener: null,
       live: null as unknown as LivePage,
     };
@@ -169,6 +172,7 @@ function harness(): Harness {
         // JSON TEXT — reproduced here rather than short-circuited.
         return JSON.stringify(h.answer(opOf(js), id));
       },
+      capturePage: async () => ({ toPNG: () => Buffer.from(`png:${id}`) }),
     };
     rec.live = { id, view, contents, webSession, protection: { state: "unknown" } } as unknown as LivePage;
     // The REAL registration (webRequestFunnel.ts), so the verdict this page
@@ -212,6 +216,21 @@ beforeEach(() => {
 });
 
 // ---------------------------------------------------------------------------
+
+describe("opening a page", () => {
+  it("attaches, records, selects, and loads a public page through injected page dependencies", () => {
+    const id = h.browser.newTab("https://example.com/read?section=1");
+    const rec = h.pages.get(id) as FakePage;
+
+    expect(h.addedViews).toEqual([rec.live.view]);
+    expect(h.browser.tabList()).toMatchObject([
+      { id, url: "https://example.com/read?section=1", active: true },
+    ]);
+    expect(rec.loaded).toEqual(["https://example.com/read?section=1"]);
+    expect(h.browser.sessionId()).not.toBe("");
+    expect(h.journal).toContainEqual(["blocker", "", "Content blocking active."]);
+  });
+});
 
 describe("the tab cap REFUSES a ninth page rather than evicting one", () => {
   it("throws, names the cap, and leaves every open page exactly where it was", () => {
@@ -429,6 +448,16 @@ describe("the shield speaks for the WHOLE browser", () => {
     expect((h.pages.get("1") as FakePage).blockingAttaches).toBe(1);
   });
 
+  it("records a failed retry when the blocker still cannot attach", () => {
+    h.blockingThrowsFor.add("0");
+    const [id] = openPages(h, 1) as [string];
+
+    h.browser.retryProtection();
+
+    expect(h.browser.protection()).toEqual({ state: "failed", reason: "webRequest unavailable" });
+    expect((h.pages.get(id) as FakePage).blockingAttaches).toBe(0);
+  });
+
   it("refuses to retry when the browser isn't open", () => {
     expect(() => h.browser.retryProtection()).toThrow("The browser isn't open.");
   });
@@ -519,6 +548,23 @@ describe("the webRequest funnel's deps are really wired (not just constructed)",
       vi.fn(),
     );
     expect(h.browser.blockedCount()).toBe(1);
+  });
+});
+
+describe("download gating and active-page capture", () => {
+  it("classifies public and private download URLs through the page's gating dependencies", () => {
+    const [id] = openPages(h, 1) as [string];
+    const gating = (h.pages.get(id) as FakePage).downloadGating;
+
+    expect(gating.isPublicHttpUrl("https://downloads.example.test/file.pdf")).toBe(true);
+    expect(gating.isPublicHttpUrl("http://127.0.0.1/private.pdf")).toBe(false);
+  });
+
+  it("evaluates and captures the active page through its live contents", async () => {
+    const [id] = openPages(h, 1) as [string];
+
+    await expect(h.browser.eval("({ answer: 42 })")).resolves.toEqual({ ok: true });
+    await expect(h.browser.captureActivePage()).resolves.toEqual(Buffer.from(`png:${id}`));
   });
 });
 

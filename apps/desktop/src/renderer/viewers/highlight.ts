@@ -5,48 +5,26 @@
  * (no DOM mutation — safe over docx-preview / react-markdown output).
  */
 
+const FOLDED_CHARACTERS = new Map<string, string>([
+  ["‘", "'"], ["’", "'"], ["ʼ", "'"],
+  ["“", '"'], ["”", '"'],
+  ["–", "-"], ["—", "-"], ["־", "-"],
+  ["ﬁ", "fi"], ["ﬂ", "fl"], [" ", " "], ["­", ""],
+]);
+const HEBREW_FOLD_EXCLUSIONS = new Set([0x05be, 0x05c0, 0x05c3, 0x05c6]);
+
+function isFoldedHebrewMark(ch: string): boolean {
+  const codePoint = ch.codePointAt(0) ?? 0;
+  return codePoint >= 0x0591 && codePoint <= 0x05c7 && !HEBREW_FOLD_EXCLUSIONS.has(codePoint);
+}
+
 /** Fold typographic look-alikes so quotes from extracted text match the
  * rendered document: curly quotes, dashes, ligatures, exotic spaces, and
  * soft hyphens (which the renderer may drop entirely). */
 function foldChar(ch: string): string {
-  switch (ch) {
-    case "‘":
-    case "’":
-    case "ʼ":
-      return "'";
-    case "“":
-    case "”":
-      return '"';
-    case "–":
-    case "—":
-    case "־": // Hebrew maqaf ≡ hyphen (models type בן-דוד for בן־דוד)
-      return "-";
-    case "ﬁ":
-      return "fi";
-    case "ﬂ":
-      return "fl";
-    case " ":
-      return " ";
-    case "­": // soft hyphen — invisible, often present on one side only
-      return "";
-    default: {
-      // Hebrew nikud/cantillation (0591–05C7 minus the punctuation in that
-      // block): search results are consonantal while the rendered document
-      // may be pointed — fold both sides to consonants so quotes match.
-      const cp = ch.codePointAt(0) ?? 0;
-      if (
-        cp >= 0x0591 &&
-        cp <= 0x05c7 &&
-        cp !== 0x05be &&
-        cp !== 0x05c0 &&
-        cp !== 0x05c3 &&
-        cp !== 0x05c6
-      ) {
-        return "";
-      }
-      return ch;
-    }
-  }
+  const folded = FOLDED_CHARACTERS.get(ch);
+  if (folded !== undefined) return folded;
+  return isFoldedHebrewMark(ch) ? "" : ch;
 }
 
 /**
@@ -60,44 +38,59 @@ function foldChar(ch: string): string {
  *   - collapse every run of whitespace (incl. newlines) to a single space.
  * The normalized form is trimmed (no leading/trailing space).
  */
+type NormalizedText = { map: number[]; norm: string; pendingSpace: boolean };
+
+function hyphenWhitespace(src: string, index: number): { end: number; hasLineBreak: boolean } {
+  let end = index + 1;
+  let hasLineBreak = false;
+  while (end < src.length && (src[end] === "­" || /\s/.test(src[end]))) {
+    if (src[end] === "\n" || src[end] === "\r") hasLineBreak = true;
+    end += 1;
+  }
+  return { end, hasLineBreak };
+}
+
+function joinedLineEnd(src: string, index: number, folded: string): number | null {
+  if (folded !== "-") return null;
+  const whitespace = hyphenWhitespace(src, index);
+  return whitespace.hasLineBreak ? whitespace.end : null;
+}
+
+function noteWhitespace(normalized: NormalizedText): void {
+  normalized.pendingSpace = normalized.norm.length > 0;
+}
+
+function appendFolded(normalized: NormalizedText, folded: string, sourceIndex: number): void {
+  if (normalized.pendingSpace) {
+    normalized.norm += " ";
+    normalized.map.push(sourceIndex);
+    normalized.pendingSpace = false;
+  }
+  for (const character of folded) {
+    normalized.norm += character;
+    normalized.map.push(sourceIndex);
+  }
+}
+
 function normalizeWithMap(src: string): { norm: string; map: number[] } {
-  let norm = "";
-  const map: number[] = [];
-  let pendingSpace = false;
-  for (let i = 0; i < src.length; i++) {
-    const ch = src[i];
-    if (ch === "­") continue; // soft hyphen: vanish, no space
-    if (/\s/.test(ch)) {
-      pendingSpace = norm.length > 0; // collapse run; suppress leading space
+  const normalized: NormalizedText = { norm: "", map: [], pendingSpace: false };
+  for (let index = 0; index < src.length; index++) {
+    const character = src[index];
+    if (character === "­") continue;
+    if (/\s/.test(character)) {
+      noteWhitespace(normalized);
       continue;
     }
-    const folded = foldChar(ch.toLowerCase());
-    if (folded === "-") {
-      // Line-end hyphenation: a hyphen whose following whitespace run
-      // contains a newline joins the two word halves — drop both.
-      let j = i + 1;
-      let newline = false;
-      while (j < src.length && (src[j] === "­" || /\s/.test(src[j]))) {
-        if (src[j] === "\n" || src[j] === "\r") newline = true;
-        j++;
-      }
-      if (newline) {
-        i = j - 1; // consume the whitespace run too
-        pendingSpace = false;
-        continue;
-      }
+    const folded = foldChar(character.toLowerCase());
+    const lineEnd = joinedLineEnd(src, index, folded);
+    if (lineEnd !== null) {
+      index = lineEnd - 1;
+      normalized.pendingSpace = false;
+      continue;
     }
-    if (pendingSpace) {
-      norm += " ";
-      map.push(i);
-      pendingSpace = false;
-    }
-    for (const fc of folded) {
-      norm += fc;
-      map.push(i);
-    }
+    appendFolded(normalized, folded, index);
   }
-  return { norm, map };
+  return normalized;
 }
 
 /** Normalize `quote` to the same form used for the haystack (see
@@ -115,31 +108,33 @@ export function normalizeForMatch(s: string): string {
  * whitespace-collapsed match, then a whitespace-free one, because text
  * extractors and renderers frequently disagree on where spaces fall.
  */
-function locateQuote(
-  source: string,
-  quote: string,
-): { start: number; end: number } | null {
-  const { norm, map } = normalizeWithMap(source);
-  const needle = normalizeForMatch(quote);
-  if (!needle) return null;
+function locatedRange(text: string, map: readonly number[], needle: string): { start: number; end: number } | null {
+  const at = text.indexOf(needle);
+  return at < 0 ? null : { start: map[at]!, end: map[at + needle.length - 1]! };
+}
 
-  let at = norm.indexOf(needle);
-  if (at >= 0) return { start: map[at], end: map[at + needle.length - 1] };
-
-  // Whitespace-free fallback: strip spaces from both sides, keep the map.
+function withoutWhitespace(normalized: { norm: string; map: readonly number[] }): { map: number[]; text: string } {
   let free = "";
   const freeMap: number[] = [];
-  for (let k = 0; k < norm.length; k++) {
-    if (norm[k] !== " ") {
-      free += norm[k];
-      freeMap.push(map[k]);
+  for (let index = 0; index < normalized.norm.length; index++) {
+    if (normalized.norm[index] !== " ") {
+      free += normalized.norm[index];
+      freeMap.push(normalized.map[index]!);
     }
   }
+  return { text: free, map: freeMap };
+}
+
+function locateQuote(source: string, quote: string): { start: number; end: number } | null {
+  const normalized = normalizeWithMap(source);
+  const needle = normalizeForMatch(quote);
+  if (!needle) return null;
+  const direct = locatedRange(normalized.norm, normalized.map, needle);
+  if (direct) return direct;
+  const free = withoutWhitespace(normalized);
   const freeNeedle = needle.replace(/ /g, "");
   if (!freeNeedle) return null;
-  at = free.indexOf(freeNeedle);
-  if (at >= 0) return { start: freeMap[at], end: freeMap[at + freeNeedle.length - 1] };
-  return null;
+  return locatedRange(free.text, free.map, freeNeedle);
 }
 
 /**
@@ -155,46 +150,53 @@ export function locateQuoteHebrewAware(
   quote: string,
 ): { start: number; end: number } | null {
   const direct = locateQuote(source, quote);
-  if (direct || !/[א-ת]/.test(quote)) return direct;
+  if (direct) return direct;
+  if (!/[א-ת]/.test(quote)) return null;
 
+  const visualOrder = visualOrderSource(source);
+  const hit = locateQuote(visualOrder.text, quote);
+  if (!hit) return null;
+  return originalRange(visualOrder.map, hit);
+}
+
+function appendVisualLine(
+  source: string,
+  start: number,
+  end: number,
+  mirrored: string[],
+  backMap: number[],
+): void {
+  const reversed = /[א-ת]/.test(source.slice(start, end));
+  for (let index = reversed ? end - 1 : start; reversed ? index >= start : index < end; index += reversed ? -1 : 1) {
+    mirrored.push(source[index]!);
+    backMap.push(index);
+  }
+}
+
+function visualOrderSource(source: string): { map: number[]; text: string } {
   const mirrored: string[] = [];
   const backMap: number[] = [];
   let lineStart = 0;
-  const flushLine = (endExcl: number) => {
-    const line = source.slice(lineStart, endExcl);
-    if (/[א-ת]/.test(line)) {
-      for (let k = endExcl - 1; k >= lineStart; k--) {
-        mirrored.push(source[k]);
-        backMap.push(k);
-      }
-    } else {
-      for (let k = lineStart; k < endExcl; k++) {
-        mirrored.push(source[k]);
-        backMap.push(k);
-      }
-    }
-  };
-  for (let i = 0; i < source.length; i++) {
-    if (source[i] === "\n") {
-      flushLine(i);
-      mirrored.push("\n");
-      backMap.push(i);
-      lineStart = i + 1;
-    }
+  for (let index = 0; index < source.length; index++) {
+    if (source[index] !== "\n") continue;
+    appendVisualLine(source, lineStart, index, mirrored, backMap);
+    mirrored.push("\n");
+    backMap.push(index);
+    lineStart = index + 1;
   }
-  flushLine(source.length);
+  appendVisualLine(source, lineStart, source.length, mirrored, backMap);
+  return { text: mirrored.join(""), map: backMap };
+}
 
-  const hit = locateQuote(mirrored.join(""), quote);
-  if (!hit) return null;
-  // The mirrored span maps to a contiguous original range; take its bounds.
-  let lo = backMap[hit.start];
-  let hi = lo;
-  for (let k = hit.start; k <= hit.end; k++) {
-    const o = backMap[k];
-    if (o < lo) lo = o;
-    if (o > hi) hi = o;
+function originalRange(map: readonly number[], hit: { start: number; end: number }): { start: number; end: number } {
+  let start = map[hit.start]!;
+  let end = start;
+  for (let index = hit.start; index <= hit.end; index++) {
+    const original = map[index]!;
+    if (original < start) start = original;
+    if (original > end) end = original;
   }
-  return { start: lo, end: hi };
+  return { start, end };
 }
 
 const HIGHLIGHT_NAME = "pr-annotation";

@@ -66,26 +66,45 @@ function boundaryOf(contentType: string): string | null {
 /** `=XX` hex escapes and `=` soft line breaks. Bytes are collected first and
  * decoded as UTF-8 at the end, so a multi-byte character split across two
  * escapes survives — the bug that turned "siège" into "si ge". */
-export function decodeQuotedPrintable(s: string): string {
-  const bytes: number[] = [];
-  const lines = s.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].replace(/\r$/, "");
-    const soft = line.endsWith("=");
-    const content = soft ? line.slice(0, -1) : line;
-    for (let j = 0; j < content.length; j++) {
-      if (content[j] === "=" && j + 2 < content.length) {
-        const hex = content.slice(j + 1, j + 3);
-        if (/^[0-9a-fA-F]{2}$/.test(hex)) {
-          bytes.push(parseInt(hex, 16));
-          j += 2;
-          continue;
-        }
-      }
-      // Non-ASCII already in the source passes through as its own UTF-8 bytes.
-      for (const b of new TextEncoder().encode(content[j])) bytes.push(b);
+function quotedPrintableLine(line: string) {
+  const withoutCarriageReturn = line.replace(/\r$/, "");
+  const soft = withoutCarriageReturn.endsWith("=");
+  return { content: soft ? withoutCarriageReturn.slice(0, -1) : withoutCarriageReturn, soft };
+}
+
+function hexEscapeAt(text: string, index: number): string | null {
+  if (text[index] !== "=" || index + 2 >= text.length) return null;
+  const hex = text.slice(index + 1, index + 3);
+  return /^[0-9a-fA-F]{2}$/.test(hex) ? hex : null;
+}
+
+function appendUtf8Bytes(bytes: number[], character: string) {
+  for (const byte of new TextEncoder().encode(character)) bytes.push(byte);
+}
+
+function appendQuotedPrintableContent(bytes: number[], content: string) {
+  for (let index = 0; index < content.length; index++) {
+    const hex = hexEscapeAt(content, index);
+    if (hex) {
+      bytes.push(parseInt(hex, 16));
+      index += 2;
+      continue;
     }
-    if (!soft && i < lines.length - 1) bytes.push(10);
+    appendUtf8Bytes(bytes, content[index]);
+  }
+}
+
+function needsLineBreak(soft: boolean, lineIndex: number, lineCount: number) {
+  return !soft && lineIndex < lineCount - 1;
+}
+
+export function decodeQuotedPrintable(source: string): string {
+  const bytes: number[] = [];
+  const lines = source.split("\n");
+  for (let index = 0; index < lines.length; index++) {
+    const line = quotedPrintableLine(lines[index]);
+    appendQuotedPrintableContent(bytes, line.content);
+    if (needsLineBreak(line.soft, index, lines.length)) bytes.push(10);
   }
   return new TextDecoder("utf-8").decode(new Uint8Array(bytes));
 }
@@ -153,46 +172,89 @@ function filenameOf(headers: string): string {
   return m ? decodeMimeWords(m[2] ?? m[1]) : "";
 }
 
+type BodyCandidates = {
+  plain: string;
+  htmlFallback: string;
+  nested: string;
+};
+
+function decodeLeaf(headers: string, body: string, contentType: string): string {
+  const decoded = decodeTransfer(headers, body);
+  return contentType.toLowerCase().startsWith("text/html") ? stripHtml(decoded) : decoded;
+}
+
+function bodyCandidates(): BodyCandidates {
+  return { plain: "", htmlFallback: "", nested: "" };
+}
+
+function attachPart(headers: string, body: string, out: ParsedEmail) {
+  const name = filenameOf(headers);
+  const rawLength = body.replace(/\s+/g, "").length;
+  out.attachments.push({
+    name: name || "(unnamed attachment)",
+    sizeHint: rawLength ? `${Math.round((rawLength * 3) / 4 / 1024).toLocaleString()} KB` : "",
+  });
+}
+
+function isAttachment(headers: string, contentType: string): boolean {
+  const disposition = header(headers, "Content-Disposition").toLowerCase();
+  const name = filenameOf(headers);
+  return disposition.startsWith("attachment") || (name !== "" && !contentType.startsWith("text/"));
+}
+
+function recordTextBody(
+  headers: string,
+  body: string,
+  contentType: string,
+  candidates: BodyCandidates,
+) {
+  const decoded = decodeTransfer(headers, body);
+  if (contentType.startsWith("text/plain") && !candidates.plain) {
+    candidates.plain = decoded;
+    return;
+  }
+  if (contentType.startsWith("text/html") && !candidates.htmlFallback) {
+    candidates.htmlFallback = stripHtml(decoded);
+  }
+}
+
+function recordNestedBody(headers: string, body: string, out: ParsedEmail, candidates: BodyCandidates) {
+  const nested = walk(headers, body, out);
+  if (nested.trim() && !candidates.nested) candidates.nested = nested;
+}
+
+function visitMultipartPart(chunk: string, out: ParsedEmail, candidates: BodyCandidates) {
+  const part = chunk.replace(/^--/, "");
+  if (!part.trim()) return;
+  const [headers, body] = splitHeaders(part);
+  const contentType = header(headers, "Content-Type").toLowerCase();
+  if (contentType.startsWith("multipart/")) {
+    recordNestedBody(headers, body, out, candidates);
+    return;
+  }
+  if (isAttachment(headers, contentType)) {
+    attachPart(headers, body, out);
+    return;
+  }
+  recordTextBody(headers, body, contentType, candidates);
+}
+
+function preferredBody(candidates: BodyCandidates): string {
+  return candidates.plain || candidates.nested || candidates.htmlFallback;
+}
+
+function walkMultipart(boundary: string, body: string, out: ParsedEmail): string {
+  const candidates = bodyCandidates();
+  for (const chunk of body.split("--" + boundary).slice(1)) {
+    visitMultipartPart(chunk, out, candidates);
+  }
+  return preferredBody(candidates);
+}
+
 function walk(headers: string, body: string, out: ParsedEmail): string {
   const contentType = header(headers, "Content-Type");
   const boundary = boundaryOf(contentType);
-  if (!boundary) {
-    const decoded = decodeTransfer(headers, body);
-    return contentType.toLowerCase().startsWith("text/html") ? stripHtml(decoded) : decoded;
-  }
-  // EVERY part is visited before a body is chosen. Returning on the first
-  // `text/plain` (the obvious shape) skipped the attachment parts that follow
-  // it, so a message whose body came before its files listed no files at all.
-  let plain = "";
-  let htmlFallback = "";
-  let nested = "";
-  for (const chunk of body.split("--" + boundary).slice(1)) {
-    const part = chunk.replace(/^--/, "");
-    if (!part.trim()) continue;
-    const [partHeaders, partBody] = splitHeaders(part);
-    const partType = header(partHeaders, "Content-Type").toLowerCase();
-    if (partType.startsWith("multipart/")) {
-      const inner = walk(partHeaders, partBody, out);
-      if (inner.trim() && !nested) nested = inner;
-      continue;
-    }
-    const disposition = header(partHeaders, "Content-Disposition").toLowerCase();
-    const name = filenameOf(partHeaders);
-    if (disposition.startsWith("attachment") || (name && !partType.startsWith("text/"))) {
-      // Attachments are LISTED, never decoded — the point is knowing the
-      // message carried them, and the room already stores the .eml whole.
-      const raw = partBody.replace(/\s+/g, "").length;
-      out.attachments.push({
-        name: name || "(unnamed attachment)",
-        sizeHint: raw ? `${Math.round((raw * 3) / 4 / 1024).toLocaleString()} KB` : "",
-      });
-      continue;
-    }
-    const decoded = decodeTransfer(partHeaders, partBody);
-    if (partType.startsWith("text/plain") && !plain) plain = decoded;
-    else if (partType.startsWith("text/html") && !htmlFallback) htmlFallback = stripHtml(decoded);
-  }
-  return plain || nested || htmlFallback;
+  return boundary ? walkMultipart(boundary, body, out) : decodeLeaf(headers, body, contentType);
 }
 
 export function parseEml(raw: string): ParsedEmail {

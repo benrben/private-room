@@ -25,6 +25,7 @@ being copy-pasted a third time.
 from __future__ import annotations
 
 _ASCII_DIGITS = frozenset("0123456789")
+_SUBTITLE_METADATA_PREFIXES = ("NOTE ", "STYLE")
 
 
 def _rust_lines(s: str) -> list[str]:
@@ -45,39 +46,48 @@ def _rust_lines(s: str) -> list[str]:
     ends_with_newline = s.endswith("\n")
     if ends_with_newline:
         parts = parts[:-1]
-    n = len(parts)
-    lines: list[str] = []
-    for i, piece in enumerate(parts):
-        terminated_by_newline = i < n - 1 or ends_with_newline
-        if terminated_by_newline and piece.endswith("\r"):
-            piece = piece[:-1]
-        lines.append(piece)
-    return lines
+    return [
+        _without_terminated_carriage_return(
+            piece,
+            index < len(parts) - 1 or ends_with_newline,
+        )
+        for index, piece in enumerate(parts)
+    ]
+
+
+def _without_terminated_carriage_return(piece: str, terminated_by_newline: bool) -> str:
+    """Strip the CR belonging to a newline terminator, but never a final bare CR."""
+    if terminated_by_newline:
+        return piece.removesuffix("\r")
+    return piece
+
+
+def _is_subtitle_metadata(line: str) -> bool:
+    """Whether a trimmed line is a non-spoken subtitle record."""
+    return (
+        line in ("", "WEBVTT")
+        or "-->" in line
+        or line.startswith(_SUBTITLE_METADATA_PREFIXES)
+    )
+
+
+def _is_bare_cue_number(line: str) -> bool:
+    """Whether a trimmed line is an ASCII-only cue number."""
+    return bool(line) and all(character in _ASCII_DIGITS for character in line)
+
+
+def _is_discarded_subtitle_line(line: str) -> bool:
+    """Whether a trimmed line carries no spoken subtitle text."""
+    return _is_subtitle_metadata(line) or _is_bare_cue_number(line)
 
 
 def extract_subtitles(raw: str) -> str | None:
-    """The spoken text of a subtitle file, without cue numbers or
-    timestamps."""
+    """The spoken text of a subtitle file, without cue numbers or timestamps."""
     out: list[str] = []
-    for line in _rust_lines(raw):
-        line = line.strip()
-        if (
-            line == ""
-            or line == "WEBVTT"
-            or "-->" in line
-            or line.startswith("NOTE ")
-            or line.startswith("STYLE")
-            # A bare cue number ("42") carries nothing. Checked against the
-            # ASCII digit set specifically (not `str.isdigit()`, which is
-            # also true for non-ASCII digit characters Rust's
-            # `is_ascii_digit()` would reject), and only ever reached on a
-            # non-empty `line` since the `line == ""` check above already
-            # short-circuits the empty case -- `all()` over an empty
-            # string would otherwise vacuously read as "all digits" too.
-            or all(c in _ASCII_DIGITS for c in line)
-        ):
+    for raw_line in _rust_lines(raw):
+        line = raw_line.strip()
+        if _is_discarded_subtitle_line(line):
             continue
-        out.append(line)
-        out.append("\n")
+        out.extend((line, "\n"))
     result = "".join(out)
     return result if result.strip() else None

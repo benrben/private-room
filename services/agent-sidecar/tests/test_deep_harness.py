@@ -3,14 +3,16 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, ChatMessage, HumanMessage, SystemMessage, ToolMessage
 
 from arcelle_sidecar.chat import RoundUsage
 from arcelle_sidecar.config import McpConfig, ProviderConfig, Routing, RunRequest
 from arcelle_sidecar.deep_harness import (
     ArcelleHarnessModelAdapter,
     ArcelleWorkspaceBackend,
+    DeepHarnessDecision,
     SAFE_WORKSPACE_FAILURE,
+    _arcelle_messages,
     _subagent_initial_state,
     _workspace_mutation_tools,
     is_small_parameter_model,
@@ -46,6 +48,40 @@ class Chat:
         assert tools[0]["function"]["name"] == "save"
         await on_delta("done")
         return "done", [ToolCall(name="save", arguments={"x": 1}, id="c1")], RoundUsage(1, 100, True)
+
+
+def test_arcelle_messages_preserve_supported_roles_calls_and_order() -> None:
+    messages = [
+        SystemMessage(content=[{"type": "text", "text": "instructions"}, {"type": "image"}]),
+        HumanMessage(content="question"),
+        AIMessage(content="answer"),
+        AIMessage(
+            content="calling",
+            tool_calls=[{"id": "call-1", "name": "save", "args": {"path": "/notes.md"}}],
+        ),
+        ToolMessage(content="written", tool_call_id="call-1", name="save"),
+        ToolMessage(content="unnamed", tool_call_id="call-2"),
+        ChatMessage(content="ignored", role="other"),
+    ]
+
+    assert _arcelle_messages(messages) == [
+        {"role": "system", "content": "instructions"},
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+        {
+            "role": "assistant",
+            "content": "calling",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "save", "arguments": {"path": "/notes.md"}},
+                }
+            ],
+        },
+        {"role": "tool", "content": "written", "tool_name": "save", "tool_call_id": "call-1"},
+        {"role": "tool", "content": "unnamed", "tool_name": "tool", "tool_call_id": "call-2"},
+    ]
 
 
 @pytest.mark.asyncio
@@ -117,6 +153,31 @@ async def test_workspace_backend_moves_and_renames_arbitrary_files_without_copyi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("new_name", ["", " . ", "..", "folder/name", r"folder\\name", ".ArCeLlE"])
+async def test_workspace_backend_rejects_unsafe_rename_names_without_calling_the_bridge(
+    new_name: str,
+) -> None:
+    bridge = Bridge()
+    backend = ArcelleWorkspaceBackend(bridge, write_enabled=True)
+
+    result = await backend.arename("/Sketches/idea.sketch.json", new_name)
+
+    assert result == {"error": "The new name must be one safe file name."}
+    assert bridge.calls == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_backend_rejects_private_rename_source_without_calling_the_bridge() -> None:
+    bridge = Bridge()
+    backend = ArcelleWorkspaceBackend(bridge, write_enabled=True)
+
+    result = await backend.arename("/.ArCeLlE/room.db", "copy.db")
+
+    assert result == {"error": "The .arcelle directory is private."}
+    assert bridge.calls == []
+
+
+@pytest.mark.asyncio
 async def test_workspace_move_tools_require_write_baseline_and_validate_both_paths() -> None:
     bridge = Bridge()
     read_only = ArcelleWorkspaceBackend(bridge, write_enabled=False)
@@ -184,6 +245,110 @@ async def test_workspace_backend_never_forwards_raw_bridge_failures(mode: str) -
 
 
 @pytest.mark.asyncio
+async def test_workspace_edit_forwards_safe_arguments_maps_result_and_deduplicates() -> None:
+    class EditBridge:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def call(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append((operation, arguments))
+            return {"path": arguments["path"], "occurrences": 2}
+
+    bridge = EditBridge()
+    backend = ArcelleWorkspaceBackend(bridge, write_enabled=True)
+
+    first = await backend.aedit("notes.md", "draft", "final", replace_all=True)
+    second = await backend.aedit("notes.md", "draft", "final", replace_all=True)
+
+    assert first.path == second.path == "/notes.md"
+    assert first.occurrences == second.occurrences == 2
+    assert bridge.calls == [
+        (
+            "edit",
+            {
+                "path": "/notes.md",
+                "old_string": "draft",
+                "new_string": "final",
+                "replace_all": True,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_workspace_edit_rejects_read_only_and_private_paths_before_the_bridge() -> None:
+    bridge = Bridge()
+
+    read_only = ArcelleWorkspaceBackend(bridge, write_enabled=False)
+    private = ArcelleWorkspaceBackend(bridge, write_enabled=True)
+
+    assert (await read_only.aedit("/notes.md", "old", "new")).error == "This run is read-only."
+    assert (await private.aedit("/.arcelle/room.db", "old", "new")).error == (
+        "The .arcelle directory is private."
+    )
+    assert bridge.calls == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_edit_hides_a_fabricated_bridge_failure() -> None:
+    class FailingBridge:
+        async def call(self, _operation: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+            raise RuntimeError("fabricated room contents")
+
+    result = await ArcelleWorkspaceBackend(FailingBridge(), write_enabled=True).aedit(
+        "/notes.md", "old", "new"
+    )
+
+    assert result.error == SAFE_WORKSPACE_FAILURE
+
+
+@pytest.mark.asyncio
+async def test_workspace_glob_uses_root_by_default_and_maps_matches() -> None:
+    class GlobBridge:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def call(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append((operation, arguments))
+            return {"matches": ["/notes.md"], "truncated": True}
+
+    bridge = GlobBridge()
+    result = await ArcelleWorkspaceBackend(bridge, write_enabled=False).aglob("*.md")
+
+    assert result.matches == ["/notes.md"]
+    assert result.truncated is True
+    assert result.error is None
+    assert bridge.calls == [("glob", {"path": "/", "pattern": "*.md"})]
+
+
+@pytest.mark.asyncio
+async def test_workspace_glob_rejects_private_paths_before_the_bridge() -> None:
+    bridge = Bridge()
+
+    result = await ArcelleWorkspaceBackend(bridge, write_enabled=False).aglob(
+        "*.md", "/.arcelle"
+    )
+
+    assert result.error == "The .arcelle directory is private."
+    assert bridge.calls == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_glob_hides_a_fabricated_bridge_error_payload() -> None:
+    class FailingBridge:
+        async def call(self, _operation: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+            return {"error": "fabricated room contents"}
+
+    result = await ArcelleWorkspaceBackend(FailingBridge(), write_enabled=False).aglob(
+        "*.md", "/"
+    )
+
+    assert result.error == SAFE_WORKSPACE_FAILURE
+    assert result.matches is None
+    assert result.truncated is False
+
+
+@pytest.mark.asyncio
 async def test_model_adapter_preserves_tool_calls() -> None:
     model = ArcelleHarnessModelAdapter(inner=Chat()).bind_tools(
         [
@@ -213,6 +378,28 @@ def deep_request(**changes: Any) -> RunRequest:
     }
     values.update(changes)
     return RunRequest(**values)
+
+
+@pytest.mark.asyncio
+async def test_early_harness_decisions_preserve_their_reason_and_small_model_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def should_not_probe(_model: str, _base_url: str) -> list[str]:
+        raise AssertionError("an early harness decision must not probe Ollama")
+
+    monkeypatch.setattr("arcelle_sidecar.deep_harness.ollama_capabilities", should_not_probe)
+
+    assert await select_deep_harness(deep_request(harness="classic", model="qwen3:4b")) == (
+        DeepHarnessDecision("deterministic", "The classic harness was requested.", True)
+    )
+    assert await select_deep_harness(deep_request(mcp=None)) == DeepHarnessDecision(
+        "deterministic", "No authenticated workspace bridge is available."
+    )
+    assert await select_deep_harness(deep_request(model="codex-cli::gpt-5")) == (
+        DeepHarnessDecision(
+            "deterministic", "This engine uses its native or compatibility harness."
+        )
+    )
 
 
 @pytest.mark.asyncio

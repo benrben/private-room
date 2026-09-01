@@ -246,6 +246,28 @@ export interface ClassifyRequestInput {
 
 export type BlockReason = "private-network" | "tracker";
 
+function requestUrl(value: string): URL | null {
+  try {
+    return new URL(value);
+  } catch {
+    return null;
+  }
+}
+
+function isPrivateNetworkRequest(url: URL): boolean {
+  return PRIVATE_RANGE_SCHEMES.has(url.protocol) && isPrivateHost(url.hostname);
+}
+
+function isTrackerRequest(input: ClassifyRequestInput, url: URL): boolean {
+  if (!TRACKER_SCHEMES.has(url.protocol)) {
+    return false;
+  }
+  if (input.resourceType === "mainFrame") {
+    return false;
+  }
+  return isThirdParty(url.hostname, input.topLevelUrl) && isTrackerHost(url.hostname);
+}
+
 /**
  * The one decision both the Rust rule list and this port exist to make: should
  * this request be blocked, and why?
@@ -265,24 +287,16 @@ export type BlockReason = "private-network" | "tracker";
  * navigation to a listed domain.
  */
 export function classifyRequest(input: ClassifyRequestInput): BlockReason | null {
-  let url: URL;
-  try {
-    url = new URL(input.url);
-  } catch {
+  const url = requestUrl(input.url);
+  if (url === null) {
     return null;
   }
-  const host = url.hostname;
-  if (!host) return null;
+  if (!url.hostname) return null;
 
-  if (PRIVATE_RANGE_SCHEMES.has(url.protocol) && isPrivateHost(host)) {
+  if (isPrivateNetworkRequest(url)) {
     return "private-network";
   }
-  if (!TRACKER_SCHEMES.has(url.protocol)) return null;
-  if (input.resourceType === "mainFrame") return null;
-  if (isThirdParty(host, input.topLevelUrl) && isTrackerHost(host)) {
-    return "tracker";
-  }
-  return null;
+  return isTrackerRequest(input, url) ? "tracker" : null;
 }
 
 /**

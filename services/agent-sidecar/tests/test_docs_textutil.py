@@ -76,6 +76,118 @@ def test_unreadable_extension_returns_none_without_touching_disk() -> None:
     assert tu.convert("sample.pdf", b"%PDF-1.4 not really", "txt") is None
 
 
+def test_convert_unit_successfully_reads_output_and_removes_private_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setattr(tu.tempfile, "gettempdir", lambda: str(tmp_path))
+    fixed = uuid.UUID("22222222-2222-2222-2222-222222222222")
+    monkeypatch.setattr(tu.uuid, "uuid4", lambda: fixed)
+
+    def write_converted_output(command: list[str], **_: object) -> subprocess.CompletedProcess:
+        assert command == [
+            "/usr/bin/textutil",
+            "-convert",
+            "txt",
+            "-output",
+            str(tmp_path / f"arcelle-tu-{fixed}.txt"),
+            str(tmp_path / f"arcelle-tu-{fixed}.rtf"),
+        ]
+        with open(command[4], "w", encoding="utf-8") as output:
+            output.write("converted prose")
+        return subprocess.CompletedProcess(command, returncode=0)
+
+    monkeypatch.setattr(tu.subprocess, "run", write_converted_output)
+
+    assert tu.convert("sample.rtf", _SAMPLE_RTF, "txt") == "converted prose"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_convert_unit_folds_expected_failures_into_none_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setattr(tu.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    monkeypatch.setattr(tu, "_write_private", lambda *_: False)
+    assert tu.convert("sample.rtf", _SAMPLE_RTF, "txt") is None
+    assert list(tmp_path.iterdir()) == []
+
+    monkeypatch.undo()
+    monkeypatch.setattr(tu.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    def bad_exit(*_: object, **__: object) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(args=[], returncode=1)
+
+    monkeypatch.setattr(tu.subprocess, "run", bad_exit)
+    assert tu.convert("sample.rtf", _SAMPLE_RTF, "txt") is None
+
+    def spawn_error(*_: object, **__: object) -> None:
+        raise OSError("textutil is unavailable")
+
+    monkeypatch.setattr(tu.subprocess, "run", spawn_error)
+    assert tu.convert("sample.rtf", _SAMPLE_RTF, "txt") is None
+
+    def omit_output(command: list[str], **_: object) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(command, returncode=0)
+
+    monkeypatch.setattr(tu.subprocess, "run", omit_output)
+    assert tu.convert("sample.rtf", _SAMPLE_RTF, "txt") is None
+
+    def write_invalid_utf8(command: list[str], **_: object) -> subprocess.CompletedProcess:
+        with open(command[4], "wb") as output:
+            output.write(b"\xff")
+        return subprocess.CompletedProcess(command, returncode=0)
+
+    monkeypatch.setattr(tu.subprocess, "run", write_invalid_utf8)
+    assert tu.convert("sample.rtf", _SAMPLE_RTF, "txt") is None
+
+    def write_blank_output(command: list[str], **_: object) -> subprocess.CompletedProcess:
+        with open(command[4], "w", encoding="utf-8") as output:
+            output.write(" \n\t")
+        return subprocess.CompletedProcess(command, returncode=0)
+
+    monkeypatch.setattr(tu.subprocess, "run", write_blank_output)
+    assert tu.convert("sample.rtf", _SAMPLE_RTF, "txt") is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_convert_unit_propagates_unexpected_errors_after_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setattr(tu.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    def unexpected_error(*_: object, **__: object) -> None:
+        raise RuntimeError("unexpected conversion failure")
+
+    monkeypatch.setattr(tu.subprocess, "run", unexpected_error)
+    with pytest.raises(RuntimeError, match="unexpected conversion failure"):
+        tu.convert("sample.rtf", _SAMPLE_RTF, "txt")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_write_private_returns_false_for_open_and_write_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    def open_error(*_: object, **__: object) -> int:
+        raise OSError("cannot create private file")
+
+    monkeypatch.setattr(tu.os, "open", open_error)
+    assert tu._write_private("ignored", b"secret") is False
+
+    monkeypatch.undo()
+
+    class FailingWriter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def write(self, _: bytes) -> None:
+            raise OSError("cannot write private file")
+
+    monkeypatch.setattr(tu.os, "open", lambda *_: 1)
+    monkeypatch.setattr(tu.os, "fdopen", lambda *_: FailingWriter())
+    assert tu._write_private("ignored", b"secret") is False
+
+
 def test_the_decrypted_temp_copy_deletes_itself_on_every_exit_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """Exercises `convert`'s `try/finally` cleanup (the Python stand-in for
     the Rust `TempPath` `Drop` guard) across every distinct exit path, not
@@ -217,6 +329,12 @@ def test_a_non_http_target_never_becomes_a_clickable_href() -> None:
 def test_the_word_hyperlink_in_ordinary_prose_is_left_alone() -> None:
     src = "The HYPERLINK, as it is called, points elsewhere."
     assert tu.resolve_field_codes(src, False) == src
+
+
+def test_an_unterminated_field_code_stays_prose() -> None:
+    src = 'The HYPERLINK "never closes.'
+    assert tu.resolve_field_codes(src, False) == src
+    assert tu.resolve_field_codes(src, True) == src
 
 
 def test_prose_between_the_word_and_a_later_quote_survives() -> None:

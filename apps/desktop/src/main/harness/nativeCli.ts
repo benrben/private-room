@@ -38,11 +38,18 @@ export function nativeCliExecutable(
   env: NodeJS.ProcessEnv = process.env,
   home: string = os.homedir(),
 ): string {
-  const override = provider === "codex" ? env.ARCELLE_CODEX_PATH : env.ARCELLE_CLAUDE_PATH;
+  const override = nativeCliOverride(provider, env);
   if (override !== undefined && override.trim() !== "") return override;
 
-  const command = provider;
-  const directories = new Set([
+  return discoveredNativeCli(provider, nativeCliDirectories(env, home)) ?? provider;
+}
+
+function nativeCliOverride(provider: NativeCliProvider, env: NodeJS.ProcessEnv): string | undefined {
+  return provider === "codex" ? env.ARCELLE_CODEX_PATH : env.ARCELLE_CLAUDE_PATH;
+}
+
+function nativeCliDirectories(env: NodeJS.ProcessEnv, home: string): Set<string> {
+  return new Set([
     ...(env.PATH ?? "").split(path.delimiter).filter(Boolean),
     path.join(home, ".local", "bin"),
     path.join(home, ".cargo", "bin"),
@@ -51,9 +58,12 @@ export function nativeCliExecutable(
     "/usr/bin",
     "/bin",
   ]);
+}
+
+function discoveredNativeCli(provider: NativeCliProvider, directories: Iterable<string>): string | null {
   for (const directory of directories) {
-    const found = executable(path.join(directory, command));
+    const found = executable(path.join(directory, provider));
     if (found !== null) return found;
   }
-  return command;
+  return null;
 }

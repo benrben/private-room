@@ -308,6 +308,64 @@ def _segment_mean_p(ctx: object, seg_index: int) -> float:
     return total / n if n > 0 else 0.0
 
 
+def _whole_file_segments(entry: _CacheEntry, pcm32: np.ndarray, threads: int):
+    return entry.model.transcribe(
+        pcm32,
+        language="auto",
+        n_threads=threads,
+        greedy={"best_of": 1},
+        print_special=False,
+        print_progress=False,
+        print_realtime=False,
+        print_timestamps=False,
+    )
+
+
+def _discard_whole_file_segment(text: str, ctx: object, index: int) -> bool:
+    if is_junk_segment(text):
+        return True
+    return is_stock_hallucination(text) and _segment_mean_p(ctx, index) < STOCK_MAX_CONFIDENCE
+
+
+def _whole_file_line(text: str, start_cs: int, timestamps: bool) -> str:
+    return f"{format_stamp(start_cs)} {text}" if timestamps else text
+
+
+def _whole_file_lines(segments: object, ctx: object, timestamps: bool) -> list[str]:
+    lines: list[str] = []
+    for index, segment in enumerate(segments):
+        text = segment.text.strip()
+        if _discard_whole_file_segment(text, ctx, index):
+            continue
+        lines.append(_whole_file_line(text, segment.t0, timestamps))
+    return lines
+
+
+def _render_whole_file_lines(lines: list[str], timestamps: bool) -> str:
+    return "\n".join(lines) if timestamps else " ".join(lines)
+
+
+def _transcribe_with_entry(
+    entry: _CacheEntry,
+    pcm32: np.ndarray,
+    threads: int,
+    timestamps: bool,
+) -> str:
+    decode_acquired = False
+    try:
+        entry.decode_lock.acquire()
+        decode_acquired = True
+        segments = _whole_file_segments(entry, pcm32, threads)
+        # `model._ctx` is valid immediately after `.transcribe()` returns and
+        # indexes the SAME segments 0..n just returned (pywhispercpp's own
+        # `_get_segments` builds that list by walking 0..n in this exact order).
+        ctx = entry.model._ctx  # noqa: SLF001 - see module docstring
+        return _render_whole_file_lines(_whole_file_lines(segments, ctx, timestamps), timestamps)
+    finally:
+        if decode_acquired:
+            entry.decode_lock.release()
+
+
 def transcribe(model_path: str, pcm: np.ndarray, timestamps: bool) -> str:
     """Transcribe mono 16 kHz samples. Language is auto-detected (Hebrew
     included). With `timestamps`, each Whisper segment becomes a "[m:ss] …"
@@ -332,58 +390,12 @@ def transcribe(model_path: str, pcm: np.ndarray, timestamps: bool) -> str:
 
     pcm32 = np.asarray(pcm, dtype=np.float32)
     threads = _n_threads()
-
     # The global cache lock ends inside `_checkout`. The per-context lock below
     # must span BOTH ``Model.transcribe`` and every ``_ctx`` result read: the
     # model mutates that context and a second decode would replace its result
     # tables before this caller had finished walking them.
     entry = _checkout(model_path)
-    decode_acquired = False
     try:
-        entry.decode_lock.acquire()
-        decode_acquired = True
-        segments = entry.model.transcribe(
-            pcm32,
-            language="auto",
-            n_threads=threads,
-            greedy={"best_of": 1},
-            print_special=False,
-            print_progress=False,
-            print_realtime=False,
-            print_timestamps=False,
-        )
-
-        # `model._ctx` is valid immediately after `.transcribe()` returns and
-        # indexes the SAME segments 0..n just returned (pywhispercpp's own
-        # `_get_segments` builds that list by walking 0..n in this exact
-        # order) — see `_segment_mean_p`'s divergence note.
-        ctx = entry.model._ctx  # noqa: SLF001 - see module docstring
-
-        lines: list[str] = []
-        for i, seg in enumerate(segments):
-            text = seg.text.strip()
-            # Drop silence hallucinations the same way the live path does —
-            # a near-silent clip otherwise decodes to a lone "." or
-            # "[BLANK_AUDIO]" and gets stored as a real (misleading)
-            # transcript. An all-junk clip -> "".
-            if is_junk_segment(text):
-                continue
-            # …and the stock phrases whisper invents over silence and music
-            # ("Thank you.", "Subtitles by the Amara.org community"), on the
-            # same terms as the live path: only when the model itself wasn't
-            # sure. Imported audio/video, voice messages and dictation all
-            # come through here, and a sentence nobody said must not reach
-            # search or the AI.
-            if is_stock_hallucination(text) and _segment_mean_p(ctx, i) < STOCK_MAX_CONFIDENCE:
-                continue
-            if timestamps:
-                # seg.t0 is in centiseconds (10 ms units), same as Rust's
-                # `seg.start_timestamp()`.
-                lines.append(f"{format_stamp(seg.t0)} {text}")
-            else:
-                lines.append(text)
-        return "\n".join(lines) if timestamps else " ".join(lines)
+        return _transcribe_with_entry(entry, pcm32, threads, timestamps)
     finally:
-        if decode_acquired:
-            entry.decode_lock.release()
         _checkin(entry)

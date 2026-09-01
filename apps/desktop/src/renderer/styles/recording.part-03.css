@@ -1,0 +1,498 @@
+
+.rec-found-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.rec-found {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background-color: var(--hover);
+}
+.rec-found.is-guessed {
+  background-color: transparent;
+  outline: 1px dashed var(--rule);
+  outline-offset: -1px;
+}
+.rec-found-at {
+  flex: none;
+  border: 0;
+  background: none;
+  padding: 0;
+  font-family: inherit;
+  cursor: pointer;
+  color: var(--ink-soft);
+}
+.rec-found-at:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.rec-found-body {
+  flex: 1;
+  min-width: 0;
+}
+.rec-found-kind {
+  display: inline-block;
+  margin-inline-end: 8px;
+  font-size: var(--fs-micro);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+}
+.rec-found-who {
+  color: var(--ink-soft);
+}
+.rec-found-span {
+  color: var(--ink-soft);
+}
+
+/* ----- a highlight row -----
+   QA 2026-08-15: it was a time range and a remove button, so a list of the
+   moments that mattered was a list of numbers. The words come from the
+   transcript phrases the mark overlaps (recReview.highlightQuote) — inline so
+   the "?" that says the room wrote it still sits beside them rather than
+   dropping onto a line of its own. */
+.rec-hl {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 100%;
+  vertical-align: top;
+}
+.rec-hl-title {
+  font-weight: 600;
+  line-height: var(--lh-body);
+}
+/* A mark over silence, over music, or over a stretch recorded with live
+   transcription off. Set apart from a real quotation and said in words: a row
+   that looked the same would read as a transcript that lost the sentence. */
+.rec-hl-title.is-silent {
+  font-weight: 400;
+  font-style: italic;
+  color: var(--faint);
+}
+.rec-hl-quote {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+/* The row's second act — hearing it is the timestamp's job, reading it is
+   this one's. Never hidden until hover the way the remove button is: it is
+   the whole reason the mark is worth keeping. */
+.rec-found-act {
+  flex: none;
+  font-size: var(--fs-micro);
+}
+.rec-found-mark {
+  margin-inline-start: 6px;
+  opacity: 0.75;
+}
+
+/* Click a word to jump the player there (drag still selects for delete). */
+.rec-word {
+  cursor: pointer;
+}
+.rec-word:hover {
+  text-decoration: underline dotted;
+}
+/* A soft-deleted word. Muted plus a red strike: the SHAPE says removed, the
+   colour only reinforces it, and the text still clears 4.5:1 — these words
+   come back the moment "Show deleted" is unticked and they are still content. */
+.rec-word.deleted {
+  color: var(--muted);
+  text-decoration: line-through;
+  text-decoration-color: var(--sem-urgent);
+  text-decoration-thickness: 1.5px;
+}
+
+.rec-translation {
+  display: block;
+  font-size: var(--fs-meta);
+  font-style: italic;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+/* A search that matched nothing. Stated where the phrases would have been,
+   because an empty transcript pane and a filter that hides all of it look
+   identical otherwise. */
+.rec-find-none {
+  margin: var(--sp-6) 0;
+  text-align: center;
+  font-size: var(--fs-meta);
+  color: var(--muted);
+}
+
+/* Lined up with the transcript column, not the stamp gutter: 8px of turn
+   padding + the 62px gutter + the 12px column gap. */
+.rec-read-note {
+  margin: var(--sp-4) 0 0;
+  padding-inline-start: 82px;
+  font-size: var(--fs-meta);
+  color: var(--faint);
+}
+
+/* ----- a reading tab with no data behind it -----
+   Not hidden and not filled with anything invented: it names what would live
+   here and says plainly that nothing is stored. */
+.rec-blank {
+  max-width: 56ch;
+  padding: var(--sp-8) var(--sp-4);
+  margin: 0 auto;
+}
+.rec-blank-title {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-section);
+  font-family: var(--display);
+  font-weight: 600;
+  line-height: 1.15;
+  color: var(--text-strong);
+  letter-spacing: -0.01em;
+}
+/* The one handwritten line: a short aside, which is exactly what the hand is
+   for. The explanation below it is set in sans, because it is an explanation. */
+.rec-blank-aside {
+  margin: 0 0 var(--sp-4);
+}
+.rec-blank-body {
+  margin: 0;
+  font-size: var(--fs-lead);
+  line-height: var(--lh-body);
+  color: var(--text);
+}
+
+/* ==========================================================================
+   3. CLIPS
+   One clip IS one speaker turn — the thing diarization already produced and
+   the thing the transcript is grouped by. No new data model, and no rounded
+   durations: a clip's length is the measured distance between the first and
+   last word timing in its turn.
+   ========================================================================== */
+
+.rec-clips {
+  flex: 0 0 268px;
+  min-width: 0;
+  overflow-y: auto;
+  padding: var(--sp-3) var(--sp-3) var(--sp-6);
+  /* The drawn vertical rule, as a background so it costs no element and
+     gives a screen reader nothing extra to walk past. */
+  background-image: linear-gradient(
+    180deg,
+    transparent 0%,
+    var(--line-soft) 5%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 1px 100%;
+  background-position: left top;
+}
+.rec-clips-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-2) var(--sp-2);
+}
+.rec-clips-head h3 {
+  margin: 0;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-strong);
+}
+/* A count is the handwriting's natural home. */
+.rec-clips-note {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  margin-inline-start: auto;
+  color: var(--faint);
+}
+.rec-clips-empty {
+  margin: 0;
+  padding: var(--sp-2);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+.rec-clip-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.rec-clip {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  text-align: start;
+  color: inherit;
+  background: none;
+  border: 0;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-pen);
+}
+.rec-clip:hover:not(:disabled) {
+  background-color: var(--hover);
+}
+.rec-clip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+/* A disabled control is exempt from the contrast floor, which is the only
+   reason an opacity fade is allowed anywhere in this file. */
+.rec-clip:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.rec-clip-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+}
+/* The sans. A speaker label is the diarizer's answer, not a note anybody
+   wrote down — the hand is reserved for words a person set there. */
+.rec-clip-who {
+  /* min-width:0 or a flex item refuses to shrink below its content and a long
+     name pushes the duration off the row instead of ellipsing. */
+  min-width: 0;
+  font-size: var(--fs-meta);
+  line-height: 1.2;
+  color: var(--mk-ink, var(--accent));
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.rec-clip-at {
+  font-size: var(--fs-micro);
+  color: var(--muted);
+}
+.rec-clip-len {
+  margin-inline-start: auto;
+  font-size: var(--fs-micro);
+  color: var(--faint);
+}
+/* A preview, clamped to two lines — the whole phrase is in the transcript,
+   in the row's title, and read out in full by a screen reader. Nothing about
+   the recording is decided from this box. */
+.rec-clip-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  margin-top: 2px;
+  font-size: var(--fs-meta);
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+/* Spans the transcript edits removed. Read-only: playback skips them, so a
+   row that seeked into one would appear to do nothing. */
+.rec-cuts {
+  margin-top: var(--sp-4);
+}
+.rec-cuts .nb-rule-dash {
+  margin: 0;
+}
+.rec-cuts h4 {
+  margin: var(--sp-3) 0 var(--sp-2);
+  padding-inline-start: var(--sp-2);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-strong);
+}
+.rec-cuts ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.rec-cut {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 4px 10px;
+}
+.rec-cut-tag {
+  flex: none;
+}
+.rec-cut-at {
+  font-size: var(--fs-micro);
+  color: var(--muted);
+}
+.rec-cut-len {
+  margin-inline-start: auto;
+  font-size: var(--fs-micro);
+  color: var(--faint);
+}
+.rec-cuts-note {
+  margin: var(--sp-2) 0 0;
+  padding: 0 var(--sp-2);
+  font-size: var(--fs-micro);
+  line-height: var(--lh-body);
+  color: var(--faint);
+}
+
+/* ==========================================================================
+   4. SELECTION BAR AND THE EXPORT DRAWER
+   ========================================================================== */
+
+/* Washed in the SAME yellow the selection wears in the transcript and on the
+   waveform: three surfaces, one mark, so it is obvious that the bar is about
+   the words that are lit up. */
+.rec-selectbar {
+  /* Set for the whole strip, so paper.css's own primitives inside it — the
+     buttons' hover swash above all — are drawn in the selection's hue rather
+     than wiping the pen's pink across a yellow ground. */
+  --mk: var(--sem-pending-fill);
+  --mk-ink: var(--sem-pending);
+  flex: none;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-3);
+  padding: var(--sp-2) var(--sp-4);
+  font-size: var(--fs-meta);
+  color: var(--text);
+  box-shadow: inset 3px 0 0 var(--mk-ink);
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--mk) 20%, transparent) 0%,
+    color-mix(in srgb, var(--mk) 10%, transparent) 62%,
+    color-mix(in srgb, var(--mk) 15%, transparent) 100%
+  );
+}
+.rec-selectbar-what {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  white-space: nowrap;
+}
+.rec-selectbar-what b {
+  font-weight: 600;
+  color: var(--text-strong);
+}
+.rec-selectbar-what .nb-num {
+  color: var(--muted);
+}
+/* .nb-btn's --rule-strong edge is 3.005:1 on bare paper, and the wash under
+   these buttons takes it below the 3:1 a control boundary owes — so on this
+   strip they are drawn in the strip's own ink. The labels stay --text. */
+.rec-selectbar .nb-btn:not(.nb-btn-quiet) {
+  border-color: var(--mk-ink);
+}
+.rec-selectbar .nb-btn-danger {
+  border-color: var(--sem-urgent);
+}
+
+/* The correction box. Grows so a whole retyped phrase is readable — the point
+   is to SEE what will replace the words before committing to it. */
+.rec-correct-input {
+  flex: 1 1 auto;
+  min-width: 140px;
+  padding: 5px 9px;
+  font-size: var(--fs-meta);
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+}
+.rec-correct-input:focus {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 42%, transparent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ----- the drawer -----
+   Everything technical, closed by default. Native <details>, so the keyboard
+   and screen-reader behaviour is the platform's rather than something this
+   file had to reinvent. */
+.rec-drawer {
+  flex: none;
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line) 2%,
+    var(--line) 97%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+.rec-drawer-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 24px;
+  padding: 10px var(--sp-4);
+  cursor: pointer;
+  /* WebKit draws its own disclosure triangle; this file draws a pen-coloured
+     caret instead so the mark matches the rest of the chrome. */
+  list-style: none;
+}
+.rec-drawer-head::-webkit-details-marker {
+  display: none;
+}
+.rec-drawer-head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.rec-drawer-caret {
+  flex: none;
+  width: 0;
+  height: 0;
+  border-left: 5px solid var(--muted);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform var(--dur-fast) var(--ease-pen);
+}
+.rec-drawer[open] .rec-drawer-caret {
+  transform: rotate(90deg);
+}
+.rec-drawer-title {
+  font-size: var(--fs-body);
+  font-weight: 600;
+  color: var(--text);
+}
+.rec-drawer-hint {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: var(--fs-meta);
+  color: var(--faint);
+}
+/* Work that is actually running is reported HERE, on the line that is always
+   visible, so closing the drawer can never hide progress. */
+.rec-drawer-run {
+  margin-inline-start: auto;
+  flex: none;
+  white-space: nowrap;
+}
+
+.rec-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-3);
+  padding: 0 var(--sp-4) var(--sp-3);
+}
+.rec-tool {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+.rec-tool input {
+  width: 170px;
+}

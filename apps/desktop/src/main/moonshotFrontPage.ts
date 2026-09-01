@@ -318,60 +318,78 @@ function parseLabelQuestions(value: unknown): string[] {
  */
 export async function frontPageSuggestions(deps: FrontPageSuggestionsDeps): Promise<string[]> {
   const room = deps.rooms.currentRoom();
-  if (room === null) {
-    return [];
-  }
-  const roomPath = room.path;
-  const roomName = getMeta(room.db, "name") ?? roomNameFromPath(room.path);
+  if (room === null) return [];
+  const snapshot = suggestionSnapshot(room);
+  if (snapshot.fileNames.length === 0) return [];
+
+  const model = await resolveStructuredModel(deps.rooms, { listModels: deps.listModels });
+  if (model === undefined) return snapshot.cached;
+
+  const questions = await generatedQuestions(deps, snapshot, model);
+  if (questions.length === 0) return snapshot.cached;
+  cacheQuestions(deps.rooms, snapshot.roomPath, questions);
+  return questions;
+}
+
+interface SuggestionSnapshot {
+  readonly roomPath: string;
+  readonly roomName: string;
+  readonly fileNames: string[];
+  readonly cached: string[];
+}
+
+function suggestionSnapshot(room: OpenRoom): SuggestionSnapshot {
   const fileNames = listPublicFiles(room.db)
     .filter((f) => !isSummaryFile(f.name, f.source))
     .slice(0, 30)
     .map((f) => f.name);
-  const cached = parseCachedSuggestions(room.db);
+  return {
+    roomPath: room.path,
+    roomName: getMeta(room.db, "name") ?? roomNameFromPath(room.path),
+    fileNames,
+    cached: parseCachedSuggestions(room.db),
+  };
+}
 
-  if (fileNames.length === 0) {
-    return [];
-  }
-
-  const model = await resolveStructuredModel(deps.rooms, { listModels: deps.listModels });
-  if (model === undefined) {
-    // Offline: reuse whatever was cached before.
-    return cached;
-  }
-
+async function generatedQuestions(
+  deps: FrontPageSuggestionsDeps,
+  snapshot: SuggestionSnapshot,
+  model: string,
+): Promise<string[]> {
   const body = {
     model,
     base_url: resolvedBaseUrl(),
-    room_name: roomName,
-    files: fileNames,
+    room_name: snapshot.roomName,
+    files: snapshot.fileNames,
   };
   const post = deps.post ?? sidecarJsonCancellable;
   // Any sidecar failure (or a `stopped` outcome, unreachable in practice since
   // `neverCancelled()`'s flag is never set — the same "kept for a total union"
   // choice `feedbackTools.ts` documents) reads as Rust's `Err(_) => Vec::new()`.
   const outcome = await post("/label", body, neverCancelled());
-  const questions = outcome.kind === "value" ? parseLabelQuestions(outcome.value) : [];
+  return outcome.kind === "value" ? parseLabelQuestions(outcome.value) : [];
+}
 
-  if (questions.length === 0) {
-    return cached;
-  }
+function isStillOpen(rooms: RoomSource, roomPath: string): OpenRoom | null {
+  const room = rooms.currentRoom();
+  return room !== null && room.path === roomPath ? room : null;
+}
 
+function cacheQuestions(rooms: RoomSource, roomPath: string, questions: string[]): void {
   // These questions name THIS room's files. The model call above can take
   // minutes, so cache them only if the same room is still open — unlocking
   // another one mid-generation must not file one room's questions in another.
-  const stillOpen = deps.rooms.currentRoom();
-  if (stillOpen !== null && stillOpen.path === roomPath) {
-    try {
-      setMeta(stillOpen.db, FRONT_PAGE_SUGGESTIONS_KEY, JSON.stringify(questions));
-    } catch {
-      // `let _ = db::set_meta(...)`: the CACHE write is best-effort. Rust
-      // returns the questions whatever happens here, and it must — a room
-      // whose disk is full or whose DB is momentarily read-only would
-      // otherwise turn a perfectly good generation into a failed command,
-      // three times in a row, with nothing to show for the minutes it took.
-    }
+  const room = isStillOpen(rooms, roomPath);
+  if (room === null) return;
+  try {
+    setMeta(room.db, FRONT_PAGE_SUGGESTIONS_KEY, JSON.stringify(questions));
+  } catch {
+    // `let _ = db::set_meta(...)`: the CACHE write is best-effort. Rust
+    // returns the questions whatever happens here, and it must — a room
+    // whose disk is full or whose DB is momentarily read-only would
+    // otherwise turn a perfectly good generation into a failed command,
+    // three times in a row, with nothing to show for the minutes it took.
   }
-  return questions;
 }
 
 // -------------------------------------------------------------- IPC (unwired)

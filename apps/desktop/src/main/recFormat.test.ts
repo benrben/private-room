@@ -86,6 +86,29 @@ describe("encodeWav / decodeWav", () => {
     const wav = encodeWav(Float32Array.from([0.25]));
     expect(decodeWav(new Uint8Array(wav)).length).toBe(1);
   });
+
+  it("skips padded non-audio chunks and averages each interleaved frame", () => {
+    // RIFF chunks are padded to an even boundary. A JUNK chunk with three
+    // bytes before data used to put the frame reader one byte out of phase.
+    const wav = Buffer.alloc(64);
+    wav.write("RIFF", 0, "ascii");
+    wav.writeUInt32LE(wav.length - 8, 4);
+    wav.write("WAVE", 8, "ascii");
+    wav.write("fmt ", 12, "ascii");
+    wav.writeUInt32LE(16, 16);
+    wav.writeUInt16LE(1, 20);
+    wav.writeUInt16LE(2, 22);
+    wav.write("JUNK", 36, "ascii");
+    wav.writeUInt32LE(3, 40);
+    wav.write("xyz", 44, "ascii");
+    wav.write("data", 48, "ascii");
+    wav.writeUInt32LE(8, 52);
+    wav.writeInt16LE(32767, 56);
+    wav.writeInt16LE(-32768, 58);
+    wav.writeInt16LE(16384, 60);
+    wav.writeInt16LE(16384, 62);
+    expect([...decodeWav(wav)]).toEqual([expect.closeTo(-1 / 65536, 6), expect.closeTo(0.5, 6)]);
+  });
 });
 
 describe("cut-list math", () => {
@@ -254,6 +277,26 @@ describe("transcriptText", () => {
     );
     expect(out).toContain("[0:00] Action (Dana): do it\n");
     expect(out).toContain("[0:00] Open question: when?\n");
+  });
+
+  it("keeps stored metadata order and marks a zero-width highlight as one tick", () => {
+    const out = transcriptText(
+      meta({
+        segments: [phrase([word("kept", 100, 120)], { t0: 100, t1: 120 })],
+        chapters: [
+          { id: "stored-first", t0: 90, title: "First stored", by: "room" },
+          { id: "stored-second", t0: 10, title: "Second stored", by: "room" },
+        ],
+        notes: [
+          { id: "n1", t0: 90, kind: "point", text: "first note", by: "room" },
+          { id: "n2", t0: 10, kind: "point", text: "second note", by: "room" },
+        ],
+        highlights: [{ id: "one-tick", t0: 100, t1: 100, by: "you" }],
+      })
+    );
+    expect(out.indexOf("First stored")).toBeLessThan(out.indexOf("Second stored"));
+    expect(out.indexOf("first note")).toBeLessThan(out.indexOf("second note"));
+    expect(out).toContain("* [0:01] You: kept\n");
   });
 });
 

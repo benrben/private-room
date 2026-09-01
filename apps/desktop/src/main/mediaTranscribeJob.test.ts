@@ -312,6 +312,82 @@ describe("postRetranscribeStream", () => {
       code: "REC_PATH_REFUSED",
     });
   });
+
+  it("keeps a malformed non-2xx envelope as an honest HTTP refusal", async () => {
+    const base = await listenOn((_req, res) => {
+      res.writeHead(503, { "content-type": "text/plain" });
+      res.end("temporarily unavailable");
+    });
+
+    await expect(postRetranscribeStream(base, {}, () => {})).resolves.toMatchObject({
+      kind: "error",
+      code: "REC_RETRANSCRIBE_FAILED",
+      error: "the speech engine refused this (HTTP 503)",
+    });
+  });
+
+  it("reports a transport drop before headers as SIDECAR_DOWN", async () => {
+    // This is the real network failure path: there is no mocked fetch and no
+    // fabricated response for the client to distinguish from a live sidecar.
+    const base = await listenOn((req) => {
+      req.socket.destroy();
+    });
+
+    await expect(postRetranscribeStream(base, {}, () => {})).resolves.toMatchObject({
+      kind: "error",
+      code: "SIDECAR_DOWN",
+    });
+  });
+
+  it("refuses a successful response with no stream body", async () => {
+    const base = await listenOn((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        // Fetch represents a 204 as a successful Response with `body === null`.
+        res.writeHead(204);
+        res.end();
+      });
+    });
+
+    await expect(postRetranscribeStream(base, {}, () => {})).resolves.toMatchObject({
+      kind: "error",
+      code: "REC_RETRANSCRIBE_FAILED",
+      error: "the speech engine answered with no body",
+    });
+  });
+
+  it("ignores malformed and non-object lines until a valid terminal line", async () => {
+    const base = await listenOn((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/x-ndjson" });
+        res.end(`not json\n[]\n${JSON.stringify({ kind: "done", meta: wireMeta(), neural: true })}\n`);
+      });
+    });
+
+    await expect(postRetranscribeStream(base, {}, () => {})).resolves.toMatchObject({
+      kind: "done",
+      neural: true,
+    });
+  });
+
+  it("reports a stream that breaks after a progress line without accepting partial work", async () => {
+    const base = await listenOn((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/x-ndjson" });
+        res.write(`${JSON.stringify({ kind: "progress", doneCs: 10, totalCs: 100 })}\n`);
+        // Let fetch receive headers and one body chunk, then sever the stream
+        // before it can produce the terminal done/stopped/error protocol line.
+        setTimeout(() => res.destroy(), 25);
+      });
+    });
+
+    await expect(postRetranscribeStream(base, {}, () => {})).resolves.toMatchObject({
+      kind: "error",
+      code: "REC_RETRANSCRIBE_FAILED",
+    });
+  });
 });
 
 // ================================================================ reconciliation

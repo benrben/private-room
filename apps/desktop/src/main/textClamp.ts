@@ -26,14 +26,36 @@
 /** Hebrew nikud/cantillation code points folded away by {@link normalizeForMatch}
  * — U+0591-05BD, U+05BF, U+05C1-05C2, U+05C4-05C5, U+05C7 (the same ranges
  * `extraction::is_heb_mark` recognizes). */
+const HEBREW_MARK_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x0591, 0x05bd],
+  [0x05c1, 0x05c2],
+  [0x05c4, 0x05c5],
+];
+const HEBREW_MARK_POINTS = new Set([0x05bf, 0x05c7]);
+
+function inCodePointRange(codePoint: number, [first, last]: readonly [number, number]): boolean {
+  return codePoint >= first && codePoint <= last;
+}
+
 function isHebMark(cp: number): boolean {
-  return (
-    (cp >= 0x0591 && cp <= 0x05bd) ||
-    cp === 0x05bf ||
-    (cp >= 0x05c1 && cp <= 0x05c2) ||
-    (cp >= 0x05c4 && cp <= 0x05c5) ||
-    cp === 0x05c7
-  );
+  return HEBREW_MARK_POINTS.has(cp) || HEBREW_MARK_RANGES.some((range) => inCodePointRange(cp, range));
+}
+
+const MATCH_CHARACTER_FOLDS: Readonly<Record<string, string>> = {
+  "‘": "'",
+  "’": "'",
+  "ʼ": "'",
+  "“": '"',
+  "”": '"',
+  "–": "-",
+  "—": "-",
+  "־": "-",
+  "ﬁ": "fi",
+  "ﬂ": "fl",
+};
+
+function foldedMatchCharacter(ch: string): string {
+  return isHebMark(ch.codePointAt(0)!) ? "" : (MATCH_CHARACTER_FOLDS[ch] ?? ch);
 }
 
 /**
@@ -46,34 +68,7 @@ function isHebMark(cp: number): boolean {
 export function normalizeForMatch(s: string): string {
   let folded = "";
   for (const ch of s.toLowerCase()) {
-    const cp = ch.codePointAt(0)!;
-    switch (ch) {
-      case "‘":
-      case "’":
-      case "ʼ":
-        folded += "'";
-        break;
-      case "“":
-      case "”":
-        folded += '"';
-        break;
-      // Hebrew maqaf ־ ≡ hyphen: models type בן-דוד for the file's בן־דוד.
-      case "–":
-      case "—":
-      case "־":
-        folded += "-";
-        break;
-      case "ﬁ":
-        folded += "fi";
-        break;
-      case "ﬂ":
-        folded += "fl";
-        break;
-      default:
-        if (!isHebMark(cp)) {
-          folded += ch;
-        }
-    }
+    folded += foldedMatchCharacter(ch);
   }
   return folded.split(/\s+/).filter((w) => w.length > 0).join(" ");
 }
@@ -217,48 +212,44 @@ function lastWhitespaceByteIndex(s: string): number {
  * false for a handful of characters (Turkish İ → "i̇"). Preserved rather
  * than "fixed" because this is a behavior-preserving port.
  */
-export function excerpt(text: string, query: string, maxChars: number): string {
-  const lower = text.toLowerCase();
-  const find = (n: string): number | null => {
-    const needle = n.trim().toLowerCase();
-    if (needle.length === 0) {
-      return null;
-    }
-    const idx = lower.indexOf(needle);
-    return idx === -1 ? null : idx;
-  };
-  const chars = [...text];
-  let matchIdx = find(query);
-  if (matchIdx === null) {
-    for (const word of query.split(/\s+/).filter((w) => w.length > 0)) {
-      matchIdx = find(word);
-      if (matchIdx !== null) {
-        break;
-      }
-    }
+function lowerMatchIndex(lower: string, candidate: string): number | null {
+  const needle = candidate.trim().toLowerCase();
+  if (needle.length === 0) return null;
+  const index = lower.indexOf(needle);
+  return index === -1 ? null : index;
+}
+
+function queryMatchIndex(lower: string, query: string): number | null {
+  const wholeQuery = lowerMatchIndex(lower, query);
+  if (wholeQuery !== null) return wholeQuery;
+  for (const word of query.split(/\s+/).filter((candidate) => candidate.length > 0)) {
+    const match = lowerMatchIndex(lower, word);
+    if (match !== null) return match;
   }
-  if (matchIdx === null) {
-    // No match: char-safe prefix.
-    let out = chars.slice(0, maxChars).join("");
-    if (chars.length > maxChars) {
-      out += "…";
-    }
-    return out;
-  }
+  return null;
+}
+
+function unmatchedExcerpt(chars: string[], maxChars: number): string {
+  const prefix = chars.slice(0, maxChars).join("");
+  return chars.length > maxChars ? `${prefix}…` : prefix;
+}
+
+function matchedExcerpt(text: string, chars: string[], matchIndex: number, maxChars: number): string {
   // `lower.indexOf` returns a UTF-16 index; convert to a CODE-POINT position
   // so slicing `chars` (already split by code point) lines up, mirroring the
   // Rust source's `text[..byte].chars().count()`.
-  const charPos = [...text.slice(0, matchIdx)].length;
+  const charPos = [...text.slice(0, matchIndex)].length;
   const radius = Math.floor(maxChars / 2);
   const start = Math.max(0, charPos - radius);
   const end = Math.min(start + maxChars, chars.length);
-  let out = "";
-  if (start > 0) {
-    out += "…";
-  }
-  out += chars.slice(start, end).join("");
-  if (end < chars.length) {
-    out += "…";
-  }
-  return out;
+  const before = start > 0 ? "…" : "";
+  const after = end < chars.length ? "…" : "";
+  return `${before}${chars.slice(start, end).join("")}${after}`;
+}
+
+export function excerpt(text: string, query: string, maxChars: number): string {
+  const chars = [...text];
+  const matchIndex = queryMatchIndex(text.toLowerCase(), query);
+  if (matchIndex === null) return unmatchedExcerpt(chars, maxChars);
+  return matchedExcerpt(text, chars, matchIndex, maxChars);
 }

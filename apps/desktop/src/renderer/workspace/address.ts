@@ -22,6 +22,21 @@ const HOSTISH = /^[^\s/?#]+\.[^\s/?#.]{2,}([/:?#].*)?$/;
 const HOST_PORT = /^[^\s/?#]+:\d+([/?#].*)?$/;
 const IPV4 = /^\d{1,3}(\.\d{1,3}){3}(:\d+)?([/?#].*)?$/;
 
+function forcedSearch(text: string): AddressIntent | null | undefined {
+  if (!text.startsWith("?")) return undefined;
+  const query = text.slice(1).trim();
+  return query ? { kind: "search", query } : null;
+}
+
+function hostLike(text: string): boolean {
+  return HOSTISH.test(text) || IPV4.test(text) || HOST_PORT.test(text);
+}
+
+function inferredIntent(text: string): AddressIntent {
+  if (hostLike(text)) return { kind: "url", url: `https://${text}` };
+  return { kind: "search", query: text };
+}
+
 /** Decide what the user meant. `null` means "nothing to do" (empty input).
  *
  * Order matters: the explicit forms (`?` and a scheme) win over the guesses,
@@ -31,10 +46,8 @@ export function classifyAddress(input: string): AddressIntent | null {
   if (!text) return null;
 
   // "?query" — force a search for text that would otherwise look like a host.
-  if (text.startsWith("?")) {
-    const query = text.slice(1).trim();
-    return query ? { kind: "search", query } : null;
-  }
+  const forced = forcedSearch(text);
+  if (forced !== undefined) return forced;
 
   // An explicit scheme is a decision the user already made.
   if (text.includes("://")) return { kind: "url", url: text };
@@ -43,12 +56,8 @@ export function classifyAddress(input: string): AddressIntent | null {
   // developer-shaped `Invalid URL:` banner.
   if (/\s/.test(text)) return { kind: "search", query: text };
 
-  if (HOSTISH.test(text) || IPV4.test(text) || HOST_PORT.test(text)) {
-    return { kind: "url", url: `https://${text}` };
-  }
-
   // A bare word: "weather", "בנק ישראל". Nothing about it addresses a host.
-  return { kind: "search", query: text };
+  return inferredIntent(text);
 }
 
 /** Must this address be FETCHED to be saved, rather than read off the page

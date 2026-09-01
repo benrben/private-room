@@ -33,11 +33,12 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { createRoom } from "./db-host/open.js";
 import { insertFile } from "./db-host/files.js";
 import { addPrivacyEntity, listPrivacyEntities } from "./db-host/privacy.js";
+import { setSetting } from "./db-host/settings.js";
 import { resetBaseUrlOverrideForTests, setBaseUrlOverride } from "./engineRouting.js";
 import { ollamaRunsHere } from "./capabilities.js";
 import { DEFAULT_MODEL } from "./turnContext.js";
@@ -78,6 +79,7 @@ import {
   runPrivacyScan,
   scanRunning,
   schedulePrivacyScan,
+  setActivePolicyForTests,
   setGlobalDefault,
   setPolicyForTests,
   setPolicyRulesForTests,
@@ -168,6 +170,16 @@ function policyState(over: Partial<PolicyState> = {}): PolicyState {
 // ------------------------------------------------------ policy cell / seams
 
 describe("activePolicy / remoteSeamRedactor", () => {
+  it("the active-policy test fixture installs the canonical protected identity", () => {
+    setActivePolicyForTests();
+
+    const policy = activePolicy();
+    const report = emptyPrivacyReport();
+    expect(policy?.active).toBe(true);
+    expect(policy?.redactor.redact("Ben Reich", report)).toBe("[Person A]");
+    expect(report.entitiesHidden).toBe(1);
+  });
+
   it("remote_seam_survives_the_switch_but_active_policy_does_not", () => {
     // The documented asymmetry: the model seams follow `active`, the outbound
     // connector seam does not. Aligning them silently would either weaken the
@@ -675,6 +687,27 @@ describe("the global default file", () => {
     writeFileSync(globalDefaultPath(dir), '{"__proto__":{"defaultOn":false}}');
     expect(globalDefaultOn(dir)).toBe(true);
   });
+
+  it("fails closed on malformed global and room concept JSON", () => {
+    const dir = userDataDir();
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(globalDefaultPath(dir), "not-json");
+    expect(globalDefaultOn(dir)).toBe(true);
+
+    const db = freshRoomDb();
+    const fixture = makeRoomFixture({ db, path: "room-a" });
+    setSetting(db, "cloud_privacy_concepts", "not-json");
+    expect(computePolicy(policyDeps(fixture))).toMatchObject({
+      kind: "policy",
+      policy: { concepts: [] },
+    });
+    setSetting(db, "cloud_privacy_concepts", '{"topic":"not-an-array"}');
+    expect(computePolicy(policyDeps(fixture))).toMatchObject({
+      kind: "policy",
+      policy: { concepts: [] },
+    });
+    db.close();
+  });
 });
 
 // ---------------------------------------------------------------- commands
@@ -1092,6 +1125,135 @@ describe("runPrivacyScan", () => {
     db.close();
   });
 
+  it("reports a synchronously thrown daemon wake failure as the same scan error", async () => {
+    const db = freshRoomDb();
+    const fixture = makeRoomFixture({ db, path: "room-a" });
+    setPrivacyRoom(policyDeps(fixture), "on");
+    addFile(db, "a.txt", "Ben Reich");
+    const end = await runPrivacyScan(
+      scanDeps(fixture, {
+        wakeDaemon: (() => {
+          throw new Error("sync wake failure");
+        }) as () => Promise<void>,
+      })
+    );
+    expect(end.error).toContain("sync wake failure");
+    db.close();
+  });
+
+  it("uses the preferred model when resolving it throws synchronously", async () => {
+    const db = freshRoomDb();
+    const fixture = makeRoomFixture({ db, path: "room-a" });
+    setPrivacyRoom(policyDeps(fixture), "on");
+    addFile(db, "a.txt", "Ben Reich");
+    const calledModels: string[] = [];
+    const end = await runPrivacyScan(
+      scanDeps(fixture, {
+        resolveGuardModel: (() => {
+          throw new Error("resolver unavailable");
+        }) as (preferred: string) => Promise<string>,
+        privacyScanCall: async (body) => {
+          calledModels.push(String(body.model));
+          return { entities: [], complete: true };
+        },
+      })
+    );
+    expect(end.error).toBeNull();
+    expect(calledModels).toEqual([DEFAULT_MODEL]);
+    db.close();
+  });
+
+  it("finishes cleanly when the room disappears before it can build the first work list", async () => {
+    const db = freshRoomDb();
+    const handle = { db, path: "room-a" };
+    let reads = 0;
+    const source: RoomSource = {
+      current: () => {
+        reads += 1;
+        return reads === 1 ? handle : null;
+      },
+    };
+    const scan = scanDeps(makeRoomFixture(handle), { room: source });
+    expect(await runPrivacyScan(scan)).toEqual({ error: null, roomChanged: false });
+    db.close();
+  });
+
+  it("reports a work-list read failure without calling the scanner", async () => {
+    const db = freshRoomDb();
+    const fixture = makeRoomFixture({ db, path: "room-a" });
+    setPrivacyRoom(policyDeps(fixture), "on");
+    addFile(db, "a.txt", "Ben Reich");
+    db.exec("DROP TABLE privacy_scans");
+    let calls = 0;
+    const end = await runPrivacyScan(
+      scanDeps(fixture, {
+        privacyScanCall: async () => {
+          calls += 1;
+          return { entities: [], complete: true };
+        },
+      })
+    );
+    expect(calls).toBe(0);
+    expect(end.error).toContain("privacy_scans");
+    db.close();
+  });
+
+  it("continues a scan without its known-entity hint when that read fails", async () => {
+    const db = freshRoomDb();
+    const fixture = makeRoomFixture({ db, path: "room-a" });
+    setPrivacyRoom(policyDeps(fixture), "on");
+    addFile(db, "a.txt", "Ben Reich");
+    db.exec("DROP TABLE privacy_entities");
+    const end = await runPrivacyScan(scanDeps(fixture));
+    expect(end.error).toBeNull();
+    db.close();
+  });
+
+  it("rebuilds a pass after its resolver changes the scan generation", async () => {
+    const db = freshRoomDb();
+    const fixture = makeRoomFixture({ db, path: "room-a" });
+    const deps = policyDeps(fixture);
+    setPrivacyRoom(deps, "on");
+    addFile(db, "a.txt", "Ben Reich");
+    let calls = 0;
+    const end = await runPrivacyScan(
+      scanDeps(fixture, {
+        resolveGuardModel: async (preferred) => {
+          setPrivacyConcepts(deps, ["health"]);
+          return preferred;
+        },
+        privacyScanCall: async () => {
+          calls += 1;
+          return { entities: [], complete: true };
+        },
+      })
+    );
+    expect(end.error).toBeNull();
+    expect(calls).toBe(1);
+    db.close();
+  });
+
+  it("skips malformed findings and carries on when saving a valid finding fails", async () => {
+    const db = freshRoomDb();
+    const fixture = makeRoomFixture({ db, path: "room-a" });
+    setPrivacyRoom(policyDeps(fixture), "on");
+    addFile(db, "a.txt", "Ben Reich");
+    db.exec(
+      "CREATE TRIGGER refuse_entity BEFORE INSERT ON privacy_entities BEGIN SELECT RAISE(ABORT, 'no entity write'); END"
+    );
+    const end = await runPrivacyScan(
+      scanDeps(fixture, {
+        privacyScanCall: async () => ({
+          entities: [null as never, { text: "Ben Reich" }],
+          complete: true,
+        }),
+      })
+    );
+    expect(end.error).toBeNull();
+    expect(listPrivacyEntities(db)).toHaveLength(0);
+    db.close();
+  });
+
   it("a transient per-file failure is retried LATER, not in this run, and the run reports the count", async () => {
     const db = freshRoomDb();
     const fixture = makeRoomFixture({ db, path: "room-a" });
@@ -1196,6 +1358,93 @@ describe("runPrivacyScan", () => {
 });
 
 describe("schedulePrivacyScan / startPrivacyScan", () => {
+  it("schedules when the global switch is turned on and tolerates a closed progress sink", async () => {
+    const db = freshRoomDb();
+    const fixture = makeRoomFixture({ db, path: "room-a" });
+    const deps = policyDeps(fixture);
+    setPrivacyGlobal(deps, false);
+    addFile(db, "a.txt", "Ben Reich");
+    let calls = 0;
+    const scan = scanDeps(fixture, {
+      emit: { emit: () => { throw new Error("fabricated closed window"); } },
+      privacyScanCall: async () => {
+        calls += 1;
+        return { entities: [], complete: true };
+      },
+    });
+
+    setPrivacyGlobal(deps, true, scan);
+    await flushScan();
+    expect(calls).toBe(1);
+    expect(scanRunning()).toBe(false);
+    db.close();
+  });
+
+  it("uses the default pause timer when chat work is briefly busy", async () => {
+    vi.useFakeTimers();
+    const db = freshRoomDb();
+    const fixture = makeRoomFixture({ db, path: "room-a" });
+    setPrivacyRoom(policyDeps(fixture), "on");
+    addFile(db, "a.txt", "Ben Reich");
+    let busy = true;
+    const scan = scanDeps(fixture, {
+      isChatBusy: () => busy,
+      sleepMs: undefined,
+    });
+    try {
+      const pending = runPrivacyScan(scan);
+      await Promise.resolve();
+      busy = false;
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(pending).resolves.toEqual({ error: null, roomChanged: false });
+      expect(scan.emitted.some((event) => event.label === "Paused while you chat")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      db.close();
+    }
+  });
+
+  it("restarts once for a replacement room after the scheduled run abandons the old one", async () => {
+    const first = freshRoomDb();
+    const second = freshRoomDb();
+    const fixture = makeRoomFixture({ db: first, path: "room-a" });
+    setPrivacyRoom(policyDeps(fixture), "on");
+    addFile(first, "a.txt", "Ben Reich");
+    let calls = 0;
+    const scan = scanDeps(fixture, {
+      privacyScanCall: async () => {
+        calls += 1;
+        setPrivacyRoom({ room: { current: () => ({ db: second, path: "room-b" }) }, userDataDir: userDataDir() }, "on");
+        fixture.swap({ db: second, path: "room-b" });
+        return { entities: [], complete: true };
+      },
+    });
+
+    schedulePrivacyScan(scan);
+    await flushScan();
+    expect(calls).toBe(1);
+    expect(scanRunning()).toBe(false);
+    first.close();
+    second.close();
+  });
+
+  it("still emits a terminal result when the completed room can no longer refresh", async () => {
+    const db = freshRoomDb();
+    const fixture = makeRoomFixture({ db, path: "room-a" });
+    setPrivacyRoom(policyDeps(fixture), "on");
+    addFile(db, "a.txt", "Ben Reich");
+    const scan = scanDeps(fixture, {
+      privacyScanCall: async () => {
+        db.close();
+        return { entities: [], complete: true };
+      },
+    });
+    schedulePrivacyScan(scan);
+    await flushScan();
+    expect(scan.emitted.some((event) => event.running === false)).toBe(true);
+    expect(scanRunning()).toBe(false);
+  });
+
   it("is a no-op while the door is off, and startPrivacyScan says why", () => {
     const db = freshRoomDb();
     const fixture = makeRoomFixture({ db, path: "room-a" });

@@ -1,0 +1,486 @@
+/* ---------- Connectors, and the connector marketplace ----------
+   Two surfaces, one stylesheet: the Connectors area (rail → Connectors,
+   workspace/ConnectorsView.tsx) and the registry browser embedded in it
+   (settings/McpMarketplace.tsx, plus its install drawer).
+
+   THIS IS A PRIVACY SURFACE. Every control on it grants a power — run a
+   connector's tools unattended, send a remote program this room's real names,
+   start a third-party binary on the Mac — so the visual job here is not to
+   make the warnings smaller. It is to stop them arriving as one undifferen-
+   tiated wall of 12px prose, which is what the page used to do: an intro
+   paragraph, two 60-word switch labels and two "in force" sentences per
+   connector, all set at the same size, in the same colour, at the same
+   weight. A reader skims a wall like that and learns nothing.
+
+   So the page is staged instead:
+
+     LEAD          what connectors are, and what is true on this Mac right
+                   now. Sans, --fs-lead, because instruction copy is never
+                   set small.
+     POWER CARDS   one drawn card per switch, each holding the control, the
+                   explanation, and — attached under it — the sentence that
+                   says what is in force.
+     ATTACHED NOTE the consequence, drawn as a note pinned to the control it
+                   belongs to. It carries a marker edge and a wash ONLY when
+                   the state is a risk (yellow for "runs unattended", red for
+                   "real values leave this Mac"); the reassuring states are
+                   the same words in a quiet annotation. The page is calm
+                   when the safe defaults hold and visibly marked up the
+                   moment a door is opened.
+     INDEX CARDS   one card per installed connector, badge-first.
+
+   Not one word of the copy was shortened to make that fit. The only text
+   change is typographic: where a sentence already began with its own label
+   in bold — "Currently ON …", "In force: …", "Local — …" — that label is now
+   a tape badge and the rest of the sentence follows it, so the words are
+   identical and the emphasis is carried by the mark instead of by <b>.
+
+   MARKER MEANINGS USED HERE (product-wide, from tokens.css — not local):
+     green  --sem-done      local, on your Mac, waits for your approval
+     blue   --sem-linked    verified: a claim the REGISTRY makes, nothing more
+     yellow --sem-pending   remote, caution, runs unattended, needs setup
+     red    --sem-urgent    this room's real values leave the Mac
+     pink   --sem-saved     a credential of yours gets stored to use this
+
+   "Verified" is deliberately informational blue rather than green. The
+   registry's `verified` flag means only that the publisher demonstrably owns
+   the namespace (see CatalogEntry in apiTypes.ts) — it is not an audit, not
+   an endorsement, and painting it the same green as "runs on your Mac" would
+   read as a safety guarantee the backend never made.
+
+   Every colour rides with a word and, where one exists, a glyph. Nothing
+   here names a colour: both themes fall out of tokens.css, so there is
+   deliberately no light-mode block at the end of this file. */
+
+/* ==========================================================================
+   1. THE PAGE
+   ========================================================================== */
+
+/* The scroll frame. Transparent, so the dotted sheet runs straight through
+   it — a page is a frame on the sheet, never a filled box. */
+.connectors-page {
+  height: 100%;
+  overflow-y: auto;
+  background: transparent;
+}
+
+/* The reading column. Wider than Find's 680px because the marketplace grid
+   needs three cards across, narrower than the old 1100px because a line of
+   privacy copy at 1100px is a line nobody finishes. */
+.conn-inner {
+  width: min(100% - 48px, 900px);
+  margin: 0 auto;
+  padding: 40px 0 80px;
+}
+
+.conn-masthead {
+  padding-bottom: var(--sp-4);
+  margin-bottom: var(--sp-6);
+  /* The masthead rule drawn the way .nb-rule draws one — thinning at both
+     ends — but as a background, so it costs no element and gives a screen
+     reader nothing extra to walk past. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line) 2%,
+    var(--line) 97%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1.5px;
+  background-position: left bottom;
+}
+
+/* --fs-section, matching the Find page: --fs-page is the front page's alone. */
+.conn-title {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: var(--fs-section);
+  font-family: var(--display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+}
+
+/* The lead was 12px `.settings-hint`. It explains what a connector is and
+   then states what is true on this Mac — that is instruction copy, and the
+   type scale is explicit that instructions are never set small. */
+.conn-lead {
+  margin: var(--sp-4) 0 0;
+  max-width: 68ch;
+  color: var(--text);
+  font-size: var(--fs-lead);
+  line-height: var(--lh-body);
+}
+.conn-lead i {
+  font-style: italic;
+}
+
+/* ----- sections ----- */
+
+.conn-section {
+  margin: 0 0 var(--sp-8);
+}
+.conn-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  padding-bottom: var(--sp-2);
+  margin-bottom: var(--sp-4);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 2%,
+    var(--line-soft) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+.conn-section-head h2 {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+/* A count in the margin — a tally the app made, so the sans. */
+.conn-section-note {
+  margin-left: auto;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--faint);
+}
+
+/* ==========================================================================
+   2. THE SWITCH
+   The native checkbox IS the control. `appearance: none` lets it be painted
+   directly instead of hidden behind a decorative span, so it keeps its role,
+   its checked state, its keyboard handling, its label association and its
+   focus ring — all of which the old `display: none` input threw away.
+   ========================================================================== */
+
+.mkt-switch {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: none;
+  width: 40px;
+  height: 24px; /* the 24px minimum target, paid by the control itself */
+  margin: 0;
+  padding: 0;
+  cursor: pointer;
+  background-color: transparent;
+  /* The knob is a BACKGROUND LAYER, not a pseudo-element. ::before on a form
+     control is not something every WebKit build agrees to render, and a
+     background circle slides with `background-position` on any engine.
+     It stays --ink-2 in both states: a physical knob does not change colour,
+     and 6.3:1 (light) / 7.9:1 (dark) is far past the 3:1 a meaningful
+     non-text mark owes. The TRACK carries the colour. */
+  background-image: radial-gradient(
+    circle closest-side,
+    var(--ink-2) 0 88%,
+    transparent 96%
+  );
+  background-repeat: no-repeat;
+  background-size: 14px 14px;
+  background-position: 3px center;
+  /* --rule-strong is the 3:1 control boundary; the asymmetric vertical radii
+     make the capsule read as drawn rather than extruded. */
+  border: 1.5px solid var(--rule-strong);
+  border-radius: 999px 999px 999px 999px / 14px 12px 14px 12px;
+  box-shadow: none;
+  transition:
+    background-position var(--dur) var(--ease-pen),
+    background-color var(--dur-fast) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen);
+}
+/* On: the knob slides right, the track fills with the marker wash and the
+   edge goes to that marker's ink. The hue comes from whatever .nb-sem-* the
+   surrounding card sets, so a switch that opens a risky door is drawn in the
+   same colour as the note explaining it. Default is the pen, for the switches
+   that are merely on/off (a connector, one of its tools). */
+.mkt-switch:checked {
+  background-position: calc(100% - 3px) center;
+  background-color: color-mix(in srgb, var(--mk, var(--accent-fill)) 26%, transparent);
+  border-color: var(--mk-ink, var(--accent));
+}
+/* base.css gives every input an accent border and an inset stroke on focus,
+   which would wipe out the semantic edge above; the ring does the work. */
+.mkt-switch:focus,
+.mkt-switch:focus-visible {
+  border-color: var(--mk-ink, var(--accent));
+  box-shadow: none;
+}
+.mkt-switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.mkt-switch:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ----- legacy switch face -----
+   .mkt-sw is the OLD span-beside-a-hidden-input switch. Nothing on these two
+   surfaces uses it any more, but workspace/skills/SkillsView.tsx still
+   renders one, and this file is where it has always been defined — deleting it
+   would silently un-draw a control in another owner's view. Kept as-is,
+   deliberately unstyled beyond the palette.
+
+   Its wrapper is `.sk-enable` (it was `.skill-enable` before the notebook
+   pass). The `:checked` and `:focus-visible` rules that switch needs now live
+   in skills.css, next to `.sk-enable`: the ones below are scoped to `.mkt-tgl`,
+   a wrapper SkillsView does not use, so they never reached it — which is why
+   that switch drew its off face no matter what the checkbox said. If SkillsView
+   ever migrates to `.mkt-switch` (the painted input in section 2), delete this
+   whole block and those two rules in skills.css with it. */
+.mkt-tgl {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-meta);
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.mkt-tgl input {
+  display: none;
+}
+.mkt-sw {
+  width: 30px;
+  height: 17px;
+  border-radius: 99px;
+  background: var(--line);
+  position: relative;
+  transition: background var(--dur-fast) var(--ease-pen);
+  flex: none;
+}
+.mkt-sw::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 99px;
+  background: var(--panel-2);
+  transition: transform var(--dur-fast) var(--ease-pen);
+  box-shadow: 0 1px 2px var(--shadow);
+}
+.mkt-tgl input:checked + .mkt-sw {
+  background: var(--accent);
+}
+.mkt-tgl input:checked + .mkt-sw::after {
+  transform: translateX(13px);
+}
+
+/* ==========================================================================
+   3. ATTACHED NOTES
+   The consequence of a choice, pinned under the control that decides it.
+
+   Two weights, and which one a note gets is a statement about risk:
+
+     .mkt-note          the quiet form. A pencil rule down the left edge and
+                        the words. Used when the state in force is the safe
+                        one — the sentence is still there, in full, at body
+                        size, it simply is not shouting.
+     .mkt-note--flag    the marked form: a 3px marker edge in the meaning's
+                        INK plus a wash of the same hue behind the words, and
+                        a dashed stem tying it to the control above. Used for
+                        every state that opens a door.
+
+   The edge is --mk-ink and not a marker fill because a 3px stroke is
+   meaningful non-text and owes 3:1 — a fill measures ~1.7:1 on ivory. Ink on
+   this wash runs 4.5:1 (light yellow, the worst pair) to 8.1:1 (dark red).
+   Same recipe as Room Home's attention strips, deliberately: a note that
+   means "look at this" should look the same everywhere in the product.
+   ========================================================================== */
+
+.mkt-note {
+  position: relative;
+  margin: var(--sp-3) 0 0;
+  padding: 0 0 0 var(--sp-3);
+  box-shadow: inset 1px 0 0 var(--line);
+  color: var(--text);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+.mkt-note--flag {
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-sm);
+  box-shadow: inset 3px 0 0 var(--mk-ink, var(--sem-pending));
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--mk, var(--sem-pending-fill)) 20%, transparent) 0%,
+    color-mix(in srgb, var(--mk, var(--sem-pending-fill)) 10%, transparent) 62%,
+    color-mix(in srgb, var(--mk, var(--sem-pending-fill)) 15%, transparent) 100%
+  );
+}
+/* The tape label. It is inline, not a flex child, so the punctuation that
+   already followed the label in the copy ("Currently OFF: every call …")
+   lands hard against it exactly as it reads in the sentence. */
+.mkt-note-tag {
+  white-space: nowrap;
+}
+/* An inline glyph inside a note (the warning triangle, the shield). */
+.mkt-note svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  vertical-align: -3px;
+  margin-right: 5px;
+  color: var(--mk-ink, var(--muted));
+}
+.mkt-note b {
+  color: var(--text-strong);
+}
+.mkt-note code {
+  overflow-wrap: anywhere;
+}
+/* When a note carries an action ("Download uv for me"), the sentence is a
+   paragraph of its own and the button sits under it — a control dropped
+   mid-sentence breaks the line box and reads as part of the prose. */
+.mkt-note-text {
+  margin: 0;
+}
+.mkt-note-action {
+  margin-top: var(--sp-2);
+}
+
+/* The stem: a short dashed pencil stroke from the control down into the
+   note, so "attached" is drawn rather than implied. Its height is exactly the
+   note's own top margin, so it always bridges the gap and never floats. Scoped
+   to the two places a note really does hang off a control directly above it —
+   in the install drawer the notes are siblings in a column and a dangling stem
+   would point at nothing. Inert and deterministic, like every other mark. */
+.conn-power .mkt-note--flag::before,
+.conn-perm .mkt-note--flag::before {
+  content: "";
+  position: absolute;
+  top: calc(var(--sp-3) * -1);
+  left: 12px;
+  width: 1px;
+  height: var(--sp-3);
+  background-image: repeating-linear-gradient(
+    to bottom,
+    var(--mk-ink, var(--sem-pending)) 0 3px,
+    transparent 3px 6px
+  );
+  pointer-events: none;
+}
+
+/* ==========================================================================
+   4. THE TWO POWERS
+   "Run connector tools without asking" and "Send remote connectors real
+   values" are the highest-stakes controls in the product. They get a card
+   each — same weight, side by side, because they are separate permissions
+   and neither is a sub-setting of the other.
+   ========================================================================== */
+
+.conn-powers {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: var(--sp-4);
+}
+
+.conn-power {
+  display: flex;
+  flex-direction: column;
+  padding: var(--sp-4);
+}
+
+/* The control and its name. The label wraps ONLY these two, not the whole
+   card: an 80-word paragraph that flips a privacy switch when clicked is a
+   footgun, and it also made the checkbox's accessible name 80 words long. */
+.conn-power-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  cursor: pointer;
+}
+.conn-power-title {
+  color: var(--text-strong);
+  font-size: var(--fs-card);
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+/* What the switch does. Sans, body size, never the hand: this explains a
+   setting, and handwriting is reserved for asides, dates and counts. */
+.conn-power-copy {
+  margin: var(--sp-3) 0 0;
+  color: var(--text);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+.conn-power-copy i {
+  font-style: italic;
+}
+
+/* ==========================================================================
+   5. BADGES
+   Every badge is a claim about a connector, so every badge carries a WORD.
+   The tape strip comes from paper.css (.nb-tape: --ink on a 34% wash, 7.8:1
+   in dark and better in light) and the meaning comes from a .nb-sem-* class
+   in the markup — this file never picks the hue.
+   ========================================================================== */
+
+.mkt-badge {
+  white-space: nowrap;
+}
+.mkt-badge svg {
+  width: 11px;
+  height: 11px;
+  flex: none;
+}
+/* The transport string ("stdio", "http", "sse") is a technical fact, not a
+   risk signal: graphite, mono, no marker. */
+.mkt-badge-plain {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px var(--sp-2);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 2px 3px 2px 4px / 4px 2px 3px 2px;
+}
+/* "Installed" is a fact about YOUR room rather than a claim about the
+   connector, so it is drawn in the pen — the accent means "this one is
+   already yours" the same way selection does everywhere else. */
+.mkt-badge-installed {
+  --mk: var(--accent-fill);
+  --mk-ink: var(--accent);
+}
+
+/* ==========================================================================
+   6. INSTALLED CONNECTORS — INDEX CARDS
+   One card per connector: the identity line (dot, name, badges, state), the
+   controls, then the permission notes and the tool list. Full width and
+   stacked rather than in a grid, because a card can grow a 40-tool list.
+   ========================================================================== */
+
+.conn-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.conn-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+}
+
+/* .nb-card presses the pen harder on hover, which is right for a card you can
+   click. None of these three IS clickable — they are containers holding
+   controls — so they hold their resting stroke and only the controls inside
+   them respond to the pointer. */
+.conn-card:hover,
+.conn-power:hover,
+.mkt-gate:hover {
+  border-color: color-mix(in srgb, var(--sketch) 72%, transparent);
+}

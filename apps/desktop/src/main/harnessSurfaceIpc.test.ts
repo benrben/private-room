@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createRoomManagerState, type RoomManagerDeps } from "./roomManager.js";
 import { createWorkspaceRoom } from "./workspace/roomLayout.js";
 import { WorkspaceService } from "./workspace/workspaceService.js";
@@ -14,6 +14,55 @@ afterEach(async () => {
 });
 
 describe("harness surface IPC", () => {
+  it("validates start requests before the controller can contact a harness", async () => {
+    const handlers = new Map<string, (_event: unknown, args: unknown) => unknown>();
+    const ipcMain = {
+      handle(channel: string, handler: (_event: unknown, args: unknown) => unknown) {
+        handlers.set(channel, handler);
+      },
+    };
+    const state = createRoomManagerState();
+    const deps = {
+      userDataDir: "/tmp/harness-ipc-fake",
+      spawnRoomServerIfEnabled: () => undefined,
+    } as RoomManagerDeps;
+    const controller = registerHarnessSurfaceIpc(
+      ipcMain as never,
+      state,
+      deps,
+      "/tmp/harness-ipc-fake",
+      () => undefined,
+    );
+    const start = vi.spyOn(controller, "start").mockResolvedValue("run-123");
+    const handler = handlers.get("harness_start");
+    if (!handler) throw new Error("harness_start was not registered");
+    const valid = {
+      provider: "codex",
+      model: "gpt-5",
+      privacyMode: "cloud-redacted",
+      writeEnabled: false,
+      text: "Review this change",
+      threadId: "thread-1",
+      systemPrompt: "",
+    };
+    await expect(handler({}, valid)).resolves.toEqual({ runId: "run-123" });
+    expect(start).toHaveBeenCalledWith(valid);
+
+    for (const [args, error] of [
+      [{ ...valid, provider: "unknown" }, "provider must be codex"],
+      [{ ...valid, privacyMode: "everywhere" }, "privacyMode is invalid"],
+      [{ ...valid, writeEnabled: "yes" }, "writeEnabled must be a boolean"],
+      [{ ...valid, model: " " }, "model must be a non-empty string"],
+      [{ ...valid, text: "" }, "text must be a non-empty string"],
+      [{ ...valid, threadId: "" }, "threadId must be a non-empty string"],
+      [{ ...valid, systemPrompt: 1 }, "systemPrompt must be a string"],
+      [null, "provider must be codex"],
+    ] as const) {
+      expect(() => handler({}, args)).toThrow(error);
+    }
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+
   it("lists encrypted provider-neutral run history through a registered IPC channel", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-harness-ipc-"));
     roots.push(root);

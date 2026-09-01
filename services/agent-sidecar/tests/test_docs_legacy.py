@@ -31,6 +31,7 @@ import struct
 import tempfile
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -219,6 +220,25 @@ def test_binary_noise_does_not_reach_the_index() -> None:
         assert junk not in text, f"binary noise leaked: {text}"
 
 
+def test_doc_prefers_a_clean_textutil_import_with_resolved_fields(monkeypatch) -> None:
+    data = _ole_with("WordDocument", _utf16le("Fallback prose must not win."))
+    monkeypatch.setattr(legacy.textutil, "convert", lambda *_: "Clean imported prose")
+    monkeypatch.setattr(
+        legacy.textutil, "resolve_field_codes", lambda imported, _: f"resolved: {imported}"
+    )
+
+    assert legacy.extract_legacy_doc("x.doc", data) == "resolved: Clean imported prose"
+
+
+def test_doc_falls_back_when_textutil_echo_is_not_clean(monkeypatch) -> None:
+    data = _ole_with("WordDocument", _utf16le("Fallback prose survives."))
+    monkeypatch.setattr(legacy.textutil, "convert", lambda *_: "raw\x00 bytes echoed")
+
+    text = legacy.extract_legacy_doc("x.doc", data)
+    assert text is not None
+    assert "Fallback prose survives." in text
+
+
 def test_a_genuine_word_97_file_reads_as_prose_not_as_its_font_table() -> None:
     # THE REGRESSION THIS PINS: live QA opened a real Word 97 file and the
     # editor showed "Times New Roman / Arial / Droid Sans Fallback /
@@ -366,6 +386,28 @@ def test_single_byte_text_atoms_are_read_as_single_bytes() -> None:
     assert "Single byte text atoms throughout." in text, text
 
 
+def test_ppt_clean_keeps_visible_spacing_and_drops_binary_controls() -> None:
+    cleaned = legacy._ppt_clean("one\rtwo\x0bthree\x00four�five\x1esix\nseven\teight")
+    assert cleaned == "one\ntwo\nthreefourfivesix\nseven\teight"
+
+
+def test_ppt_rendering_drops_notes_master_and_marks_an_overflow(monkeypatch) -> None:
+    notes_master = legacy._PptChunk(is_notes=True)
+    notes_master.lines.append("Master notes must not appear")
+    placeholder = legacy._PptChunk(is_notes=False)
+    placeholder.lines.append("*")
+    slide = legacy._PptChunk(is_notes=False)
+    slide.lines.append("Visible slide")
+    notes = legacy._PptChunk(is_notes=True)
+    notes.lines.append("Visible notes")
+
+    rendered = legacy._render_ppt_chunks([notes_master, placeholder, slide, notes])
+    assert rendered == "[slide 1]\nVisible slide\n[slide 1 notes]\nVisible notes\n"
+
+    monkeypatch.setattr(legacy, "MAX_LEGACY_CHARS", 1)
+    assert legacy._render_ppt_chunks([slide]) == "[slide 1]\nVisible slide\n\n… (truncated)\n"
+
+
 def test_a_record_claiming_a_length_past_the_buffer_stops_the_walk() -> None:
     # A malformed or truncated deck must not be reinterpreted as records.
     stream = _container(legacy.RT_SLIDE, _text_chars("Good slide"))
@@ -373,6 +415,14 @@ def test_a_record_claiming_a_length_past_the_buffer_stops_the_walk() -> None:
     text = legacy.extract_legacy_ppt(_ole_with("PowerPoint Document", stream))
     assert text is not None, "no text"
     assert "Good slide" in text, text
+
+
+def test_ppt_record_walk_drops_root_text_and_stops_at_a_partial_header() -> None:
+    # Document-summary atoms belong to no slide, and a trailing partial
+    # header is not a new record. Both must leave the chunk list untouched.
+    chunks: list[legacy._PptChunk] = []
+    legacy._walk_ppt_records(_text_chars("Deck title") + bytes(7), chunks, None, 0)
+    assert chunks == []
 
 
 def test_deeply_nested_containers_cannot_run_away_with_the_stack() -> None:
@@ -499,6 +549,27 @@ def test_ods_all_numeric_sheet_extracts_with_columns_and_blanks_preserved() -> N
     assert "1.0" not in text and "100.0" not in text and "4.0" not in text, text
 
 
+def test_ods_cell_values_prefer_usable_typed_values_and_otherwise_use_display_text() -> None:
+    odf_table = pytest.importorskip("odf.table")
+    odf_text = pytest.importorskip("odf.text")
+    TableCell, P = odf_table.TableCell, odf_text.P
+
+    invalid_number = TableCell(valuetype="float", value="not-a-number")
+    invalid_number.addElement(P(text="shown instead"))
+    missing_number = TableCell(valuetype="currency")
+    missing_number.addElement(P(text="also shown"))
+    string = TableCell(valuetype="string")
+    string.addElement(P(text="plain text"))
+
+    assert legacy._ods_cell_value(TableCell(valuetype="percentage", value=2.5)) == "2.5"
+    assert legacy._ods_cell_value(TableCell(valuetype="boolean", booleanvalue="true")) == "true"
+    assert legacy._ods_cell_value(TableCell(valuetype="date", datevalue="2026-08-31")) == "2026-08-31"
+    assert legacy._ods_cell_value(TableCell(valuetype="time", timevalue="PT1H2M")) == "PT1H2M"
+    assert legacy._ods_cell_value(invalid_number) == "shown instead"
+    assert legacy._ods_cell_value(missing_number) == "also shown"
+    assert legacy._ods_cell_value(string) == "plain text"
+
+
 def test_an_all_blank_sheet_is_skipped_entirely() -> None:
     xlwt = pytest.importorskip("xlwt")
     wb = xlwt.Workbook()
@@ -507,6 +578,38 @@ def test_an_all_blank_sheet_is_skipped_entirely() -> None:
     buf = io.BytesIO()
     wb.save(buf)
     assert legacy.extract_legacy_spreadsheet(buf.getvalue(), "xls") is None
+
+
+def test_a_blank_row_in_a_non_empty_sheet_is_skipped() -> None:
+    xlwt = pytest.importorskip("xlwt")
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet("Sparse")
+    ws.write(0, 0, "first row")
+    ws.write(1, 0, "")
+    ws.write(2, 0, "last row")
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    text = legacy.extract_legacy_spreadsheet(buf.getvalue(), "xls")
+    assert text == "--- Sparse ---\nfirst row\nlast row\n"
+
+
+def test_spreadsheet_output_keeps_the_overflowing_row_then_marks_truncation(monkeypatch) -> None:
+    xlwt = pytest.importorskip("xlwt")
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet("Tiny")
+    ws.write(0, 0, "row beyond the limit")
+    buf = io.BytesIO()
+    wb.save(buf)
+    monkeypatch.setattr(legacy, "MAX_LEGACY_CHARS", len("--- Tiny ---\n"))
+
+    text = legacy.extract_legacy_spreadsheet(buf.getvalue(), "xls")
+    assert text == "--- Tiny ---\nrow beyond the limit\n\n… (truncated)\n"
+
+
+def test_invalid_known_spreadsheet_formats_read_as_nothing() -> None:
+    assert legacy.extract_legacy_spreadsheet(b"not a spreadsheet", "xls") is None
+    assert legacy.extract_legacy_spreadsheet(b"not a spreadsheet", "ods") is None
 
 
 def test_an_unknown_spreadsheet_extension_reads_as_nothing() -> None:
@@ -530,6 +633,28 @@ def test_xls_boolean_cells_render_lowercase_matching_rust() -> None:
     assert text is not None
     assert "true" in text and "false" in text, text
     assert "True" not in text and "False" not in text, text
+
+
+def test_xls_cell_values_keep_type_specific_rendering(monkeypatch) -> None:
+    def cell(ctype, value):
+        return SimpleNamespace(ctype=ctype, value=value)
+
+    assert legacy._xls_cell_value(cell(legacy.xlrd.XL_CELL_EMPTY, "ignored"), 0) == ""
+    assert legacy._xls_cell_value(cell(legacy.xlrd.XL_CELL_NUMBER, 12.0), 0) == "12"
+    assert legacy._xls_cell_value(cell(legacy.xlrd.XL_CELL_BOOLEAN, False), 0) == "false"
+
+    monkeypatch.setattr(legacy.xlrd, "xldate_as_datetime", lambda *_: "date value")
+    assert legacy._xls_cell_value(cell(legacy.xlrd.XL_CELL_DATE, 2.0), 0) == "date value"
+    monkeypatch.setattr(
+        legacy.xlrd,
+        "xldate_as_datetime",
+        lambda *_: (_ for _ in ()).throw(ValueError("invalid date")),
+    )
+    assert legacy._xls_cell_value(cell(legacy.xlrd.XL_CELL_DATE, 12.0), 0) == "12"
+
+    error_code, error_text = next(iter(legacy.xlrd.error_text_from_code.items()))
+    assert legacy._xls_cell_value(cell(legacy.xlrd.XL_CELL_ERROR, error_code), 0) == error_text
+    assert legacy._xls_cell_value(cell(99, "displayed"), 0) == "displayed"
 
 
 def test_ods_merged_cell_continuation_keeps_later_cells_in_their_real_column() -> None:

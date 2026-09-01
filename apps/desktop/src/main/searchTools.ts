@@ -82,6 +82,75 @@ export function ftsMatchAll(terms: Iterable<string>): string | null {
   return quoted.length === 0 ? null : quoted.join(" AND ");
 }
 
+interface FileSearchState {
+  files: FileHit[];
+  seen: Set<string>;
+}
+
+function fileSearchExpression(trimmed: string, needle: string): string | null {
+  return ftsMatchAll(questionTerms(trimmed)) ?? ftsMatchAll([needle]);
+}
+
+function addContentFileHits(
+  db: Database.Database,
+  expression: string,
+  query: string,
+  state: FileSearchState,
+): void {
+  for (const [id, name, chunk] of filesContentFts(db, expression, FILE_CONTENT_HITS * 20)) {
+    if (state.files.length >= FILE_CONTENT_HITS) {
+      break;
+    }
+    if (!state.seen.has(id)) {
+      state.seen.add(id);
+      state.files.push({ id, name, snippet: makeSnippet(chunk, query, 60) });
+    }
+  }
+}
+
+function addNameFileHits(db: Database.Database, needle: string, state: FileSearchState): void {
+  for (const [id, name] of filesNameLike(db, needle)) {
+    if (!state.seen.has(id)) {
+      state.seen.add(id);
+      state.files.push({ id, name, snippet: "" });
+    }
+  }
+}
+
+function searchFiles(db: Database.Database, trimmed: string, needle: string): FileHit[] {
+  const state: FileSearchState = { files: [], seen: new Set<string>() };
+  const expression = fileSearchExpression(trimmed, needle);
+  if (expression !== null) {
+    // `filesContentFts` limits CHUNKS, and one long document can own all of
+    // the best-ranked ones — a 15-chunk fetch then listed a single file and
+    // dropped every other document that matched, unreachably. Over-fetch and
+    // stop at the first N distinct files instead.
+    addContentFileHits(db, expression, trimmed, state);
+  }
+  // Name-only matches carry NO snippet. The row already shows the name (which
+  // is where the match is), so repeating it as the preview line said the same
+  // thing twice — and the overlay hands the snippet to the viewer as the text
+  // to jump to, so a file name sent the viewer looking for words the document
+  // does not contain and nothing was highlighted.
+  addNameFileHits(db, needle, state);
+  return state.files;
+}
+
+function searchMessages(db: Database.Database, needle: string, query: string): MessageHit[] {
+  return messagesLike(db, needle).map(([chatId, messageId, content]) => ({
+    chatId,
+    messageId,
+    snippet: makeSnippet(content, query, 60),
+  }));
+}
+
+function searchMemories(db: Database.Database, needle: string, query: string): MemoryHit[] {
+  return memoriesLike(db, needle).map(([id, content]) => ({
+    id,
+    snippet: makeSnippet(content, query, 60),
+  }));
+}
+
 /**
  * ADD-6: search the user's own room across file names + content, chat
  * messages, and memories. File content rides the FTS5 index (HLT-3); messages
@@ -95,50 +164,11 @@ export function searchAll(db: Database.Database, query: string): SearchResults {
     return { files: [], messages: [], memories: [] };
   }
   const needle = trimmed.toLowerCase();
-
-  // Files: content hits (FTS) first, then name-only matches not already shown.
-  const files: FileHit[] = [];
-  const seen = new Set<string>();
-  const expr = ftsMatchAll(questionTerms(trimmed)) ?? ftsMatchAll([needle]);
-  if (expr !== null) {
-    // `filesContentFts` limits CHUNKS, and one long document can own all of
-    // the best-ranked ones — a 15-chunk fetch then listed a single file and
-    // dropped every other document that matched, unreachably. Over-fetch and
-    // stop at the first N distinct files instead.
-    for (const [id, name, chunk] of filesContentFts(db, expr, FILE_CONTENT_HITS * 20)) {
-      if (files.length >= FILE_CONTENT_HITS) {
-        break;
-      }
-      if (!seen.has(id)) {
-        seen.add(id);
-        files.push({ id, name, snippet: makeSnippet(chunk, trimmed, 60) });
-      }
-    }
-  }
-  // Name-only matches carry NO snippet. The row already shows the name (which
-  // is where the match is), so repeating it as the preview line said the same
-  // thing twice — and the overlay hands the snippet to the viewer as the text
-  // to jump to, so a file name sent the viewer looking for words the document
-  // does not contain and nothing was highlighted.
-  for (const [id, name] of filesNameLike(db, needle)) {
-    if (!seen.has(id)) {
-      seen.add(id);
-      files.push({ id, name, snippet: "" });
-    }
-  }
-
-  const messages: MessageHit[] = messagesLike(db, needle).map(([chatId, messageId, content]) => ({
-    chatId,
-    messageId,
-    snippet: makeSnippet(content, trimmed, 60),
-  }));
-
-  const memories: MemoryHit[] = memoriesLike(db, needle).map(([id, content]) => ({
-    id,
-    snippet: makeSnippet(content, trimmed, 60),
-  }));
-
-  return { files, messages, memories };
+  return {
+    files: searchFiles(db, trimmed, needle),
+    messages: searchMessages(db, needle, trimmed),
+    memories: searchMemories(db, needle, trimmed),
+  };
 }
 
 // ------------------------------------------------------------------- ipc

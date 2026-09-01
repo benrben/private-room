@@ -13,7 +13,10 @@ export function fileNameOf(path: string): string {
  * one. A room with no usable name at all falls back to the old wording rather
  * than suggesting an empty file name. */
 export function duplicateFileName(roomName: string): string {
-  const clean = (roomName ?? "").replace(/[/:]/g, " ").replace(/\s+/g, " ").trim();
+  const clean = (roomName ?? "")
+    .replace(/[/:]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   return clean ? `Copy of ${clean}` : "Copy of room";
 }
 
@@ -34,25 +37,29 @@ export function duplicateDestinationSuggestion(
     : { title: "Save duplicated Arcelle room", defaultPath: `${name}.arcelle` };
 }
 
-export type Strength = { score: 0 | 1 | 2 | 3; label: string; level: "weak" | "okay" | "strong" };
+export type Strength = {
+  score: 0 | 1 | 2 | 3;
+  label: string;
+  level: "weak" | "okay" | "strong";
+};
 
-// Simple, library-free estimate: length plus the mix of character kinds
-// (lowercase, uppercase, digit, symbol). Empty input scores nothing.
-export function passwordStrength(pw: string): Strength {
-  if (!pw) return { score: 0, label: "", level: "weak" };
-  let kinds = 0;
-  if (/[a-z]/.test(pw)) kinds++;
-  if (/[A-Z]/.test(pw)) kinds++;
-  if (/[0-9]/.test(pw)) kinds++;
-  if (/[^A-Za-z0-9]/.test(pw)) kinds++;
+function characterKinds(value: string): number {
+  return [/[a-z]/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9]/].filter((pattern) =>
+    pattern.test(value),
+  ).length;
+}
 
+function strengthPoints(password: string, kinds: number): number {
   let points = 0;
-  if (pw.length >= 8) points++;
-  if (pw.length >= 12) points++;
-  if (kinds >= 2) points++;
-  if (kinds >= 3) points++;
+  if (password.length >= 8) points += 1;
+  if (password.length >= 12) points += 1;
+  if (kinds >= 2) points += 1;
+  if (kinds >= 3) points += 1;
+  return points;
+}
 
-  if (pw.length < 8 || points <= 1) {
+function strengthBand(password: string, points: number): Strength {
+  if (password.length < 8 || points <= 1) {
     return { score: 1, label: "Weak", level: "weak" };
   }
   if (points === 2 || points === 3) {
@@ -61,32 +68,55 @@ export function passwordStrength(pw: string): Strength {
   return { score: 3, label: "Strong", level: "strong" };
 }
 
+// Simple, library-free estimate: length plus the mix of character kinds
+// (lowercase, uppercase, digit, symbol). Empty input scores nothing.
+export function passwordStrength(pw: string): Strength {
+  if (!pw) return { score: 0, label: "", level: "weak" };
+  return strengthBand(pw, strengthPoints(pw, characterKinds(pw)));
+}
+
+function counted(value: number, unit: string): string {
+  return `${value} ${unit}${value === 1 ? "" : "s"} ago`;
+}
+
+function monthTime(days: number): string {
+  const months = Math.round(days / 30);
+  if (months < 12) return counted(months, "month");
+  return counted(Math.round(months / 12), "year");
+}
+
+function dayTime(hours: number): string {
+  const days = Math.round(hours / 24);
+  if (days < 30) return counted(days, "day");
+  return monthTime(days);
+}
+
+function hourTime(minutes: number): string {
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return counted(hours, "hour");
+  return dayTime(hours);
+}
+
+function minuteTime(minutes: number): string {
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  return hourTime(minutes);
+}
+
 // Friendly "Opened 2 hours ago" for the Recent list.
 export function relativeTime(ms?: number | null): string {
   if (!ms) return "";
   const diff = Date.now() - ms;
   if (diff < 0) return "just now";
-  const min = Math.round(diff / 60000);
-  if (min < 1) return "just now";
-  if (min < 60) return `${min} min ago`;
-  const hr = Math.round(min / 60);
-  if (hr < 24) return `${hr} hour${hr === 1 ? "" : "s"} ago`;
-  const day = Math.round(hr / 24);
-  if (day < 30) return `${day} day${day === 1 ? "" : "s"} ago`;
-  const mo = Math.round(day / 30);
-  if (mo < 12) return `${mo} month${mo === 1 ? "" : "s"} ago`;
-  const yr = Math.round(mo / 12);
-  return `${yr} year${yr === 1 ? "" : "s"} ago`;
+  return minuteTime(Math.round(diff / 60000));
 }
 
 // The check-off chips shown under the strength meter, so "how much more?" is
 // answerable rather than a mystery between Weak and Strong.
-export function passwordCriteria(pw: string): { label: string; met: boolean }[] {
-  const kinds =
-    (/[a-z]/.test(pw) ? 1 : 0) +
-    (/[A-Z]/.test(pw) ? 1 : 0) +
-    (/[0-9]/.test(pw) ? 1 : 0) +
-    (/[^A-Za-z0-9]/.test(pw) ? 1 : 0);
+export function passwordCriteria(
+  pw: string,
+): { label: string; met: boolean }[] {
+  const kinds = characterKinds(pw);
   return [
     { label: "8+ characters", met: pw.length >= 8 },
     { label: "12+ characters", met: pw.length >= 12 },

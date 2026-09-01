@@ -51,9 +51,11 @@ import {
   saveWebImage,
   saveWebPage,
 } from "../db-host/webCache.js";
-import { checkPublicHttpUrl } from "./guard.js";
 import { browseGuardUrl } from "./browseGuard.js";
+import { cacheKey, clip, stripThinkSpans } from "./searchText.js";
 import { requireWebEnabled } from "./webAccess.js";
+
+export { cacheKey, clip, stripThinkSpans } from "./searchText.js";
 
 /** How many results the enrich pass will read per search. The page shows a
  *  dozen; reading the top eight covers the feature card, the two-up row and
@@ -295,10 +297,17 @@ async function previewOne(
   deps: PreviewDeps,
   url: string,
 ): Promise<ResultPreview> {
+  const preview = emptyPreview(url);
+  const page = await deps.fetchPreview(url).catch(() => null);
+  if (!page) return preview;
+  return fillPreview(db, deps, preview, page);
+}
+
+function emptyPreview(url: string): ResultPreview {
   // Every field spelled out, matching Rust's `..Default::default()` + serde:
   // a preview that failed says `image: null` rather than omitting the key, so
   // the card can tell "read it, no image" from "never answered".
-  const preview: ResultPreview = {
+  return {
     url,
     image: null,
     icon: null,
@@ -306,20 +315,36 @@ async function previewOne(
     title: null,
     done: true,
   };
-  const page = await deps.fetchPreview(url).catch(() => null);
-  if (!page) {
-    return preview;
-  }
+}
+
+function cachePreviewText(db: Database.Database, url: string, page: PreviewFetch): void {
+  if (page.text.trim() === "") return;
+  bestEffort(() => saveWebPage(db, cacheKey(url), page.title ?? "", page.text));
+}
+
+async function fillPreview(
+  db: Database.Database,
+  deps: PreviewDeps,
+  preview: ResultPreview,
+  page: PreviewFetch,
+): Promise<ResultPreview> {
   preview.description = page.description ?? null;
   preview.title = page.title ?? null;
   // The readable text is already in hand — cache it so a later Peek, or the AI
   // summary, costs nothing.
-  if (page.text.trim() !== "") {
-    bestEffort(() => saveWebPage(db, cacheKey(url), page.title ?? "", page.text));
-  }
+  cachePreviewText(db, preview.url, page);
+  await fillPreviewImages(db, deps, preview, page);
+  return preview;
+}
+
+async function fillPreviewImages(
+  db: Database.Database,
+  deps: PreviewDeps,
+  preview: ResultPreview,
+  page: PreviewFetch,
+): Promise<void> {
   if (page.imageUrl) preview.image = await cachedDataUrl(db, deps, page.imageUrl);
   if (page.iconUrl) preview.icon = await cachedDataUrl(db, deps, page.iconUrl);
-  return preview;
 }
 
 /** Fetch one image through the guard (or read it from the 24h cache) and
@@ -443,119 +468,84 @@ export interface SummaryDeps extends PeekDeps {
  */
 export async function browserSearchSummary(deps: SummaryDeps, query: string): Promise<string> {
   const db = requireWebEnabled(deps.db);
-  const hits = getFreshWebSearch(db, query.trim());
-  if (!hits) {
-    throw new Error("Those results have expired — search again to summarize them.");
-  }
-  const model = deps.modelSetting(db);
-  if (!model) {
-    throw new Error("No AI engine is set for this room.");
-  }
-
-  const sources: Array<[number, string, string]> = [];
-  for (let i = 0; i < hits.length && sources.length < SUMMARY_SOURCES; i += 1) {
-    const hit = hits[i];
-    if (!hit) continue;
-    const key = cacheKey(hit.url);
-    const cached = getFreshWebPage(db, key);
-    let text: string;
-    if (cached && cached.text.trim() !== "") {
-      text = cached.text;
-    } else {
-      const fetched = await deps.fetchPage(hit.url).catch(() => null);
-      if (!fetched) continue;
-      bestEffort(() => saveWebPage(db, key, fetched.title, fetched.text));
-      text = fetched.text;
-    }
-    sources.push([i + 1, hit.title, clip(text, SUMMARY_CHARS_PER_SOURCE)]);
-  }
-  if (sources.length === 0) {
-    throw new Error("None of these results could be read, so there is nothing to summarize.");
-  }
-  const context = sources.map(([n, title, text]) => `[${n}] ${title}\n${text}`).join("\n\n---\n\n");
+  const hits = summaryHits(db, query);
+  const model = summaryModel(deps, db);
+  const sources = await summarySources(db, deps, hits);
+  if (sources.length === 0) throw new Error("None of these results could be read, so there is nothing to summarize.");
+  const context = formatSummarySources(sources);
   const raw = await deps.generate(
     model,
     SUMMARY_PROMPT,
     `Question: ${query}\n\nSources:\n\n${context}`,
   );
+  return summaryText(raw);
+}
+
+type SummarySource = [number, string, string];
+
+function summaryHits(db: Database.Database, query: string): WebHit[] {
+  const hits = getFreshWebSearch(db, query.trim());
+  if (!hits) throw new Error("Those results have expired — search again to summarize them.");
+  return hits;
+}
+
+function summaryModel(deps: SummaryDeps, db: Database.Database): string {
+  const model = deps.modelSetting(db);
+  if (!model) throw new Error("No AI engine is set for this room.");
+  return model;
+}
+
+async function summarySource(
+  db: Database.Database,
+  deps: SummaryDeps,
+  hit: WebHit,
+  index: number,
+): Promise<SummarySource | null> {
+  const key = cacheKey(hit.url);
+  const cached = getFreshWebPage(db, key);
+  const text = cached && cached.text.trim() !== "" ? cached.text : await fetchedSummaryText(db, deps, hit.url, key);
+  return text === null ? null : [index + 1, hit.title, clip(text, SUMMARY_CHARS_PER_SOURCE)];
+}
+
+async function fetchedSummaryText(
+  db: Database.Database,
+  deps: SummaryDeps,
+  url: string,
+  key: string,
+): Promise<string | null> {
+  const fetched = await deps.fetchPage(url).catch(() => null);
+  if (!fetched) return null;
+  bestEffort(() => saveWebPage(db, key, fetched.title, fetched.text));
+  return fetched.text;
+}
+
+async function summarySources(
+  db: Database.Database,
+  deps: SummaryDeps,
+  hits: WebHit[],
+): Promise<SummarySource[]> {
+  const sources: SummarySource[] = [];
+  for (let index = 0; index < hits.length && sources.length < SUMMARY_SOURCES; index += 1) {
+    const hit = hits[index];
+    if (!hit) continue;
+    const source = await summarySource(db, deps, hit, index);
+    if (source) sources.push(source);
+  }
+  return sources;
+}
+
+function formatSummarySources(sources: SummarySource[]): string {
+  return sources.map(([number, title, text]) => `[${number}] ${title}\n${text}`).join("\n\n---\n\n");
+}
+
+function summaryText(raw: string): string {
   // A thinking model puts its private reasoning in `<think>…</think>` before
   // the answer, and `generate` hands the raw text back. Unstripped, the
   // monologue was rendered as the summary paragraph sitting above the real
   // results — the one place on the page that has to be trustworthy.
   const text = stripThinkSpans(raw).trim();
-  if (text === "") {
-    throw new Error("The engine returned nothing for this summary.");
-  }
+  if (text === "") throw new Error("The engine returned nothing for this summary.");
   return text;
-}
-
-/**
- * Port of `crate::ollama::strip_think_spans`: remove every `<think>…</think>`
- * span. An UNTERMINATED `<think>` truncates everything from that point on
- * rather than leaving its contents in — a thinking model cut off mid-thought
- * must not have its private reasoning spliced into the answer. Small enough,
- * and a direct enough dependency of {@link browserSearchSummary}, to live here
- * rather than pull in the whole (unported) `ollama.rs`.
- */
-export function stripThinkSpans(raw: string): string {
-  let out = raw;
-  for (;;) {
-    const start = out.indexOf("<think>");
-    if (start === -1) break;
-    const closeAt = out.indexOf("</think>", start);
-    if (closeAt === -1) {
-      out = out.slice(0, start);
-      break;
-    }
-    out = out.slice(0, start) + out.slice(closeAt + "</think>".length);
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-/**
- * The key a fetched page is cached under.
- *
- * The search engine writes a URL one way (`https://example.com`) and the URL
- * parser normalizes it another (`https://example.com/`), so looking a page up
- * under the engine's spelling while filing it under the normalized one meant
- * the two never met: for every plain domain the Peek cache could not be hit,
- * and expanding the same result re-downloaded the page every single time. ONE
- * key, used by everything that reads or writes the cache.
- *
- * Deliberately the LITERAL check only — no DNS — because this runs on the
- * cache-hit path, which must not touch the network. The full guard
- * ({@link browseGuardUrl}) still runs before anything is actually fetched.
- */
-export function cacheKey(url: string): string {
-  try {
-    return checkPublicHttpUrl(url).toString();
-  } catch {
-    return url;
-  }
-}
-
-/**
- * Clip text to a code-point budget on a whitespace boundary where possible, so
- * a source never ends mid-word. A single unbroken token longer than the budget
- * is still hard-cut, or the budget would not be a budget.
- */
-export function clip(text: string, max: number): string {
-  const chars = Array.from(text);
-  if (chars.length <= max) {
-    return text;
-  }
-  const clipped = chars.slice(0, max);
-  const half = Math.floor(max / 2);
-  for (let i = clipped.length - 1; i > half; i -= 1) {
-    if (/\s/.test(clipped[i] ?? "")) {
-      return clipped.slice(0, i).join("");
-    }
-  }
-  return clipped.join("");
 }
 
 /** A cache write, which Rust spells `let _ = db::save_web_page(...)`: the

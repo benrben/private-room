@@ -1,0 +1,23 @@
+
+
+/* ==========================================================================
+   13. MOTION
+   Every animation and transition above has its escape here.
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  .stream-cursor,
+  .msg.is-streaming .msg-content strong {
+    animation: none;
+  }
+  .prompt-chip,
+  .msg-footer > button {
+    transition: none;
+  }
+  .prompt-chip:hover {
+    transform: none;
+  }
+  .prompt-chip:active {
+    transform: none;
+  }
+}

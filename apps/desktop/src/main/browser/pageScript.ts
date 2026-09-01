@@ -7,29 +7,36 @@
 // Kept as a sibling `.js` resource read at call time, the same way
 // db-host/open.ts's `schemaSql()` reads `schema.sql` — this workspace's
 // established convention for a non-TypeScript asset that belongs next to the
-// module that owns it. Named `page.js` (matching the Rust file) rather than
-// `pageScript.js`, which is this module's own compiled-output name: a real
-// same-named `.js` beside a `.ts` is a module-resolution collision waiting to
-// happen.
+// module that owns it. The final fragment stays named `page.js` (matching the
+// Rust file); cohesive sibling fragments carry `page*.js` names so none can
+// collide with this module's compiled `pageScript.js` output.
 //
 // PACKAGING NOTE, the same one `schema.sql` carries: `import.meta.url` resolves
 // beside the module at runtime, so whatever eventually packages this app must
-// copy `page.js` next to the built `pageScript.js`, exactly as it must copy
-// `schema.sql`.
+// copy every `page*.js` fragment next to the built `pageScript.js`, exactly as
+// it must copy `schema.sql`.
 
-// A PATH is all this module exports, deliberately. Electron loads the preload
-// from disk itself, and a live probe confirmed it lands in every frame before
-// the page's own first script — so nothing here needs the SOURCE at runtime,
-// and an exported `pageScriptSource()` with no production caller would be an
-// injection backstop for a race that does not exist. Tests that want the text
-// read this path themselves.
+// Paths are all this module exports, deliberately. Electron loads each preload
+// fragment from disk itself, and a live probe confirmed registered preloads land
+// in every frame before the page's own first script. Nothing here needs source
+// text at runtime; tests that inspect the text read these paths themselves.
 
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-/** Absolute path to the page script, for
- *  `session.registerPreloadScript({ filePath })`. */
-export const PAGE_SCRIPT_PATH = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
+export const PAGE_SCRIPT_FILES = [
+  "pageCore.js",
+  "pageSnapshot.js",
+  "pageRead.js",
+  "pageActions.js",
   "page.js",
-);
+] as const;
+
+/** Absolute paths in their required synchronous registration order. */
+export const PAGE_SCRIPT_PATHS = PAGE_SCRIPT_FILES.map((file) => path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  file,
+));
+
+/** Final bridge-export fragment, retained for diagnostics and compatibility. */
+export const PAGE_SCRIPT_PATH = PAGE_SCRIPT_PATHS.at(-1)!;

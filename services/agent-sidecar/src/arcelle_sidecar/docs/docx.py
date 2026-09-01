@@ -48,15 +48,23 @@ def extract_docx(data: bytes) -> str | None:
         _append_docx_part(out, data, entry, label)
     # Headers and footers are per-section parts; take them in archive order.
     for name in zip_entry_names(data):
-        if name.startswith("word/header"):
-            label = "header"
-        elif name.startswith("word/footer"):
-            label = "footer"
-        else:
-            continue
-        if name.endswith(".xml"):
-            _append_docx_part(out, data, name, label)
+        _append_docx_header_or_footer(out, data, name)
     return "".join(out)
+
+
+def _append_docx_header_or_footer(out: list[str], data: bytes, entry: str) -> None:
+    label = _docx_header_or_footer_label(entry)
+    if label is None or not entry.endswith(".xml"):
+        return
+    _append_docx_part(out, data, entry, label)
+
+
+def _docx_header_or_footer_label(entry: str) -> str | None:
+    if entry.startswith("word/header"):
+        return "header"
+    if entry.startswith("word/footer"):
+        return "footer"
+    return None
 
 
 def _append_docx_part(out: list[str], data: bytes, entry: str, label: str) -> None:

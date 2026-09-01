@@ -8,6 +8,12 @@ interface Props {
   boxes: ImageBox[];
 }
 
+function imageSource(img: FileContent | null): string | null {
+  return img?.dataB64
+    ? `data:${img.mime};base64,${img.dataB64}`
+    : fileUrl(img?.mediaToken);
+}
+
 /** A marked-up image rendered inside a chat bubble. */
 export default function ChatAnnotatedImage({ fileId, boxes }: Props) {
   const [img, setImg] = useState<FileContent | null>(null);
@@ -43,9 +49,7 @@ export default function ChatAnnotatedImage({ fileId, boxes }: Props) {
       </div>
     );
   }
-  const src = img?.dataB64
-    ? `data:${img.mime};base64,${img.dataB64}`
-    : fileUrl(img?.mediaToken);
+  const src = imageSource(img);
   if (!img || img.kind !== "image" || !src) return null;
   return (
     <div className="img-wrap chat-img">

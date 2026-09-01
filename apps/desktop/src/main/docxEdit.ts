@@ -88,7 +88,7 @@ export interface RoomSource {
  * `previewTools.ts` already spell it. */
 const NO_ROOM_OPEN = "No room is open.";
 
-function openDb(room: RoomSource): Database.Database {
+export function openDb(room: RoomSource): Database.Database {
   const open = room.currentRoom();
   if (open === null) {
     throw new Error(NO_ROOM_OPEN);
@@ -150,7 +150,7 @@ function trimEndUnicode(s: string): string {
 
 /** Rust's `str::trim()` — both ends, same Unicode property as
  * {@link trimEndUnicode}. */
-function trimUnicode(s: string): string {
+export function trimUnicode(s: string): string {
   let start = 0;
   let end = s.length;
   while (start < end && isUnicodeWhitespace(s.charAt(start))) {
@@ -186,6 +186,41 @@ function snippet(s: string): string {
   return `${chars.slice(0, 60).join("")}…`;
 }
 
+function assertMatchingParagraphCounts(oldParagraphs: readonly string[], newParagraphs: readonly string[]): void {
+  if (oldParagraphs.length === newParagraphs.length) return;
+  throw new Error(
+    "This editor can change the wording of a Word file's paragraphs, but not add or " +
+      `remove them — the document has ${oldParagraphs.length} and the edited text has ` +
+      `${newParagraphs.length}. Undo the added or deleted line, or use "Save as a copy" to keep ` +
+      "this version as a separate note."
+  );
+}
+
+function replaceParagraph(bytes: Uint8Array, oldParagraph: string, newParagraph: string): Uint8Array {
+  const result = docxReplaceText(bytes, oldParagraph, newParagraph);
+  if (!result.ok) {
+    throw new Error(
+      "One paragraph could not be written back into the Word file, so nothing was " +
+        "saved. This happens when the changed line comes from a header, a footer, a " +
+        "footnote or a comment — those are shown in the reader but live outside the " +
+        `document body. Paragraph: "${snippet(oldParagraph)}"\n\n${result.error}`
+    );
+  }
+  if (result.count > 1) {
+    throw new Error(
+      `"${snippet(oldParagraph)}" appears ${result.count} times in this document, so saving ` +
+        'would change all of them. Edit it in a way that makes the line unique, or use ' +
+        '"Save as a copy".'
+    );
+  }
+  return result.bytes;
+}
+
+function changedBuffer(bytes: Uint8Array, changed: number): Buffer | null {
+  if (changed === 0) return null;
+  return Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+}
+
 /**
  * The core, split out so it is testable without a room. `null` is "the
  * edited text says exactly what the document already says" — reporting that
@@ -201,14 +236,7 @@ function snippet(s: string): string {
 export function applyParagraphEdits(bytes: Uint8Array, before: string, after: string): Buffer | null {
   const oldParas = paragraphs(before);
   const newParas = paragraphs(after);
-  if (oldParas.length !== newParas.length) {
-    throw new Error(
-      "This editor can change the wording of a Word file's paragraphs, but not add or " +
-        `remove them — the document has ${oldParas.length} and the edited text has ` +
-        `${newParas.length}. Undo the added or deleted line, or use "Save as a copy" to keep ` +
-        "this version as a separate note."
-    );
-  }
+  assertMatchingParagraphCounts(oldParas, newParas);
   let patched: Uint8Array = bytes;
   let changed = 0;
   for (let i = 0; i < oldParas.length; i++) {
@@ -221,32 +249,13 @@ export function applyParagraphEdits(bytes: Uint8Array, before: string, after: st
     // editor too, but only `word/document.xml` is rewritten — so a paragraph
     // that lives elsewhere simply won't match. Say which one rather than
     // reporting a bare failure.
-    const result = docxReplaceText(patched, oldPara, newPara);
-    if (!result.ok) {
-      throw new Error(
-        "One paragraph could not be written back into the Word file, so nothing was " +
-          "saved. This happens when the changed line comes from a header, a footer, a " +
-          "footnote or a comment — those are shown in the reader but live outside the " +
-          `document body. Paragraph: "${snippet(oldPara)}"\n\n${result.error}`
-      );
-    }
     // A paragraph repeated verbatim elsewhere in the document would be
     // rewritten in both places. Refuse instead of silently changing a line
     // the user never looked at.
-    if (result.count > 1) {
-      throw new Error(
-        `"${snippet(oldPara)}" appears ${result.count} times in this document, so saving ` +
-          'would change all of them. Edit it in a way that makes the line unique, or use ' +
-          '"Save as a copy".'
-      );
-    }
-    patched = result.bytes;
+    patched = replaceParagraph(patched, oldPara, newPara);
     changed += 1;
   }
-  if (changed === 0) {
-    return null;
-  }
-  return Buffer.isBuffer(patched) ? patched : Buffer.from(patched);
+  return changedBuffer(patched, changed);
 }
 
 // ---------------------------------------------------------------------- command

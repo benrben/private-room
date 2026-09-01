@@ -166,6 +166,44 @@ ul.tree>li>details>ul>li>.leaf{border-left:3px solid var(--accent-fill)}
 // render_mindmap_html — the recursive <details> tree builder
 // ============================================================================
 
+function mindmapLeaf(escapedLabel: string): string {
+  return `<span class="leaf">${escapedLabel}</span>`;
+}
+
+function mindmapChildrenHtml(
+  kids: Map<string, string[]>,
+  children: readonly string[],
+  depth: number,
+  seen: Set<string>,
+): string {
+  let inner = "";
+  for (const child of children) {
+    inner += "<li>";
+    inner += mindmapNodeHtml(kids, child, depth + 1, seen);
+    inner += "</li>";
+  }
+  return inner;
+}
+
+function mindmapBranch(escapedLabel: string, depth: number, inner: string): string {
+  const open = depth < 2 ? " open" : "";
+  return `<details${open}><summary>${escapedLabel}</summary><ul>${inner}</ul></details>`;
+}
+
+function mindmapNodeHtml(kids: Map<string, string[]>, label: string, depth: number, seen: Set<string>): string {
+  const escapedLabel = htmlEscape(label);
+  if (depth > 8 || seen.has(label)) {
+    return mindmapLeaf(escapedLabel);
+  }
+  seen.add(label);
+  const children = kids.get(label) ?? [];
+  const html = children.length === 0
+    ? mindmapLeaf(escapedLabel)
+    : mindmapBranch(escapedLabel, depth, mindmapChildrenHtml(kids, children, depth, seen));
+  seen.delete(label);
+  return html;
+}
+
 /**
  * D5: render a collapsible mind-map tree as a self-contained HTML page. Built
  * as STATIC nested `<details>` (native disclosure, no JavaScript) for the
@@ -196,31 +234,7 @@ export function renderMindmapHtml(title: string, root: string, nodes: readonly M
   // removed on the way back up, so two different branches may reuse the same
   // label freely; only a label reappearing among its OWN ancestors is a
   // cycle.
-  function nodeHtml(label: string, depth: number, seen: Set<string>): string {
-    const esc = htmlEscape(label);
-    if (depth > 8 || seen.has(label)) {
-      return `<span class="leaf">${esc}</span>`;
-    }
-    seen.add(label);
-    const children = kids.get(label) ?? [];
-    let out: string;
-    if (children.length === 0) {
-      out = `<span class="leaf">${esc}</span>`;
-    } else {
-      const open = depth < 2 ? " open" : "";
-      let inner = "";
-      for (const c of children) {
-        inner += "<li>";
-        inner += nodeHtml(c, depth + 1, seen);
-        inner += "</li>";
-      }
-      out = `<details${open}><summary>${esc}</summary><ul>${inner}</ul></details>`;
-    }
-    seen.delete(label);
-    return out;
-  }
-
-  const tree = `<ul class="tree"><li>${nodeHtml(root, 0, new Set<string>())}</li></ul>`;
+  const tree = `<ul class="tree"><li>${mindmapNodeHtml(kids, root, 0, new Set<string>())}</li></ul>`;
   return fillTemplate(MINDMAP_TEMPLATE, [
     ["__NOTEBOOK__", NOTEBOOK_CSS],
     ["__TITLE__", htmlEscape(title)],

@@ -132,159 +132,26 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { MediaMeta } from "../shared/apiTypes.js";
+import {
+  EMPTY_MEDIA_META,
+  codecName,
+  fourccString,
+  fractionOf,
+  isEmptyMediaMeta,
+  saneFrameRate,
+  type FfprobeOutput,
+  type FfprobeStream,
+} from "./mediaProbeMetadata.js";
+
+export {
+  EMPTY_MEDIA_META,
+  codecName,
+  fourccString,
+  isEmptyMediaMeta,
+  saneFrameRate,
+} from "./mediaProbeMetadata.js";
 
 // ------------------------------------------------------------------- MediaMeta
-
-/** `MediaMeta::default()` — every field unknown. Storing THIS in the database
- * would put a row of "unknown" that a later, better probe could never tell
- * apart from a real answer, so callers drop it instead (same reasoning as the
- * Rust doc comment on `is_empty`). */
-export const EMPTY_MEDIA_META: MediaMeta = {
-  durationSecs: null,
-  width: null,
-  height: null,
-  videoCodec: null,
-  frameRate: null,
-  bitrateKbps: null,
-  hasAudio: null,
-  audioCodec: null,
-};
-
-/** `MediaMeta::is_empty` — field-for-field equality with the all-`null`
- * struct, not a generic deep-equal, so an unrelated future field on the
- * shared type can never silently change what "empty" means here. */
-export function isEmptyMediaMeta(meta: MediaMeta): boolean {
-  return (
-    meta.durationSecs === null &&
-    meta.width === null &&
-    meta.height === null &&
-    meta.videoCodec === null &&
-    meta.frameRate === null &&
-    meta.bitrateKbps === null &&
-    meta.hasAudio === null &&
-    meta.audioCodec === null
-  );
-}
-
-// --------------------------------------------------------------------- codecs
-
-/**
- * `codec_name`, ported verbatim as a lookup table (a `Map`, per this
- * migration's rule 2 — the key comes from a file the room does not control
- * the container of, and a plain `{}` literal keyed by it is the exact
- * `"__proto__"`-pollution shape already found four times in this codebase).
- * Anything absent from the table stays the raw tag verbatim in the UI — an
- * unrecognized codec is a fact about our table, not about the file.
- */
-const CODEC_NAMES: ReadonlyMap<string, string> = new Map([
-  ["avc1", "H.264"],
-  ["avc3", "H.264"],
-  ["hvc1", "HEVC"],
-  ["hev1", "HEVC"],
-  ["vp09", "VP9"],
-  ["av01", "AV1"],
-  ["mp4v", "MPEG-4"],
-  ["jpeg", "Motion JPEG"],
-  ["apch", "Apple ProRes"],
-  ["apcn", "Apple ProRes"],
-  ["apcs", "Apple ProRes"],
-  ["apco", "Apple ProRes"],
-  ["ap4h", "Apple ProRes"],
-  ["ap4x", "Apple ProRes"],
-  ["aac", "AAC"],
-  ["mp4a", "AAC"],
-  [".mp3", "MP3"],
-  ["mp3", "MP3"],
-  ["lpcm", "Linear PCM"],
-  ["alac", "Apple Lossless"],
-  ["opus", "Opus"],
-]);
-
-export function codecName(fourcc: string): string {
-  return CODEC_NAMES.get(fourcc) ?? fourcc;
-}
-
-/** ffmpeg's own placeholder for a `codec_tag_string` that is not printable
- * ASCII — each byte of the raw tag shown as a bracketed decimal, e.g.
- * `"[0][0][0][0]"` for an unset tag or `"[1][0][0][0]"` for WAV/AIFF PCM's
- * numeric `wFormatTag` (1 = `WAVE_FORMAT_PCM`). Neither is a fourcc a viewer
- * should show, so both are treated as "no tag" here — see {@link trackCodec}
- * for what that costs a plain WAV file specifically. */
-const FFMPEG_UNTAGGED = /^(\[-?\d+\])+$/;
-
-/**
- * `fourcc_string`, adapted to the shape THIS engine hands over: ffprobe's
- * `codec_tag_string` arrives already decoded to a string (Rust decoded four
- * raw bytes out of a `CMFormatDescription` itself). Still rejects the same
- * "not printable ASCII" case Rust's `(0x20..0x7f).contains(b)` byte check
- * does, applied per character (identical for the ASCII range both operate
- * in), plus {@link FFMPEG_UNTAGGED} — a case Rust never had, since
- * AVFoundation's FourCharCode is either a real tag or absent, never a
- * placeholder string.
- */
-export function fourccString(tag: string | null | undefined): string | null {
-  if (tag === null || tag === undefined) return null;
-  for (let i = 0; i < tag.length; i++) {
-    const code = tag.charCodeAt(i);
-    if (code < 0x20 || code >= 0x7f) return null;
-  }
-  if (FFMPEG_UNTAGGED.test(tag)) return null;
-  const trimmed = tag.trim();
-  return trimmed.length > 0 ? trimmed : null;
-}
-
-// ---------------------------------------------------------------- frame rate
-
-/**
- * `sane_frame_rate`, ported verbatim. AVFoundation returns 0 for a container
- * that states none; ffprobe's fraction fields (`r_frame_rate`/
- * `avg_frame_rate`) collapse to the same "0/1" or "0/0" shape for the same
- * reason, and {@link fractionOf} already turns either into `null` before this
- * runs. The upper bound rejects nonsense without rejecting real high-speed
- * capture (240 fps slow motion is a normal iPhone file — and this app's own
- * test fixture, the Sonoma wallpaper `.mov`, genuinely is one).
- */
-export function saneFrameRate(fps: number): number | null {
-  return Number.isFinite(fps) && fps > 0 && fps <= 1000 ? Math.round(fps * 100) / 100 : null;
-}
-
-/** `"30000/1001"` → `29.97002997...`, `null` for anything that is not
- * exactly `int/int` with a non-zero denominator — ffprobe's own shape for "no
- * value" (`"0/0"`) falls out of the zero-denominator guard for free. */
-function fractionOf(raw: string | undefined): number | null {
-  if (raw === undefined) return null;
-  const m = /^(-?\d+)\/(-?\d+)$/.exec(raw.trim());
-  if (m === null) return null;
-  const den = Number(m[2]);
-  if (den === 0) return null;
-  return Number(m[1]) / den;
-}
-
-// ------------------------------------------------------------------ ffprobe
-
-/** ffprobe's own `-show_streams -show_format` shape, narrowed to the fields
- * this module actually reads. Every field is genuinely optional in ffprobe's
- * own output (a WAV has no `r_frame_rate` semantics, a raw stream may have no
- * `bit_rate`), so this mirrors that with `?:` rather than asserting fields
- * that are not always there. */
-interface FfprobeStream {
-  codec_type?: string;
-  codec_name?: string;
-  codec_tag_string?: string;
-  width?: number;
-  height?: number;
-  r_frame_rate?: string;
-  avg_frame_rate?: string;
-  bit_rate?: string;
-  duration?: string;
-  tags?: { rotate?: string };
-  side_data_list?: Array<{ rotation?: number }>;
-}
-
-interface FfprobeOutput {
-  streams?: FfprobeStream[];
-  format?: { duration?: string };
-}
 
 /** ffprobe's `side_data_list[].rotation` (newer, a signed degree value) with
  * `tags.rotate` (older, a string) as the fallback — the two shapes real
@@ -292,15 +159,30 @@ interface FfprobeOutput {
  * (no rotation stated) when neither is present, matching an untransformed
  * `AVAssetTrack`. */
 function rotationOf(stream: FfprobeStream): number {
-  for (const sd of stream.side_data_list ?? []) {
-    if (typeof sd.rotation === "number" && Number.isFinite(sd.rotation)) return sd.rotation;
+  return sideDataRotation(stream.side_data_list) ?? tagRotation(stream.tags) ?? 0;
+}
+
+function sideDataRotation(entries: unknown): number | null {
+  if (!Array.isArray(entries)) return null;
+  for (const entry of entries) {
+    const rotation = sideDataEntryRotation(entry);
+    if (rotation !== null) return rotation;
   }
-  const tag = stream.tags?.rotate;
-  if (tag !== undefined) {
-    const n = Number(tag);
-    if (Number.isFinite(n)) return n;
-  }
-  return 0;
+  return null;
+}
+
+function sideDataEntryRotation(entry: unknown): number | null {
+  if (typeof entry !== "object" || entry === null) return null;
+  return finiteNumber((entry as Record<string, unknown>).rotation);
+}
+
+function tagRotation(tags: FfprobeStream["tags"]): number | null {
+  if (tags?.rotate === undefined) return null;
+  return finiteNumber(Number(tags.rotate));
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 /** Nearest axis-aligned quarter turn, in `[0, 360)`. See this module's own
@@ -381,41 +263,73 @@ function durationSecsOf(raw: string | undefined): number | null {
  * that we probed a video").
  */
 export function parseFfprobeOutput(stdout: string): MediaMeta | null {
-  let parsed: unknown;
+  const output = parseFfprobeDocument(stdout);
+  if (output === null) return null;
+  const tracks = mediaTracks(output);
+  if (tracks.video === undefined && tracks.audio === undefined) return null;
+  const meta = mediaMetaForTracks(output, tracks.audio);
+  return tracks.video === undefined ? nonEmptyMeta(meta) : videoMeta(meta, tracks.video);
+}
+
+function parseFfprobeDocument(stdout: string): FfprobeOutput | null {
   try {
-    parsed = JSON.parse(stdout);
+    return ffprobeOutput(JSON.parse(stdout));
   } catch {
     return null;
   }
-  if (typeof parsed !== "object" || parsed === null) return null;
-  const out = parsed as FfprobeOutput;
-  const streams = Array.isArray(out.streams) ? out.streams : [];
-  const video = streams.find((s) => s.codec_type === "video");
-  const audio = streams.find((s) => s.codec_type === "audio");
-  if (video === undefined && audio === undefined) return null;
+}
 
-  const meta: MediaMeta = {
+function ffprobeOutput(value: unknown): FfprobeOutput | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as FfprobeOutput)
+    : null;
+}
+
+function mediaTracks(output: FfprobeOutput): { video: FfprobeStream | undefined; audio: FfprobeStream | undefined } {
+  const streams = ffprobeStreams(output.streams);
+  return { video: trackOfType(streams, "video"), audio: trackOfType(streams, "audio") };
+}
+
+function ffprobeStreams(value: unknown): FfprobeStream[] {
+  return Array.isArray(value) ? value.filter(isFfprobeStream) : [];
+}
+
+function isFfprobeStream(value: unknown): value is FfprobeStream {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function trackOfType(streams: readonly FfprobeStream[], type: string): FfprobeStream | undefined {
+  return streams.find((stream) => stream.codec_type === type);
+}
+
+function mediaMetaForTracks(output: FfprobeOutput, audio: FfprobeStream | undefined): MediaMeta {
+  return {
     ...EMPTY_MEDIA_META,
     hasAudio: audio !== undefined,
     audioCodec: trackCodec(audio),
-    durationSecs: durationSecsOf(out.format?.duration),
+    durationSecs: durationSecsOf(output.format?.duration),
   };
-  if (video !== undefined) {
-    const size = displaySize(video);
-    if (size !== null) {
-      meta.width = size.width;
-      meta.height = size.height;
-    }
-    meta.videoCodec = trackCodec(video);
-    const fraction = fractionOf(video.r_frame_rate) ?? fractionOf(video.avg_frame_rate);
-    meta.frameRate = fraction === null ? null : saneFrameRate(fraction);
-    meta.bitrateKbps = bitrateKbpsOf(video);
-  }
-  // Belt-and-suspenders, matching the Rust source's own
-  // `(!meta.is_empty()).then_some(meta)` after the very same track check —
-  // `hasAudio` is always `Some`/non-null once a stream exists, so this never
-  // actually trips today, exactly as it never trips in the Rust source
-  // either; kept for the same reason Rust keeps it.
+}
+
+function videoMeta(meta: MediaMeta, video: FfprobeStream): MediaMeta | null {
+  const fraction = fractionOf(video.r_frame_rate) ?? fractionOf(video.avg_frame_rate);
+  const enriched: MediaMeta = {
+    ...meta,
+    ...videoSize(video),
+    videoCodec: trackCodec(video),
+    frameRate: fraction === null ? null : saneFrameRate(fraction),
+    bitrateKbps: bitrateKbpsOf(video),
+  };
+  return nonEmptyMeta(enriched);
+}
+
+function videoSize(video: FfprobeStream): Partial<MediaMeta> {
+  const size = displaySize(video);
+  return size === null ? {} : size;
+}
+
+function nonEmptyMeta(meta: MediaMeta): MediaMeta | null {
+  // Belt-and-suspenders, matching Rust's `(!meta.is_empty()).then_some(meta)`.
   return isEmptyMediaMeta(meta) ? null : meta;
 }
 
@@ -445,16 +359,30 @@ function defaultIsFile(p: string): boolean {
  * in it. */
 function findBinary(name: "ffmpeg" | "ffprobe", opts: FindBinaryOptions = {}): string | null {
   const isFile = opts.isFile ?? defaultIsFile;
-  const candidates: string[] = [
+  return binaryCandidates(name, binaryPath(opts)).find(isFile) ?? null;
+}
+
+function binaryPath(opts: FindBinaryOptions): string {
+  return opts.pathEnv ?? process.env.PATH ?? "";
+}
+
+function binaryCandidates(name: "ffmpeg" | "ffprobe", pathEnv: string): string[] {
+  return [...explicitBinaryCandidates(name), ...pathBinaryCandidates(name, pathEnv)];
+}
+
+function explicitBinaryCandidates(name: "ffmpeg" | "ffprobe"): string[] {
+  return [
     `/opt/homebrew/bin/${name}`,
     `/usr/local/bin/${name}`,
     `/opt/local/bin/${name}`,
   ];
-  const pathEnv = opts.pathEnv ?? process.env.PATH ?? "";
-  for (const dir of pathEnv.split(path.delimiter)) {
-    if (dir) candidates.push(path.join(dir, name));
-  }
-  return candidates.find(isFile) ?? null;
+}
+
+function pathBinaryCandidates(name: "ffmpeg" | "ffprobe", pathEnv: string): string[] {
+  return pathEnv
+    .split(path.delimiter)
+    .filter((dir) => dir.length > 0)
+    .map((dir) => path.join(dir, name));
 }
 
 export function findFfmpeg(opts?: FindBinaryOptions): string | null {

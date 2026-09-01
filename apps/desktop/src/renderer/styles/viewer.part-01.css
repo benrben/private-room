@@ -1,0 +1,500 @@
+/* ---------- viewer (middle pane) ----------
+   THE READING ROOM. Everything the app can open is drawn here, and the whole
+   promise of the product is that what you see is the file.
+
+   THE ONE IDEA: the centre pane is the notebook's sheet, and a document is a
+   SHEET OF PAPER LAID ON IT. That is the single deliberate exception to
+   paper.css's "only floating things get a fill" rule, and it is exact rather
+   than decorative — a page of prose really is a physical object sitting on a
+   desk, and the frame-on-the-grid treatment that suits a pane suits a document
+   badly (a wall of text with no ground under it reads as a dump, not a page).
+   The paper is TRANSLUCENT so the dotted grid still whispers through it, which
+   is what keeps it a sheet on the notebook rather than an opaque box over it.
+
+   TWO KINDS OF DOCUMENT, and the difference decides everything below:
+
+     documents made of TEXT  (.md, .txt, .eml, .ipynb) — the app draws them,
+       so the app gives them paper. See "THE DOCUMENT SHEET".
+
+     documents that BRING their own paper (PDF pages, Word sections, slides,
+       an e-book chapter, a saved web page) — they are rendered by pdf.js,
+       docx-preview, macOS or a sandboxed frame, on the ground their author
+       chose. We give those a COLUMN and a ground to sit on, and we never
+       repaint them. Dark mode does not invert an authored page here: a
+       document written on white stays on white, because a theme that flips
+       an author's own colours produces black-on-charcoal body text the first
+       time a document sets a colour and not a background.
+
+   Local custom properties live on `.viewer` rather than in tokens.css: they
+   are this pane's vocabulary, nothing outside the reading room consumes them,
+   and tokens.css is not ours to edit. They resolve entirely through canonical
+   tokens, so they flip with the theme without a light-mode block. */
+
+.viewer {
+  flex: 1.15;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  /* The positioning context for `.viewer-opening`, which reports a file being
+     fetched without displacing whatever is on screen. */
+  position: relative;
+
+  /* ----- the reading room's own vocabulary -----
+     The sheet. --surface is already "warm paper" in both themes by design —
+     ivory #FAF8F1 on light, matte warm charcoal #202321 on dark — so the one
+     recipe reads correctly in both without a per-theme override. At 88% the
+     grid shows through at a whisper: enough that the page is ON the notebook,
+     far too little to disturb a run of text. */
+  --doc-paper: color-mix(in srgb, var(--surface) 88%, transparent);
+  /* The drawn edge of the sheet. Decorative framing, not a control boundary,
+     so it sits below the 3:1 a control would owe — same reasoning as
+     .nb-card's 72% pen, one step quieter because a document's edge should
+     never compete with the words inside it. */
+  --doc-edge: color-mix(in srgb, var(--sketch) 46%, transparent);
+  /* The measure, including the sheet's own side padding. ~72ch of text is the
+     long-standing reading measure; the extra is the margin of the page. */
+  --doc-measure: 86ch;
+  --doc-pad-i: var(--sp-8);
+  --doc-pad-b: var(--sp-8);
+}
+
+/* A narrow centre pane is a phone-shaped column: the page's margins are the
+   first thing to give, never its text. */
+@media (max-width: 720px) {
+  .viewer {
+    --doc-pad-i: var(--sp-4);
+  }
+}
+
+.viewer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px var(--sp-4);
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.viewer-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The desk the sheet is laid on. The gutter is the notebook margin around the
+   page, so it is real space rather than the 18px the pane used to give. */
+.viewer-body {
+  flex: 1;
+  overflow: auto;
+  padding: var(--sp-6) var(--sp-6) var(--sp-8);
+  /* The document itself (P0-3) — explicit so a file's content stays
+     selectable even though `.viewer-head`/`.editor-breadcrumb-bar` above it
+     (shell.css) are not. */
+  user-select: text;
+}
+
+.viewer-body img {
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+}
+
+/* A bare <pre> in the viewer is TECHNICAL text — a raw dump, a stack trace,
+   a wire format — and mono is the honest face for it. --mono is the bundled
+   IBM Plex Mono with the platform fallbacks behind it; the old literal stack
+   skipped the app's own face.
+
+   WATCH THE SPECIFICITY. This is `.viewer-body pre` = (0,1,1), which beats a
+   plain class, and several things in this pane are prose that merely LIVES in
+   a <pre> — an email body, the words read out of a Word file, a web page's
+   text. Every one of those has to be written at two classes or more to get
+   out of here; `.eml-body`'s `font-family: inherit` sat under this rule and
+   lost, which is why a saved letter has been rendering in 13px monospace. */
+.viewer-body pre {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-size: var(--fs-meta);
+  line-height: 1.6;
+  margin: 0;
+  font-family: var(--mono);
+}
+
+/* ==========================================================================
+   THE DOCUMENT SHEET
+   The documents this app draws ITSELF get paper. The list is explicit rather
+   than a blanket rule on `.viewer-host > *`, because the same slot also holds
+   a spreadsheet grid, a waveform, a picture and a room map — none of which is
+   a page and all of which would look absurd inside one.
+
+   `.viewer-host` is what ViewerRouter wraps a PREVIEW in. Edit mode returns
+   its editor without that wrapper, so scoping here cannot leak into a buffer
+   the user is typing in, and `.md-body` in a chat bubble is untouched — which
+   matters, because MarkdownView renders every AI answer in the app.
+   ========================================================================== */
+.viewer-host > .prose-view,
+.viewer-host > .md-body,
+.viewer-host > .eml-view,
+.viewer-host > .nb-view {
+  max-width: var(--doc-measure);
+  margin-inline: auto;
+  padding: var(--doc-pad-b) var(--doc-pad-i) calc(var(--doc-pad-b) * 2);
+  background: var(--doc-paper);
+  border: var(--stroke-w) solid var(--doc-edge);
+  /* Drawn, not computed — the asymmetric radii are the whole hand-made-
+     rectangle trick from tokens.css. */
+  border-radius: var(--radius-lg);
+}
+
+/* Documents that arrive already on paper — PDF pages, Word sections, a slide,
+   a sandboxed page — are NOT in that list, and deliberately get no measure of
+   their own. Their width is a physical fact of the file (a US Letter page is
+   816px at 96dpi, A4 is 794, and the zoom control multiplies it), so clamping
+   them to a reading measure would either shrink the page or make it overflow
+   its own container. They centre themselves and the pane scrolls. */
+
+/* ==========================================================================
+   THE READER SHELL  (.rdr-*)
+   The chrome a document reader draws AROUND a document: a mode strip, a
+   compact source card, a reading-progress stroke, a margin column. Shared so
+   the HTML reader, the note reader and the plain-text reader are recognisably
+   one surface instead of three toolbars that happen to be near each other.
+
+   Everything here is transparent. The document is the only thing on this
+   pane allowed to have a ground.
+   ========================================================================== */
+
+/* The mode strip. A pencil rule under it, nothing else — a filled toolbar
+   over a sheet of paper is the exact "stack of grey boxes" the notebook is a
+   reaction to. */
+.rdr-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  padding: var(--sp-2) var(--sp-4);
+  background: transparent;
+  /* The hand-drawn divider from paper.css, as a background so it can fade at
+     both ends the way a pencil stroke does. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+
+/* The modes themselves. Active is the marker underline — the app's ONE active
+   signal, per paper.css — never a filled tab. */
+.rdr-modes {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+.rdr-mode {
+  position: relative;
+  min-height: 24px;
+  padding: 3px 2px;
+  font: inherit;
+  font-size: var(--fs-meta);
+  color: var(--muted);
+  background: none;
+  border: 0;
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-pen);
+}
+.rdr-mode:hover {
+  color: var(--text);
+}
+.rdr-mode[aria-pressed="true"] {
+  color: var(--text-strong);
+}
+.rdr-mode[aria-pressed="true"]::after {
+  content: "";
+  position: absolute;
+  left: -2px;
+  right: -2px;
+  bottom: -1px;
+  height: 3px;
+  border-radius: 2px 3px 2px 4px / 3px 2px 4px 2px;
+  background: linear-gradient(
+    92deg,
+    var(--accent-fill) 0%,
+    color-mix(in srgb, var(--accent-fill) 72%, transparent) 68%,
+    color-mix(in srgb, var(--accent-fill) 28%, transparent) 100%
+  );
+  animation: nb-draw var(--dur) var(--ease-pen);
+  pointer-events: none;
+}
+.rdr-mode:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Pushes the trailing action (Open in browser, Re-read…) to the far end. */
+.rdr-bar-end {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+/* ----- the compact information note -----
+   Where a technical notice goes once it has stopped being a banner: a small
+   drawn card in the margin of the chrome, in sans (it is an INSTRUCTION, and
+   the hand is never used for those). */
+.rdr-note {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  max-width: 46ch;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  line-height: var(--lh-body);
+}
+.rdr-note strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* ----- reading progress -----
+   A thin marker stroke wiped across the top of the page as you read down it.
+   Sticky rather than fixed so it belongs to the document and cannot end up
+   floating over an unrelated pane, and `--nb-val` is driven from the reader's
+   REAL scroll position — a progress mark that is decorative is a lie.
+
+   aria-hidden in the markup: the position is already stated in words next to
+   it ("page 4 of 21", "chapter 3 of 12"), and a bar that announces a
+   percentage on every scroll frame is unusable with a screen reader. */
+.rdr-progress {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  height: 3px;
+  margin-bottom: var(--sp-4);
+  border-radius: 999px;
+  /* Opaque, unusually for this system: it is sticky, so text scrolls UNDER it,
+     and a translucent 3px strip with words showing through reads as a
+     rendering fault. --surface is the paper the sheet is already made of, so
+     the strip disappears into the page's top margin when it is not carrying a
+     stroke. The unfilled remainder is the pencil track. */
+  background-color: var(--surface);
+  background-image: linear-gradient(
+    to right,
+    color-mix(in srgb, var(--rule) 45%, transparent) 0 100%
+  );
+  pointer-events: none;
+}
+.rdr-progress > i {
+  display: block;
+  width: var(--nb-val, 0%);
+  height: 100%;
+  border-radius: inherit;
+  /* The highlighter's uneven alpha ramp, so it reads as a stroke laid down by
+     a chisel tip rather than as a loading bar. */
+  background-image: linear-gradient(
+    99deg,
+    color-mix(in srgb, var(--accent-fill) 78%, transparent) 0%,
+    color-mix(in srgb, var(--accent-fill) 54%, transparent) 48%,
+    color-mix(in srgb, var(--accent-fill) 72%, transparent) 90%,
+    color-mix(in srgb, var(--accent-fill) 44%, transparent) 100%
+  );
+}
+
+/* ----- deliberately absent: reader-made notes, quotes and margin annotations
+   A research reader wants handwritten margin notes, highlights the READER
+   draws, and a connector tying a note to the passage it comments on. There is
+   no styling for any of that here, and that is on purpose: every one of them
+   is user data, and this app has nowhere to keep it. There is no per-file
+   annotation table in src-tauri/src/db/schema.rs, no command that writes one,
+   and nothing in src/api.ts that could reach one.
+
+   A session-only version is the obvious shortcut and the wrong one — a note
+   the user writes in their reader and loses when they open the next file is
+   worse than a reader that never offered to take one. So the room for it
+   exists (the sheet has real margins, `.rdr-bar` has space for another mode)
+   and the feature does not, until there is somewhere to put a note.
+
+   What DOES ship is every mark the app can already prove, because it comes
+   from the file rather than from the reader: the cited passage in a PDF
+   (`.pdf-page-box .pdf-hl`) and a <mark> inside a document (`.md-body mark`)
+   are both drawn as true marker strokes now instead of flat washes. */
+
+@media (prefers-reduced-motion: reduce) {
+  .rdr-mode[aria-pressed="true"]::after {
+    animation: none;
+  }
+}
+
+.viewer-body.fill {
+  padding: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ViewerRouter wraps EVERY preview in `.viewer-host`, and that class had no
+ * rule of its own — so inside a `fill` body it was an auto-height block sitting
+ * in a flex column. A viewer whose root asks for `height: 100%` then resolved
+ * against auto and got auto back, and the height it was promised never arrived.
+ *
+ * The visible symptom was a `.doc` rendering as a 150px band with the rest of
+ * the pane empty: 150px is an iframe's DEFAULT height, which is what you get
+ * when `flex: 1` has no definite height to divide up. Every viewer in
+ * FILL_HEIGHT_KINDS depended on this working.
+ *
+ * `min-height: 0` on both levels is the part that is easy to miss: a flex item
+ * refuses to shrink below its content by default, so a long document would push
+ * the pane instead of scrolling inside it. */
+.viewer-body.fill > .viewer-host {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+.viewer-body.fill > .viewer-host > * {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+
+.viewer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* P1-4: the file's own core verbs (Edit, Run, Export, Minutes) — the plain
+   button default already draws the outlined-pill "real button" look (see
+   base.css), so this only adds the bold label weight that marks them apart
+   from the quiet .subtle text and the icon-only Rename/Close beside them.
+   Never filled ink: two or three of these sit side by side, and a filled
+   button is this system's ONE strong CTA (base.css `button.primary`) — a row
+   of them would compete with itself. Same restraint as `.script-go`, the
+   other place a toolbar-weight action already existed. */
+.viewer-primary {
+  font-weight: 600;
+  font-size: var(--fs-meta);
+}
+
+/* Full-size host for the Room Map in the center pane (RoomMap fills this). */
+.room-map-canvas {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  background: var(--bg);
+}
+
+/* ---- Wave 2: data safety (ADD-1/2/3, HLT-6) ---- */
+
+/* Files-pane header actions (Export all… + Add). */
+.side-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ADD-2 / P1-4 — anchors both popovers this corner of the toolbar owns: the
+   "..." overflow menu itself, and the version-history panel (`.history-pop`)
+   that used to hang off its own History button and now hangs off this one
+   instead — same corner, same panel, nothing inside it changed. Renamed from
+   `.history-wrap`: it was never anyone else's, but naming it for the one
+   thing it held stopped being accurate the day a second thing moved in. */
+.viewer-overflow-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+/* The "..." overflow menu's own items reuse `.pop-menu` / `.pop-item`
+   (workspace.css) — the same shell the room menu and model picker already
+   use — plus two rows of its own: a plain divider, and the encoding picker,
+   which holds a <select> rather than being a button itself and so skips the
+   button rows' hover wash. */
+.viewer-overflow-menu .pop-menu-sep {
+  height: 1px;
+  margin: var(--sp-1) 6px;
+  background: var(--line-soft);
+}
+.viewer-overflow-menu .viewer-enc-row {
+  padding: 6px 10px 7px;
+}
+.viewer-overflow-menu .viewer-enc-row .encoding-label {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+}
+.viewer-overflow-menu .viewer-enc-row .encoding-lede {
+  font-size: var(--fs-micro);
+  color: var(--muted);
+}
+.viewer-overflow-menu .viewer-enc-row .encoding-select {
+  width: 100%;
+  max-width: none;
+}
+
+/* A popover genuinely floats, so it is one of the few things allowed an
+   opaque fill (paper.css section 9). Same recipe as `.nb-float`, written out
+   because the markup is not ours to add a class to. The shadow comes from the
+   theme rather than a literal black, which was invisible on ivory paper. */
+.history-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  width: 280px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 6px;
+  background: var(--raised);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  box-shadow:
+    0 12px 30px var(--shadow),
+    0 2px 6px var(--shadow-lift);
+}
+
+.history-empty {
+  padding: var(--sp-3) 10px;
+  color: var(--text-dim);
+  font-size: var(--fs-meta);
+}
+
+.history-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
+}
+
+.history-row:hover {
+  background: var(--panel);
+}
+
+.history-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.history-cause {
+  font-size: var(--fs-meta);
+}

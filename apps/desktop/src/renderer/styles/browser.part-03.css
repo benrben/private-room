@@ -1,0 +1,500 @@
+
+
+/* The node. Filled in --page so the dash passes behind it rather than through
+   it; the ring is --rule-strong, the 3:1 stroke, because on a journal the
+   node is what says "an entry is here". */
+.browser-journal-list > li::before {
+  content: "";
+  position: absolute;
+  left: -19px;
+  top: 15px;
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid var(--rule-strong);
+  border-radius: 50%;
+  background: var(--page);
+  pointer-events: none;
+}
+
+/* A refused navigation and a failure are the two rows a user scans for, so
+   their node is FILLED — a shape difference, not only a hue. */
+.browser-journal-list > li[data-kind="blocked"]::before,
+.browser-journal-list > li[data-kind="blocker"]::before,
+.browser-journal-list > li[data-kind="error"]::before {
+  border-color: var(--sem-urgent);
+  background: var(--sem-urgent);
+}
+
+.browser-journal-list > li[data-kind="consent"]::before {
+  border-color: var(--sem-pending);
+  background: var(--sem-pending);
+}
+
+/* The kind, as a strip of tape. --ink on a 34% wash measures 7.8:1 in dark
+   and better in light, so the WORD carries the meaning and the colour only
+   reinforces it. */
+.browser-journal .jk {
+  --mk: var(--sem-linked-fill);
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  padding: 1px var(--sp-2);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--mk) 34%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--mk) 46%, transparent);
+  border-radius: 2px 3px 2px 4px / 4px 2px 3px 2px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* The whole kind vocabulary Rust can write (browse.rs), mapped onto the
+   product's marker meanings once, here, rather than case by case:
+     blocked / blocker / error   urgent    refused or failed
+     consent                     pending   a moment that needed your word
+     save / download             saved     something landed in the room
+     everything else             linked    the agent moved or read a page */
+.browser-journal li[data-kind="blocked"] .jk,
+.browser-journal li[data-kind="blocker"] .jk,
+.browser-journal li[data-kind="error"] .jk {
+  --mk: var(--sem-urgent-fill);
+}
+
+.browser-journal li[data-kind="consent"] .jk {
+  --mk: var(--sem-pending-fill);
+}
+
+.browser-journal li[data-kind="save"] .jk,
+.browser-journal li[data-kind="download"] .jk {
+  --mk: var(--sem-saved-fill);
+}
+
+/* What was done — the annotation beside the record. Full ink, not the
+   secondary tier: this is how a user audits what an agent did on their behalf,
+   and it has to be the most readable thing in the row.
+
+   The SANS, despite reading as an annotation, because Rust interpolates real
+   user strings into it — `Searched for "{query}"`, `Saved "{name}"` (see
+   browse/search.rs). The element carries dir="auto" for exactly that reason.
+   Kalam ships latin + latin-ext only and every fallback behind it is Latin
+   too, so a Hebrew query or a CJK page title would drop to the system
+   last-resort face mid-sentence. The hand belongs on the FIXED English
+   annotations in this view (.browser-journal-empty, .bstart-aside-note),
+   never on something a person typed. */
+.browser-journal .jd {
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+
+/* A refusal or a failure is the machine's own words, not an annotation: Rust
+   writes "<tool> failed: <error>" into these rows, and a long technical
+   message set in the hand would be the exact misuse the type rules forbid.
+   They keep the interface sans. */
+.browser-journal li[data-kind="error"] .jd,
+.browser-journal li[data-kind="blocked"] .jd,
+.browser-journal li[data-kind="blocker"] .jd {
+  font-family: var(--sans);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+
+/* The address it happened to. Mono and never the hand: a URL is technical
+   data, and a record you cannot read character by character is not a record.
+   It wraps rather than truncates for the same reason. */
+.browser-journal .ju {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+/* Tabular figures, so a column of instants lines up. */
+.browser-journal time {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ==========================================================================
+   7. THE READING VIEW — the page as text
+   A PANEL, never an overlay: the same rule the journal follows and the one
+   thing about this view that must not change. The native page keeps a real
+   (merely narrower) layout viewport beside it, which is what makes the text
+   it reports the whole page rather than a 1px-wide reflow of it.
+
+   The markup lives in workspace/BrowserReader.tsx, which this stylesheet does
+   not own — every selector below keys off the class names that component
+   already uses.
+   ========================================================================== */
+
+.browser-reader {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 18px 22px 44px;
+  border-left: 1px solid var(--line);
+  background: transparent;
+  overflow-y: auto;
+}
+
+/* THE READING VIEW REPLACES THE PAGE; `split` is the exception.
+   It used to hold the live page at a permanent 320px sliver, so reading a page
+   meant looking at two copies of it and having room for neither (audit P2).
+   The stage collapses to nothing while the text has the floor — the native view
+   is parked at 1×1 to match, so the hole must not reserve width it is not
+   using.
+
+   `split` is set for exactly two reasons, both in BrowserView: the user pressed
+   `Compare with page`, or an extraction is in flight and the page needs a real
+   layout viewport to be read from. 320px is the width that made the second case
+   safe (Rust refuses anything under 200px) and it stays that width. */
+.browser-body.reading .browser-stage {
+  flex: 0 0 0;
+  min-width: 0;
+}
+
+.browser-body.reading.split .browser-stage {
+  flex: 0 0 320px;
+}
+
+.browser-reader-head {
+  padding-bottom: var(--sp-4);
+  margin-bottom: var(--sp-4);
+  /* The masthead rule of the reading sheet, thinning at both ends the way a
+     pencil stroke drawn against a straight edge does. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line) 2%,
+    var(--line) 97%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1.5px;
+  background-position: left bottom;
+}
+
+.browser-reader-head h1 {
+  margin: 0 0 var(--sp-2);
+  color: var(--text-strong);
+  font-size: var(--fs-section);
+  font-family: var(--display);
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+
+.browser-reader-head h1:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+/* WHERE the text came from, and whether the wire was encrypted. Sans for the
+   sentence; mono for the HOST alone, because that is the address and the
+   origin is the fact this line exists to state. The component gives the host
+   the first span and nothing to key off but its position, so the selector
+   uses it. Not shrunk below the metadata rung — "anything typed into this
+   page travels in the clear" is not a footnote. */
+.browser-reader-where {
+  margin: 0 0 var(--sp-2);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  overflow-wrap: anywhere;
+}
+
+.browser-reader-where > span:first-child {
+  color: var(--text);
+  font-family: var(--mono);
+}
+
+.browser-reader-where .sep {
+  margin: 0 6px;
+  color: var(--faint);
+}
+
+/* An explanation of what the reading view is — sans, at the metadata rung. */
+.browser-reader-note {
+  margin: 0 0 var(--sp-3);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+
+.browser-reader-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.browser-reader-tools .browser-btn {
+  border-color: var(--rule-strong);
+}
+
+/* The reading measure. This is a DOCUMENT, so it gets the room's reading
+   settings — a capped measure, body type, and generous leading — rather than
+   the interface's density. */
+.browser-reader-body {
+  max-width: 72ch;
+  color: var(--text);
+  font-size: 14.5px;
+  line-height: 1.7;
+}
+
+.browser-reader-body h1,
+.browser-reader-body h2,
+.browser-reader-body h3,
+.browser-reader-body h4 {
+  margin: var(--sp-6) 0 var(--sp-2);
+  color: var(--text-strong);
+  line-height: 1.3;
+}
+
+.browser-reader-body p,
+.browser-reader-body ul,
+.browser-reader-body ol,
+.browser-reader-body blockquote {
+  margin: 0 0 var(--sp-3);
+}
+
+.browser-reader-body ul,
+.browser-reader-body ol {
+  padding-left: 22px;
+}
+
+.browser-reader-body li {
+  margin: 3px 0;
+}
+
+/* A quoted passage is marked in the margin the way one is in a book. */
+.browser-reader-body blockquote {
+  padding-left: var(--sp-3);
+  border-left: 2px solid var(--rule);
+  color: var(--muted);
+}
+
+.browser-reader-body table {
+  border-collapse: collapse;
+  margin: 0 0 var(--sp-4);
+  display: block;
+  overflow-x: auto;
+}
+
+.browser-reader-body th,
+.browser-reader-body td {
+  padding: 5px 9px;
+  border: 1px solid var(--line);
+  text-align: left;
+}
+
+.browser-reader-body th {
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+/* Code keeps the mono face and a paper wash — never the hand, and never
+   reflowed: it scrolls in its own box so the source stays exactly as it is. */
+.browser-reader-body pre {
+  overflow-x: auto;
+  padding: 10px var(--sp-3);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--raised) 70%, transparent);
+  border: 1px solid var(--line-soft);
+  font-family: var(--mono);
+}
+
+/* Inside a block, the wash and the padding base.css gives an inline <code>
+   would repeat behind every line and inset the first one. The block already
+   carries both. */
+.browser-reader-body pre code {
+  padding: 0;
+  background: none;
+  border-radius: 0;
+  font-size: inherit;
+}
+
+.browser-reader-body a {
+  color: var(--accent);
+  text-decoration-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  text-underline-offset: 2px;
+}
+
+/* Links in the text are the navigation for a keyboard user, so the focus ring
+   has to be unmissable — this is the one place it does real work. */
+.browser-reader-body a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px 2px 4px 2px / 2px 4px 2px 3px;
+}
+
+.browser-reader-error {
+  padding: 10px var(--sp-3);
+  color: var(--sem-urgent);
+  border: 1px solid var(--sem-urgent);
+  border-radius: var(--radius-sm);
+}
+
+/* How much of the page is on screen. A sentence, so it stays in the sans —
+   only the figures are made tabular, so the count does not jitter as more of
+   the page arrives. A reader that silently stopped would present a slice as
+   the whole page, which is why this line exists at all. */
+.browser-reader-more {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-6);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ==========================================================================
+   8. THE SCREEN-READER COMMENTARY
+   The page is a native layer: it repaints without a single DOM change, so
+   without this a screen-reader user is never told that anything happened.
+   ========================================================================== */
+
+.browser-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  margin: 0;
+}
+
+/* ==========================================================================
+   9. THE OUTBOUND CONSENT CARD
+   Lives in the AI pane, never over the page (see the file header). This is
+   the OUTBOUND privacy door: room content about to be typed into a web form.
+   NOTE: no markup in the app currently renders these classes — kept in step
+   with the rest of the area rather than left in the old palette, but it is
+   dead until the door is re-mounted. Reported, not deleted.
+   ========================================================================== */
+
+.browse-consent {
+  --mk: var(--sem-pending-fill);
+  --mk-ink: var(--sem-pending);
+  display: grid;
+  gap: 9px;
+  padding: 12px 13px;
+  margin: var(--sp-2) 0;
+  border: 1px solid var(--mk-ink);
+  border-radius: var(--radius);
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--mk) 16%, transparent) 0%,
+    color-mix(in srgb, var(--mk) 8%, transparent) 100%
+  );
+  font-size: var(--fs-meta);
+}
+
+.browse-consent h3 {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: var(--fs-card);
+  font-weight: 600;
+}
+
+/* WHAT is about to leave, verbatim. Mono, so it can be read exactly. */
+.browse-consent .bc-what {
+  padding: 7px 9px;
+  border-radius: var(--radius-xs);
+  background: color-mix(in srgb, var(--raised) 70%, transparent);
+  border: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  overflow-wrap: anywhere;
+}
+
+.browse-consent .bc-entities {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.browse-consent .bc-entities span {
+  padding: 1px 9px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px 999px 999px 999px / 14px 12px 14px 12px;
+  font-size: var(--fs-micro);
+}
+
+.browse-consent .bc-actions {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+/* ==========================================================================
+   10. THE SEARCH RESULTS PAGE (BROWSE-3)
+   Rendered in the HOST while the native webview is parked at 1x1 (the start
+   screen's mechanism). Everything is in normal flow — no popovers, no
+   overlays — because the moment the user opens a result the native page comes
+   back and would swallow anything floating.
+
+   THE LAYOUT ENCODES THE RANKING: a feature card, a two-up row, then compact
+   rows. That is the whole point — a flat list gives the 8th result the same
+   authority as the 1st. Every measurement below is unchanged from the version
+   that shipped; what changed is that the cards became drawn frames on the
+   sheet instead of filled boxes.
+   ========================================================================== */
+
+/* A flex item for the same reason as `.browser-start` — see the note there. */
+.bsearch {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 22px 26px var(--sp-8);
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  /* Transparent: the results are written on the room's own sheet. */
+  background: transparent;
+  outline: none;
+}
+
+/* ---- header ---- */
+.bsearch-head h1 {
+  margin: 0 0 var(--sp-2);
+  color: var(--text-strong);
+  font-size: var(--fs-section);
+  font-family: var(--display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  text-wrap: balance;
+}
+
+/* Seven segments, one per engine, lit when that engine returned something.
+   The fused ranking made visible in one glance. */
+.bsearch-fuse {
+  display: flex;
+  gap: 3px;
+  height: 4px;
+  max-width: 330px;
+  margin-bottom: var(--sp-2);
+}
+
+.bsearch-fuse i {
+  flex: 1;
+  border-radius: 2px 3px 2px 3px / 3px 2px 3px 2px;
+  background: color-mix(in srgb, var(--line) 60%, transparent);
+  transform-origin: left;
+  animation: bsearch-grow var(--dur-slow) var(--ease-pen) both;
+  animation-delay: calc(var(--i) * 60ms);
+}
+
+.bsearch-fuse i.on[data-engine="duckduckgo"] { background: var(--eng-duckduckgo); }
+.bsearch-fuse i.on[data-engine="brave"] { background: var(--eng-brave); }
+.bsearch-fuse i.on[data-engine="mojeek"] { background: var(--eng-mojeek); }

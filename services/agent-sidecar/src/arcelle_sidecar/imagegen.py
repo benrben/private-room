@@ -146,6 +146,31 @@ def _split_data_url(url: str) -> tuple[str, bytes]:
     return mime, _decode_artwork(payload)
 
 
+def _first_entry(data: dict[str, Any], model: str) -> dict[str, Any]:
+    """Get a provider reply's first object, naming a missing picture clearly."""
+    entries = data.get("data")
+    if not isinstance(entries, list) or not entries:
+        raise ImageGenError(
+            f"{model} returned no picture. Pick a model the catalog lists as "
+            "making images."
+        )
+    entry = entries[0]
+    return entry if isinstance(entry, dict) else {}
+
+
+def _nonblank_string(entry: dict[str, Any], key: str) -> str | None:
+    """A trimmed string response field, if the provider supplied one."""
+    value = entry.get(key)
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
+
+
+def _artwork_mime(entry: dict[str, Any]) -> str:
+    """The declared media type, with the documented PNG default."""
+    return str(entry.get("media_type") or "image/png").split(";", 1)[0].strip().lower() or "image/png"
+
+
 def _first_artwork(data: dict[str, Any], model: str) -> tuple[str, bytes]:
     """The first picture off an ``/images`` reply, whichever way it is carried.
 
@@ -155,22 +180,15 @@ def _first_artwork(data: dict[str, Any], model: str) -> tuple[str, bytes]:
     when it is inline; a link to somewhere else is not followed, because
     fetching one would be an outbound request the privacy door never saw.
     """
-    entries = data.get("data")
-    if not isinstance(entries, list) or not entries:
-        raise ImageGenError(
-            f"{model} returned no picture. Pick a model the catalog lists as "
-            "making images."
-        )
-    entry = entries[0] if isinstance(entries[0], dict) else {}
+    entry = _first_entry(data, model)
 
-    b64 = entry.get("b64_json")
-    if isinstance(b64, str) and b64.strip():
-        mime = str(entry.get("media_type") or "image/png").split(";", 1)[0].strip().lower()
-        return mime or "image/png", _decode_artwork(b64.strip())
+    b64 = _nonblank_string(entry, "b64_json")
+    if b64 is not None:
+        return _artwork_mime(entry), _decode_artwork(b64)
 
-    url = entry.get("url")
-    if isinstance(url, str) and url.strip():
-        return _split_data_url(url.strip())
+    url = _nonblank_string(entry, "url")
+    if url is not None:
+        return _split_data_url(url)
 
     raise ImageGenError(f"{model} answered, but with nothing this room could save")
 
@@ -188,23 +206,41 @@ def _reference_url(b64: str, mime: str) -> str:
     naming the limit, was uploaded whole from this tab and came back as
     whatever opaque error the provider chose, after the wait.
     """
+    payload = _reference_b64(b64)
+    raw = _decode_reference_payload(payload)
+    _check_reference_size(raw)
+    kind = _reference_mime(mime)
+    return f"data:{kind};base64,{payload}"
+
+
+def _reference_b64(b64: str) -> str:
     payload = (b64 or "").strip()
-    if not payload:
-        raise ImageGenError("a reference picture was empty")
+    if payload:
+        return payload
+    raise ImageGenError("a reference picture was empty")
+
+
+def _decode_reference_payload(payload: str) -> bytes:
     try:
-        raw = base64.b64decode(payload, validate=True)
+        return base64.b64decode(payload, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise ImageGenError("a reference picture could not be read") from exc
+
+
+def _check_reference_size(raw: bytes) -> None:
     if len(raw) > MAX_REFERENCE_BYTES:
         raise ImageGenError(
             f"a reference picture is {len(raw) // (1024 * 1024)} MB, over this "
             f"room's {MAX_REFERENCE_BYTES // (1024 * 1024)} MB limit for one "
             "picture sent to a model"
         )
+
+
+def _reference_mime(mime: str) -> str:
     kind = (mime or "").strip().lower() or "image/png"
     if not kind.startswith("image/"):
         raise ImageGenError(f"{kind} is not a picture, so it cannot guide a drawing")
-    return f"data:{kind};base64,{payload}"
+    return kind
 
 
 def guard_prompt(
@@ -236,13 +272,10 @@ def guard_prompt(
     from . import privacy as privacy_mod
 
     policy = privacy_mod.policy_from_payload(privacy)
-    engaged = (
-        policy is not None and policy.active and privacy_mod.is_nonlocal_model(model)
-    )
-    if not engaged or policy is None:
+    if not _privacy_door_is_engaged(privacy_mod, policy, model):
         return prompt, None
 
-    if has_reference and not acknowledged:
+    if _unacknowledged_reference(has_reference, acknowledged):
         raise ImageGenError(
             "This room's privacy door does not let pictures leave the Mac, so "
             f"{model} cannot be shown the one you attached. Send it for this "
@@ -250,6 +283,14 @@ def guard_prompt(
         )
 
     return policy.redact_text(prompt), policy.report.as_payload()
+
+
+def _privacy_door_is_engaged(privacy_mod: Any, policy: Any, model: str) -> bool:
+    return policy is not None and policy.active and privacy_mod.is_nonlocal_model(model)
+
+
+def _unacknowledged_reference(has_reference: bool, acknowledged: bool) -> bool:
+    return has_reference and not acknowledged
 
 
 async def generate(
@@ -275,19 +316,8 @@ async def generate(
     from here at all (see :mod:`.videogen`), and a caller that asks this seam
     for a clip has made a routing mistake worth naming.
     """
-    if kind == "video":
-        raise ImageGenError(
-            "A clip is not made here. Video is a submit-and-wait API — this is "
-            "an internal routing mistake, not something you did."
-        )
-    text = prompt.strip()
-    if not text:
-        raise ImageGenError("nothing to draw — the prompt is empty")
-
-    references = [image for image in (reference_b64 or []) if image and image.strip()]
-    # Positional, and padded rather than zipped: a caller that sent five
-    # pictures and three types meant five pictures, and PNG is what every
-    # picture this room generates already is. `zip` would silently drop two.
+    text = _generation_text(kind, prompt)
+    references = _reference_images(reference_b64)
     mimes = list(reference_mime or [])
     outbound, report = guard_prompt(
         text,
@@ -296,20 +326,60 @@ async def generate(
         has_reference=bool(references),
         acknowledged=references_ack,
     )
+    payload = _generation_payload(model, provider.model, outbound)
+    _add_reference_payloads(payload, references, mimes)
+    _add_generation_dimensions(payload, aspect_ratio, resolution)
+    response = await _post_generation(provider, payload)
+    data = _response_data(response)
+    return _generation_result(data, model, report)
 
-    payload: dict[str, Any] = {
-        "model": _model_slug(model, provider.model),
-        "prompt": outbound,
+
+def _generation_text(kind: str, prompt: str) -> str:
+    if kind == "video":
+        raise ImageGenError(
+            "A clip is not made here. Video is a submit-and-wait API — this is "
+            "an internal routing mistake, not something you did."
+        )
+    text = prompt.strip()
+    if not text:
+        raise ImageGenError("nothing to draw — the prompt is empty")
+    return text
+
+
+def _reference_images(reference_b64: list[str] | None) -> list[str]:
+    return [image for image in (reference_b64 or []) if image and image.strip()]
+
+
+def _generation_payload(model: str, configured_model: str, prompt: str) -> dict[str, Any]:
+    return {
+        "model": _model_slug(model, configured_model),
+        "prompt": prompt,
         "n": 1,
     }
-    if references:
-        payload["input_references"] = [
-            {
-                "type": "image_url",
-                "image_url": {"url": _reference_url(image, mimes[i] if i < len(mimes) else "")},
-            }
-            for i, image in enumerate(references)
-        ]
+
+
+def _reference_payload(image: str, mimes: list[str], index: int) -> dict[str, Any]:
+    mime = mimes[index] if index < len(mimes) else ""
+    return {
+        "type": "image_url",
+        "image_url": {"url": _reference_url(image, mime)},
+    }
+
+
+def _add_reference_payloads(
+    payload: dict[str, Any], references: list[str], mimes: list[str]
+) -> None:
+    # Positional, and padded rather than zipped: a caller that sent five
+    # pictures and three types meant five pictures, and PNG is what every
+    # picture this room generates already is. `zip` would silently drop two.
+    if not references:
+        return
+    payload["input_references"] = [
+        _reference_payload(image, mimes, index) for index, image in enumerate(references)
+    ]
+
+
+def _add_generation_dimensions(payload: dict[str, Any], aspect_ratio: str, resolution: str) -> None:
     # Sent only when asked for. An omitted parameter is honoured by every
     # provider; a guessed one can be refused, and a refusal here costs the
     # user a round trip to learn something the catalogue already knew.
@@ -318,6 +388,8 @@ async def generate(
     if resolution.strip():
         payload["resolution"] = resolution.strip()
 
+
+async def _post_generation(provider: Any, payload: dict[str, Any]) -> httpx.Response:
     try:
         async with httpx.AsyncClient(timeout=GENERATE_TIMEOUT_SECS) as client:
             response = await client.post(
@@ -330,12 +402,19 @@ async def generate(
 
     if not response.is_success:
         raise ImageGenError(_error_message(response))
+    return response
 
+
+def _response_data(response: httpx.Response) -> dict[str, Any]:
     try:
-        data = response.json()
+        return response.json()
     except ValueError as exc:
         raise ImageGenError("the provider returned a reply that was not JSON") from exc
 
+
+def _generation_result(
+    data: dict[str, Any], model: str, report: dict[str, int] | None
+) -> dict[str, Any]:
     mime, raw = _first_artwork(data, model)
     ext = KNOWN_MIMES.get(mime)
     if ext is None:
@@ -355,18 +434,21 @@ async def generate(
 
 def _error_message(response: httpx.Response) -> str:
     """The provider's own words when it refuses, not just a status code."""
+    fallback = f"the provider refused the request ({response.status_code})"
     try:
         body = response.json()
     except ValueError:
-        return f"the provider refused the request ({response.status_code})"
+        return fallback
+    return _provider_error_text(body) or fallback
+
+
+def _provider_error_text(body: dict[str, Any]) -> str | None:
     error = body.get("error")
     if isinstance(error, dict):
-        message = error.get("message")
-        if isinstance(message, str) and message.strip():
-            return message.strip()
-    elif isinstance(error, str) and error.strip():
-        return error.strip()
-    return f"the provider refused the request ({response.status_code})"
+        return _nonblank_string(error, "message")
+    if isinstance(error, str):
+        return error.strip() or None
+    return None
 
 
 __all__ = [

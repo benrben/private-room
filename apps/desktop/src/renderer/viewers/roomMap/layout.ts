@@ -33,79 +33,118 @@ export function mulberry32(seed: number): () => number {
   };
 }
 
+interface Displacements {
+  x: Float64Array;
+  y: Float64Array;
+}
+
+interface Offset {
+  x: number;
+  y: number;
+  distanceSquared: number;
+}
+
+function displacementsFor(count: number): Displacements {
+  return { x: new Float64Array(count), y: new Float64Array(count) };
+}
+
+function pairOffset(a: SimNode, b: SimNode, aIndex: number, bIndex: number): Offset {
+  const x = a.x - b.x;
+  const y = a.y - b.y;
+  const distanceSquared = x * x + y * y;
+  if (distanceSquared < 0.01) return nudgedOffset(aIndex, bIndex);
+  return { x, y, distanceSquared };
+}
+
+function nudgedOffset(aIndex: number, bIndex: number): Offset {
+  const hash = ((aIndex * 73856093) ^ (bIndex * 19349663)) >>> 0;
+  const x = (hash & 0xffff) / 0xffff - 0.5;
+  const y = ((hash >>> 16) & 0xffff) / 0xffff - 0.5;
+  return { x, y, distanceSquared: x * x + y * y + 0.01 };
+}
+
+function applyRepulsion(nodes: SimNode[], displacement: Displacements, k: number) {
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      const offset = pairOffset(nodes[i], nodes[j], i, j);
+      const distance = Math.sqrt(offset.distanceSquared);
+      const repulsion = (k * k) / distance;
+      const x = offset.x / distance;
+      const y = offset.y / distance;
+      displacement.x[i] += x * repulsion;
+      displacement.y[i] += y * repulsion;
+      displacement.x[j] -= x * repulsion;
+      displacement.y[j] -= y * repulsion;
+    }
+  }
+}
+
+function nonzeroDistance(x: number, y: number): number {
+  return Math.sqrt(x * x + y * y) || 0.01;
+}
+
+function edgeAttraction(edge: SimEdge, distance: number, k: number): number {
+  return ((distance * distance) / k) * (0.5 + edge.edge.weight) * styleFor(edge.edge.kind).springMul;
+}
+
+function applyAttraction(nodes: SimNode[], edges: SimEdge[], displacement: Displacements, k: number) {
+  for (const edge of edges) {
+    if (edge.hidden) continue;
+    const a = nodes[edge.ai];
+    const b = nodes[edge.bi];
+    const x = a.x - b.x;
+    const y = a.y - b.y;
+    const distance = nonzeroDistance(x, y);
+    const attraction = edgeAttraction(edge, distance, k);
+    const unitX = x / distance;
+    const unitY = y / distance;
+    displacement.x[edge.ai] -= unitX * attraction;
+    displacement.y[edge.ai] -= unitY * attraction;
+    displacement.x[edge.bi] += unitX * attraction;
+    displacement.y[edge.bi] += unitY * attraction;
+  }
+}
+
+function nonzeroLength(x: number, y: number): number {
+  return Math.hypot(x, y) || 1e-6;
+}
+
+function containNode(node: SimNode, maxRadius: number) {
+  const radius = Math.hypot(node.x, node.y);
+  if (radius > maxRadius) {
+    node.x *= maxRadius / radius;
+    node.y *= maxRadius / radius;
+  }
+}
+
+function applyGravityAndMovement(nodes: SimNode[], displacement: Displacements, temp: number, k: number) {
+  const maxRadius = 1.15 * k * Math.sqrt(nodes.length) + 2 * k;
+  for (let i = 0; i < nodes.length; i++) {
+    displacement.x[i] -= nodes[i].x * GRAVITY;
+    displacement.y[i] -= nodes[i].y * GRAVITY;
+    const distance = nonzeroLength(displacement.x[i], displacement.y[i]);
+    const move = Math.min(distance, temp);
+    nodes[i].x += (displacement.x[i] / distance) * move;
+    nodes[i].y += (displacement.y[i] / distance) * move;
+    containNode(nodes[i], maxRadius);
+  }
+}
+
 /** One Fruchterman-Reingold tick: pairwise repulsion, edge attraction, a
  *  whiff of gravity, then a temperature-limited move. Mutates `nodes`.
  *  Fully deterministic — coincident nodes are nudged apart with an
  *  index-hashed offset rather than Math.random. */
 export function runTick(nodes: SimNode[], edges: SimEdge[], temp: number, k: number) {
-  const n = nodes.length;
-  const dx = new Float64Array(n);
-  const dy = new Float64Array(n);
-  for (let i = 0; i < n; i++) {
-    for (let j = i + 1; j < n; j++) {
-      let ox = nodes[i].x - nodes[j].x;
-      let oy = nodes[i].y - nodes[j].y;
-      let d2 = ox * ox + oy * oy;
-      if (d2 < 0.01) {
-        // exactly overlapping — nudge apart in a deterministic direction
-        const hash = ((i * 73856093) ^ (j * 19349663)) >>> 0;
-        ox = (hash & 0xffff) / 0xffff - 0.5;
-        oy = ((hash >>> 16) & 0xffff) / 0xffff - 0.5;
-        d2 = ox * ox + oy * oy + 0.01;
-      }
-      const dist = Math.sqrt(d2);
-      const rep = (k * k) / dist;
-      const ux = ox / dist;
-      const uy = oy / dist;
-      dx[i] += ux * rep;
-      dy[i] += uy * rep;
-      dx[j] -= ux * rep;
-      dy[j] -= uy * rep;
-    }
-  }
-  for (const e of edges) {
-    // A hidden edge exerts no pull. Zeroing it here rather than removing it
-    // from the list is what lets the type filter be a pure render-time choice:
-    // the layout's INPUT never changes, so toggling a kind can't re-seed the
-    // simulation and scatter the map the reader was looking at.
-    if (e.hidden) continue;
-    const a = nodes[e.ai];
-    const b = nodes[e.bi];
-    const ox = a.x - b.x;
-    const oy = a.y - b.y;
-    const dist = Math.sqrt(ox * ox + oy * oy) || 0.01;
-    // Stronger for higher-confidence edges — and for the kinds that are facts,
-    // so a "made from" pair actually settles adjacent and the map reads as
-    // provenance rather than merely being coloured like it.
-    const att =
-      ((dist * dist) / k) * (0.5 + e.edge.weight) * styleFor(e.edge.kind).springMul;
-    const ux = ox / dist;
-    const uy = oy / dist;
-    dx[e.ai] -= ux * att;
-    dy[e.ai] -= uy * att;
-    dx[e.bi] += ux * att;
-    dy[e.bi] += uy * att;
-  }
+  const displacement = displacementsFor(nodes.length);
+  applyRepulsion(nodes, displacement, k);
+  applyAttraction(nodes, edges, displacement, k);
   // A disconnected node feels only repulsion (pushing out) and gravity (pulling
   // in); it settles at r ≈ k·√(n/GRAVITY) — with GRAVITY=0.015 that's ~8× the
   // connected cluster's radius, so a single unlinked file "floats far above" and
   // wrecks the auto-fit (the cluster shrinks to a dot). Contain every node
   // inside a frame sized to the connected layout so nothing escapes; the fit
   // then frames the real room instead of one outlier.
-  const maxR = 1.15 * k * Math.sqrt(n) + 2 * k;
-  for (let i = 0; i < n; i++) {
-    dx[i] -= nodes[i].x * GRAVITY;
-    dy[i] -= nodes[i].y * GRAVITY;
-    const dl = Math.hypot(dx[i], dy[i]) || 1e-6;
-    const move = Math.min(dl, temp);
-    nodes[i].x += (dx[i] / dl) * move;
-    nodes[i].y += (dy[i] / dl) * move;
-    const r = Math.hypot(nodes[i].x, nodes[i].y);
-    if (r > maxR) {
-      nodes[i].x *= maxR / r;
-      nodes[i].y *= maxR / r;
-    }
-  }
+  applyGravityAndMovement(nodes, displacement, temp, k);
 }
 
 /* ----- the pen circle round a selected node -----
@@ -154,27 +193,59 @@ export function handCircle(r: number): string {
   return d;
 }
 
+interface Bounds {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+}
+
+function lowerBound(current: number, candidate: number): number {
+  return candidate < current ? candidate : current;
+}
+
+function upperBound(current: number, candidate: number): number {
+  return candidate > current ? candidate : current;
+}
+
+function includeInBounds(bounds: Bounds, node: SimNode): Bounds {
+  return {
+    minX: lowerBound(bounds.minX, node.x),
+    minY: lowerBound(bounds.minY, node.y),
+    maxX: upperBound(bounds.maxX, node.x),
+    maxY: upperBound(bounds.maxY, node.y),
+  };
+}
+
+function boundsOf(nodes: SimNode[]): Bounds {
+  let bounds: Bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+  for (const node of nodes) bounds = includeInBounds(bounds, node);
+  return bounds;
+}
+
+function fitScale(bounds: Bounds, width: number, height: number): number {
+  const boundsWidth = Math.max(bounds.maxX - bounds.minX, 1);
+  const boundsHeight = Math.max(bounds.maxY - bounds.minY, 1);
+  const scale = Math.min((width - FIT_PAD * 2) / boundsWidth, (height - FIT_PAD * 2) / boundsHeight);
+  return clamp(validScale(scale), MIN_SCALE, MAX_SCALE);
+}
+
+function validScale(scale: number): number {
+  if (!isFinite(scale) || scale <= 0) return 1;
+  return scale;
+}
+
+function centeredView(bounds: Bounds, scale: number, width: number, height: number): View {
+  const centerX = (bounds.minX + bounds.maxX) / 2;
+  const centerY = (bounds.minY + bounds.maxY) / 2;
+  return { k: scale, x: width / 2 - centerX * scale, y: height / 2 - centerY * scale };
+}
+
 /** Fit the node bounds into a `w`×`h` viewport with padding, returning the
  *  world→screen transform. Used for the initial frame, on resize, and by the
  *  reset-view affordance. */
 export function computeFit(nodes: SimNode[], w: number, h: number): View {
   if (!nodes.length || w <= 0 || h <= 0) return { k: 1, x: w / 2, y: h / 2 };
-  let minX = Infinity,
-    minY = Infinity,
-    maxX = -Infinity,
-    maxY = -Infinity;
-  for (const n of nodes) {
-    if (n.x < minX) minX = n.x;
-    if (n.y < minY) minY = n.y;
-    if (n.x > maxX) maxX = n.x;
-    if (n.y > maxY) maxY = n.y;
-  }
-  const bw = Math.max(maxX - minX, 1);
-  const bh = Math.max(maxY - minY, 1);
-  let k = Math.min((w - FIT_PAD * 2) / bw, (h - FIT_PAD * 2) / bh);
-  if (!isFinite(k) || k <= 0) k = 1;
-  k = clamp(k, MIN_SCALE, MAX_SCALE);
-  const cx = (minX + maxX) / 2;
-  const cy = (minY + maxY) / 2;
-  return { k, x: w / 2 - cx * k, y: h / 2 - cy * k };
+  const bounds = boundsOf(nodes);
+  return centeredView(bounds, fitScale(bounds, w, h), w, h);
 }

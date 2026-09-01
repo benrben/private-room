@@ -77,8 +77,8 @@ export const emptySketch = (): Sketch => ({
   elements: [],
 });
 
-const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
-const round = (n: number) => Math.round(n);
+export const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
+export const round = (n: number) => Math.round(n);
 
 /**
  * Read a document off disk.
@@ -90,45 +90,77 @@ const round = (n: number) => Math.round(n);
 export function parseSketch(raw: string): { doc: Sketch; error: string | null } {
   if (!raw || !raw.trim()) return { doc: emptySketch(), error: null };
   try {
-    const v = JSON.parse(raw) as Partial<Sketch>;
-    const elements = Array.isArray(v.elements) ? (v.elements as SketchElement[]) : [];
-    const doc: Sketch = {
-      version: typeof v.version === "number" ? v.version : 1,
-      width: typeof v.width === "number" && v.width > 0 ? v.width : CANVAS_W,
-      height: typeof v.height === "number" && v.height > 0 ? v.height : CANVAS_H,
-      seq: typeof v.seq === "number" ? v.seq : 0,
-      elements: elements.filter(isElement),
-    };
-    // The same counter recovery Rust does: a file written by hand, or one
-    // whose seq was lost, must not mint an id that is already on the page.
-    const high = doc.elements.reduce((m, e) => {
-      const n = Number.parseInt(e.id.replace(/^e/, ""), 10);
-      return Number.isFinite(n) ? Math.max(m, n) : m;
-    }, 0);
-    doc.seq = Math.max(doc.seq, high);
-    return { doc, error: null };
+    return { doc: parsedSketch(JSON.parse(raw) as Partial<Sketch>), error: null };
   } catch (e) {
     return { doc: emptySketch(), error: e instanceof Error ? e.message : String(e) };
   }
 }
 
+function parsedSketch(value: Partial<Sketch>): Sketch {
+  const elements = parsedElements(value);
+  return {
+    version: typeof value.version === "number" ? value.version : 1,
+    width: positiveDimension(value.width, CANVAS_W),
+    height: positiveDimension(value.height, CANVAS_H),
+    seq: Math.max(numericSequence(value.seq), highestElementSequence(elements)),
+    elements,
+  };
+}
+
+function parsedElements(value: Partial<Sketch>): SketchElement[] {
+  const candidates = Array.isArray(value.elements) ? value.elements : [];
+  return candidates.filter(isElement);
+}
+
+function positiveDimension(value: unknown, fallback: number): number {
+  return typeof value === "number" && value > 0 ? value : fallback;
+}
+
+function numericSequence(value: unknown): number {
+  return typeof value === "number" ? value : 0;
+}
+
+function highestElementSequence(elements: SketchElement[]): number {
+  return elements.reduce((highest, element) => Math.max(highest, sequenceFromId(element.id)), 0);
+}
+
+function sequenceFromId(id: string): number {
+  const sequence = Number.parseInt(id.replace(/^e/, ""), 10);
+  return Number.isFinite(sequence) ? sequence : 0;
+}
+
 function isElement(e: unknown): e is SketchElement {
   if (!e || typeof e !== "object") return false;
-  const o = e as Record<string, unknown>;
-  if (typeof o.id !== "string") return false;
-  switch (o.type) {
-    case "rect":
-    case "ellipse":
-      return ["x", "y", "w", "h"].every((k) => typeof o[k] === "number");
-    case "text":
-      return typeof o.x === "number" && typeof o.y === "number" && typeof o.text === "string";
-    case "arrow":
-    case "line":
-    case "pen":
-      return Array.isArray(o.points) && o.points.length >= 2;
-    default:
-      return false;
-  }
+  const element = e as Record<string, unknown>;
+  const validator = elementValidator(element.type);
+  return typeof element.id === "string" && validator?.(element) === true;
+}
+
+type ElementValidator = (element: Record<string, unknown>) => boolean;
+
+const ELEMENT_VALIDATORS = new Map<string, ElementValidator>([
+  ["rect", hasBoxCoordinates],
+  ["ellipse", hasBoxCoordinates],
+  ["text", hasTextCoordinates],
+  ["arrow", hasPoints],
+  ["line", hasPoints],
+  ["pen", hasPoints],
+]);
+
+function elementValidator(type: unknown): ElementValidator | null {
+  return typeof type === "string" ? ELEMENT_VALIDATORS.get(type) ?? null : null;
+}
+
+function hasBoxCoordinates(element: Record<string, unknown>): boolean {
+  return ["x", "y", "w", "h"].every((key) => typeof element[key] === "number");
+}
+
+function hasTextCoordinates(element: Record<string, unknown>): boolean {
+  return typeof element.x === "number" && typeof element.y === "number" && typeof element.text === "string";
+}
+
+function hasPoints(element: Record<string, unknown>): boolean {
+  return Array.isArray(element.points) && element.points.length >= 2;
 }
 
 export const serializeSketch = (doc: Sketch): string => JSON.stringify(doc, null, 2);
@@ -194,16 +226,18 @@ const inRect = (r: Rect, x: number, y: number) =>
 export function hitTest(doc: Sketch, x: number, y: number): SketchElement | null {
   for (let i = doc.elements.length - 1; i >= 0; i--) {
     const e = doc.elements[i];
-    if (e.type === "pen" || e.type === "line" || e.type === "arrow") {
-      // A stroke has no interior to click, so the test is distance to the
-      // polyline rather than its bounding box — a diagonal arrow's box covers
-      // a large empty area the user is usually trying to click THROUGH.
-      if (nearPolyline(e.points, x, y, 12)) return e;
-      continue;
-    }
-    if (inRect(grow(bboxOf(e), 4), x, y)) return e;
+    if (hitsElement(e, x, y)) return e;
   }
   return null;
+}
+
+function hitsElement(element: SketchElement, x: number, y: number): boolean {
+  if (isPolyline(element)) return nearPolyline(element.points, x, y, 12);
+  return inRect(grow(bboxOf(element), 4), x, y);
+}
+
+function isPolyline(element: SketchElement): element is Extract<SketchElement, { points: Point[] }> {
+  return element.type === "pen" || element.type === "line" || element.type === "arrow";
 }
 
 function nearPolyline(points: Point[], px: number, py: number, tol: number): boolean {
@@ -213,7 +247,7 @@ function nearPolyline(points: Point[], px: number, py: number, tol: number): boo
   return false;
 }
 
-function distToSegment(a: Point, b: Point, px: number, py: number): number {
+export function distToSegment(a: Point, b: Point, px: number, py: number): number {
   const dx = b[0] - a[0];
   const dy = b[1] - a[1];
   const len2 = dx * dx + dy * dy;
@@ -284,21 +318,18 @@ export function bboxOfMany(els: SketchElement[]): Rect | null {
  * made it. An arrow that has been attached at both ends is a connector — it
  * behaves differently from a loose arrow, so it is named differently. */
 export function kindOf(e: SketchElement): string {
-  switch (e.type) {
-    case "rect":
-      return "Box";
-    case "ellipse":
-      return "Ellipse";
-    case "text":
-      return "Note";
-    case "arrow":
-      return e.from && e.to ? "Connector" : "Arrow";
-    case "line":
-      return "Line";
-    default:
-      return "Stroke";
-  }
+  if (e.type === "arrow" && e.from && e.to) return "Connector";
+  return KIND_NAMES[e.type];
 }
+
+const KIND_NAMES: Record<ElementKind, string> = {
+  rect: "Box",
+  ellipse: "Ellipse",
+  text: "Note",
+  arrow: "Arrow",
+  line: "Line",
+  pen: "Stroke",
+};
 
 /** The words written on an object, if any. */
 function wordsOf(e: SketchElement): string {
@@ -402,48 +433,66 @@ export function resizedBox(
   dy: number,
   even = false,
 ): Rect {
-  let { x, y, w, ...rest } = box;
-  let hgt = rest.h;
-  if (even && box.w > 0 && box.h > 0 && h.length === 2) {
-    // A corner drag: take the larger movement and derive the other axis, so
-    // the shape cannot be squashed while Shift is held.
-    const sx = h.includes("w") ? -1 : 1;
-    const sy = h.startsWith("n") ? -1 : 1;
-    const byW = (dx * sx) / box.w;
-    const byH = (dy * sy) / box.h;
-    const f = Math.abs(byW) > Math.abs(byH) ? byW : byH;
-    dx = f * box.w * sx;
-    dy = f * box.h * sy;
-  }
-  if (h.includes("w")) {
-    x = box.x + dx;
-    w = box.w - dx;
-  } else if (h.includes("e")) {
-    w = box.w + dx;
-  }
-  if (h.startsWith("n")) {
-    y = box.y + dy;
-    hgt = box.h - dy;
-  } else if (h.startsWith("s")) {
-    hgt = box.h + dy;
-  }
+  const pointer = constrainedResizePointer(box, h, dx, dy, even);
+  const horizontal = resizedHorizontalEdge(box, h, pointer.dx);
+  const vertical = resizedVerticalEdge(box, h, pointer.dy);
+  return normalisedResizeBox(horizontal, vertical);
+}
+
+function constrainedResizePointer(
+  box: Rect,
+  handle: Handle,
+  dx: number,
+  dy: number,
+  even: boolean,
+): { dx: number; dy: number } {
+  if (!keepsAspectRatio(box, handle, even)) return { dx, dy };
+  // A corner drag: take the larger movement and derive the other axis, so
+  // the shape cannot be squashed while Shift is held.
+  const sx = handle.includes("w") ? -1 : 1;
+  const sy = handle.startsWith("n") ? -1 : 1;
+  const byWidth = (dx * sx) / box.w;
+  const byHeight = (dy * sy) / box.h;
+  const factor = Math.abs(byWidth) > Math.abs(byHeight) ? byWidth : byHeight;
+  return { dx: factor * box.w * sx, dy: factor * box.h * sy };
+}
+
+function keepsAspectRatio(box: Rect, handle: Handle, even: boolean): boolean {
+  return even && box.w > 0 && box.h > 0 && handle.length === 2;
+}
+
+function resizedHorizontalEdge(box: Rect, handle: Handle, dx: number): Pick<Rect, "x" | "w"> {
+  if (handle.includes("w")) return { x: box.x + dx, w: box.w - dx };
+  if (handle.includes("e")) return { x: box.x, w: box.w + dx };
+  return { x: box.x, w: box.w };
+}
+
+function resizedVerticalEdge(box: Rect, handle: Handle, dy: number): Pick<Rect, "y" | "h"> {
+  if (handle.startsWith("n")) return { y: box.y + dy, h: box.h - dy };
+  if (handle.startsWith("s")) return { y: box.y, h: box.h + dy };
+  return { y: box.y, h: box.h };
+}
+
+function normalisedResizeBox(
+  horizontal: Pick<Rect, "x" | "w">,
+  vertical: Pick<Rect, "y" | "h">,
+): Rect {
+  const width = positiveResizeSize(horizontal.x, horizontal.w);
+  const height = positiveResizeSize(vertical.y, vertical.h);
+  return {
+    x: round(width.origin),
+    y: round(height.origin),
+    w: round(Math.max(MIN_SIZE, width.size)),
+    h: round(Math.max(MIN_SIZE, height.size)),
+  };
+}
+
+function positiveResizeSize(origin: number, size: number): { origin: number; size: number } {
   // A side dragged past its opposite flips rather than inverting: the shape
   // stays a rectangle with a positive size, which is what the person dragging
   // sees happen on every other canvas.
-  if (w < 0) {
-    x += w;
-    w = -w;
-  }
-  if (hgt < 0) {
-    y += hgt;
-    hgt = -hgt;
-  }
-  return {
-    x: round(x),
-    y: round(y),
-    w: round(Math.max(MIN_SIZE, w)),
-    h: round(Math.max(MIN_SIZE, hgt)),
-  };
+  if (size < 0) return { origin: origin + size, size: -size };
+  return { origin, size };
 }
 
 /** Map an element from one box onto another, proportionally.
@@ -535,495 +584,8 @@ export function routeBetween(a: Rect, b: Rect): [Point, Point] {
  * points — the arrow stays exactly where it was drawn rather than vanishing or
  * springing to the corner of the page, and the user can delete it themselves.
  */
-export function reflow(doc: Sketch): Sketch {
-  const boxes = new Map<string, Rect>();
-  for (const e of doc.elements) boxes.set(e.id, bboxOf(e));
-  let touched = false;
-  const elements = doc.elements.map((e) => {
-    if (e.type !== "arrow" && e.type !== "line") return e;
-    if (!e.from && !e.to) return e;
-    const a = e.from ? boxes.get(e.from) : undefined;
-    const b = e.to ? boxes.get(e.to) : undefined;
-    if (!a || !b) {
-      // One end is gone. Forget the attachment rather than leaving a connector
-      // that claims to join something the page no longer has.
-      if ((e.from && !a) || (e.to && !b)) {
-        touched = true;
-        const { from: _f, to: _t, ...rest } = e;
-        return rest as SketchElement;
-      }
-      return e;
-    }
-    const [p, q] = routeBetween(a, b);
-    const [op, oq] = [e.points[0], e.points[e.points.length - 1]];
-    if (op[0] === p[0] && op[1] === p[1] && oq[0] === q[0] && oq[1] === q[1]) return e;
-    touched = true;
-    return { ...e, points: [p, q] as Point[] };
-  });
-  return touched ? { ...doc, elements } : doc;
-}
 
-/** What a connector may attach to. A connector cannot hang off another
- * connector — that is a chain with no shape at the end of it — and a shape
- * cannot join itself. */
-export function canConnect(e: SketchElement | null): e is SketchElement {
-  return !!e && (e.type === "rect" || e.type === "ellipse" || e.type === "text");
-}
-
-// ---------------------------------------------------------------------------
-// Arrangement
-// ---------------------------------------------------------------------------
-
-export type AlignEdge = "left" | "hcenter" | "right" | "top" | "vcenter" | "bottom";
-
-/**
- * Line a selection up against its own bounding box.
- *
- * Nothing moves along the other axis, and one element is a no-op — aligning a
- * single shape to "left" against itself would be a change with no meaning and
- * an undo entry to match.
- */
-export function align(els: SketchElement[], edge: AlignEdge): SketchElement[] {
-  const box = bboxOfMany(els);
-  if (!box || els.length < 2) return els;
-  return els.map((e) => {
-    const b = bboxOf(e);
-    switch (edge) {
-      case "left":
-        return translate(e, box.x - b.x, 0);
-      case "right":
-        return translate(e, box.x + box.w - (b.x + b.w), 0);
-      case "hcenter":
-        return translate(e, box.x + box.w / 2 - (b.x + b.w / 2), 0);
-      case "top":
-        return translate(e, 0, box.y - b.y);
-      case "bottom":
-        return translate(e, 0, box.y + box.h - (b.y + b.h));
-      default:
-        return translate(e, 0, box.y + box.h / 2 - (b.y + b.h / 2));
-    }
-  });
-}
-
-/**
- * Equal gaps between three or more elements, along one axis.
- *
- * The two outermost stay put — they define the span the rest are spread
- * inside — and the gap is the leftover space divided evenly, so shapes of
- * different sizes end up evenly SPACED rather than evenly numbered.
- */
-export function distribute(els: SketchElement[], axis: "x" | "y"): SketchElement[] {
-  if (els.length < 3) return els;
-  const order = [...els].sort((p, q) =>
-    axis === "x" ? bboxOf(p).x - bboxOf(q).x : bboxOf(p).y - bboxOf(q).y,
-  );
-  const span = bboxOfMany(order);
-  if (!span) return els;
-  const total = order.reduce((sum, e) => {
-    const b = bboxOf(e);
-    return sum + (axis === "x" ? b.w : b.h);
-  }, 0);
-  const gap = ((axis === "x" ? span.w : span.h) - total) / (order.length - 1);
-  let cursor = axis === "x" ? span.x : span.y;
-  const moved = new Map<string, SketchElement>();
-  for (const e of order) {
-    const b = bboxOf(e);
-    moved.set(
-      e.id,
-      axis === "x" ? translate(e, cursor - b.x, 0) : translate(e, 0, cursor - b.y),
-    );
-    cursor += (axis === "x" ? b.w : b.h) + gap;
-  }
-  // Returned in the caller's order, not the sorted one: the document's element
-  // order is its z-order, and quietly restacking a drawing because someone
-  // tidied it is a change nobody asked for.
-  return els.map((e) => moved.get(e.id) ?? e);
-}
-
-export type Ordering = "front" | "forward" | "backward" | "back";
-
-/**
- * Move elements through the z-order, which IS the document's element order.
- *
- * The moved set keeps its own relative order in every direction, so sending
- * three overlapping shapes to the back does not shuffle them against each
- * other on the way.
- */
-export function reorder(doc: Sketch, ids: string[], where: Ordering): Sketch {
-  const picked = new Set(ids);
-  if (!picked.size) return doc;
-  const moving = doc.elements.filter((e) => picked.has(e.id));
-  const rest = doc.elements.filter((e) => !picked.has(e.id));
-  if (!moving.length) return doc;
-  if (where === "front") return { ...doc, elements: [...rest, ...moving] };
-  if (where === "back") return { ...doc, elements: [...moving, ...rest] };
-  // One step. Walk in the direction of travel so a run of selected elements
-  // moves as a block instead of piling onto the first free slot.
-  const next = [...doc.elements];
-  const step = where === "forward" ? 1 : -1;
-  const order =
-    step === 1
-      ? next.map((_, i) => i).reverse()
-      : next.map((_, i) => i);
-  for (const i of order) {
-    const j = i + step;
-    if (j < 0 || j >= next.length) continue;
-    if (!picked.has(next[i].id) || picked.has(next[j].id)) continue;
-    [next[i], next[j]] = [next[j], next[i]];
-  }
-  return { ...doc, elements: next };
-}
-
-/** How far a copy lands from its original, so it is visibly a second thing. */
-export const DUPLICATE_OFFSET = 24;
-
-/**
- * Copy elements, giving each a fresh id.
- *
- * A connector between two copied shapes is re-pointed at the COPIES, so
- * duplicating a diagram gives a second working diagram rather than a second
- * set of boxes wired back into the first.
- */
-export function duplicate(
-  doc: Sketch,
-  ids: string[],
-  offset = DUPLICATE_OFFSET,
-): { doc: Sketch; ids: string[] } {
-  const picked = doc.elements.filter((e) => ids.includes(e.id));
-  if (!picked.length) return { doc, ids: [] };
-  let seq = doc.seq;
-  const remap = new Map<string, string>();
-  for (const e of picked) remap.set(e.id, `e${++seq}`);
-  const copies = picked.map((e) => {
-    const moved = translate(e, offset, offset);
-    const copy: SketchElement = { ...moved, id: remap.get(e.id) as string };
-    if (copy.from) copy.from = remap.get(copy.from) ?? copy.from;
-    if (copy.to) copy.to = remap.get(copy.to) ?? copy.to;
-    return copy;
-  });
-  return {
-    doc: { ...doc, seq, elements: [...doc.elements, ...copies] },
-    ids: copies.map((e) => e.id),
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Snapping and guides
-// ---------------------------------------------------------------------------
-
-/** The paper's dot spacing — what "snap to grid" snaps to. */
-export const GRID = 22;
-
-export const snapTo = (n: number, grid = GRID) => Math.round(n / grid) * grid;
-
-/** How near an edge has to be before it pulls, in canvas units. */
-export const SNAP_TOLERANCE = 6;
-
-export interface Guide {
-  axis: "x" | "y";
-  at: number;
-}
-
-/**
- * The alignment lines a moving box should snap to, and the offset that lands
- * it on them.
- *
- * Three lines per axis on each side — near edge, centre, far edge — which is
- * what makes "line this up with that" work without the user aiming: any of the
- * nine pairings can catch. The nearest catch on each axis wins, so a box
- * between two candidates does not jitter between them.
- */
-export function guidesFor(
-  moving: Rect,
-  others: Rect[],
-  tolerance = SNAP_TOLERANCE,
-): { dx: number; dy: number; guides: Guide[] } {
-  const linesX = (r: Rect) => [r.x, r.x + r.w / 2, r.x + r.w];
-  const linesY = (r: Rect) => [r.y, r.y + r.h / 2, r.y + r.h];
-  const guides: Guide[] = [];
-  let dx = 0;
-  let dy = 0;
-  let bestX = tolerance + 1;
-  let bestY = tolerance + 1;
-  for (const o of others) {
-    for (const mine of linesX(moving)) {
-      for (const theirs of linesX(o)) {
-        const d = theirs - mine;
-        if (Math.abs(d) <= tolerance && Math.abs(d) < Math.abs(bestX)) {
-          bestX = d;
-          dx = d;
-        }
-      }
-    }
-    for (const mine of linesY(moving)) {
-      for (const theirs of linesY(o)) {
-        const d = theirs - mine;
-        if (Math.abs(d) <= tolerance && Math.abs(d) < Math.abs(bestY)) {
-          bestY = d;
-          dy = d;
-        }
-      }
-    }
-  }
-  // Report only the lines actually landed on, so the canvas draws a guide
-  // exactly where the box is now — not everywhere it nearly was.
-  if (Math.abs(bestX) <= tolerance) {
-    const at = moving.x + dx;
-    for (const o of others) {
-      for (const theirs of linesX(o)) {
-        if (linesX({ ...moving, x: at }).some((m) => Math.abs(m - theirs) < 0.5)) {
-          guides.push({ axis: "x", at: theirs });
-        }
-      }
-    }
-  }
-  if (Math.abs(bestY) <= tolerance) {
-    const at = moving.y + dy;
-    for (const o of others) {
-      for (const theirs of linesY(o)) {
-        if (linesY({ ...moving, y: at }).some((m) => Math.abs(m - theirs) < 0.5)) {
-          guides.push({ axis: "y", at: theirs });
-        }
-      }
-    }
-  }
-  return { dx, dy, guides };
-}
-
-// ---------------------------------------------------------------------------
-// Freehand
-// ---------------------------------------------------------------------------
-
-/**
- * Ramer–Douglas–Peucker. Iterative, not recursive: a fast stroke on a
- * high-refresh trackpad arrives as thousands of coalesced points, and the
- * recursive form blows the stack on exactly the drawing someone put effort
- * into.
- */
-export function simplify(points: Point[], tolerance = 1.2): Point[] {
-  if (points.length <= 2) return points.slice();
-  const keep = new Array<boolean>(points.length).fill(false);
-  keep[0] = true;
-  keep[points.length - 1] = true;
-  const stack: Array<[number, number]> = [[0, points.length - 1]];
-  while (stack.length) {
-    const [first, last] = stack.pop() as [number, number];
-    let worst = 0;
-    let index = -1;
-    for (let i = first + 1; i < last; i++) {
-      const d = distToSegment(points[first], points[last], points[i][0], points[i][1]);
-      if (d > worst) {
-        worst = d;
-        index = i;
-      }
-    }
-    if (index !== -1 && worst > tolerance) {
-      keep[index] = true;
-      stack.push([first, index], [index, last]);
-    }
-  }
-  return points.filter((_, i) => keep[i]);
-}
-
-/** Cap a stroke's point count so one very long scribble cannot bloat the file. */
-export const MAX_STROKE_POINTS = 2000;
-
-export function strokeFromTrail(trail: Point[]): Point[] {
-  const simplified = simplify(
-    trail.map(([x, y]) => [clamp(round(x), 0, CANVAS_W), clamp(round(y), 0, CANVAS_H)] as Point),
-  );
-  return simplified.length > MAX_STROKE_POINTS
-    ? simplified.slice(0, MAX_STROKE_POINTS)
-    : simplified;
-}
-
-// ---------------------------------------------------------------------------
-// Deterministic hand-drawn geometry
-// ---------------------------------------------------------------------------
-
-/**
- * The same seeded wobble Rust renders with, ported so the editor and the
- * exported file draw the same picture.
- *
- * The seed is the element id and nothing else. Randomising per render would
- * make a box jitter on every React update — which reads as the drawing being
- * unstable — and would break the property the Rust tests lean on: one document
- * always produces one picture.
- */
-export function seeded(id: string): () => number {
-  let h = 2166136261 >>> 0;
-  for (let i = 0; i < id.length; i++) {
-    h ^= id.charCodeAt(i);
-    h = Math.imul(h, 16777619) >>> 0;
-  }
-  return () => {
-    h ^= h << 13;
-    h >>>= 0;
-    h ^= h >>> 17;
-    h ^= h << 5;
-    h >>>= 0;
-    return (h % 100000) / 100000;
-  };
-}
-
-const jitter = (r: () => number, amp: number) => (r() * 2 - 1) * amp;
-
-export function wobblySegment(
-  r: () => number,
-  x1: number,
-  y1: number,
-  x2: number,
-  y2: number,
-  amp: number,
-): string {
-  const mx = (x1 + x2) / 2 + jitter(r, amp * 1.8);
-  const my = (y1 + y2) / 2 + jitter(r, amp * 1.8);
-  return `M${(x1 + jitter(r, amp)).toFixed(1)} ${(y1 + jitter(r, amp)).toFixed(1)}Q${mx.toFixed(
-    1,
-  )} ${my.toFixed(1)} ${(x2 + jitter(r, amp)).toFixed(1)} ${(y2 + jitter(r, amp)).toFixed(1)}`;
-}
-
-export function rectPath(r: () => number, x: number, y: number, w: number, h: number): string {
-  let d = "";
-  for (let pass = 0; pass < 2; pass++) {
-    d += wobblySegment(r, x, y, x + w, y, 2.2);
-    d += wobblySegment(r, x + w, y, x + w, y + h, 2.2);
-    d += wobblySegment(r, x + w, y + h, x, y + h, 2.2);
-    d += wobblySegment(r, x, y + h, x, y, 2.2);
-  }
-  return d;
-}
-
-export function ellipsePath(
-  r: () => number,
-  cx: number,
-  cy: number,
-  rx: number,
-  ry: number,
-): string {
-  let d = "";
-  const n = 16;
-  const wob = Math.min(Math.min(rx, ry) * 0.04 + 1.5, 4);
-  for (let pass = 0; pass < 2; pass++) {
-    const pts: Point[] = [];
-    for (let i = 0; i < n; i++) {
-      const t = (i / n) * Math.PI * 2;
-      const jr = jitter(r, wob);
-      pts.push([cx + Math.cos(t) * (rx + jr), cy + Math.sin(t) * (ry + jr)]);
-    }
-    const mid = (a: Point, b: Point): Point => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
-    const start = mid(pts[0], pts[1 % n]);
-    d += `M${start[0].toFixed(1)} ${start[1].toFixed(1)}`;
-    for (let k = 1; k <= n; k++) {
-      const a = pts[k % n];
-      const b = pts[(k + 1) % n];
-      const m = mid(a, b);
-      d += `Q${a[0].toFixed(1)} ${a[1].toFixed(1)} ${m[0].toFixed(1)} ${m[1].toFixed(1)}`;
-    }
-    d += "Z";
-  }
-  return d;
-}
-
-export function strokePath(points: Point[]): string {
-  if (points.length < 2) return "";
-  if (points.length === 2) {
-    return `M${points[0][0]} ${points[0][1]}L${points[1][0]} ${points[1][1]}`;
-  }
-  let d = `M${points[0][0]} ${points[0][1]}`;
-  for (let i = 0; i < points.length - 1; i++) {
-    const a = points[i];
-    const b = points[i + 1];
-    d += `Q${a[0]} ${a[1]} ${((a[0] + b[0]) / 2).toFixed(1)} ${((a[1] + b[1]) / 2).toFixed(1)}`;
-  }
-  const last = points[points.length - 1];
-  d += `L${last[0]} ${last[1]}`;
-  return d;
-}
-
-/** The two short lines that make an arrowhead. */
-export function arrowHead(points: Point[]): [Point, Point] {
-  const [x1, y1] = points[0];
-  const [x2, y2] = points[points.length - 1];
-  const ang = Math.atan2(y2 - y1, x2 - x1);
-  const len = 20;
-  return [
-    [x2 + Math.cos(ang + 2.6) * len, y2 + Math.sin(ang + 2.6) * len],
-    [x2 + Math.cos(ang - 2.6) * len, y2 + Math.sin(ang - 2.6) * len],
-  ];
-}
-
-// ---------------------------------------------------------------------------
-// Undo
-// ---------------------------------------------------------------------------
-
-/**
- * Snapshot undo, capped.
- *
- * A document here is a few hundred small objects, so a whole-document snapshot
- * per edit costs less than the bookkeeping an inverse-operation stack would
- * need — and it cannot drift out of step with the document the way a
- * hand-written inverse for each operation can.
- */
-export const UNDO_DEPTH = 80;
-
-export interface History {
-  past: Sketch[];
-  future: Sketch[];
-}
-
-export const emptyHistory = (): History => ({ past: [], future: [] });
-
-export function pushHistory(h: History, before: Sketch): History {
-  const past = [...h.past, before];
-  return { past: past.length > UNDO_DEPTH ? past.slice(-UNDO_DEPTH) : past, future: [] };
-}
-
-export function undo(h: History, current: Sketch): { doc: Sketch; history: History } | null {
-  if (!h.past.length) return null;
-  const doc = h.past[h.past.length - 1];
-  return {
-    doc,
-    history: { past: h.past.slice(0, -1), future: [current, ...h.future].slice(0, UNDO_DEPTH) },
-  };
-}
-
-export function redo(h: History, current: Sketch): { doc: Sketch; history: History } | null {
-  if (!h.future.length) return null;
-  const doc = h.future[0];
-  return {
-    doc,
-    history: { past: [...h.past, current].slice(-UNDO_DEPTH), future: h.future.slice(1) },
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Merging the agent's work into an open editor
-// ---------------------------------------------------------------------------
-
-/**
- * Fold a drawing the agent just wrote into the page the user has open.
- *
- * The agent's document is authoritative for everything it touched, but it was
- * built from the file on disk — so anything the user drew since the last
- * autosave is not in it. Those elements are carried over rather than dropped:
- * losing a stroke someone just drew because the assistant happened to answer
- * at that moment is the worst failure this page can have.
- */
-export function mergeAgentDoc(
-  mine: Sketch,
-  theirs: Sketch,
-  removed: string[],
-): { doc: Sketch; unsavedKept: string[] } {
-  const theirIds = new Set(theirs.elements.map((e) => e.id));
-  const gone = new Set(removed);
-  const unsaved = mine.elements.filter((e) => !theirIds.has(e.id) && !gone.has(e.id));
-  return {
-    doc: {
-      ...theirs,
-      seq: Math.max(theirs.seq, mine.seq),
-      elements: [...theirs.elements, ...unsaved],
-    },
-    unsavedKept: unsaved.map((e) => e.id),
-  };
-}
+export { reflow, canConnect, align, distribute, reorder } from "./modelLayout";
+export type { AlignEdge, Axis, Ordering } from "./modelLayout";
+export { DUPLICATE_OFFSET, duplicate, GRID, snapTo, SNAP_TOLERANCE, guidesFor, simplify, MAX_STROKE_POINTS, strokeFromTrail, seeded, wobblySegment, rectPath, ellipsePath, strokePath, arrowHead, UNDO_DEPTH, emptyHistory, pushHistory, undo, redo, mergeAgentDoc } from "./modelDrawing";
+export type { Guide, History } from "./modelDrawing";

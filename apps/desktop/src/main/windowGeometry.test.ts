@@ -49,12 +49,52 @@ describe("geometryIsUsable", () => {
     // No screens at all (a headless or mid-wake state) can never be usable.
     expect(geometryIsUsable(ok, [])).toBe(false);
   });
+
+  it("refuses a display rectangle that cannot be reasoned about as i32", () => {
+    const usable: Geometry = { x: 10, y: 10, width: 900, height: 600 };
+    const overflowDisplay: Screen = [0, 0, 2_200_000_000, 1080];
+    expect(geometryIsUsable(usable, [overflowDisplay])).toBe(false);
+    expect(
+      geometryIsUsable({ x: 10, y: 10, width: 2_200_000_000, height: 600 }, [
+        LAPTOP,
+      ]),
+    ).toBe(false);
+  });
 });
 
 describe("parseGeometry", () => {
   it("round-trips a well-formed, current-schema file", () => {
     const raw = JSON.stringify({ v: 1, x: 10, y: 20, width: 900, height: 600 });
-    expect(parseGeometry(raw)).toEqual({ x: 10, y: 20, width: 900, height: 600 });
+    expect(parseGeometry(raw)).toEqual({
+      x: 10,
+      y: 20,
+      width: 900,
+      height: 600,
+    });
+  });
+
+  it("keeps signed positions and unsigned dimensions distinct", () => {
+    expect(
+      parseGeometry(
+        JSON.stringify({
+          v: 1,
+          x: -2_147_483_648,
+          y: 2_147_483_647,
+          width: 0,
+          height: 4_294_967_295,
+        }),
+      ),
+    ).toEqual({
+      x: -2_147_483_648,
+      y: 2_147_483_647,
+      width: 0,
+      height: 4_294_967_295,
+    });
+    expect(
+      parseGeometry(
+        JSON.stringify({ v: 1, x: "-1", y: 20, width: 900, height: 600 }),
+      ),
+    ).toBeNull();
   });
 
   it("rejects malformed JSON rather than throwing", () => {
@@ -65,7 +105,9 @@ describe("parseGeometry", () => {
   });
 
   it("rejects a file missing a field", () => {
-    expect(parseGeometry(JSON.stringify({ v: 1, x: 10, y: 20, width: 900 }))).toBeNull();
+    expect(
+      parseGeometry(JSON.stringify({ v: 1, x: 10, y: 20, width: 900 })),
+    ).toBeNull();
   });
 
   it("rejects fractional or out-of-i32/u32-range fields, same as serde's typed deserialize", () => {
@@ -74,13 +116,37 @@ describe("parseGeometry", () => {
     // and the caller falls back to "nothing saved". A finite JS double can
     // represent all of these without wrapping, so this must be checked
     // explicitly rather than relying on the arithmetic to fail loudly.
-    expect(parseGeometry(JSON.stringify({ v: 1, x: 10.5, y: 20, width: 900, height: 600 }))).toBeNull();
-    expect(parseGeometry(JSON.stringify({ v: 1, x: 10, y: 20, width: -900, height: 600 }))).toBeNull();
     expect(
-      parseGeometry(JSON.stringify({ v: 1, x: 10, y: 20, width: 5_000_000_000, height: 600 })),
+      parseGeometry(
+        JSON.stringify({ v: 1, x: 10.5, y: 20, width: 900, height: 600 }),
+      ),
     ).toBeNull();
     expect(
-      parseGeometry(JSON.stringify({ v: 1, x: 2_200_000_000, y: 20, width: 900, height: 600 })),
+      parseGeometry(
+        JSON.stringify({ v: 1, x: 10, y: 20, width: -900, height: 600 }),
+      ),
+    ).toBeNull();
+    expect(
+      parseGeometry(
+        JSON.stringify({
+          v: 1,
+          x: 10,
+          y: 20,
+          width: 5_000_000_000,
+          height: 600,
+        }),
+      ),
+    ).toBeNull();
+    expect(
+      parseGeometry(
+        JSON.stringify({
+          v: 1,
+          x: 2_200_000_000,
+          y: 20,
+          width: 900,
+          height: 600,
+        }),
+      ),
     ).toBeNull();
   });
 
@@ -89,18 +155,27 @@ describe("parseGeometry", () => {
     // has no `v` field at all, and its numbers are physical pixels, not the
     // DIP `screen.getAllDisplays()` now reports. Reading it as-is would
     // restore the wrong rectangle on any Retina display.
-    const oldTauriFile = JSON.stringify({ x: 10, y: 20, width: 1800, height: 1200 });
+    const oldTauriFile = JSON.stringify({
+      x: 10,
+      y: 20,
+      width: 1800,
+      height: 1200,
+    });
     expect(parseGeometry(oldTauriFile)).toBeNull();
     // A future/foreign schema version is equally untrusted.
     expect(
-      parseGeometry(JSON.stringify({ v: 2, x: 10, y: 20, width: 900, height: 600 })),
+      parseGeometry(
+        JSON.stringify({ v: 2, x: 10, y: 20, width: 900, height: 600 }),
+      ),
     ).toBeNull();
   });
 });
 
 describe("saveGeometryPath", () => {
   it("places window.json inside the given per-machine data directory", () => {
-    expect(saveGeometryPath("/Users/x/Library/Application Support/Arcelle")).toBe(
+    expect(
+      saveGeometryPath("/Users/x/Library/Application Support/Arcelle"),
+    ).toBe(
       path.join("/Users/x/Library/Application Support/Arcelle", "window.json"),
     );
   });
@@ -125,7 +200,9 @@ describe("GeometryStore", () => {
     // the rectangle the user actually arranged.
     store.note(true, { x: 0, y: 0 }, { width: 1728, height: 1117 });
     store.save();
-    const written = JSON.parse(fs.readFileSync(path.join(dir, "window.json"), "utf8"));
+    const written = JSON.parse(
+      fs.readFileSync(path.join(dir, "window.json"), "utf8"),
+    );
     expect(written).toEqual({ v: 1, x: 10, y: 10, width: 900, height: 600 });
   });
 
@@ -135,7 +212,9 @@ describe("GeometryStore", () => {
     store.note(false, null, { width: 1000, height: 700 });
     store.note(false, { x: 20, y: 20 }, null);
     store.save();
-    const written = JSON.parse(fs.readFileSync(path.join(dir, "window.json"), "utf8"));
+    const written = JSON.parse(
+      fs.readFileSync(path.join(dir, "window.json"), "utf8"),
+    );
     expect(written).toEqual({ v: 1, x: 10, y: 10, width: 900, height: 600 });
   });
 
@@ -161,7 +240,12 @@ describe("GeometryStore", () => {
     writer.save();
 
     const reader = new GeometryStore(dir);
-    expect(reader.restore([LAPTOP])).toEqual({ x: 10, y: 10, width: 900, height: 600 });
+    expect(reader.restore([LAPTOP])).toEqual({
+      x: 10,
+      y: 10,
+      width: 900,
+      height: 600,
+    });
   });
 
   it("refuses to restore onto a screen set where the rectangle is unusable", () => {
@@ -207,7 +291,9 @@ describe("GeometryStore", () => {
     // with a screen change to prove the cache, not the old file, was used).
     fs.rmSync(path.join(dir, "window.json"));
     reader.save();
-    const written = JSON.parse(fs.readFileSync(path.join(dir, "window.json"), "utf8"));
+    const written = JSON.parse(
+      fs.readFileSync(path.join(dir, "window.json"), "utf8"),
+    );
     expect(written).toEqual({ v: 1, x: 10, y: 10, width: 900, height: 600 });
   });
 });

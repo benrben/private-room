@@ -58,6 +58,80 @@ export function createMcpRuntime(): McpRuntime {
   return { manager: new McpManager(), sessionApprovals: new Set() };
 }
 
+type McpReconnect = (
+  servers: Array<[string, ServerConfig]>,
+) => Promise<ReturnType<McpManager["statuses"]>>;
+
+export interface McpOauthAuthorizeInput {
+  state: RoomManagerState;
+  userDataDir: string;
+  emit: EventSender;
+  runtime: McpRuntime;
+  openBrowser: (url: string) => void | Promise<void>;
+  reconnect: McpReconnect;
+  server: string;
+}
+
+export async function authorizeMcpConnector({
+  state,
+  userDataDir,
+  emit,
+  runtime,
+  openBrowser,
+  reconnect,
+  server,
+}: McpOauthAuthorizeInput): Promise<ReturnType<McpManager["statuses"]>> {
+  const starting = oauthStartingRoom(state);
+  const roomPath = starting.path;
+  const epoch = state.roomEpoch;
+  const url = oauthConnectorUrl(getMcpConfig(starting.conn), server);
+  const challenge = await probeWwwAuthenticate(url);
+  const token = await authorizeOauth(url, challenge, {
+    openBrowser,
+    onAuthorizeUrl: (authorizeUrl) => emit("mcp-oauth-url", { server, url: authorizeUrl }),
+  });
+  const activeRoom = oauthActiveRoom(state, roomPath, epoch, server);
+  saveTokens(activeRoom.conn, server, token);
+  const merged = mergeBearer(getMcpConfig(activeRoom.conn), server, token.accessToken);
+  setSetting(activeRoom.conn, "mcp_config", merged);
+  recordMcpApproval(userDataDir, runtime, merged);
+  return reconnect(parseMcpConfig(merged));
+}
+
+function oauthStartingRoom(state: RoomManagerState): NonNullable<RoomManagerState["room"]> {
+  if (state.room === null) throw new Error("No room is open.");
+  return state.room;
+}
+
+function oauthConnectorUrl(config: string, server: string): string {
+  const found = parseMcpConfig(config).find(([name]) => name === server);
+  if (found === undefined || found[1].transport.kind !== "http") {
+    throw new Error(`"${server}" is not a remote connector in this room.`);
+  }
+  return found[1].transport.url;
+}
+
+function oauthActiveRoom(
+  state: RoomManagerState,
+  roomPath: string,
+  epoch: number,
+  server: string,
+): NonNullable<RoomManagerState["room"]> {
+  const activeRoom = state.room;
+  if (activeRoom === null || activeRoom.path !== roomPath || state.roomEpoch !== epoch) {
+    throw new Error(
+      `The room this sign-in belongs to was closed while the browser was open, so nothing was saved. Open it again and connect "${server}" from there.`,
+    );
+  }
+  return activeRoom;
+}
+
+function recordMcpApproval(userDataDir: string, runtime: McpRuntime, config: string): void {
+  const fingerprint = mcpFingerprint(config);
+  addMcpApproval(userDataDir, fingerprint);
+  runtime.sessionApprovals.add(fingerprint);
+}
+
 export function registerMcpSurfaceIpc(
   ipcMain: Pick<IpcMain, "handle">,
   state: RoomManagerState,
@@ -93,7 +167,7 @@ export function registerMcpSurfaceIpc(
     }
   };
 
-  const reconnect = async (servers: Array<[string, ServerConfig]>): Promise<ReturnType<McpManager["statuses"]>> => {
+  const reconnect: McpReconnect = async (servers) => {
     for (const existing of runtime.manager.servers) existing.client?.close();
     runtime.manager.generation += 1;
     runtime.manager.servers = servers.map(([name, cfg]) => ({
@@ -198,33 +272,15 @@ export function registerMcpSurfaceIpc(
     return token !== null && (!needsRefresh(token) || canRefresh(token));
   });
   ipcMain.handle("mcp_oauth_authorize", async (_event: IpcMainInvokeEvent, raw: unknown) => {
-    const server = String(args(raw).server ?? "");
-    const starting = room();
-    const roomPath = starting.path;
-    const epoch = state.roomEpoch;
-    const config = getMcpConfig(starting.conn);
-    const found = parseMcpConfig(config).find(([name]) => name === server);
-    if (!found || found[1].transport.kind !== "http") {
-      throw new Error(`"${server}" is not a remote connector in this room.`);
-    }
-    const url = found[1].transport.url;
-    const challenge = await probeWwwAuthenticate(url);
-    const token = await authorizeOauth(url, challenge, {
+    return authorizeMcpConnector({
+      state,
+      userDataDir,
+      emit,
+      runtime,
       openBrowser,
-      onAuthorizeUrl: (authorizeUrl) => emit("mcp-oauth-url", { server, url: authorizeUrl }),
+      reconnect,
+      server: String(args(raw).server ?? ""),
     });
-    if (!state.room || state.room.path !== roomPath || state.roomEpoch !== epoch) {
-      throw new Error(
-        `The room this sign-in belongs to was closed while the browser was open, so nothing was saved. Open it again and connect "${server}" from there.`,
-      );
-    }
-    saveTokens(state.room.conn, server, token);
-    const merged = mergeBearer(getMcpConfig(state.room.conn), server, token.accessToken);
-    setSetting(state.room.conn, "mcp_config", merged);
-    const fingerprint = mcpFingerprint(merged);
-    addMcpApproval(userDataDir, fingerprint);
-    runtime.sessionApprovals.add(fingerprint);
-    return reconnect(parseMcpConfig(merged));
   });
   ipcMain.handle("mcp_oauth_sign_out", (_event: IpcMainInvokeEvent, raw: unknown) => {
     const server = String(args(raw).server ?? "");

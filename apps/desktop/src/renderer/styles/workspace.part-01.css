@@ -1,0 +1,478 @@
+/* ---------- workspace ---------- */
+
+@keyframes room-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+.room-name {
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.ai-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.ai-dot.ok {
+  background: var(--ok);
+}
+
+.ai-dot.warn {
+  background: var(--warn);
+}
+
+.ai-dot.down {
+  background: var(--danger);
+}
+
+/* Branded model pill (replaces the native <select>). */
+.model-pill-wrap,
+.room-menu-wrap,
+.add-menu-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+/* Shared popover-menu shell (model picker, room menu, add menu). */
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+}
+.pop-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 46;
+  min-width: 200px;
+  background: var(--surface-3);
+  border: 1.5px solid var(--sketch);
+  border-radius: var(--radius);
+  padding: 6px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.pop-item,
+.model-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: var(--radius-xs);
+  padding: 8px 10px;
+  font-size: var(--fs-meta);
+  color: var(--text);
+  white-space: nowrap;
+}
+.pop-item:hover:not(:disabled),
+.model-menu-item:hover {
+  background: var(--accent-ghost);
+  border-color: transparent;
+}
+.pop-item svg {
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+/* Two-line menu items: what it is, then what pressing it captures/saves. */
+.pop-item-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.pop-item-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: normal;
+  line-height: 1.35;
+  max-width: 240px;
+}
+.pop-item:has(.pop-item-sub) {
+  align-items: flex-start;
+}
+.pop-item:has(.pop-item-sub) svg {
+  margin-top: 2px;
+}
+/* ----- menu furniture: labels, separators, ticks, keys -----
+   Shared by the Layout menu and available to any popover that needs to group
+   or check its rows. */
+.pop-label {
+  padding: 6px 10px 3px;
+  font-size: var(--fs-micro);
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.pop-sep {
+  height: 1px;
+  margin: 4px 6px;
+  /* The same lifted-pencil taper the rail dividers use, so a rule inside a
+     menu and a rule inside the sidebar are recognisably the same mark. */
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--rule) 18%,
+    var(--rule) 82%,
+    transparent 100%
+  );
+}
+/* A fixed gutter every row reserves, checkable or not, so one left edge runs
+   down the whole menu instead of the presets sitting half a glyph to the left
+   of the panes above them. */
+.pop-tick {
+  width: 14px;
+  flex: 0 0 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+}
+.pop-glyph {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--text-dim);
+}
+.pop-text {
+  min-width: 0;
+  flex: 1;
+}
+/* The shortcut, printed where a shortcut belongs. ⌘1 and ⌘2 were previously
+   learnable only from a tooltip on a sidebar button that no longer exists. */
+.pop-key {
+  margin-left: auto;
+  padding-left: 14px;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--faint);
+  flex: 0 0 auto;
+}
+.pop-item-preset .pop-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.pop-title {
+  font-size: var(--fs-meta);
+  color: var(--text);
+}
+.pop-hint {
+  font-size: var(--fs-micro);
+  color: var(--faint);
+  white-space: normal;
+  line-height: 1.35;
+}
+.layout-menu {
+  min-width: 246px;
+}
+.layout-menu-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+/* ----- toolbar pill buttons (Layout, Assistant) -----
+   Deliberately the same shape and weight as .model-pill beside them: these
+   three are the bar's stateful controls and should read as one family, not as
+   three different kinds of button that happen to sit together. */
+.pill-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1.5px solid var(--rule);
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  transition:
+    color var(--dur-fast) var(--ease-pen),
+    background var(--dur-fast) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen);
+}
+.pill-btn:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+.pill-btn[aria-expanded="true"],
+.pill-btn[aria-pressed="true"] {
+  color: var(--text-strong);
+  background: var(--accent-ghost);
+  border-color: var(--accent-fill);
+}
+.pill-caret {
+  color: var(--faint);
+  flex-shrink: 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pill-btn {
+    transition: none;
+  }
+}
+
+/* ----- the Assistant button's two marks -----
+   Both only render while the pane is SHUT — see TopBar. They are the same two
+   facts, in the same two shapes and colours, that the rail's AI toggle used to
+   carry: a hand-circled number for what is WAITING ON YOU, and a quiet dot for
+   work running by itself. Different shapes because they are different claims
+   and can be true at once; never summed, because one number would say "N
+   things need you" when N-1 of them did not. */
+.pill-count {
+  flex: 0 0 auto;
+  margin-left: 1px;
+}
+.pill-live {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  margin-left: 1px;
+  border-radius: 999px;
+  background: var(--mk-ink, var(--sem-linked));
+}
+
+.model-menu {
+  min-width: 240px;
+}
+.model-menu-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.model-menu-tier {
+  font-size: 11px;
+  color: var(--ok);
+}
+.model-menu-tier.cloud {
+  color: var(--warn);
+}
+.model-menu-item.sel {
+  background: var(--accent-ghost);
+}
+.model-menu-item svg:last-child {
+  color: var(--accent);
+  margin-left: auto;
+}
+
+/* EngineModelPicker: Local/Cloud toggle, shared by the composer's model pill
+ * and Settings' Model section. */
+.engine-picker {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+.engine-tier-tabs {
+  display: flex;
+  gap: var(--sp-1);
+  padding: 3px;
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+}
+.engine-tier-tab {
+  flex: 1;
+  background: none;
+  border: none;
+  border-radius: var(--radius-xs);
+  padding: 6px 8px;
+  font-size: var(--fs-micro);
+  color: var(--text-dim);
+}
+.engine-tier-tab.active {
+  background: var(--surface-3);
+  color: var(--text);
+}
+.engine-tier-tab:disabled {
+  opacity: 0.5;
+}
+.engine-tier-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.model-menu-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+.model-menu-row .model-menu-item {
+  flex: 1;
+}
+.engine-cloud-group {
+  display: flex;
+  flex-direction: column;
+}
+.engine-expand-caret {
+  margin-left: auto;
+  transition: transform 0.12s ease;
+}
+.engine-expand-caret.open {
+  transform: rotate(180deg);
+}
+.engine-submodel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-left: var(--sp-4);
+  border-left: 1px solid var(--border);
+  margin: 2px 0 2px 14px;
+}
+.model-catalog-controls {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.model-catalog-controls input {
+  width: 100%;
+  min-width: 0;
+  font-size: var(--fs-micro);
+}
+.model-filter-chips {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+}
+.model-filter-chips button {
+  padding: 3px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1.5px solid var(--sketch);
+}
+.model-filter-chips button.active {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: var(--accent-soft);
+}
+.model-filter-chips > span {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 10px;
+}
+.engine-cloud-group:has(.model-catalog-controls) .engine-submodel-list {
+  max-height: min(52vh, 520px);
+  overflow-y: auto;
+}
+.model-catalog-name {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+}
+.model-catalog-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 8px;
+  margin-top: 3px;
+  color: var(--text-dim);
+  font-size: 9px;
+  font-weight: 400;
+}
+.engine-submodel-loading {
+  padding: 6px 10px;
+}
+.engine-submodel-default {
+  color: var(--text-dim);
+}
+.engine-submodel {
+  display: flex;
+  flex-direction: column;
+}
+.effort-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  padding: 4px 10px 6px 27px;
+}
+.effort-chip {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: capitalize;
+}
+.effort-chip:hover {
+  color: var(--text);
+}
+.effort-chip.sel {
+  background: var(--accent-ghost);
+  border-color: var(--accent);
+  color: var(--text);
+}
+.add-menu {
+  left: 0;
+  right: auto;
+  /* The button lives in the library pane's bottom footer and the pane clips
+     overflow — a drop-DOWN would render past the pane edge, invisible. */
+  top: auto;
+  bottom: calc(100% + 6px);
+  max-height: min(70vh, 480px);
+  overflow-y: auto;
+}
+
+/* ==========================================================================
+   ROOM HOME — the briefing page (src/workspace/FrontPage.tsx)
+
+   Home is a broadsheet, read top to bottom: masthead and date, what needs
+   attention, a ruled timeline of what has been happening, and only then the
+   things you can start. The old page inverted that — it opened with a title,
+   then spent nine near-identical rows re-listing places the rail already
+   goes. Those destinations all survive; four of them became wide notebook
+   cards and the rest became chips, which is the whole point of the section.
+
+   Everything here composes from the .nb-* primitives in paper.css and reads
+   its colour from tokens.css. Nothing below names a colour, so light mode
+   falls out of the same rules rather than out of an override block.
+
+   Class names are deliberately fresh (rh-*, "room home") rather than the
+   old home-*: those rules live in shell.css, which another owner maintains
+   and which loads AFTER this file. Renaming is how this page stops needing
+   to win a cascade fight it has no way to win.
+   ========================================================================== */
+
+.rh-view {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  /* Transparent, so whatever the centre pane is drawn on shows straight
+     through: a page is a frame on the sheet, never a filled box. */
+  background: transparent;
+  /* The marginalia below need to know how wide the CONTENT COLUMN is, and
+     that is the centre pane's width, not the window's — the rail and the AI
+     pane both resize it, so a @media query would answer the wrong question.
+     Named, so it cannot accidentally be answered by .pane's own unnamed
+     container in shell.css. Container queries have been in WebKit since
+     Safari 16 and shell.css already ships two. */
+  container-type: inline-size;
+  container-name: rh-home;
+}
+
+.rh-inner {
+  /* Wider than the old 680px: the AI pane starts closed now, so the column
+     it leaves behind is a broadsheet measure rather than a sidebar. */
+  width: min(100% - 48px, 760px);
+  margin: 0 auto;
+  padding: var(--sp-8) 0 72px;
+}

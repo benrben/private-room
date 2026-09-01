@@ -77,6 +77,52 @@ export function opfPath(files: Record<string, Uint8Array>): string | null {
   return Object.keys(files).find((n) => n.toLowerCase().endsWith(".opf")) ?? null;
 }
 
+function addTitle(titles: Map<string, string>, path: string, label: string) {
+  if (!label || titles.has(path)) return;
+  titles.set(path, label);
+}
+
+function tocNav(doc: Document | null): Element | undefined {
+  if (!doc) return undefined;
+  const navs = descendants(doc, "nav");
+  return navs.find((nav) => (attr(nav, "type") ?? "").includes("toc")) ?? navs[0];
+}
+
+function addNavTitles(
+  files: Record<string, Uint8Array>,
+  navPath: string | null,
+  titles: Map<string, string>,
+) {
+  if (!navPath) return;
+  const doc = parseXml(bytesToText(findEntry(files, navPath)));
+  const nav = tocNav(doc);
+  for (const anchor of nav ? descendants(nav, "a") : []) {
+    const href = attr(anchor, "href");
+    if (!href) continue;
+    addTitle(titles, hrefToPath(navPath, href), (anchor.textContent ?? "").trim());
+  }
+}
+
+function ncxTitle(point: Element): { href: string; label: string } | null {
+  const content = descendants(point, "content")[0];
+  const href = content ? attr(content, "src") : null;
+  const label = descendants(point, "text")[0]?.textContent?.trim() ?? "";
+  return href && label ? { href, label } : null;
+}
+
+function addNcxTitles(
+  files: Record<string, Uint8Array>,
+  ncxPath: string | null,
+  titles: Map<string, string>,
+) {
+  if (!ncxPath) return;
+  const doc = parseXml(bytesToText(findEntry(files, ncxPath)));
+  for (const point of doc ? descendants(doc, "navPoint") : []) {
+    const title = ncxTitle(point);
+    if (title) addTitle(titles, hrefToPath(ncxPath, title.href), title.label);
+  }
+}
+
 /** Titles keyed by chapter path, from the EPUB 3 nav document or the EPUB 2
  * NCX. Both are read because real libraries contain both. */
 function tocTitles(
@@ -84,31 +130,10 @@ function tocTitles(
   navPath: string | null,
   ncxPath: string | null,
 ): Map<string, string> {
-  const out = new Map<string, string>();
-  if (navPath) {
-    const doc = parseXml(bytesToText(findEntry(files, navPath)));
-    // The nav with `epub:type="toc"`, or the first one when nothing is typed.
-    const navs = doc ? descendants(doc, "nav") : [];
-    const toc = navs.find((n) => (attr(n, "type") ?? "").includes("toc")) ?? navs[0];
-    for (const a of toc ? descendants(toc, "a") : []) {
-      const href = attr(a, "href");
-      const label = (a.textContent ?? "").trim();
-      if (href && label) out.set(hrefToPath(navPath, href), label);
-    }
-  }
-  if (ncxPath) {
-    const doc = parseXml(bytesToText(findEntry(files, ncxPath)));
-    for (const point of doc ? descendants(doc, "navPoint") : []) {
-      const content = descendants(point, "content")[0];
-      const href = content ? attr(content, "src") : null;
-      const label = descendants(point, "text")[0]?.textContent?.trim() ?? "";
-      if (href && label) {
-        const path = hrefToPath(ncxPath, href);
-        if (!out.has(path)) out.set(path, label);
-      }
-    }
-  }
-  return out;
+  const titles = new Map<string, string>();
+  addNavTitles(files, navPath, titles);
+  addNcxTitles(files, ncxPath, titles);
+  return titles;
 }
 
 /** Read the book's structure: reading order, chapter titles and metadata.
@@ -123,12 +148,17 @@ export function parseEpub(files: Record<string, Uint8Array>): Book | null {
   if (!opf) return null;
   const doc = parseXml(bytesToText(findEntry(files, opf)));
   if (!doc) return null;
+  const manifest = readManifest(doc, opf);
+  const titles = tocTitles(files, navigationPath(manifest), ncxPath(manifest));
+  const chapters = spineChapters(files, doc, manifest, titles);
+  const orderedChapters = chapters.length ? chapters : fallbackChapters(files, titles);
+  return bookFrom(doc, manifest, files, orderedChapters);
+}
 
-  const title = descendants(doc, "title")[0]?.textContent?.trim() ?? "";
-  const author = descendants(doc, "creator")[0]?.textContent?.trim() ?? "";
+type ManifestEntry = { path: string; type: string; props: string };
 
-  // manifest: id → { href, mediaType, properties }
-  const manifest = new Map<string, { path: string; type: string; props: string }>();
+function readManifest(doc: Document, opf: string): Map<string, ManifestEntry> {
+  const manifest = new Map<string, ManifestEntry>();
   for (const item of descendants(doc, "item")) {
     const id = attr(item, "id");
     const href = attr(item, "href");
@@ -139,45 +169,85 @@ export function parseEpub(files: Record<string, Uint8Array>): Book | null {
       props: attr(item, "properties") ?? "",
     });
   }
+  return manifest;
+}
 
-  const navEntry = Array.from(manifest.values()).find((m) => m.props.includes("nav"));
-  const ncxEntry = Array.from(manifest.values()).find((m) => m.type.includes("dtbncx"));
-  const titles = tocTitles(files, navEntry?.path ?? null, ncxEntry?.path ?? null);
+function manifestEntry(
+  manifest: Map<string, ManifestEntry>,
+  predicate: (entry: ManifestEntry) => boolean,
+): ManifestEntry | undefined {
+  return Array.from(manifest.values()).find(predicate);
+}
 
+function navigationPath(manifest: Map<string, ManifestEntry>): string | null {
+  return manifestEntry(manifest, (entry) => entry.props.includes("nav"))?.path ?? null;
+}
+
+function ncxPath(manifest: Map<string, ManifestEntry>): string | null {
+  return manifestEntry(manifest, (entry) => entry.type.includes("dtbncx"))?.path ?? null;
+}
+
+function chapterForEntry(
+  files: Record<string, Uint8Array>,
+  entry: ManifestEntry | undefined,
+  titles: Map<string, string>,
+  number: number,
+): Chapter | null {
+  if (!entry || entry.props.includes("nav") || !findEntry(files, entry.path)) return null;
+  return { path: entry.path, title: titles.get(entry.path) ?? `Section ${number}` };
+}
+
+function spineChapters(
+  files: Record<string, Uint8Array>,
+  doc: Document,
+  manifest: Map<string, ManifestEntry>,
+  titles: Map<string, string>,
+): Chapter[] {
   const chapters: Chapter[] = [];
   for (const ref of descendants(doc, "itemref")) {
-    const idref = attr(ref, "idref");
-    const entry = idref ? manifest.get(idref) : undefined;
-    if (!entry || !findEntry(files, entry.path)) continue;
-    // The nav document is part of the spine in some books; it is a table of
-    // contents, not a chapter.
-    if (entry.props.includes("nav")) continue;
-    chapters.push({
-      path: entry.path,
-      title: titles.get(entry.path) ?? `Section ${chapters.length + 1}`,
-    });
+    const id = attr(ref, "idref");
+    const chapter = chapterForEntry(files, id ? manifest.get(id) : undefined, titles, chapters.length + 1);
+    if (chapter) chapters.push(chapter);
   }
-  // A book with no usable spine still opens — every XHTML part, in name order.
-  if (chapters.length === 0) {
-    for (const path of Object.keys(files).sort()) {
-      if (/\.x?html?$/i.test(path) && !path.startsWith("META-INF/")) {
-        chapters.push({ path, title: titles.get(path) ?? `Section ${chapters.length + 1}` });
-      }
+  return chapters;
+}
+
+function fallbackChapters(
+  files: Record<string, Uint8Array>,
+  titles: Map<string, string>,
+): Chapter[] {
+  const chapters: Chapter[] = [];
+  for (const path of Object.keys(files).sort()) {
+    if (/\.x?html?$/i.test(path) && !path.startsWith("META-INF/")) {
+      chapters.push({ path, title: titles.get(path) ?? `Section ${chapters.length + 1}` });
     }
   }
+  return chapters;
+}
 
-  const coverEntry =
-    Array.from(manifest.values()).find((m) => m.props.includes("cover-image")) ??
-    Array.from(manifest.values()).find(
-      (m) => m.type.startsWith("image/") && /cover/i.test(m.path),
-    );
-  const coverBytes = coverEntry ? findEntry(files, coverEntry.path) : undefined;
+function coverEntry(manifest: Map<string, ManifestEntry>): ManifestEntry | undefined {
+  return (
+    manifestEntry(manifest, (entry) => entry.props.includes("cover-image")) ??
+    manifestEntry(
+      manifest,
+      (entry) => entry.type.startsWith("image/") && /cover/i.test(entry.path),
+    )
+  );
+}
 
+function bookFrom(
+  doc: Document,
+  manifest: Map<string, ManifestEntry>,
+  files: Record<string, Uint8Array>,
+  chapters: Chapter[],
+): Book {
+  const cover = coverEntry(manifest);
+  const coverBytes = cover ? findEntry(files, cover.path) : undefined;
   return {
-    title,
-    author,
+    title: descendants(doc, "title")[0]?.textContent?.trim() ?? "",
+    author: descendants(doc, "creator")[0]?.textContent?.trim() ?? "",
     chapters,
-    cover: coverBytes ? toDataUrl(coverBytes, mimeForPath(coverEntry!.path)) : null,
+    cover: coverBytes ? toDataUrl(coverBytes, mimeForPath(cover!.path)) : null,
   };
 }
 
@@ -198,48 +268,92 @@ export function chapterHtml(
   dark = false,
 ): string {
   const doc = parseXml(bytesToText(findEntry(files, path)));
-  if (!doc) {
-    // An unparseable chapter still shows its words rather than nothing.
-    return wrap(escapeBody(bytesToText(findEntry(files, path))), fontScale, dark);
-  }
+  if (!doc) return fallbackChapter(files, path, fontScale, dark);
+  inlineChapterImages(doc, files, path);
+  const styles = chapterStyles(doc, files, path);
+  removeScripts(doc);
+  return wrap(chapterBody(doc), fontScale, dark, styles);
+}
 
-  // Inline images.
-  for (const img of Array.from(doc.getElementsByTagName("*"))) {
-    if (img.localName !== "img" && img.localName !== "image") continue;
-    const srcAttr = img.localName === "image" ? "href" : "src";
-    const raw = attr(img, srcAttr);
-    if (!raw || raw.startsWith("data:")) continue;
-    const assetPath = hrefToPath(path, raw);
-    const asset = findEntry(files, assetPath);
-    if (asset) {
-      img.setAttribute(srcAttr, toDataUrl(asset, mimeForPath(assetPath)));
-    } else {
-      img.removeAttribute(srcAttr);
-    }
-  }
+function fallbackChapter(
+  files: Record<string, Uint8Array>,
+  path: string,
+  fontScale: number,
+  dark: boolean,
+): string {
+  return wrap(escapeBody(bytesToText(findEntry(files, path))), fontScale, dark);
+}
 
-  // Inline stylesheets, so the publisher's typography survives the sandbox.
+function isChapterImage(element: Element): boolean {
+  return element.localName === "img" || element.localName === "image";
+}
+
+function imageAttribute(element: Element): "href" | "src" {
+  return element.localName === "image" ? "href" : "src";
+}
+
+function inlineChapterImage(
+  element: Element,
+  files: Record<string, Uint8Array>,
+  chapterPath: string,
+) {
+  const source = imageAttribute(element);
+  const raw = attr(element, source);
+  if (!raw || raw.startsWith("data:")) return;
+  const assetPath = hrefToPath(chapterPath, raw);
+  const asset = findEntry(files, assetPath);
+  if (asset) element.setAttribute(source, toDataUrl(asset, mimeForPath(assetPath)));
+  else element.removeAttribute(source);
+}
+
+function inlineChapterImages(
+  doc: Document,
+  files: Record<string, Uint8Array>,
+  chapterPath: string,
+) {
+  for (const element of Array.from(doc.getElementsByTagName("*"))) {
+    if (isChapterImage(element)) inlineChapterImage(element, files, chapterPath);
+  }
+}
+
+function inlineStylesheet(
+  link: Element,
+  files: Record<string, Uint8Array>,
+  chapterPath: string,
+  styles: string[],
+) {
+  const rel = (attr(link, "rel") ?? "").toLowerCase();
+  const href = attr(link, "href");
+  if (!rel.includes("stylesheet") || !href) return;
+  const cssPath = hrefToPath(chapterPath, href);
+  const css = findEntry(files, cssPath);
+  if (css) styles.push(inlineCssAssets(files, cssPath, bytesToText(css)));
+  link.remove();
+}
+
+function chapterStyles(
+  doc: Document,
+  files: Record<string, Uint8Array>,
+  chapterPath: string,
+): string[] {
   const styles: string[] = [];
   for (const link of descendants(doc, "link")) {
-    const rel = (attr(link, "rel") ?? "").toLowerCase();
-    const href = attr(link, "href");
-    if (!rel.includes("stylesheet") || !href) continue;
-    const cssPath = hrefToPath(path, href);
-    const css = findEntry(files, cssPath);
-    if (css) styles.push(inlineCssAssets(files, cssPath, bytesToText(css)));
-    link.remove();
+    inlineStylesheet(link, files, chapterPath, styles);
   }
   for (const style of descendants(doc, "style")) {
     styles.push(style.textContent ?? "");
     style.remove();
   }
+  return styles;
+}
 
-  // Script never reaches the sandbox anyway (its CSP forbids it); removing it
-  // here keeps the document honest and the console quiet.
-  for (const s of descendants(doc, "script")) s.remove();
+function removeScripts(doc: Document) {
+  for (const script of descendants(doc, "script")) script.remove();
+}
 
+function chapterBody(doc: Document): string {
   const body = descendants(doc, "body")[0];
-  return wrap(body ? body.innerHTML : doc.documentElement.outerHTML, fontScale, dark, styles);
+  return body ? body.innerHTML : doc.documentElement.outerHTML;
 }
 
 /** Rewrite `url(...)` references inside a stylesheet to data URLs. Without

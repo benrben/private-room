@@ -13,35 +13,48 @@ any result text — an engine failure logs the ENGINE's name, never its input
 (SPEC §6), and the 'failed' list :func:`timed_search` returns is engine names for
 the same reason.
 
-Nothing here ever fetches a RESULT url. Only the engines' own endpoints are
-requested, so this module cannot be pointed at an address the user's query
-names. A developer-only ``--dates`` command line used to break that rule — it
-fetched every result page from Python, around the Rust SSRF guard that refuses
-local and private addresses, and read it whole with no size limit — so it and
-the page fetch behind it were deleted (2026-08-01 audit). Anything that needs a
-result page goes through the host's guarded fetch.
+Nothing here fetches a result URL; only fixed engine endpoints are requested.
+Anything needing a result page goes through the host's guarded fetch, preserving
+its local/private-address refusal and response-size boundary.
 """
-
 from __future__ import annotations
 
 import itertools
 import logging
-import re
 import threading
 import time
 import xml.etree.ElementTree as ET
-from collections import defaultdict
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
-from email.utils import parsedate_to_datetime
 from functools import wraps
-from operator import itemgetter
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from urllib.parse import urlencode
 
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
+
+from .websearch_fusion import (
+    _fuse_results as _fuse_results,
+    _lexical as _lexical,
+    _rank_results as _rank_results,
+    _timed_result as _timed_result,
+)
+from .websearch_parse import (
+    Hit,
+    _brave_snippet as _brave_snippet,
+    _collect as _collect,
+    _ddg_anchors as _ddg_anchors,
+    _ddg_snippet as _ddg_snippet,
+    _dedupe_key as _dedupe_key,
+    _hit as _hit,
+    _marginalia_snippet as _marginalia_snippet,
+    _mojeek_snippet as _mojeek_snippet,
+    _rss_date as _rss_date,
+    _rss_snippet as _rss_snippet,
+    _text_of as _text_of,
+    _unwrap_ddg as _unwrap_ddg,
+)
 
 __all__ = [
     "search",
@@ -56,9 +69,6 @@ __all__ = [
     "DEFAULT_ENGINES",
 ]
 
-#: A hit is ``{'title', 'url', 'source', 'date', 'snippet'}``; fusion adds
-#: ``'engines'`` (every engine that returned the URL) and :func:`search` ``'score'``.
-Hit = dict[str, Any]
 #: An engine takes a query (plus optional tuning kwargs) and never raises.
 Engine = Callable[..., list[Hit]]
 
@@ -130,29 +140,6 @@ def _get(url: str, **kwargs: Any) -> requests.Response:
     return _session().get(url, headers=headers, timeout=timeout, **kwargs)
 
 
-def _hit(
-    title: str | None,
-    url: str | None,
-    source: str,
-    date: str | None = None,
-    snippet: str | None = None,
-) -> Hit:
-    """`date` is an ISO string 'YYYY-MM-DD' when known, else None. `snippet` is the
-    engine's own result blurb, whitespace-trimmed; whitespace-only becomes None."""
-    return {
-        "title": (title or "").strip(),
-        "url": (url or "").strip(),
-        "source": source,
-        "date": date,
-        "snippet": (snippet or "").strip() or None,
-    }
-
-
-def _dedupe_key(url: str) -> str:
-    """URLs differing only by fragment or trailing slash are the same page."""
-    return url.split("#", 1)[0].rstrip("/")
-
-
 def _note_failure(reason: str) -> None:
     """Record that the engine running on THIS thread could not answer at all —
     unreachable, blocked, an HTTP error. Every engine still fails soft to [], but
@@ -216,68 +203,6 @@ def _ok(response: requests.Response, source: str) -> bool:
     return False
 
 
-def _self_link(href: str, domain: str) -> bool:
-    """True when `href` points back at the engine itself — `domain` or a subdomain of
-    it. Matched on the HOST, never as a substring of the whole URL: "marginalia"
-    anywhere in a path meant every genuine article ABOUT marginalia was dropped."""
-    host = urlparse(href).hostname or ""
-    return host == domain or host.endswith(f".{domain}")
-
-
-def _collect(
-    anchors: Iterable[Tag],
-    source: str,
-    *,
-    k: int,
-    exclude: str | None = None,
-    min_title: int = 0,
-    unwrap: Callable[[str], str] = lambda href: href,
-    snippet: Callable[[Tag], str | None] = lambda anchor: None,
-) -> list[Hit]:
-    """Turn scraped `<a>` tags into at most `k` deduped hits, dropping the engine's own
-    links (`exclude`, a domain), non-http hrefs and titles shorter than `min_title`.
-    `snippet` maps a kept anchor to its result blurb elsewhere in the soup — best-effort
-    by nature (it reads markup the engine already sent, never fetches), so None is normal."""
-    hits: list[Hit] = []
-    seen: set[str] = set()
-    for anchor in anchors:
-        href = unwrap(anchor.get("href", ""))
-        key = _dedupe_key(href)
-        title = anchor.get_text(" ", strip=True)
-        if (
-            not href.startswith("http")
-            or key in seen
-            or len(title) < min_title
-            or (exclude and _self_link(href, exclude))
-        ):
-            continue
-        seen.add(key)
-        hits.append(_hit(title, href, source, snippet=snippet(anchor)))
-        if len(hits) >= k:
-            break
-    if not hits:
-        # Engines increasingly serve bot-checks as HTTP 200 (Mojeek does), and selectors
-        # rot silently. Both land here looking exactly like an empty search.
-        _log.warning("%s: 200 OK but no results parsed — bot-check or changed layout?", source)
-    return hits
-
-
-def _text_of(element: Tag | None) -> str | None:
-    """Element text for the snippet extractors, or None when the lookup missed."""
-    return element.get_text(" ", strip=True) if element is not None else None
-
-
-def _rss_date(pub_date: str | None) -> str | None:
-    """RFC-2822 pubDate -> 'YYYY-MM-DD', or None if absent/unparseable."""
-    if not pub_date:
-        return None
-    try:
-        return parsedate_to_datetime(pub_date).date().isoformat()
-    except Exception:
-        _log.debug("unparseable pubDate %r", pub_date)
-        return None
-
-
 # ── engines (each returns a list of hits; each fails soft to []) ─────────────────────────
 
 _DDG_URL = "https://html.duckduckgo.com/html/"
@@ -295,28 +220,6 @@ _DDG_HEADERS = {
 #: Wait this long before re-asking a DDG that answered with a challenge — the block is
 #: intermittent, and asking again instantly just collects a second one.
 _DDG_RETRY_PAUSE = 2.0
-
-
-def _unwrap_ddg(href: str) -> str:
-    """DDG wraps outbound links as `/l/?uddg=<encoded>`; unwrap when present."""
-    if "uddg=" not in href:
-        return href
-    absolute = href if href.startswith("http") else f"https:{href}"
-    return unquote(parse_qs(urlparse(absolute).query).get("uddg", [href])[0])
-
-
-def _ddg_anchors(soup: BeautifulSoup) -> Iterable[Tag]:
-    """The first result link inside each DDG result block (skips inline extras)."""
-    for result in soup.select("div.web-result, div.result"):
-        anchor = result.select_one("h2 a, a.result__a")
-        if anchor and anchor.get("href"):
-            yield anchor
-
-
-def _ddg_snippet(anchor: Tag) -> str | None:
-    """The blurb sits beside the title link, inside the same result block."""
-    block = anchor.find_parent("div", class_=["result", "web-result"])
-    return _text_of(block.select_one(".result__snippet")) if block else None
 
 
 def _ddg_attempt(query: str, k: int, read: float = 20.0) -> list[Hit]:
@@ -343,6 +246,36 @@ def _ddg_attempt(query: str, k: int, read: float = 20.0) -> list[Hit]:
     )
 
 
+def _ddg_attempt_read_budget(deadline: float, attempt: int) -> float:
+    """Leave the next retry's pause inside the search's remaining budget."""
+    retry_pause = _DDG_RETRY_PAUSE if attempt else 0.0
+    return deadline - time.monotonic() - retry_pause
+
+
+def _ddg_attempts_within_budget(
+    query: str, k: int, tries: int, budget: float
+) -> list[Hit] | None:
+    """Return DDG hits, [] after challenges, or None after an unrecoverable failure."""
+    deadline = time.monotonic() + budget
+    for attempt in range(tries):
+        left = _ddg_attempt_read_budget(deadline, attempt)
+        if left <= 0:
+            _log.warning("duckduckgo spent its %.0fs budget after %d attempt(s)", budget, attempt)
+            _note_failure("out of budget")
+            return None
+        if attempt:
+            time.sleep(_DDG_RETRY_PAUSE)
+        try:
+            hits = _ddg_attempt(query, k, read=left)
+        except requests.RequestException as exc:
+            _log.warning("duckduckgo unreachable (%s); not retrying", type(exc).__name__)
+            _note_failure(type(exc).__name__)
+            return None
+        if hits:
+            return hits
+    return []
+
+
 @_fails_soft
 def duckduckgo(query: str, k: int = 10, tries: int = 3, budget: float = FANOUT_BUDGET) -> list[Hit]:
     """Real DuckDuckGo web results by scraping the no-JS HTML endpoint.
@@ -356,28 +289,11 @@ def duckduckgo(query: str, k: int = 10, tries: int = 3, budget: float = FANOUT_B
 
     Fail-soft like every other engine — the inner `except requests.RequestException`
     is a different thing, the do-not-retry short-circuit for an unreachable host."""
-    deadline = time.monotonic() + budget
-    for attempt in range(tries):
-        # A retry's pause comes out of the same budget the attempt does, and is not
-        # worth sitting through when there is nothing left to spend after it.
-        left = deadline - time.monotonic() - (_DDG_RETRY_PAUSE if attempt else 0.0)
-        if left <= 0:
-            _log.warning("duckduckgo spent its %.0fs budget after %d attempt(s)", budget, attempt)
-            _note_failure("out of budget")
-            return []
-        if attempt:  # 202 / challenge / empty -> wait a moment, rotate UA, try again
-            time.sleep(_DDG_RETRY_PAUSE)
-        try:
-            if hits := _ddg_attempt(query, k, read=left):
-                return hits
-        except requests.RequestException as exc:
-            # Unreachable is not the same as blocked. Retrying a host that will
-            # not complete a TCP handshake just spends the fan-out's budget on
-            # a foregone conclusion — it was 3 x 5s + 2 x 2s of every search
-            # from a network that cannot reach DDG at all.
-            _log.warning("duckduckgo unreachable (%s); not retrying", type(exc).__name__)
-            _note_failure(type(exc).__name__)
-            return []
+    hits = _ddg_attempts_within_budget(query, k, tries, budget)
+    if hits is None:
+        return []
+    if hits:
+        return hits
     _log.warning("duckduckgo blocked after %d attempts", tries)
     _note_failure("blocked")
     return []  # still blocked after retries; the other engines below cover you
@@ -386,12 +302,6 @@ def duckduckgo(query: str, k: int = 10, tries: int = 3, budget: float = FANOUT_B
 # Brave's result markup also matches its own chrome ("Images", "Settings", "Log in"),
 # and every one of those labels is shorter than a real headline.
 _BRAVE_MIN_TITLE = 11
-
-
-def _brave_snippet(anchor: Tag) -> str | None:
-    """Brave wraps each result in a `.snippet` card; the blurb is its description."""
-    block = anchor.find_parent(class_="snippet")
-    return _text_of(block.select_one(".snippet-description, .snippet-content")) if block else None
 
 
 @_fails_soft
@@ -413,12 +323,6 @@ def brave(query: str, k: int = 10) -> list[Hit]:
     )
 
 
-def _mojeek_snippet(anchor: Tag) -> str | None:
-    """Mojeek keeps title and blurb (`p.s`) as siblings inside one `<li>`."""
-    block = anchor.find_parent("li")
-    return _text_of(block.select_one("p.s")) if block else None
-
-
 @_fails_soft
 def mojeek(query: str, k: int = 10) -> list[Hit]:
     """Mojeek (scrape). One of the few truly independent crawlers. Clean IP works;
@@ -429,14 +333,6 @@ def mojeek(query: str, k: int = 10) -> list[Hit]:
     soup = BeautifulSoup(response.text, "html.parser")
     anchors = soup.select("ul.results-standard li a.title, li h2 a, a.ob")
     return _collect(anchors, "mojeek", k=k, exclude="mojeek.com", snippet=_mojeek_snippet)
-
-
-def _marginalia_snippet(anchor: Tag) -> str | None:
-    """The description `<p>` follows the result's `<h2>`. Stop at the NEXT `<h2>`,
-    or a description-less result would steal its neighbour's blurb."""
-    heading = anchor.find_parent("h2")
-    following = heading.find_next(["p", "h2"]) if heading else None
-    return _text_of(following) if following is not None and following.name == "p" else None
 
 
 @_fails_soft
@@ -481,14 +377,6 @@ def duckduckgo_ia(query: str, k: int = 10) -> list[Hit]:
         if isinstance(topic, dict) and topic.get("FirstURL")
     )
     return hits[:k]
-
-
-def _rss_snippet(description: str | None) -> str | None:
-    """Google News item descriptions are HTML (a link back to the article plus the
-    outlet's name); keep the text, drop the tags."""
-    if not description:
-        return None
-    return BeautifulSoup(description, "html.parser").get_text(" ", strip=True)
 
 
 @_fails_soft
@@ -551,12 +439,10 @@ DEFAULT_ENGINES: tuple[Engine, ...] = (
     google_news,
 )
 
-#: The fan-out pool is shared by every search instead of being built and binned per
-#: query: a search should not pay to create seven threads — and, through them, seven
-#: fresh requests.Sessions — that it discards a second later. Nothing here is ever
+#: The fan-out pool is shared: a search should not create seven threads and
+#: sessions that it discards a second later. Nothing here is ever
 #: shut down; a straggler ends on its own read timeout, which _timeout() caps at the
 #: fan-out budget.
-#:
 #: Sized for several searches at once, because a straggler holds its thread for the
 #: whole fan-out budget: at 2x one search, two overlapping searches with hanging
 #: engines took every slot and a third one's engines sat in the QUEUE until its
@@ -579,22 +465,79 @@ def _pool() -> ThreadPoolExecutor:
         return _POOL
 
 
-_RRF_WEIGHT = 0.70
-_LEXICAL_WEIGHT = 0.30
-_WORD = re.compile(r"[a-z0-9]+")
+def _run_engines_politely(
+    engines: list[Engine], query: str, delay: float, results: list[list[Hit]], broke: list[bool]
+) -> None:
+    """Run engines in order when the caller asked to space out its requests."""
+    for index, engine in enumerate(engines):
+        if index:
+            time.sleep(delay)  # be polite; protects your IP reputation
+        results[index], broke[index] = _run_engine(engine, query)
 
 
-def _lexical(query: str, title: str | None) -> float:
-    """Fraction of query words present in the title (0..1) — a cheap on-topic signal."""
-    words = set(_WORD.findall(query.lower()))
-    if not words:
-        return 0.0
-    return len(words & set(_WORD.findall((title or "").lower()))) / len(words)
+def _save_engine_result(
+    future: Any,
+    index: int,
+    engines: list[Engine],
+    results: list[list[Hit]],
+    broke: list[bool],
+) -> None:
+    """Keep one parallel engine's answer without letting its bug sink the search."""
+    try:
+        results[index], broke[index] = future.result()
+    except Exception as exc:
+        # Every engine is wrapped in _fails_soft, so reaching here means one was
+        # added without it. Keep the engines that did answer, and diagnose only
+        # the engine and exception type — never the query (SPEC §6).
+        _log.warning(
+            "engine %s raised past its guard: %s",
+            engines[index].__name__,
+            type(exc).__name__,
+        )
+        broke[index] = True
 
 
-def _score(query: str, hit: Hit, rrf_share: float) -> float:
-    """Blend cross-engine agreement (RRF, as a share of the best hit's) with title match."""
-    return round(_RRF_WEIGHT * rrf_share + _LEXICAL_WEIGHT * _lexical(query, hit["title"]), 3)
+def _cancel_unfinished_engines(futures: dict[Any, int], broke: list[bool]) -> tuple[list[int], list[int]]:
+    """Return running and never-started engine indices after the fan-out budget."""
+    late, queued = [], []
+    for future, index in futures.items():
+        if future.done():
+            continue
+        if future.cancel():
+            queued.append(index)
+            continue
+        late.append(index)
+        broke[index] = True
+    return late, queued
+
+
+def _log_budget_miss(engines: list[Engine], indices: list[int], why: str, budget: float) -> None:
+    """Log timed-out engines without exposing the user's query."""
+    if indices:
+        names = ", ".join(engines[index].__name__ for index in indices)
+        _log.warning("web search: %s %s the %.0fs budget", names, why, budget)
+
+
+def _handle_fanout_timeout(
+    futures: dict[Any, int], engines: list[Engine], broke: list[bool], budget: float
+) -> None:
+    """Cancel queued work and record only engines that really started then missed budget."""
+    late, queued = _cancel_unfinished_engines(futures, broke)
+    _log_budget_miss(engines, sorted(late), "missed", budget)
+    _log_budget_miss(engines, sorted(queued), "never started within", budget)
+
+
+def _run_engines_in_parallel(
+    engines: list[Engine], query: str, budget: float, results: list[list[Hit]], broke: list[bool]
+) -> None:
+    """Fan independent engine calls out concurrently, with one wall-clock budget."""
+    pool = _pool()
+    futures = {pool.submit(_run_engine, engine, query): index for index, engine in enumerate(engines)}
+    try:
+        for future in as_completed(list(futures), timeout=budget):
+            _save_engine_result(future, futures[future], engines, results, broke)
+    except FuturesTimeout:
+        _handle_fanout_timeout(futures, engines, broke, budget)
 
 
 def _fuse(
@@ -605,112 +548,16 @@ def _fuse(
     rrf_k: int,
     budget: float = FANOUT_BUDGET,
 ) -> tuple[dict[str, Hit], dict[str, float], int, list[str]]:
-    """Run every engine and return (page by URL, summed reciprocal rank by URL,
-    raw hit count before dedup, names of the engines that could not answer).
-    A page ranked `rank` by one engine contributes 1/(rrf_k + rank) — once per
-    engine, or an engine listing the same page twice would look like two engines
-    agreeing.
-
-    The page keeps the FIRST engine's dict (so 'source' stays that engine's name)
-    and gains 'engines': every engine that returned the URL, in the order the
-    engines ran — DEFAULT_ENGINES order, which is the priority order. A later
-    engine also fills in 'snippet' when the earlier ones had none, so dedup never
-    throws away the only blurb we got.
-
-    An engine counts as having FAILED when it was blocked, unreachable or too slow
-    for the budget — not when it simply had nothing to say, and not when it never
-    ran at all because the shared pool was busy with another search. Fusion still
-    ignores it either way; the names are for whoever has to tell the user which of
-    "no results" and "no network" just happened, and blaming the network for a busy
-    moment is the answer that sends them looking at their router."""
-    engines = list(engines)
-    # Results are slotted BY INDEX, so the merge below sees the engines in
-    # DEFAULT_ENGINES order no matter what order they finish in. That order is
-    # load-bearing: it decides each page's 'source' and the order of its
-    # 'engines' list.
-    results: list[list[Hit]] = [[] for _ in engines]
-    broke = [False] * len(engines)
-    # Run the engines CONCURRENTLY. They are independent network calls to
-    # different hosts, and running them one after another made the wall clock
-    # the SUM of seven timeouts — measured at 86s for one query, which the
-    # browser's results page shows as a dead "Searching…" screen (owner report
-    # 2026-08-01). In parallel the cost is the slowest single engine.
-    #
-    # `delay` is the politeness knob for the CLI, and spacing requests out is
-    # its entire purpose, so that path stays sequential.
-    if delay:
-        for i, engine in enumerate(engines):
-            if i:
-                time.sleep(delay)  # be polite; protects your IP reputation
-            results[i], broke[i] = _run_engine(engine, query)
-    else:
-        pool = _pool()
-        futures = {pool.submit(_run_engine, engine, query): i for i, engine in enumerate(engines)}
-        try:
-            for future in as_completed(list(futures), timeout=budget):
-                index = futures[future]
-                try:
-                    results[index], broke[index] = future.result()
-                except Exception as exc:
-                    # Every engine is wrapped in _fails_soft, so reaching here
-                    # means one was added without it (duckduckgo was, for a
-                    # year). Letting that escape discards the six engines that
-                    # DID answer and turns the whole search into a 502 — the
-                    # engine name and the exception TYPE, never the query
-                    # (SPEC §6), say which one to go and fix.
-                    _log.warning(
-                        "engine %s raised past its guard: %s",
-                        engines[index].__name__,
-                        type(exc).__name__,
-                    )
-                    broke[index] = True
-        except FuturesTimeout:
-            # A running engine is not waited for: a straggler blocked on a dead
-            # host would put the whole budget back. It ends on its own read
-            # timeout (capped at the budget by _timeout) and frees its pooled
-            # thread; its result is simply not part of this search.
-            #
-            # An engine that never STARTED is a different animal and must not be
-            # reported as one that could not answer: nothing was wrong with it —
-            # the shared pool was busy with another search — and 'failed' means
-            # "the search never happened, you are offline" to whoever reads it.
-            # Cancelling is both true and useful: it would otherwise run against
-            # a search that has already answered, holding a thread from the next
-            # one.
-            late, queued = [], []
-            for future, index in futures.items():
-                if future.done():
-                    continue
-                if future.cancel():
-                    queued.append(index)
-                    continue
-                late.append(index)
-                broke[index] = True
-            # Engine names only, never the query (SPEC §6).
-            for indices, why in ((sorted(late), "missed"), (sorted(queued), "never started within")):
-                if indices:
-                    names = ", ".join(engines[index].__name__ for index in indices)
-                    _log.warning("web search: %s %s the %.0fs budget", names, why, budget)
-
-    merged: dict[str, Hit] = {}
-    rrf: defaultdict[str, float] = defaultdict(float)
-    collected = 0
-    for hits in results:
-        counted: set[str] = set()
-        for rank, hit in enumerate(hits, start=1):
-            collected += 1
-            key = _dedupe_key(hit["url"])
-            if not key or key in counted:
-                continue
-            counted.add(key)
-            page = merged.setdefault(key, dict(hit, engines=[]))
-            if hit["source"] not in page["engines"]:
-                page["engines"].append(hit["source"])
-            if page.get("snippet") is None and hit.get("snippet"):
-                page["snippet"] = hit["snippet"]
-            rrf[key] += 1.0 / (rrf_k + rank)
-    failed = [engine.__name__ for engine, missed in zip(engines, broke, strict=True) if missed]
-    return merged, rrf, collected, failed
+    """Run engines with the original network seams, then fuse their results."""
+    return _fuse_results(
+        engines,
+        query=query,
+        delay=delay,
+        rrf_k=rrf_k,
+        budget=budget,
+        run_politely=_run_engines_politely,
+        run_parallel=_run_engines_in_parallel,
+    )
 
 
 def _ranked(
@@ -722,25 +569,16 @@ def _ranked(
     rrf_k: int = 60,
     budget: float = FANOUT_BUDGET,
 ) -> tuple[list[Hit], int, list[str]]:
-    """search() minus the public shape: (hits, raw hit count before dedup, engines
-    that could not answer) — the count is what the route reports as 'merged', the
-    names what it reports as 'failed'."""
-    merged, rrf, collected, failed = _fuse(
+    """Return ranked hits, raw hit count, and engines that could not answer."""
+    return _rank_results(
         query,
-        DEFAULT_ENGINES if engines is None else engines,
+        limit,
+        engines=DEFAULT_ENGINES if engines is None else engines,
         delay=delay,
         rrf_k=rrf_k,
         budget=budget,
+        fuse_runner=_fuse,
     )
-    if not merged:
-        return [], collected, failed
-
-    top_rrf = max(rrf.values()) or 1.0
-    scored = [
-        dict(hit, score=_score(query, hit, rrf[key] / top_rrf)) for key, hit in merged.items()
-    ]
-    scored.sort(key=itemgetter("score"), reverse=True)
-    return scored[:limit], collected, failed
 
 
 def search(
@@ -751,49 +589,12 @@ def search(
     delay: float = 0.0,
     rrf_k: int = 60,
 ) -> list[Hit]:
-    """Return up to `limit` deduped web links, most-relevant first:
-        [{'title','url','source','date','snippet','engines','score'}, ...]
-
-    'engines' lists every engine that returned the URL (in DEFAULT_ENGINES order);
-    'source' is always engines[0]. 'snippet' is the first non-empty blurb among
-    those engines, in the same order.
-
-    score (0..1, relative within this query) = 70% Reciprocal-Rank-Fusion + 30% title match.
-      - RRF rewards links the engines rank HIGH and that MULTIPLE engines agree on
-        (a URL found by two engines sums both contributions). `rrf_k` is its damping
-        constant — larger flattens the rank curve, so agreement outweighs position.
-      - title match rewards links whose title actually contains your query words.
-    So it's a real cross-engine relevance ranking, computed from scratch — no ML, no API.
-
-    Dates: news carries a real date for free; the other links keep whatever their
-    engine reported, which is often nothing. Filling the rest in would mean fetching
-    each RESULT url from Python, around the Rust SSRF guard — see the module
-    docstring — so this module never does it."""
+    """Return the highest-ranked deduplicated engine results."""
     return _ranked(query, limit, engines=engines, delay=delay, rrf_k=rrf_k)[0]
 
 
 def timed_search(
     query: str, limit: int = 12, *, engines: Iterable[Engine] | None = None
 ) -> dict[str, Any]:
-    """What ``POST /web_search`` returns: ``{'hits', 'merged', 'tookMs', 'failed'}`` —
-    the fused hits plus how much raw material the fusion saw ('merged', hits
-    across all engines before URL dedup), the wall-clock milliseconds, and the
-    engines that could not answer at all ('failed': blocked, unreachable or too
-    slow for the budget).
-
-    'failed' is what separates the two ways a search comes back empty. No hits and
-    nothing failed means the web really had nothing for that query. No hits and
-    every engine failed means the search never happened — offline, or a network
-    blocking all of them — and telling the user to try fewer words would be a lie.
-
-    Like :func:`search` it never fetches a result URL — no entry point here owns
-    a knob that would step around the Rust SSRF guard (see the module
-    docstring)."""
-    started = time.monotonic()
-    hits, collected, failed = _ranked(query, limit, engines=engines)
-    return {
-        "hits": hits,
-        "merged": collected,
-        "tookMs": int((time.monotonic() - started) * 1000),
-        "failed": failed,
-    }
+    """Return fused hits with raw count, elapsed milliseconds, and failures."""
+    return _timed_result(query, limit, engines, _ranked, time.monotonic)

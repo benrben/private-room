@@ -42,150 +42,175 @@ const TONE_WORD: Partial<Record<BriefTone, string>> = {
  * what's merely recent — raw-cloud exposure, unscanned files, scripts to
  * review, failed runs, drafts to activate. Every row resolves its own issue in
  * one click. Renders nothing when the room is clear, so Home stays calm. */
-function RoomBrief({ s, a }: { s: WSState; a: WSActions }) {
-  const openPrivacy = () => {
-    s.setSettingsSection("set-cloud-privacy");
-    s.setShowSettings(true);
-  };
+function openPrivacySettings(s: WSState) {
+  s.setSettingsSection("set-cloud-privacy");
+  s.setShowSettings(true);
+}
 
-  const items: BriefItem[] = [];
+function pluralEnding(count: number): string {
+  return count === 1 ? "" : "s";
+}
+
+function rawCloudItem(s: WSState): BriefItem | null {
   if (isCloudRoute(s.model, s.ai) && s.privacyOn === false) {
-    items.push({
+    return {
       key: "raw-cloud",
       tone: "danger",
       text: "This room is answering with a raw cloud model — real names and content leave this Mac.",
       cta: "Review privacy",
-      run: openPrivacy,
-    });
+      run: () => openPrivacySettings(s),
+    };
   }
-  if (s.privacyPending > 0) {
-    // While a scan is already running, "Scan now" is a button that does
-    // nothing: `start_privacy_scan` returns Ok after the running flag turns it
-    // away. Say what is happening instead, and offer the place to watch it.
-    const scanning = s.privacyScanning;
-    items.push({
-      key: "scan",
-      tone: "warn",
-      text: scanning
-        ? `Scanning ${s.privacyPending} file${s.privacyPending === 1 ? "" : "s"} for private details.`
-        : `${s.privacyPending} file${s.privacyPending === 1 ? "" : "s"} haven't been scanned for private details yet.`,
-      cta: scanning ? "Watch progress" : "Scan now",
-      run: () => {
-        // The command now answers when it will not act — a door-off room says
-        // so instead of returning Ok and starting nothing. Swallowing that
-        // would put the dead button back.
-        if (!scanning) {
-          api.startPrivacyScan().catch((e) => s.pushToast("error", String(e)));
-        }
-        openPrivacy();
-      },
-    });
+  return null;
+}
+
+function privacyScanText(pending: number, scanning: boolean): string {
+  if (scanning) {
+    return `Scanning ${pending} file${pluralEnding(pending)} for private details.`;
   }
-  const needReview = s.scripts.filter((sc) => !sc.approved || sc.changedSinceApproval).length;
-  if (needReview > 0) {
-    items.push({
-      key: "script-review",
-      tone: "warn",
-      text: `${needReview} script${needReview === 1 ? "" : "s"} need review before ${needReview === 1 ? "it" : "they"} can run.`,
-      cta: "Review scripts",
-      run: () => a.openScripts(),
-    });
+  return `${pending} file${pluralEnding(pending)} haven't been scanned for private details yet.`;
+}
+
+function startPrivacyScan(s: WSState, scanning: boolean) {
+  if (!scanning) {
+    api.startPrivacyScan().catch((error) => s.pushToast("error", String(error)));
   }
-  const failed = s.scripts.filter(
-    (sc) => sc.lastRun && (sc.lastRun.status === "failed" || sc.lastRun.status === "error"),
+  openPrivacySettings(s);
+}
+
+function privacyScanItem(s: WSState): BriefItem | null {
+  if (s.privacyPending <= 0) return null;
+  const scanning = s.privacyScanning;
+  return {
+    key: "scan",
+    tone: "warn",
+    text: privacyScanText(s.privacyPending, scanning),
+    cta: scanning ? "Watch progress" : "Scan now",
+    run: () => startPrivacyScan(s, scanning),
+  };
+}
+
+function scriptsNeedingReview(s: WSState): number {
+  return s.scripts.filter((script) => !script.approved || script.changedSinceApproval).length;
+}
+
+function scriptReviewItem(s: WSState, a: WSActions): BriefItem | null {
+  const count = scriptsNeedingReview(s);
+  if (count === 0) return null;
+  return {
+    key: "script-review",
+    tone: "warn",
+    text: `${count} script${pluralEnding(count)} need review before ${count === 1 ? "it" : "they"} can run.`,
+    cta: "Review scripts",
+    run: () => a.openScripts(),
+  };
+}
+
+function failedScripts(s: WSState): number {
+  return s.scripts.filter(
+    (script) => script.lastRun && (script.lastRun.status === "failed" || script.lastRun.status === "error"),
   ).length;
-  if (failed > 0) {
-    items.push({
-      key: "script-failed",
-      tone: "warn",
-      text: `${failed} script${failed === 1 ? "" : "s"} failed on ${failed === 1 ? "its" : "their"} last run.`,
-      cta: "Open scripts",
-      run: () => a.openScripts(),
-    });
-  }
-  const drafts = visibleWorkflows(s.workflows).filter((w) => w.status === "draft").length;
-  if (drafts > 0) {
-    items.push({
-      key: "wf-draft",
-      tone: "info",
-      text: `${drafts} workflow${drafts === 1 ? "" : "s"} ${drafts === 1 ? "is a draft" : "are drafts"} waiting to be activated.`,
-      cta: "Review workflows",
-      run: () => a.openWorkflows(),
-    });
-  }
+}
 
+function failedScriptItem(s: WSState, a: WSActions): BriefItem | null {
+  const count = failedScripts(s);
+  if (count === 0) return null;
+  return {
+    key: "script-failed",
+    tone: "warn",
+    text: `${count} script${pluralEnding(count)} failed on ${count === 1 ? "its" : "their"} last run.`,
+    cta: "Open scripts",
+    run: () => a.openScripts(),
+  };
+}
+
+function workflowDraftItem(s: WSState, a: WSActions): BriefItem | null {
+  const count = visibleWorkflows(s.workflows).filter((workflow) => workflow.status === "draft").length;
+  if (count === 0) return null;
+  return {
+    key: "wf-draft",
+    tone: "info",
+    text: `${count} workflow${pluralEnding(count)} ${count === 1 ? "is a draft" : "are drafts"} waiting to be activated.`,
+    cta: "Review workflows",
+    run: () => a.openWorkflows(),
+  };
+}
+
+function briefItems(s: WSState, a: WSActions): BriefItem[] {
+  return [
+    rawCloudItem(s),
+    privacyScanItem(s),
+    scriptReviewItem(s, a),
+    failedScriptItem(s, a),
+    workflowDraftItem(s, a),
+  ]
+    .filter((item): item is BriefItem => item !== null)
+    .sort((first, second) => TONE_RANK[first.tone] - TONE_RANK[second.tone]);
+}
+
+function BriefItemRow({ item }: { item: BriefItem }) {
+  const word = TONE_WORD[item.tone];
+  return (
+    <li className={`rh-attn ${TONE_MARK[item.tone]}`}>
+      {word && <span className="nb-tape rh-attn-tag">{word}</span>}
+      <span className="rh-attn-text">{item.text}</span>
+      <button className="nb-btn nb-btn-go rh-attn-cta" onClick={item.run}>
+        {item.cta}
+      </button>
+    </li>
+  );
+}
+
+function RoomBrief({ s, a }: { s: WSState; a: WSActions }) {
+  const items = briefItems(s, a);
   if (items.length === 0) return null;
-  items.sort((x, y) => TONE_RANK[x.tone] - TONE_RANK[y.tone]);
-
   return (
     <section className="rh-section">
       <div className="rh-section-head">
         <h2>Needs your attention</h2>
         <span className="rh-section-note">
-          {items.length} item{items.length === 1 ? "" : "s"}
+          {items.length} item{pluralEnding(items.length)}
         </span>
       </div>
       <ul className="rh-attn-list">
-        {items.map((it) => (
-          <li key={it.key} className={`rh-attn ${TONE_MARK[it.tone]}`}>
-            {TONE_WORD[it.tone] && (
-              <span className="nb-tape rh-attn-tag">{TONE_WORD[it.tone]}</span>
-            )}
-            <span className="rh-attn-text">{it.text}</span>
-            <button className="nb-btn nb-btn-go rh-attn-cta" onClick={it.run}>
-              {it.cta}
-            </button>
-          </li>
-        ))}
+        {items.map((item) => <BriefItemRow key={item.key} item={item} />)}
       </ul>
     </section>
   );
 }
 
+type StampState = { word: string; mark: string };
+
+function recordingStamp(rec: WSState["recLive"]): StampState | null {
+  if (rec?.status === "recording") return { word: "Recording now", mark: "nb-sem-urgent" };
+  if (rec?.status === "paused") return { word: "Recording paused", mark: "nb-sem-pending" };
+  return null;
+}
+
+function activityStamp(s: WSState): StampState {
+  const busy = runningJobCount(s);
+  const recording = recordingStamp(s.recLive);
+  if (recording) return recording;
+  if (busy > 0) return { word: `${busy} running or waiting`, mark: "nb-sem-linked" };
+  if (s.privacyScanning) return { word: "Scanning files", mark: "nb-sem-pending" };
+  return { word: "All quiet", mark: "nb-sem-done" };
+}
+
 /** The dated annotation in the masthead's upper-right: what day it is, how big
- * the room is, and whether anything is happening in it right now.
- *
- * The date is CONTENT, not decoration — nothing on this page derives its shape,
- * angle or position from the clock, so a given room state still draws an
- * identical frame every render. */
+ * the room is, and whether anything is happening in it right now. */
 function RoomStamp({ page, s }: { page: FrontPageData; s: WSState }) {
   const today = new Date().toLocaleDateString(undefined, {
     weekday: "long",
     day: "numeric",
     month: "long",
   });
-  // `runningJobCount` is the ONE definition of "something is happening" the
-  // status bar and the Activity tab already count through. Asking it here
-  // rather than re-testing job statuses is what stops Home from disagreeing
-  // with the rest of the window about whether the room is busy.
-  const busy = runningJobCount(s);
-  const rec = s.recLive;
-  const state =
-    rec && rec.status === "recording"
-      ? { word: "Recording now", mark: "nb-sem-urgent" }
-      : rec && rec.status === "paused"
-        ? { word: "Recording paused", mark: "nb-sem-pending" }
-        : busy > 0
-          ? // `runningJobCount` counts queued jobs alongside running ones, so
-            // "running" was a claim the number could not make — the status bar
-            // and Activity both say so in the same words.
-            { word: `${busy} running or waiting`, mark: "nb-sem-linked" }
-          : // The privacy scanner is real work with no job row, so
-            // `runningJobCount` cannot see it and Home said "All quiet" while
-            // the fans were up. Deliberately NOT folded into `runningJobCount`:
-            // the status bar renders that number as a button that opens
-            // Activity, and a scan has no card there — the button would open a
-            // pane showing nothing. The actionable count and the room's mood
-            // are two different readouts.
-            s.privacyScanning
-            ? { word: "Scanning files", mark: "nb-sem-pending" }
-            : { word: "All quiet", mark: "nb-sem-done" };
+  const state = activityStamp(s);
   return (
     <div className="rh-stamp">
       <span className="rh-stamp-date">{today}</span>
       <span className="rh-stamp-counts">
-        {page.fileCount} room file{page.fileCount === 1 ? "" : "s"} · {page.chatCount}{" "}
-        chat{page.chatCount === 1 ? "" : "s"}
+        {page.fileCount} room file{pluralEnding(page.fileCount)} · {page.chatCount}{" "}
+        chat{pluralEnding(page.chatCount)}
       </span>
       <span className={`nb-tape rh-stamp-state ${state.mark}`}>{state.word}</span>
     </div>

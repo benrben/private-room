@@ -39,16 +39,128 @@ const SEP_WEIGHT: Record<string, number> = { ",": 3, "\t": 2, ";": 1, "|": 0 };
  * weight breaking ties. A file with none of them falls back to the comma. */
 function guessSep(str: string): string {
   const counts = new Map<string, number>();
-  let instr = false;
-  for (let i = 0; i < str.length; i++) {
-    const ch = str.charAt(i);
-    if (ch === '"') instr = !instr;
-    else if (!instr && ch in SEP_WEIGHT) counts.set(ch, (counts.get(ch) ?? 0) + 1);
+  let inString = false;
+  for (let index = 0; index < str.length; index += 1) {
+    inString = countSeparator(str.charAt(index), inString, counts);
   }
-  let ranked = [...counts.entries()];
-  if (ranked.length === 0) ranked = Object.entries(SEP_WEIGHT);
+  return rankedSeparators(counts).at(-1)![0];
+}
+
+function countSeparator(
+  character: string,
+  inString: boolean,
+  counts: Map<string, number>,
+): boolean {
+  if (character === '"') return !inString;
+  if (!inString && character in SEP_WEIGHT) {
+    counts.set(character, (counts.get(character) ?? 0) + 1);
+  }
+  return inString;
+}
+
+function rankedSeparators(counts: Map<string, number>): [string, number][] {
+  const ranked = [...counts.entries()];
+  if (!ranked.length) ranked.push(...Object.entries(SEP_WEIGHT));
   ranked.sort((a, b) => a[1] - b[1] || SEP_WEIGHT[a[0]] - SEP_WEIGHT[b[0]]);
-  return ranked[ranked.length - 1][0];
+  return ranked;
+}
+
+type CsvScan = {
+  column: number;
+  end: number;
+  inString: boolean;
+  quoted: Set<string>;
+  row: number;
+  separatorCode: number;
+  source: string;
+  start: number;
+  startCode: number;
+};
+
+function directiveEnd(source: string): number | null {
+  const newline = source.charCodeAt(5);
+  if (newline === 13 && source.charCodeAt(6) === 10) return 7;
+  if (newline === 13 || newline === 10) return 6;
+  return null;
+}
+
+function separatorSource(source: string): {
+  separator: string;
+  source: string;
+} {
+  if (!source.startsWith("sep=")) {
+    return { separator: guessSep(source.slice(0, 1024)), source };
+  }
+  const end = directiveEnd(source);
+  if (end === null)
+    return { separator: guessSep(source.slice(0, 1024)), source };
+  return { separator: source.charAt(4), source: source.slice(end) };
+}
+
+function startScan(source: string, separator: string): CsvScan {
+  return {
+    column: 0,
+    end: 0,
+    inString: false,
+    quoted: new Set<string>(),
+    row: 0,
+    separatorCode: separator.charCodeAt(0),
+    source,
+    start: 0,
+    startCode: source.charCodeAt(0),
+  };
+}
+
+function finishCell(scan: CsvScan, delimiter: number): void {
+  let field = scan.source.slice(scan.start, scan.end);
+  if (field.slice(-1) === "\r") field = field.slice(0, -1);
+  if (field.charAt(0) === '"' && field.charAt(field.length - 1) === '"') {
+    scan.quoted.add(`${colLetters(scan.column)}${scan.row + 1}`);
+  }
+  scan.start = scan.end + 1;
+  scan.startCode = scan.source.charCodeAt(scan.start);
+  if (delimiter === scan.separatorCode) scan.column += 1;
+  else {
+    scan.column = 0;
+    scan.row += 1;
+  }
+}
+
+function toggleQuote(scan: CsvScan): void {
+  if (scan.startCode === 0x22) scan.inString = !scan.inString;
+}
+
+function finishCarriageReturn(scan: CsvScan): void {
+  if (scan.inString) return;
+  if (scan.source.charCodeAt(scan.end + 1) === 0x0a) scan.end += 1;
+  finishCell(scan, 0x0d);
+}
+
+function isDelimiter(scan: CsvScan, code: number): boolean {
+  return code === scan.separatorCode || code === 0x0a;
+}
+
+function finishDelimiter(scan: CsvScan, code: number): void {
+  if (!scan.inString) finishCell(scan, code);
+}
+
+function scanCells(scan: CsvScan): void {
+  for (; scan.end < scan.source.length; scan.end += 1) {
+    const code = scan.source.charCodeAt(scan.end);
+    if (code === 0x22) {
+      toggleQuote(scan);
+      continue;
+    }
+    if (code === 0x0d) {
+      finishCarriageReturn(scan);
+      continue;
+    }
+    if (isDelimiter(scan, code)) finishDelimiter(scan, code);
+  }
+}
+
+function finishFinalCell(scan: CsvScan): void {
+  if (scan.end - scan.start > 0) finishCell(scan, -1);
 }
 
 /**
@@ -60,68 +172,11 @@ function guessSep(str: string): string {
  * drift from SheetJS's.
  */
 export function quotedCsvCells(text: string): Set<string> {
-  let str = text;
-  let sep: string;
-  // An Excel-authored `sep=;` line is consumed as configuration, not as row 1.
-  if (str.slice(0, 4) === "sep=") {
-    if (str.charCodeAt(5) === 13 && str.charCodeAt(6) === 10) {
-      sep = str.charAt(4);
-      str = str.slice(7);
-    } else if (str.charCodeAt(5) === 13 || str.charCodeAt(5) === 10) {
-      sep = str.charAt(4);
-      str = str.slice(6);
-    } else {
-      sep = guessSep(str.slice(0, 1024));
-    }
-  } else {
-    sep = guessSep(str.slice(0, 1024));
-  }
-
-  const quoted = new Set<string>();
-  const sepcc = sep.charCodeAt(0);
-  let r = 0;
-  let c = 0;
-  let start = 0;
-  let end = 0;
-  let instr = false;
-  // Quotes only toggle the in-string state when the FIELD began with one, so a
-  // stray `"` mid-field can't swallow the rest of the file.
-  let startcc = str.charCodeAt(0);
-
-  const finishCell = (cc: number) => {
-    let field = str.slice(start, end);
-    if (field.slice(-1) === "\r") field = field.slice(0, -1);
-    if (field.charAt(0) === '"' && field.charAt(field.length - 1) === '"') {
-      quoted.add(`${colLetters(c)}${r + 1}`);
-    }
-    start = end + 1;
-    startcc = str.charCodeAt(start);
-    if (cc === sepcc) c++;
-    else {
-      c = 0;
-      r++;
-    }
-  };
-
-  for (; end < str.length; ++end) {
-    const cc = str.charCodeAt(end);
-    if (cc === 0x22) {
-      if (startcc === 0x22) instr = !instr;
-      continue;
-    }
-    if (cc === 0x0d) {
-      if (instr) continue;
-      if (str.charCodeAt(end + 1) === 0x0a) ++end;
-      finishCell(cc);
-      continue;
-    }
-    if (cc === sepcc || cc === 0x0a) {
-      if (!instr) finishCell(cc);
-    }
-  }
-  // A file whose last line has no newline still ends on a field.
-  if (end - start > 0) finishCell(-1);
-  return quoted;
+  const { separator, source } = separatorSource(text);
+  const scan = startScan(source, separator);
+  scanCells(scan);
+  finishFinalCell(scan);
+  return scan.quoted;
 }
 
 /**
@@ -133,10 +188,18 @@ export function quotedCsvCells(text: string): Set<string> {
  * cannot be reached by this even if `XLSX.read` sniffed some other parser for
  * the string it was handed.
  */
-export function stripQuotedCsvFormulas(sheet: Record<string, unknown>, text: string): void {
+export function stripQuotedCsvFormulas(
+  sheet: Record<string, unknown>,
+  text: string,
+): void {
   for (const ref of quotedCsvCells(text)) {
     const cell = sheet[ref] as { f?: string; v?: unknown } | undefined;
-    if (cell && cell.f && typeof cell.v === "string" && cell.v === `=${cell.f}`) {
+    if (
+      cell &&
+      cell.f &&
+      typeof cell.v === "string" &&
+      cell.v === `=${cell.f}`
+    ) {
       delete cell.f;
     }
   }

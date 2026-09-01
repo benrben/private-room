@@ -145,22 +145,39 @@ def span_print(
     vec_sum: np.ndarray | None = None
     frames = 0.0
     for b, e, p in wins:
-        overlap = float(min(t1, e) - max(t0, b))
-        if overlap <= 0.0 or p.is_silent():
+        contribution = _span_contribution(b, e, p, t0, t1)
+        if contribution is None:
             continue
-        pvec = np.asarray(p.vec, dtype=np.float64)
-        if vec_sum is None:
-            vec_sum = np.zeros(pvec.shape[0], dtype=np.float64)
-        if vec_sum.shape[0] != pvec.shape[0]:
-            continue  # never mix print generations in one mean
-        w = p.voiced_frames * overlap / max(e - b, 1)
-        vec_sum = vec_sum + pvec * w
-        frames += w
+        vec_sum, frames_added = _add_span_contribution(vec_sum, contribution)
+        frames += frames_added
+    return _merged_span_print(vec_sum, frames)
 
+
+def _span_contribution(
+    begin: int, end: int, print_: VoicePrint, t0: int, t1: int
+) -> tuple[np.ndarray, float] | None:
+    overlap = float(min(t1, end) - max(t0, begin))
+    if overlap <= 0.0 or print_.is_silent():
+        return None
+    weight = print_.voiced_frames * overlap / max(end - begin, 1)
+    return np.asarray(print_.vec, dtype=np.float64), weight
+
+
+def _add_span_contribution(
+    vec_sum: np.ndarray | None, contribution: tuple[np.ndarray, float]
+) -> tuple[np.ndarray, float]:
+    vector, weight = contribution
+    if vec_sum is None:
+        vec_sum = np.zeros(vector.shape[0], dtype=np.float64)
+    if vec_sum.shape[0] != vector.shape[0]:
+        return vec_sum, 0.0  # never mix print generations in one mean
+    return vec_sum + vector * weight, weight
+
+
+def _merged_span_print(vec_sum: np.ndarray | None, frames: float) -> VoicePrint | None:
     if vec_sum is None:
         return None
     norm = float(np.sqrt(np.sum(vec_sum * vec_sum)))
     if norm < 1e-6:
         return None
-    vec_sum = vec_sum / norm
-    return VoicePrint(vec=vec_sum.astype(np.float32), voiced_frames=int(frames / 2.0))
+    return VoicePrint(vec=(vec_sum / norm).astype(np.float32), voiced_frames=int(frames / 2.0))

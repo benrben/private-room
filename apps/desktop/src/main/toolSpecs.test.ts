@@ -22,6 +22,8 @@ import {
   toolsCatalog,
   transcribeToolsSpecs,
   uiToolsSpecs,
+  webLanesAreAll,
+  webLanesBlock,
 } from "./toolSpecs.js";
 
 function names(specs: { function: { name: string } }[]): string[] {
@@ -246,6 +248,21 @@ describe("tools_catalog", () => {
     expect(createFile.function.description).toContain(
       "NEVER reference a CDN or any external <script src>/<link href>/remote image"
     );
+  });
+});
+
+describe("webLanesBlock", () => {
+  it("recognizes only the configuration with both web lanes enabled", () => {
+    expect(webLanesAreAll({ search: true, browse: true })).toBe(true);
+    expect(webLanesAreAll({ search: false, browse: true })).toBe(false);
+    expect(webLanesAreAll({ search: true, browse: false })).toBe(false);
+  });
+
+  it("gates search/download and browser tools independently", () => {
+    expect(webLanesBlock({ search: false, browse: true }, "web_search")).toBe(true);
+    expect(webLanesBlock({ search: false, browse: true }, DOWNLOAD_TOOL_NAMES[0]!)).toBe(true);
+    expect(webLanesBlock({ search: true, browse: false }, "browse_open")).toBe(true);
+    expect(webLanesBlock({ search: true, browse: true }, "web_search")).toBe(false);
   });
 });
 

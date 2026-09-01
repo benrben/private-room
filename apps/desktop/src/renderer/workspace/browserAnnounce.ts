@@ -38,6 +38,10 @@ export function hostOf(url?: string | null): string | null {
 function identity(info: BrowserInfo | null): string {
   if (!info || !info.open) return "closed";
   if (info.blank) return "blank";
+  return openPageIdentity(info);
+}
+
+function openPageIdentity(info: BrowserInfo): string {
   // `protection` is part of the identity because a blocker that fails after the
   // page has settled changes nothing else in this record — without it, the one
   // announcement that matters most would be suppressed as "nothing changed".
@@ -89,6 +93,10 @@ export function announcement(
   next: BrowserInfo,
 ): string | null {
   if (identity(prev) === identity(next)) return null;
+  return announcementForChangedInfo(next);
+}
+
+function announcementForChangedInfo(next: BrowserInfo): string {
   // The end of a browsing sitting is an EVENT, and it is the one that clears
   // the session. A sighted user watches the chrome go blank; this is the only
   // way anyone else learns it happened.
@@ -100,12 +108,21 @@ export function announcement(
   // the truth can disagree, so it outranks everything else.
   if (next.error) return `This page is not answering. ${next.error}`;
 
+  return pageAnnouncement(next);
+}
+
+function pageAnnouncement(next: BrowserInfo): string {
   const host = hostOf(next.url);
   const where = host ?? next.url ?? "an unnamed page";
   const title = (next.title ?? "").trim();
   if (next.ready !== "complete") {
     return `Loading ${where}.${guardClause(next)}`;
   }
+
+  return loadedPageAnnouncement(next, where, title);
+}
+
+function loadedPageAnnouncement(next: BrowserInfo, where: string, title: string): string {
   // The scheme is SPOKEN, not left to a padlock icon: "anything you type into
   // this page travels in the clear" is not something to encode as a glyph.
   const wire = next.url?.startsWith("http://") === true ? " Not encrypted." : "";

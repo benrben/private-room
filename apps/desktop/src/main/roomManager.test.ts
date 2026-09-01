@@ -30,12 +30,12 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { cpSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
-import { CancelFlag } from "./cancel.js";
+import { CancelFlag, createCancelState } from "./cancel.js";
 import { insertFile } from "./db-host/files.js";
 import { checkpointJob, createJob, getJob, setJobStatus } from "./db-host/jobs.js";
 import { getMeta } from "./db-host/meta.js";
@@ -44,10 +44,13 @@ import { hasRecovery } from "./db-host/recovery.js";
 import { setSetting } from "./db-host/settings.js";
 import { resetBaseUrlOverrideForTests, resolvedBaseUrl } from "./engineRouting.js";
 import { PARKED_BY_EXIT, PARKED_BY_LOCK } from "./jobs.js";
+import { createJobQueueState } from "./jobQueue.js";
+import { createSchedulerState } from "./jobScheduler.js";
 import { McpManager } from "./mcpClient.js";
 import { peekPendingOpen, setPendingOpen } from "./pendingOpen.js";
 import { readRecent } from "./recentTools.js";
 import { ROLLBACK_BUSY } from "./turnContext.js";
+import { activePolicy } from "./privacy.js";
 import {
   acquireWorkspaceLease,
   createWorkspaceRoom,
@@ -73,6 +76,7 @@ import {
   renameRoom,
   registerWorkspaceCopy,
   reportRecRecoveryFailure,
+  rescanWorkspaceRoom,
   ROOM_SERVER_NOT_IMPLEMENTED,
   roomInfo,
   roomNameFromPath,
@@ -305,6 +309,15 @@ describe("pendingMcpFor (SEC-1) / infoOf", () => {
     expect(pendingMcpFor(conn, dir)).toBeNull();
   });
 
+  it("is null when every saved connector is already disabled", () => {
+    const dir = freshDir();
+    const conn = dbCreateRoom(roomPathIn(dir, "disabled-mcp"), PASSWORD, "Disabled MCP");
+    strayConns.push(conn);
+    setSetting(conn, "mcp_config", JSON.stringify({ mcpServers: {} }));
+
+    expect(pendingMcpFor(conn, dir)).toBeNull();
+  });
+
   it("describes an enabled, unapproved server for the approval dialog", () => {
     const dir = freshDir();
     const conn = dbCreateRoom(roomPathIn(dir, "needs-approval"), PASSWORD, "Needs Approval");
@@ -488,6 +501,33 @@ describe("openRoom / openRoomImpl", () => {
     }
   });
 
+  it("opens an unlocked workspace writable and starts its workspace runtime", () => {
+    const dir = freshDir();
+    const workspacePath = path.join(dir, "Writable Workspace");
+    createWorkspaceRoom(workspacePath, PASSWORD, "Writable Workspace").db.close();
+
+    const state = createRoomManagerState();
+    const info = openRoom(state, baseDeps(dir), workspacePath, PASSWORD);
+
+    expect(info.readOnly).toBeUndefined();
+    expect(state.room?.readOnly).toBe(false);
+    expect(state.room?.workspace).toBeDefined();
+    teardownOpenRoom(state, baseDeps(dir));
+  });
+
+  it("releases a workspace writer lease when its password cannot unlock the room", () => {
+    const dir = freshDir();
+    const workspacePath = path.join(dir, "Wrong Password Workspace");
+    createWorkspaceRoom(workspacePath, PASSWORD, "Wrong Password Workspace").db.close();
+
+    expect(() => openRoom(createRoomManagerState(), baseDeps(dir), workspacePath, "wrong password"))
+      .toThrow();
+
+    const unlocked = createRoomManagerState();
+    expect(openRoom(unlocked, baseDeps(dir), workspacePath, PASSWORD).readOnly).toBeUndefined();
+    teardownOpenRoom(unlocked, baseDeps(dir));
+  });
+
   it("opens a raw Finder copy read-only until it is registered with a fresh identity", () => {
     const dir = freshDir();
     const originalPath = path.join(dir, "Original Workspace");
@@ -507,6 +547,17 @@ describe("openRoom / openRoomImpl", () => {
     expect(registered.duplicateRoomIdentity).toBeUndefined();
     expect(copied.room!.descriptor!.roomId).not.toBe(originalId);
     teardownOpenRoom(copied, baseDeps(dir));
+  });
+
+  it("refuses to register a workspace that is not an unregistered Finder copy", () => {
+    const dir = freshDir();
+    const state = createRoomManagerState();
+    createRoom(state, baseDeps(dir), roomPathIn(dir, "ordinary-room"), PASSWORD, "Ordinary");
+
+    expect(() => registerWorkspaceCopy(state, baseDeps(dir))).toThrow(
+      "The open room is not an unregistered workspace copy."
+    );
+    teardownOpenRoom(state, baseDeps(dir));
   });
 
   it("falls back to the file's own name when the room has none in meta", () => {
@@ -552,6 +603,32 @@ describe("openRoom / openRoomImpl", () => {
     expect(state.room).toBe(safeHandle);
     expect(state.room!.conn.open).toBe(true);
     state.room!.conn.close();
+  });
+
+  it("closes a fully opened handle when computing its room info fails", () => {
+    const dir = freshDir();
+    const roomPath = path.join(dir, "missing-files.roomai");
+    const broken = dbCreateRoom(roomPath, PASSWORD, "Broken Info");
+    broken.exec("DROP TABLE files");
+    broken.close();
+
+    const state = createRoomManagerState();
+    expect(() => openRoom(state, baseDeps(dir), roomPath, PASSWORD)).toThrow(/files/);
+    expect(state.room).toBeNull();
+  });
+
+  it("rejects a sealed backup before migration and closes its database handle", () => {
+    const dir = freshDir();
+    const roomPath = path.join(dir, "sealed-backup.roomai");
+    const sealed = dbCreateRoom(roomPath, PASSWORD, "Sealed");
+    sealed.exec("CREATE TABLE sealed_package_meta(version INTEGER NOT NULL)");
+    sealed.close();
+
+    const state = createRoomManagerState();
+    expect(() => openRoom(state, baseDeps(dir), roomPath, PASSWORD)).toThrow(
+      "This is a sealed backup. Import it as a new workspace instead of editing it directly."
+    );
+    expect(state.room).toBeNull();
   });
 
   it("refuses while a rollback is in flight", () => {
@@ -667,6 +744,48 @@ describe("openRoom / openRoomImpl", () => {
     state.room!.conn.close();
   });
 
+  it("runs supplied scheduler, queue, policy, and scanner dependencies after a writable unlock", () => {
+    const dir = freshDir();
+    const roomPath = existingRoom(dir);
+    const raw = dbOpenRoom(roomPath, PASSWORD);
+    setSetting(raw, "cloud_privacy", "on");
+    raw.close();
+    const state = createRoomManagerState();
+    const schedulerState = createSchedulerState();
+    const noRoom = { current: () => null };
+    const scanner = vi.fn(async () => ({ entities: [], complete: true }));
+    const deps = baseDeps(dir, {
+      scheduler: {
+        deps: { rooms: noRoom, startWorkflowRun: async () => "" },
+        state: schedulerState,
+      },
+      jobQueue: {
+        state: createJobQueueState(),
+        rooms: noRoom,
+        sink: { emit: () => undefined },
+        cancelState: createCancelState(),
+        starters: new Map(),
+      },
+      policy: { room: toRoomSource(state), userDataDir: dir },
+      privacyScan: {
+        room: toRoomSource(state),
+        userDataDir: dir,
+        roomEpoch: () => state.roomEpoch,
+        emit: { emit: () => undefined },
+        privacyScanCall: scanner,
+        isChatBusy: () => false,
+        sleepMs: async () => undefined,
+      },
+    });
+
+    openRoom(state, deps, roomPath, PASSWORD);
+
+    expect(schedulerState.generation).toBe(1);
+    expect(activePolicy()).not.toBeNull();
+    expect(scanner).not.toHaveBeenCalled();
+    teardownOpenRoom(state, deps);
+  });
+
   it("runs every create/open background spawn in Rust's own order", () => {
     const dir = freshDir();
     const state = createRoomManagerState();
@@ -732,6 +851,25 @@ describe("recovery", () => {
 
   it("refuses when no room is open", async () => {
     await expect(writeRecoveryKey(createRoomManagerState())).rejects.toThrow(NO_ROOM_OPEN);
+  });
+
+  it("refuses to write a recovery sidecar for a read-only workspace", async () => {
+    const dir = freshDir();
+    const state = createRoomManagerState();
+    createRoom(state, baseDeps(dir), roomPathIn(dir, "read-only-recovery"), PASSWORD, "Read only");
+    state.room!.readOnly = true;
+
+    await expect(writeRecoveryKey(state)).rejects.toThrow(/read-only/i);
+    state.room!.readOnly = false;
+    teardownOpenRoom(state, baseDeps(dir));
+  });
+
+  it("reports no recovery sidecar for a malformed workspace folder", () => {
+    const dir = freshDir();
+    const malformed = path.join(dir, "malformed-workspace");
+    mkdirSync(malformed);
+
+    expect(hasRecoveryKey(malformed)).toBe(false);
   });
 
   it("recovers the password and opens exactly as openRoom does", async () => {
@@ -1132,6 +1270,126 @@ describe("renameRoom", () => {
     teardownOpenRoom(state, deps);
   });
 
+  it("rejects unsafe workspace names and a pre-existing destination without disrupting its runtime", () => {
+    const dir = freshDir();
+    const workspacePath = path.join(dir, "Safe Workspace");
+    const state = createRoomManagerState();
+    const deps = baseDeps(dir);
+    createRoom(state, deps, workspacePath, PASSWORD, "Safe Workspace", "workspace-folder");
+    const conn = state.room!.conn;
+
+    expect(() => renameRoom(state, deps, "nested/name")).toThrow(/path separators/);
+    expect(state.room?.conn).toBe(conn);
+    writeFileSync(path.join(dir, "Taken Workspace"), "reserved");
+    expect(() => renameRoom(state, deps, "Taken Workspace")).toThrow(/already exists/);
+    expect(state.room?.path).toBe(workspacePath);
+    expect(state.room?.conn.open).toBe(true);
+    teardownOpenRoom(state, deps);
+  });
+
+  it("keeps a workspace usable when its Touch ID credential cannot be copied", () => {
+    const dir = freshDir();
+    const oldPath = path.join(dir, "Keychain Failure Workspace");
+    const state = createRoomManagerState();
+    const keychain = {
+      has: () => true,
+      store: () => { throw new Error("Keychain is unavailable"); },
+      read: () => PASSWORD,
+      deleteEntry: () => undefined,
+    };
+    const deps = baseDeps(dir, { keychain });
+    createRoom(state, deps, oldPath, PASSWORD, "Keychain Failure Workspace", "workspace-folder");
+
+    expect(renameRoom(state, deps, "Renamed After Keychain Failure").path)
+      .toBe(path.join(dir, "Renamed After Keychain Failure"));
+    expect(state.room?.conn.open).toBe(true);
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining("could not follow"));
+    teardownOpenRoom(state, deps);
+  });
+
+  it("uses the real no-prompt Keychain lookup when no credential seam is supplied", () => {
+    const dir = freshDir();
+    const oldPath = path.join(dir, "Default Keychain Workspace");
+    const state = createRoomManagerState();
+    const deps = baseDeps(dir);
+    createRoom(state, deps, oldPath, PASSWORD, "Default Keychain Workspace", "workspace-folder");
+
+    expect(renameRoom(state, deps, "Default Keychain Renamed").path)
+      .toBe(path.join(dir, "Default Keychain Renamed"));
+    teardownOpenRoom(state, deps);
+  });
+
+  it("restores the original workspace after a moved directory cannot be reopened", () => {
+    const dir = freshDir();
+    const oldPath = path.join(dir, "Recoverable Rename Workspace");
+    const created = createWorkspaceRoom(oldPath, PASSWORD, "Recoverable Rename Workspace");
+    const dbPath = created.descriptor.dbPath;
+    created.db.close();
+    const realDbPath = path.join(path.dirname(dbPath), "room-before-rename.roomai");
+    renameSync(dbPath, realDbPath);
+    symlinkSync(realDbPath, dbPath);
+
+    const state = createRoomManagerState();
+    const deps = baseDeps(dir);
+    openRoom(state, deps, oldPath, PASSWORD);
+
+    expect(() => renameRoom(state, deps, "Broken Reopen Workspace")).toThrow();
+    expect(state.room?.path).toBe(oldPath);
+    expect(state.room?.workspaceRuntimeClosed).toBe(false);
+    expect(state.room?.conn.open).toBe(true);
+    teardownOpenRoom(state, deps);
+  });
+
+  it("covers a filesystem race that also blocks the reverse move", async () => {
+    const dir = freshDir();
+    const oldPath = path.join(dir, "Reverse Move Failure Workspace");
+    const created = createWorkspaceRoom(oldPath, PASSWORD, "Reverse Move Failure Workspace");
+    const dbPath = created.descriptor.dbPath;
+    created.db.close();
+    const realDbPath = path.join(path.dirname(dbPath), "room-before-reverse-failure.roomai");
+    renameSync(dbPath, realDbPath);
+    symlinkSync(realDbPath, dbPath);
+
+    const state = createRoomManagerState();
+    const deps = baseDeps(dir);
+    openRoom(state, deps, oldPath, PASSWORD);
+    await sleep(60);
+    // Keep the asynchronously started watcher from observing the deliberately
+    // closed connection below. The race under test is the filesystem change,
+    // not watcher recovery.
+    state.room!.workspaceRuntimeClosed = true;
+    await state.room!.workspaceWatcher?.close();
+    let lockedParent = false;
+    Object.defineProperty(state.room!, "password", {
+      configurable: true,
+      get: () => {
+        if (!lockedParent) {
+          lockedParent = true;
+          chmodSync(dir, 0o500);
+        }
+        return PASSWORD;
+      },
+    });
+
+    try {
+      expect(() => renameRoom(state, deps, "Reverse Move Blocked")).toThrow();
+    } finally {
+      chmodSync(dir, 0o700);
+    }
+  });
+
+  it("keeps the database rename when the best-effort recents update cannot write", () => {
+    const dir = freshDir();
+    const state = opened(dir);
+    const blockedDataPath = path.join(dir, "not-a-data-directory");
+    writeFileSync(blockedDataPath, "not a directory");
+
+    expect(renameRoom(state, baseDeps(blockedDataPath), "Saved Despite Recents Failure").name)
+      .toBe("Saved Despite Recents Failure");
+    expect(getMeta(state.room!.conn, "name")).toBe("Saved Despite Recents Failure");
+    state.room!.conn.close();
+  });
+
   it("rejects an empty (or whitespace-only) name", () => {
     const dir = freshDir();
     const state = opened(dir);
@@ -1504,6 +1762,19 @@ describe("teardownOpenRoom", () => {
     expect(removeDiscovery).toHaveBeenCalledTimes(1);
     expect(state.roomServer).toBeNull();
   });
+
+  it("still stops a room-server bridge when discovery removal is not wired", () => {
+    const { state, dir } = roomWithReader("teardown-room-server-no-discovery");
+    const stop = vi.fn();
+    const logged = vi.spyOn(console, "error");
+    state.roomServer = { stop };
+
+    teardownOpenRoom(state, baseDeps(dir));
+
+    expect(stop).toHaveBeenCalledOnce();
+    expect(logged.mock.calls.some(([message]) => String(message).includes("remove_discovery"))).toBe(true);
+    expect(state.roomServer).toBeNull();
+  });
 });
 
 // ============================================================================
@@ -1557,6 +1828,16 @@ describe("drainInflight", () => {
 
     // Recorded here, once, so the card can't read as a Stop the user chose.
     expect(getJob(reader, running).parkedReason).toBe(PARKED_BY_LOCK);
+  });
+
+  it("continues draining when a closing database cannot mark running jobs", async () => {
+    const { state, deps } = roomWithReader("drain-closed-db");
+    state.room!.conn.close();
+
+    await expect(drainInflight(state, deps, fast)).resolves.toEqual({
+      asksDrained: true,
+      jobsDrained: true,
+    });
   });
 
   it("awaits an injected stopRecordingAndWait, with Rust's own 30s bound", async () => {

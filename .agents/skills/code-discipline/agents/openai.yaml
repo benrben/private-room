@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Discipline"
+  short_description: "Engineering discipline and strict quality loops"
+  default_prompt: "Use $code-discipline to implement and verify this change with repository quality gates when requested."

@@ -220,6 +220,30 @@ export function slideCountOf(bytes: Uint8Array): number {
   return splitSelfClosing(xml.slice(s, e), "p:sldId").length;
 }
 
+interface PresentationSlideList {
+  xml: string;
+  listStart: number;
+  listEnd: number;
+  ids: string[];
+}
+
+function presentationSlideList(bytes: Uint8Array): PresentationSlideList {
+  const xml = readZipEntryText(bytes, PRESENTATION_PART);
+  if (xml === undefined) {
+    throw new Error("This file is not a readable .pptx presentation.");
+  }
+  const body = findTagBody(xml, "p:sldIdLst");
+  if (body === undefined) {
+    throw new Error("This presentation does not list its slides, so its pages can't be drawn.");
+  }
+  const [listStart, listEnd] = body;
+  const ids = splitSelfClosing(xml.slice(listStart, listEnd), "p:sldId");
+  if (ids.length === 0) {
+    throw new Error("This presentation has no slides.");
+  }
+  return { xml, listStart, listEnd, ids };
+}
+
 /**
  * Rewrite a deck so slide `index` is the FIRST slide. Ported verbatim from
  * `office.rs`'s `deck_with_slide_first`.
@@ -246,19 +270,7 @@ export function slideCountOf(bytes: Uint8Array): number {
  * must not be able to silently corrupt a deck by skipping that guard.
  */
 export function deckWithSlideFirst(bytes: Uint8Array, index: number): Buffer {
-  const xml = readZipEntryText(bytes, PRESENTATION_PART);
-  if (xml === undefined) {
-    throw new Error("This file is not a readable .pptx presentation.");
-  }
-  const body = findTagBody(xml, "p:sldIdLst");
-  if (body === undefined) {
-    throw new Error("This presentation does not list its slides, so its pages can't be drawn.");
-  }
-  const [listStart, listEnd] = body;
-  const ids = splitSelfClosing(xml.slice(listStart, listEnd), "p:sldId");
-  if (ids.length === 0) {
-    throw new Error("This presentation has no slides.");
-  }
+  const { xml, listStart, listEnd, ids } = presentationSlideList(bytes);
   if (index >= ids.length) {
     throw new Error(`This presentation has ${ids.length} slides.`);
   }
@@ -364,6 +376,66 @@ export function evictToFit(map: Map<string, SlideCacheEntry>, ceiling: number): 
   }
 }
 
+interface SlidePreviewPlan {
+  bytes: Buffer;
+  ooxml: number;
+  slides: number;
+  key: string;
+}
+
+function assertSlideIndex(index: number): void {
+  if (!Number.isInteger(index) || index < 0) {
+    throw new Error(
+      `slide_preview's index must be a non-negative integer (Tauri's usize deserialization ` +
+        `would refuse anything else before the command ever ran); got ${index}.`
+    );
+  }
+}
+
+function planSlidePreview(id: string, index: number, storedBytes: Buffer | null): SlidePreviewPlan | null {
+  const bytes = storedBytes ?? Buffer.alloc(0);
+  if (bytes.length === 0) return null;
+  const ooxml = slideCountOf(bytes);
+  const slides = Math.max(ooxml, 1);
+  if (index >= slides) return null;
+  return { bytes, ooxml, slides, key: `${id}:${index}:${deckDigest(bytes)}` };
+}
+
+function cachedSlide(plan: SlidePreviewPlan, cache: SlideCache): SlideImage | undefined {
+  const hit = cache.map.get(plan.key);
+  return hit === undefined ? undefined : { pngB64: hit.pngB64, slides: plan.slides };
+}
+
+function bytesToRender(plan: SlidePreviewPlan, index: number): Buffer {
+  return index === 0 || plan.ooxml === 0
+    ? Buffer.from(plan.bytes)
+    : deckWithSlideFirst(plan.bytes, index);
+}
+
+function cacheSlide(plan: SlidePreviewPlan, cache: SlideCache, png: Buffer): SlideImage {
+  const pngB64 = png.toString("base64");
+  const seq = nextSlideSeq(cache);
+  evictToFit(cache.map, MAX_CACHED_SLIDES);
+  cache.map.set(plan.key, { seq, pngB64 });
+  return { pngB64, slides: plan.slides };
+}
+
+async function previewSlideBytes(
+  name: string,
+  id: string,
+  index: number,
+  storedBytes: Buffer | null,
+  cache: SlideCache,
+  render: PreviewRenderFn,
+): Promise<SlideImage | null> {
+  const plan = planSlidePreview(id, index, storedBytes);
+  if (plan === null) return null;
+  const cached = cachedSlide(plan, cache);
+  if (cached !== undefined) return cached;
+  const png = await render(name, bytesToRender(plan, index));
+  return png === null ? null : cacheSlide(plan, cache, png);
+}
+
 /**
  * One slide of a `.pptx`, drawn by macOS at full fidelity. Ported from
  * `office.rs`'s `slide_preview` `#[tauri::command]`.
@@ -394,39 +466,9 @@ export async function slidePreview(
   cache: SlideCache,
   render: PreviewRenderFn = previewRenderNotImplemented
 ): Promise<SlideImage | null> {
-  if (!Number.isInteger(index) || index < 0) {
-    throw new Error(
-      `slide_preview's index must be a non-negative integer (Tauri's usize deserialization ` +
-        `would refuse anything else before the command ever ran); got ${index}.`
-    );
-  }
+  assertSlideIndex(index);
   const [name, , storedBytes] = getFileFull(db, id);
-  const bytes = storedBytes ?? Buffer.alloc(0);
-  if (bytes.length === 0) {
-    return null;
-  }
-  const ooxml = slideCountOf(bytes);
-  const slides = Math.max(ooxml, 1);
-  if (index >= slides) {
-    return null;
-  }
-  const key = `${id}:${index}:${deckDigest(bytes)}`;
-  const hit = cache.map.get(key);
-  if (hit !== undefined) {
-    return { pngB64: hit.pngB64, slides };
-  }
-  // Slide 0 is already first, and a legacy .ppt can't be reordered at all: in
-  // both cases render the file exactly as it stands.
-  const staged = index === 0 || ooxml === 0 ? Buffer.from(bytes) : deckWithSlideFirst(bytes, index);
-  const png = await render(name, staged);
-  if (png === null) {
-    return null;
-  }
-  const pngB64 = png.toString("base64");
-  const seq = nextSlideSeq(cache);
-  evictToFit(cache.map, MAX_CACHED_SLIDES);
-  cache.map.set(key, { seq, pngB64 });
-  return { pngB64, slides };
+  return previewSlideBytes(name, id, index, storedBytes, cache, render);
 }
 
 /** Same renderer path, with current bytes loaded from the room's source of truth. */
@@ -437,29 +479,9 @@ export async function slidePreviewInRoom(
   cache: SlideCache,
   render: PreviewRenderFn = previewRenderNotImplemented,
 ): Promise<SlideImage | null> {
-  if (!Number.isInteger(index) || index < 0) {
-    throw new Error(
-      `slide_preview's index must be a non-negative integer (Tauri's usize deserialization ` +
-        `would refuse anything else before the command ever ran); got ${index}.`,
-    );
-  }
+  assertSlideIndex(index);
   const file = await readRoomFile(open, id);
-  const bytes = file.bytes ?? Buffer.alloc(0);
-  if (bytes.length === 0) return null;
-  const ooxml = slideCountOf(bytes);
-  const slides = Math.max(ooxml, 1);
-  if (index >= slides) return null;
-  const key = `${id}:${index}:${deckDigest(bytes)}`;
-  const hit = cache.map.get(key);
-  if (hit !== undefined) return { pngB64: hit.pngB64, slides };
-  const staged = index === 0 || ooxml === 0 ? Buffer.from(bytes) : deckWithSlideFirst(bytes, index);
-  const png = await render(file.name, staged);
-  if (png === null) return null;
-  const pngB64 = png.toString("base64");
-  const seq = nextSlideSeq(cache);
-  evictToFit(cache.map, MAX_CACHED_SLIDES);
-  cache.map.set(key, { seq, pngB64 });
-  return { pngB64, slides };
+  return previewSlideBytes(file.name, id, index, file.bytes, cache, render);
 }
 
 // ============================================================================

@@ -521,6 +521,49 @@ describe("dispatchJsonRpc", () => {
 // ---------------------------------------------------------------------------
 
 describe("McpBridge over real HTTP", () => {
+  it("does not expose a URL before the loopback listener is bound", () => {
+    const bridge = new McpBridge({
+      token: TOKEN,
+      scope: LOCAL_ENGINE,
+      dispatcher: makeFakeDispatcher(),
+    });
+
+    expect(() => bridge.url).toThrow("McpBridge is not listening yet");
+  });
+
+  it("rejects listen when another server already owns the requested port", async () => {
+    const occupied = net.createServer();
+    await new Promise<void>((resolve) => occupied.listen(0, "127.0.0.1", resolve));
+    const address = occupied.address();
+    expect(address).not.toBeNull();
+    const port = typeof address === "object" && address !== null ? address.port : 0;
+    const bridge = new McpBridge({
+      token: TOKEN,
+      scope: LOCAL_ENGINE,
+      dispatcher: makeFakeDispatcher(),
+    });
+
+    await expect(bridge.listen(port)).rejects.toMatchObject({ code: "EADDRINUSE" });
+    await new Promise<void>((resolve, reject) => occupied.close((error) => error ? reject(error) : resolve()));
+  });
+
+  it("drops a truncated authenticated request without dispatching and remains usable", async () => {
+    const { bridge, url, dispatcher } = await startBridge();
+    await new Promise<void>((resolve) => {
+      const socket = net.connect(bridge.port as number, "127.0.0.1", () => {
+        socket.write(
+          `POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer ${TOKEN}\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{`,
+        );
+        socket.destroy();
+      });
+      socket.once("close", resolve);
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(dispatcher.calls).toEqual([]);
+    expect((await postJson(url, { jsonrpc: "2.0", id: 1, method: "ping" })).status).toBe(200);
+  });
+
   it("a valid bearer succeeds", async () => {
     const { url } = await startBridge();
     const resp = await postJson(url, { jsonrpc: "2.0", id: 1, method: "ping" });

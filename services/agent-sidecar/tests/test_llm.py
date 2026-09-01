@@ -158,6 +158,27 @@ async def test_embed_connection_down_maps_to_ollama_down(fake_client: type[FakeA
     assert resp.json()["code"] == "OLLAMA_DOWN"
 
 
+async def test_embed_redacts_a_nonlocal_batch_without_mutating_caller_texts(
+    fake_client: type[FakeAsyncClient],
+) -> None:
+    texts = ["Ben Reich", "public context"]
+    fake_client.script["embed"] = SimpleNamespace(embeddings=[(0.1, 0.2), (0.3,)])
+
+    vectors = await llm.embed(
+        "nomic-embed-text:cloud",
+        texts,
+        "http://fake-ollama",
+        privacy={
+            "active": True,
+            "rules": [{"real": "Ben Reich", "placeholder": "[Person A]"}],
+        },
+    )
+
+    assert fake_client.calls["embed"]["input"] == ["[Person A]", "public context"]
+    assert texts == ["Ben Reich", "public context"]
+    assert vectors == [[0.1, 0.2], [0.3]]
+
+
 # --- /generate --------------------------------------------------------------
 
 
@@ -250,6 +271,83 @@ async def test_generate_model_missing_maps_to_code(fake_client: type[FakeAsyncCl
         )
     assert resp.status_code == 502
     assert resp.json()["code"] == "MODEL_MISSING"
+
+
+async def test_generate_external_engine_redacts_then_restores_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent: dict[str, Any] = {}
+
+    async def external_generate(
+        model: str, messages: list[dict[str, Any]], *, format: object, images: object
+    ) -> str:
+        sent.update(model=model, messages=messages, format=format, images=images)
+        return "Hello [Person A]"
+
+    monkeypatch.setattr(llm.external_llm, "is_external_model", lambda _model: True)
+    monkeypatch.setattr(llm.external_llm, "generate_external", external_generate)
+
+    text = await llm.generate(
+        "m:cloud",
+        [{"role": "user", "content": "Ben Reich"}],
+        "http://h:1",
+        format={"type": "object"},
+        images=["png"],
+        privacy={
+            "active": True,
+            "rules": [{"real": "Ben Reich", "placeholder": "[Person A]"}],
+        },
+    )
+
+    assert text == "Hello Ben Reich"
+    assert sent == {
+        "model": "m:cloud",
+        "messages": [{"role": "user", "content": "[Person A]"}],
+        "format": {"type": "object"},
+        "images": None,
+    }
+
+
+async def test_generate_provider_passes_the_unmodified_provider_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, Any] = {}
+
+    class ProviderChat:
+        def __init__(self, model: str, provider: object, temperature: float | None) -> None:
+            calls["init"] = (model, provider, temperature)
+
+        async def generate(self, messages: object, format: object, images: object) -> str:
+            calls["generate"] = (messages, format, images)
+            return "provider reply"
+
+    provider = _openrouter()
+    monkeypatch.setattr(llm, "OpenAICompatibleChatModel", ProviderChat)
+    messages = [{"role": "user", "content": "hi"}]
+    schema = {"type": "object"}
+
+    assert await llm.generate(
+        "openrouter/anthropic/claude-sonnet-4",
+        messages,
+        "http://h:1",
+        temperature=0.2,
+        format=schema,
+        images=["png"],
+        provider=provider,
+    ) == "provider reply"
+    assert calls["init"] == ("openrouter/anthropic/claude-sonnet-4", provider, 0.2)
+    assert calls["generate"] == (messages, schema, ["png"])
+
+
+async def test_generate_local_passes_the_output_cap(fake_client: type[FakeAsyncClient]) -> None:
+    fake_client.script["chat"] = _chat_reply("short reply")
+    assert await llm.generate(
+        "m",
+        [{"role": "user", "content": "hi"}],
+        "http://h:1",
+        num_predict=32,
+    ) == "short reply"
+    assert fake_client.calls["chat"]["options"]["num_predict"] == 32
 
 
 # --- /generate_stream -------------------------------------------------------
@@ -367,6 +465,30 @@ async def test_generate_stream_mid_stream_error_after_deltas(
     assert lines[1] == {"t": "delta", "v": "tial"}
     assert lines[-1] == {"t": "error", "code": "MODEL_MISSING", "error": "model 'x' not found"}
     assert {"t": "done"} not in lines
+
+
+async def test_generate_stream_flushes_an_unfinished_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The final partial placeholder must not disappear when a stream ends."""
+
+    async def fake_stream(self, messages, *, format=None, images=None):  # noqa: A002
+        yield "answer ends with [Per"
+
+    monkeypatch.setattr(llm.OllamaChatModel, "generate_stream", fake_stream)
+    parts = [
+        delta
+        async for delta in llm.generate_stream(
+            "m:cloud",
+            [{"role": "user", "content": "hi"}],
+            "http://127.0.0.1:11434",
+            privacy={
+                "active": True,
+                "rules": [{"real": "Ben Reich", "placeholder": "[Person A]"}],
+            },
+        )
+    ]
+    assert "".join(parts) == "answer ends with [Per"
 
 
 # --- /delete ----------------------------------------------------------------
@@ -588,3 +710,14 @@ def test_provider_host_falls_back_when_the_base_url_is_unusable() -> None:
     err = llm._classify(httpx.ConnectError(""), provider_host="openrouter.ai")
     assert err.code == "ENGINE_ERROR"
     assert err.message.strip() and "openrouter.ai" in err.message
+
+
+def test_classify_preserves_classified_provider_and_generic_errors() -> None:
+    existing = llm.LlmError("OLLAMA_DOWN", "already classified")
+    assert llm._classify(existing) is existing
+
+    provider = llm._classify(llm.ProviderApiError("provider refused"))
+    assert (provider.code, provider.message) == ("ENGINE_ERROR", "provider refused")
+
+    generic = llm._classify(RuntimeError("unexpected engine failure"))
+    assert (generic.code, generic.message) == ("ENGINE_ERROR", "unexpected engine failure")

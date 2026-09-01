@@ -38,8 +38,25 @@
  * untested.
  */
 
-import type { Menu as ElectronMenu, MenuItemConstructorOptions } from "electron";
+import type { Menu as ElectronMenu, MenuItem as ElectronMenuItem, MenuItemConstructorOptions } from "electron";
 import { QUIT_REQUESTED } from "./quitDoor.js";
+import type {
+  DispatchDeps,
+  MainWindowLike,
+  QuitDoorLike,
+  Row,
+  Section,
+  ViewMenuState,
+} from "./menuTypes.js";
+
+export type {
+  DispatchDeps,
+  MainWindowLike,
+  QuitDoorLike,
+  Row,
+  Section,
+  ViewMenuState,
+} from "./menuTypes.js";
 
 // LAZY `import()`, never a top-level value `import`, for the one place below
 // (`build`) that needs the real `Menu` value rather than just its type.
@@ -137,36 +154,6 @@ export function alwaysEnabled(id: string): boolean {
 }
 
 // ---------------------------------------------------------------- the spec
-
-/**
- * One row of the menu bar.
- *
- * `"platform"` rows carry macOS's own predefined behaviour and key
- * equivalents (the Rust source calls these out as a `Platform` enum plus a
- * conversion function; Electron's `role` string already names the same
- * concept directly, so there is nothing left to convert).
- */
-export type Row =
-  | { kind: "platform"; role: MenuItemConstructorOptions["role"] }
-  | { kind: "separator" }
-  /** A row that does something to the room. Raises {@link MENU_EVENT}. */
-  | { kind: "command"; id: string; label: string; accelerator?: string }
-  /**
-   * A row whose tick is a fact about the window. Raises {@link MENU_EVENT}
-   * too; the tick itself is pushed back by `menuSync`, never toggled here —
-   * the frontend owns the state, so letting the menu tick itself would let
-   * the two disagree the first time an action was refused.
-   */
-  | { kind: "check"; id: string; label: string; accelerator?: string }
-  | { kind: "nested"; label: string; rows: Row[] };
-
-export interface Section {
-  id: string;
-  /** `null` is the application menu, which macOS titles with the app's own
-   * name and draws in bold at the far left. */
-  label: string | null;
-  rows: Row[];
-}
 
 /**
  * The whole menu bar.
@@ -375,30 +362,6 @@ export function ids(): string[] {
  * same "Sidebar" fallback either way, so the two behave identically once the
  * IPC boundary has been crossed.
  */
-export interface ViewMenuState {
-  /** False whenever no room is open — see the row-building comments above. */
-  enabled: boolean;
-  library: boolean;
-  assistant: boolean;
-  focus: boolean;
-  railLabels: boolean;
-  /**
-   * False while the WINDOW, not the reader, is what took the sidebar's
-   * labels away. Below 1180px the rail drops them on its own and the
-   * preference cannot put them back, so the row would tick itself off and
-   * then refuse to tick back on. The rail's own expander hides for the same
-   * reason; a menu row cannot hide, so it greys out instead.
-   */
-  railLabelsSettable: boolean;
-  /**
-   * What the ⌘1 row is called right now — the active destination's name for
-   * its second column. Empty falls back to the generic word rather than to
-   * any destination's, so a stale payload cannot leave the row claiming to
-   * toggle something it is not standing over.
-   */
-  sidebar: string;
-}
-
 /**
  * What to write on the ⌘1 row.
  *
@@ -504,24 +467,6 @@ export async function build(onCommand: (id: string) => void): Promise<ElectronMe
 // -------------------------------------------------------------- dispatch
 
 /**
- * The minimal shape `dispatch`/`quit` need from a main window — deliberately
- * not `Electron.BrowserWindow` itself, so the pure decision logic below can
- * be unit tested with a plain object instead of a real window.
- */
-export interface MainWindowLike {
-  webContents: { send: (channel: string, ...args: unknown[]) => void };
-  close: () => void;
-}
-
-/**
- * The minimal shape `quit` needs from the quit door — see `quitDoor.ts`'s
- * `QuitDoor` class, which satisfies this.
- */
-export interface QuitDoorLike {
-  holdForUnsaved(code: number | null): boolean;
-}
-
-/**
  * ⌘Q, asked properly.
  *
  * The hold is the quit door's to decide and its latch to keep: it answers
@@ -551,23 +496,6 @@ export function quit(
     // `if let Some(window) = ... else` falls through for.
   }
   appExit();
-}
-
-/**
- * Dependencies `dispatch` needs, injected rather than reached for — see the
- * module header's warning about scoped window lookups.
- */
-export interface DispatchDeps {
-  quitDoor: QuitDoorLike;
-  getMainWindow: () => MainWindowLike | null | undefined;
-  /**
-   * True only when we LOOKED and there was no room — see the Rust source's
-   * `no_room_is_open`, whose `try_lock`-over-`lock` reasoning does not
-   * translate to single-threaded Node and is therefore the caller's concern,
-   * not this function's.
-   */
-  isRoomOpen: () => boolean;
-  appExit: () => void;
 }
 
 /**
@@ -602,6 +530,37 @@ export function dispatch(id: string, deps: DispatchDeps): void {
   window.webContents.send(MENU_EVENT, id);
 }
 
+type ViewMenuCheck = ReturnType<typeof viewMenuChecks>[number];
+
+function syncCheckItem(
+  item: ElectronMenuItem,
+  id: string,
+  checks: ViewMenuCheck[],
+  sidebar: string,
+): void {
+  const match = checks.find(([rowId]) => rowId === id);
+  if (!match) {
+    // Unreachable by construction (every check row above has a payload
+    // field), and a warn rather than a silent default if it ever isn't:
+    // a tick left at whatever it happened to be is a menu quietly lying
+    // about the window.
+    // TODO: obs.warn("menu_check_unmapped", [["id", id]]) once obs.ts lands.
+    return;
+  }
+  const [, checked, enabled] = match;
+  item.checked = checked;
+  item.enabled = enabled;
+  if (id === VIEW_LIBRARY_ID) item.label = sidebarLabel(sidebar);
+}
+
+function syncGatedItem(item: ElectronMenuItem, id: string, checks: ViewMenuCheck[], view: ViewMenuState): void {
+  if (item.type === "checkbox") {
+    syncCheckItem(item, id, checks, view.sidebar);
+    return;
+  }
+  if (item.type === "normal") item.enabled = view.enabled || alwaysEnabled(id);
+}
+
 /**
  * Push the window's layout state onto the native View menu.
  *
@@ -628,36 +587,11 @@ export function menuSync(menu: ElectronMenu, view: ViewMenuState): void {
       // TODO: obs.warn("menu_row_missing", [["id", id]]) once obs.ts lands.
       continue;
     }
-    if (item.type === "checkbox") {
-      // Row by row, never the section — View holds two different
-      // lifetimes: these rows belong to the open room, but Toggle Full
-      // Screen belongs to the WINDOW and is meaningful with no room at all.
-      // See the module header for why disabling the submenu as a unit is
-      // not an option.
-      const match = checks.find(([rowId]) => rowId === id);
-      if (!match) {
-        // Unreachable by construction (every check row above has a payload
-        // field), and a warn rather than a silent default if it ever isn't:
-        // a tick left at whatever it happened to be is a menu quietly
-        // lying about the window.
-        // TODO: obs.warn("menu_check_unmapped", [["id", id]]) once obs.ts lands.
-        continue;
-      }
-      const [, checked, enabled] = match;
-      item.checked = checked;
-      item.enabled = enabled;
-      if (id === VIEW_LIBRARY_ID) {
-        item.label = sidebarLabel(view.sidebar);
-      }
-    } else if (item.type === "normal") {
-      // The rows that only act — presets, Reset, New — follow the section;
-      // Close does not, because it can always close the window. The
-      // Rust source's `match` on `MenuItemKind` falls through anything that
-      // is neither a Check nor a MenuItem with `_ => {}`; mirroring that
-      // with an explicit `"normal"` check (rather than a catch-all `else`)
-      // keeps this branch from silently reinterpreting some future row kind
-      // that ought to be ignored instead.
-      item.enabled = view.enabled || alwaysEnabled(id);
-    }
+    // Row by row, never the section — View holds two different lifetimes:
+    // these rows belong to the open room, but Toggle Full Screen belongs to
+    // the WINDOW and is meaningful with no room at all. The explicit normal
+    // check keeps an unknown future row kind a no-op, as Rust's `_ => {}`
+    // did, rather than silently reinterpreting it as a command.
+    syncGatedItem(item, id, checks, view);
   }
 }

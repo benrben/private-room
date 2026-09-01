@@ -841,6 +841,22 @@ describe("spawnDownload — MEDIA engine", () => {
     db.close();
   });
 
+  it("keeps a completed import successful when best-effort temp cleanup fails", async () => {
+    const db = freshRoom();
+    const id = createJob(db, "download", "Download", { url: PUBLIC_URL }, 0);
+    const media = await realThrowawayWorkDir();
+    const rm = vi.fn(async () => { throw new Error("fabricated cleanup refusal"); });
+    const { deps } = makeRunnerDeps(db, "room-a", {
+      downloadMedia: fakeDownloadMedia(() => media),
+      removeWorkDir: rm,
+    });
+
+    await spawnDownload(deps, id, "room-a", PUBLIC_URL, DOWNLOAD_ENGINE_MEDIA, new CancelFlag());
+    expect(getJob(db, id).status).toBe("done");
+    expect(rm).toHaveBeenCalledWith(media.workDir, { recursive: true, force: true });
+    db.close();
+  });
+
   it("a genuine failure (cancel NOT set) parks the job with the real reason", async () => {
     const db = freshRoom();
     const id = createJob(db, "download", "Download", { url: PUBLIC_URL }, 0);

@@ -211,14 +211,12 @@ export function reportablePageState(
   return { ready, error };
 }
 
-/** The browser area's live poll, assembling protection / sitting / address /
- *  readiness into one answer. Port of `browser_info`. */
-export async function browserInfo(deps: BrowseCommandsDeps): Promise<BrowserInfo> {
-  const { browser } = deps;
-  if (!browser.isOpen()) {
-    return { open: false };
-  }
+interface BrowserPageReply {
+  info: Record<string, unknown>;
+  error: string | undefined;
+}
 
+async function readBrowserPageInfo(browser: BrowseCommandsDeps["browser"]): Promise<BrowserPageReply> {
   let info: Record<string, unknown> = {};
   let error: string | undefined;
   try {
@@ -233,12 +231,10 @@ export async function browserInfo(deps: BrowseCommandsDeps): Promise<BrowserInfo
     // exactly like one that was fine. Hand the reason back.
     error = e instanceof Error ? e.message : String(e);
   }
+  return { info, error };
+}
 
-  // A lost round trip IS a navigation — the same evidence the readiness probe
-  // already reads that way, applied to the poll that reports it.
-  const navigating = error !== undefined && evalLostToNavigation(error);
-  const reported = reportablePageState(navigating, info.ready ?? null, error);
-
+function recordBrowserPageInfo(browser: BrowseCommandsDeps["browser"], info: Record<string, unknown>): void {
   // The page script answers for the MAIN frame, so this is the authoritative
   // "where is this page" — write it back so a record corrupted by a sub-frame
   // navigation heals on the next poll instead of persisting as a wrong tab
@@ -246,58 +242,65 @@ export async function browserInfo(deps: BrowseCommandsDeps): Promise<BrowserInfo
   if (typeof info.url === "string") {
     browser.recordActiveUrl(info.url);
   }
-  // …and what the page calls itself, from the same answer. The strip was
-  // labelled from the URL alone, so a page the toolbar was already calling
-  // "Example Domain" sat in the sidebar as "New page" — one poll carrying both
-  // facts, one of them thrown away. Written AFTER the URL: a move clears the
-  // old title, and this is the new one.
+  // Written AFTER the URL: a move clears the old title, and this is the new one.
   if (typeof info.title === "string") {
     browser.recordActiveTitle(info.title);
   }
+}
 
-  // With no answer from the page, our own RECORD of where this page was sent
-  // is the only honest address there is. Better than a null the view falls
-  // back to its last known value for, and better than flashing the idle
-  // document in the bar the user just typed a destination into.
-  const url = typeof info.url === "string" ? info.url : (browser.activeUrl() ?? null);
+function browserInfoUrl(browser: BrowseCommandsDeps["browser"], info: Record<string, unknown>): string | null {
+  return typeof info.url === "string" ? info.url : (browser.activeUrl() ?? null);
+}
 
-  const out: BrowserInfo = {
+function browserInfoResult(
+  browser: BrowseCommandsDeps["browser"],
+  info: Record<string, unknown>,
+  reported: ReturnType<typeof reportablePageState>
+): BrowserInfo {
+  return {
     open: true,
     // Recorded, not read from the page script — a blank page runs no script.
     blank: browser.isBlank(),
-    // What the content blocker DID, worst page first. The shield used to read
-    // "Trackers blocked." off the STORAGE check, which knows nothing about the
-    // rule list.
+    // What the content blocker DID, worst page first.
     protection: browser.protection(),
-    // What it BLOCKED, on the page showing — a real count of cancellations the
-    // one webRequest funnel actually made (webRequestFunnel.ts), where the
-    // audit-wave shield's "12 blocked" was a mockup number behind which nothing
-    // counted anything. Always sent while a page is open, `0` included: absent
-    // means an older backend, not "nothing was blocked".
+    // Always sent while a page is open, `0` included: absent means an older backend.
     blockedCount: browser.blockedCount(),
-    // The browsing sitting the journal is writing into — empty when none is
-    // live — so the Journal can tell this sitting from the earlier ones.
+    // The browsing sitting the journal is writing into — empty when none is live.
     session: browser.sessionId(),
-    url,
+    url: browserInfoUrl(browser, info),
     title: typeof info.title === "string" ? info.title : null,
     ready: reported.ready as string | boolean | null,
     takeover: browser.takeover,
     // Item #18: the page latches a double Escape and reports it here, once.
-    // This poll is the ONLY channel out of the native layer, so the flag has
-    // to ride the state the chrome already asks for.
     leaveRequested: info.leaveRequested === true,
-    // Whether a passage is selected on the page, so the assistant's scope
-    // strip can OFFER a "selected passage" scope only when there is one.
+    // Whether a passage is selected on the page.
     hasSelection: info.hasSelection === true,
   };
-  // Present ONLY when there is a reason, so the field means what `apiTypes.ts`
-  // declares it to mean (`error?: string`). A `null` on every poll is not an
-  // optional field, it is a null one — and the view would have to know the
-  // difference for no gain.
-  if (reported.error !== undefined) {
-    out.error = reported.error;
+}
+
+function withBrowserInfoError(info: BrowserInfo, error: string | undefined): BrowserInfo {
+  if (error !== undefined) {
+    info.error = error;
   }
-  return out;
+  return info;
+}
+
+/** The browser area's live poll, assembling protection / sitting / address /
+ *  readiness into one answer. Port of `browser_info`. */
+export async function browserInfo(deps: BrowseCommandsDeps): Promise<BrowserInfo> {
+  const { browser } = deps;
+  if (!browser.isOpen()) {
+    return { open: false };
+  }
+
+  const { info, error } = await readBrowserPageInfo(browser);
+
+  // A lost round trip IS a navigation — the same evidence the readiness probe
+  // already reads that way, applied to the poll that reports it.
+  const navigating = error !== undefined && evalLostToNavigation(error);
+  const reported = reportablePageState(navigating, info.ready ?? null, error);
+  recordBrowserPageInfo(browser, info);
+  return withBrowserInfoError(browserInfoResult(browser, info, reported), reported.error);
 }
 
 // ---------------------------------------------------------------------------

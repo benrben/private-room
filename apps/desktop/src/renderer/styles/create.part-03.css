@@ -1,0 +1,488 @@
+
+/* Numbered because a shot list IS a sequence — the order is information the
+   reader needs, not decoration. */
+.cr-shot-n {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--faint);
+  min-width: 2ch;
+  text-align: right;
+  padding-top: 6px;
+}
+.cr-shot-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+.cr-shot-who {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  align-items: center;
+}
+.cr-who {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--line);
+  background: none;
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.cr-who:hover:not(:disabled) {
+  background: var(--hover);
+}
+.cr-who.is-on {
+  color: var(--text);
+  border-color: var(--accent);
+}
+/* Not a warning, a fact: without a picture only their description travels,
+   so they will not look the same twice. */
+.cr-who-noface {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--faint);
+}
+.cr-shot-knobs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+.cr-knob {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--faint);
+}
+.cr-shot-made {
+  display: flex;
+  gap: var(--sp-2);
+}
+.cr-shot-made button {
+  border: none;
+  background: none;
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--accent);
+}
+.cr-shot-made button:hover {
+  background: var(--hover);
+}
+.cr-shot-x {
+  border: none;
+  background: none;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: var(--radius-sm);
+  color: var(--faint);
+  font-size: 12px;
+  line-height: 1;
+}
+.cr-shot-x:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+}
+.cr-shot-new {
+  display: flex;
+  gap: var(--sp-2);
+}
+.cr-shot-new .cr-field {
+  flex: 1;
+}
+
+/* ----- the two passes ----- */
+
+.cr-make-all {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--line);
+}
+.cr-make-step {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: var(--sp-3);
+  align-items: center;
+}
+/* Numbered because the passes genuinely are ordered: a clip is animated out
+   of the still that step 1 draws, so 2 cannot precede 1. */
+.cr-step-n {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+.cr-make-step b {
+  display: block;
+  font-size: 12px;
+  color: var(--text);
+}
+.cr-make-step span:not(.cr-step-n) {
+  font-size: 11px;
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+.cr-make-note {
+  margin-top: var(--sp-1);
+}
+
+/* ==========================================================================
+   8. PICTURES FROM THIS ROOM
+   ========================================================================== */
+
+.cr-pick-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: var(--sp-4);
+  background: color-mix(in srgb, var(--page) 72%, transparent);
+  backdrop-filter: blur(2px);
+}
+.cr-pick {
+  width: min(760px, 100%);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  overflow: hidden;
+}
+.cr-pick-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+.cr-pick-head h3 {
+  margin: 0;
+  font-size: 14px;
+  flex: 1;
+}
+.cr-pick-search {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--hover);
+  color: var(--text);
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: inherit;
+}
+.cr-pick-x {
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--faint);
+  font-size: 13px;
+  padding: 4px 6px;
+  border-radius: var(--radius-sm);
+}
+.cr-pick-x:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.cr-pick-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: var(--sp-2);
+  overflow-y: auto;
+  min-height: 0;
+}
+.cr-pick-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: none;
+  padding: 4px;
+  cursor: pointer;
+  text-align: left;
+}
+.cr-pick-item:hover {
+  border-color: var(--accent);
+  background: var(--hover);
+}
+.cr-pick-item img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 3px;
+  display: block;
+}
+.cr-pick-name {
+  font-size: 10px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* An attached picture always carries WHAT IT IS FOR. A first frame and a
+   reference behave completely differently, and a row of anonymous thumbnails
+   would hide that at exactly the moment it costs money to get wrong. */
+.cr-attach-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  align-items: center;
+}
+.cr-attached {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 3px 6px 3px 3px;
+  max-width: 100%;
+}
+.cr-attached img {
+  width: 34px;
+  height: 34px;
+  object-fit: cover;
+  border-radius: 3px;
+  display: block;
+  flex: 0 0 auto;
+}
+.cr-attached-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.cr-attached-role {
+  font-family: var(--mono);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--faint);
+}
+.cr-attached-name {
+  font-size: 11px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 15ch;
+}
+.cr-attached-x {
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--faint);
+  font-size: 11px;
+  padding: 2px 3px;
+  border-radius: var(--radius-sm);
+}
+.cr-attached-x:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.cr-attach {
+  font-size: 12px;
+  padding: 5px 10px;
+}
+
+/* ==========================================================================
+   9. AN EPISODE — a script cut into shots, and shots joined end to end.
+
+   The constraint driving all of it: no model films more than 20 seconds, and
+   most stop at 15. Five minutes is therefore twenty generations, and the two
+   things the page owes are (a) the arithmetic, said plainly, because it is
+   twenty charges; and (b) a preview, because turning one paste into twenty
+   rows is a large edit to perform unseen.
+   ========================================================================== */
+
+.cr-split-open {
+  align-self: flex-start;
+  font-size: 12px;
+}
+.cr-split {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--hover);
+}
+.cr-split-knobs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+.cr-split-knobs .cr-knob input,
+.cr-split-knobs .cr-knob select {
+  min-width: 120px;
+}
+
+/* The count and the runtime, at a size that is read rather than skimmed —
+   this is the number that decides whether to press the button. */
+.cr-split-sum {
+  font-size: 13px;
+  color: var(--text);
+  padding: var(--sp-2) 0;
+  border-top: 1px solid var(--line);
+}
+.cr-split-sum b {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.cr-split-preview {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 260px;
+  overflow-y: auto;
+  font-size: 11px;
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+.cr-split-preview li {
+  display: grid;
+  grid-template-columns: 2.5ch 1fr;
+  gap: var(--sp-2);
+  padding: 3px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 50%, transparent);
+}
+
+/* What the list adds up to. Twenty rows is not obviously five minutes, and a
+   runtime is the thing the writer actually has in mind. */
+.cr-runtime {
+  font-size: 12px;
+  color: var(--muted);
+  padding: var(--sp-1) 0;
+}
+.cr-runtime b {
+  color: var(--text);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The join. A checkbox rather than a hidden default, because it changes what
+   is sent to a paid model and can silently do nothing on a model that takes
+   no ending picture — which the line underneath says outright. */
+.cr-chain {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  font-size: 11px;
+  line-height: var(--lh-body);
+  color: var(--muted);
+  cursor: pointer;
+}
+.cr-chain input {
+  margin-top: 2px;
+  flex: 0 0 auto;
+}
+
+/* ==========================================================================
+   THE REVIEW SHEET — read the whole run before any of it is paid for
+
+   Every other control on this page is undone by clicking it again. This one
+   is not: it queues twenty billed calls. So the sheet is a full-height
+   reading surface rather than a confirmation dialog — the rows are meant to
+   be scrolled and read, and the prompt on each one is the thing being bought.
+   ========================================================================== */
+.cr-review-back {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: var(--sp-4);
+  background: color-mix(in srgb, var(--page) 72%, transparent);
+  backdrop-filter: blur(2px);
+}
+.cr-review {
+  width: min(880px, 100%);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  overflow-y: auto;
+}
+.cr-review-sum {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding-bottom: var(--sp-3);
+  border-bottom: 1px solid var(--rule);
+}
+.cr-review-big {
+  font-size: var(--fs-body);
+  color: var(--text);
+}
+.cr-review-big b {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-strong);
+}
+
+.cr-review-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+.cr-review-row {
+  display: flex;
+  gap: var(--sp-3);
+  padding-bottom: var(--sp-3);
+  border-bottom: 1px solid var(--rule);
+}
+/* A skipped part is dimmed AND says why in words on the row — colour is never
+   the only signal, and "why is this one grey" is the exact question a dimmed
+   row without a sentence would raise. */
+.cr-review-row.is-skipped {
+  opacity: 0.62;
+}
+.cr-review-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.cr-review-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: 11px;
+  color: var(--faint);
+}
+.cr-review-model {
+  color: var(--muted);
+}
+.cr-review-secs {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.cr-review-cast {
+  color: var(--accent);
+}
+.cr-review-skip {
+  margin: 0;
+  font-size: 11px;
+  color: var(--danger);
+}

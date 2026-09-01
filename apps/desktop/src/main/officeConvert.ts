@@ -62,24 +62,83 @@ async function downloadRaw(url: string, destination: string, redirects = 0): Pro
   if (redirects > 5) throw new Error("Too many office-converter download redirects.");
   await new Promise<void>((resolve, reject) => {
     const request = https.get(url, { headers: { "Accept-Encoding": "br" } }, (response) => {
-      if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        response.resume();
-        void downloadRaw(new URL(response.headers.location, url).toString(), destination, redirects + 1).then(resolve, reject);
-        return;
-      }
-      if (response.statusCode !== 200) {
-        response.resume();
-        reject(new Error(`Office-converter download returned HTTP ${response.statusCode ?? "unknown"}.`));
-        return;
-      }
-      const output = fs.createWriteStream(destination, { mode: 0o600 });
-      response.pipe(output);
-      response.on("error", reject);
-      output.on("error", reject);
-      output.on("finish", () => output.close(() => resolve()));
+      receiveOfficeDownload(response, url, destination, redirects, resolve, reject);
     });
     request.on("error", reject);
   });
+}
+
+export function officeDownloadRedirect(response: http.IncomingMessage, sourceUrl: string): string | null {
+  const { statusCode } = response;
+  const location = response.headers.location;
+  if (!statusCode || statusCode < 300 || statusCode >= 400 || !location) return null;
+  return new URL(location, sourceUrl).toString();
+}
+
+type OfficeArtifactDownload = (url: string, destination: string, redirects?: number) => Promise<void>;
+
+/** The installer keeps its I/O behind this small seam so the integrity rules
+ * can be verified without fetching a converter or touching the host disk. */
+export interface OfficeArtifactInstallerDeps {
+  join(directory: string, name: string): string;
+  exists(filePath: string): boolean;
+  mkdir(directory: string): Promise<void>;
+  remove(filePath: string): Promise<void>;
+  rename(from: string, to: string): Promise<void>;
+  sha256(filePath: string): Promise<string>;
+  download: OfficeArtifactDownload;
+}
+
+const defaultOfficeArtifactInstallerDeps: OfficeArtifactInstallerDeps = {
+  join: path.join,
+  exists: fs.existsSync,
+  mkdir: async (directory) => {
+    await fs.promises.mkdir(directory, { recursive: true, mode: 0o700 });
+  },
+  remove: async (filePath) => {
+    await fs.promises.rm(filePath, { force: true });
+  },
+  rename: fs.promises.rename,
+  sha256: fileSha256,
+  download: downloadRaw,
+};
+
+export type OfficeDownloadOutput = NodeJS.WritableStream & {
+  close(callback: () => void): unknown;
+};
+
+type OfficeOutputFactory = (destination: string) => OfficeDownloadOutput;
+
+function createOfficeDownloadOutput(destination: string): OfficeDownloadOutput {
+  return fs.createWriteStream(destination, { mode: 0o600 });
+}
+
+export function receiveOfficeDownload(
+  response: http.IncomingMessage,
+  sourceUrl: string,
+  destination: string,
+  redirects: number,
+  resolve: () => void,
+  reject: (reason: unknown) => void,
+  download: OfficeArtifactDownload = downloadRaw,
+  createOutput: OfficeOutputFactory = createOfficeDownloadOutput,
+): void {
+  const redirectUrl = officeDownloadRedirect(response, sourceUrl);
+  if (redirectUrl) {
+    response.resume();
+    void download(redirectUrl, destination, redirects + 1).then(resolve, reject);
+    return;
+  }
+  if (response.statusCode !== 200) {
+    response.resume();
+    reject(new Error(`Office-converter download returned HTTP ${response.statusCode ?? "unknown"}.`));
+    return;
+  }
+  const output = createOutput(destination);
+  response.pipe(output);
+  response.on("error", reject);
+  output.on("error", reject);
+  output.on("finish", () => output.close(resolve));
 }
 
 export async function verifyOfficeArtifacts(directory: string): Promise<boolean> {
@@ -91,23 +150,103 @@ export async function verifyOfficeArtifacts(directory: string): Promise<boolean>
 }
 
 /** Download only after the caller has shown and received explicit consent. */
-export async function installOfficeArtifacts(directory: string): Promise<void> {
-  await fs.promises.mkdir(directory, { recursive: true, mode: 0o700 });
+export async function installOfficeArtifacts(
+  directory: string,
+  deps: OfficeArtifactInstallerDeps = defaultOfficeArtifactInstallerDeps,
+): Promise<void> {
+  await deps.mkdir(directory);
   for (const artifact of OFFICE_ARTIFACTS) {
-    const destination = path.join(directory, artifact.name);
-    if (fs.existsSync(destination) && await fileSha256(destination) === artifact.sha256) continue;
+    const destination = deps.join(directory, artifact.name);
+    if (deps.exists(destination) && await deps.sha256(destination) === artifact.sha256) continue;
     const partial = `${destination}.partial`;
-    await fs.promises.rm(partial, { force: true });
-    await downloadRaw(artifact.url, partial);
-    if (await fileSha256(partial) !== artifact.sha256) {
-      await fs.promises.rm(partial, { force: true });
+    await deps.remove(partial);
+    await deps.download(artifact.url, partial);
+    if (await deps.sha256(partial) !== artifact.sha256) {
+      await deps.remove(partial);
       throw new Error(`The downloaded ${artifact.name} failed its integrity check.`);
     }
-    await fs.promises.rename(partial, destination);
+    await deps.rename(partial, destination);
   }
 }
 
 type ElectronModule = typeof import("electron");
+
+export interface OfficeConverterRuntime {
+  loadElectron(): Promise<ElectronModule>;
+  createServer: typeof http.createServer;
+}
+
+const defaultOfficeConverterRuntime: OfficeConverterRuntime = {
+  loadElectron: () => import("electron"),
+  createServer: http.createServer,
+};
+
+export interface OfficeServerFile {
+  artifact: OfficeArtifact | undefined;
+  localPath: string;
+}
+
+export interface OfficeHeaderResponse {
+  setHeader(name: string, value: string): void;
+}
+
+export interface OfficeConverterFiles {
+  fileExists(filePath: string): boolean;
+  openReadStream(filePath: string): { pipe(destination: http.ServerResponse): unknown };
+}
+
+const defaultOfficeConverterFiles: OfficeConverterFiles = {
+  fileExists: fs.existsSync,
+  openReadStream: fs.createReadStream,
+};
+
+function officeArtifactForPath(pathname: string): OfficeArtifact | undefined {
+  return OFFICE_ARTIFACTS.find((item) => pathname === `/artifacts/${item.name}`);
+}
+
+function officeServerPath(
+  artifact: OfficeArtifact | undefined,
+  artifactDir: string,
+  rendererRoot: string,
+  pathname: string,
+): string {
+  if (artifact) return path.join(artifactDir, artifact.name);
+  const relativePath = pathname === "/" ? "converter.html" : pathname.replace(/^\//, "");
+  return path.join(rendererRoot, relativePath);
+}
+
+function isAvailableOfficeServerFile(
+  localPath: string,
+  root: string,
+  fileExists: (filePath: string) => boolean,
+): boolean {
+  return localPath.startsWith(`${root}${path.sep}`) && fileExists(localPath);
+}
+
+export function resolveOfficeServerFile(
+  artifactDir: string,
+  rendererRoot: string,
+  pathname: string,
+  fileExists: (filePath: string) => boolean = fs.existsSync,
+): OfficeServerFile | null {
+  const artifact = officeArtifactForPath(pathname);
+  const root = artifact ? artifactDir : rendererRoot;
+  const localPath = officeServerPath(artifact, artifactDir, rendererRoot, pathname);
+  if (!isAvailableOfficeServerFile(localPath, root, fileExists)) return null;
+  return { artifact, localPath };
+}
+
+export function setOfficeResponseHeaders(response: OfficeHeaderResponse, file: OfficeServerFile): void {
+  if (file.artifact) {
+    response.setHeader("Content-Type", file.artifact.contentType);
+    if (file.artifact.brotli) response.setHeader("Content-Encoding", "br");
+    return;
+  }
+  const contentType = file.localPath.endsWith(".html")
+    ? "text/html; charset=utf-8"
+    : "application/javascript; charset=utf-8";
+  response.setHeader("Content-Type", contentType);
+}
 
 export class OfficeConverter {
   private server: http.Server | null = null;
@@ -117,7 +256,11 @@ export class OfficeConverter {
   private chain: Promise<unknown> = Promise.resolve();
   private completedInWindow = 0;
 
-  constructor(private readonly artifactDir: string) {}
+  constructor(
+    private readonly artifactDir: string,
+    private readonly files: OfficeConverterFiles = defaultOfficeConverterFiles,
+    private readonly runtime: OfficeConverterRuntime = defaultOfficeConverterRuntime,
+  ) {}
 
   convert(name: string, bytes: Uint8Array): Promise<Buffer> {
     const task = this.chain.then(() => this.convertOne(name, bytes));
@@ -127,28 +270,10 @@ export class OfficeConverter {
 
   private async boot(): Promise<void> {
     if (this.window && !this.window.isDestroyed()) return;
-    this.electron = await import("electron");
+    this.electron = await this.runtime.loadElectron();
     const rendererRoot = path.join(this.electron.app.getAppPath(), "dist_renderer", "office");
-    this.server = http.createServer((request, response) => {
-      const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
-      response.setHeader("Cross-Origin-Opener-Policy", "same-origin");
-      response.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
-      response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
-      const artifact = OFFICE_ARTIFACTS.find((item) => requestUrl.pathname === `/artifacts/${item.name}`);
-      const local = artifact
-        ? path.join(this.artifactDir, artifact.name)
-        : path.join(rendererRoot, requestUrl.pathname === "/" ? "converter.html" : requestUrl.pathname.replace(/^\//, ""));
-      const root = artifact ? this.artifactDir : rendererRoot;
-      if (!local.startsWith(`${root}${path.sep}`) || !fs.existsSync(local)) {
-        response.writeHead(404).end();
-        return;
-      }
-      if (artifact) {
-        response.setHeader("Content-Type", artifact.contentType);
-        if (artifact.brotli) response.setHeader("Content-Encoding", "br");
-      } else if (local.endsWith(".html")) response.setHeader("Content-Type", "text/html; charset=utf-8");
-      else response.setHeader("Content-Type", "application/javascript; charset=utf-8");
-      fs.createReadStream(local).pipe(response);
+    this.server = this.runtime.createServer((request, response) => {
+      this.serveOfficeRequest(request, response, rendererRoot);
     });
     await new Promise<void>((resolve, reject) => {
       this.server!.once("error", reject);
@@ -169,6 +294,28 @@ export class OfficeConverter {
         else if (Date.now() - started > 60000) { clearInterval(timer); reject(new Error('Office converter startup timed out.')); }
       }, 100);
     })`, true);
+  }
+
+  private serveOfficeRequest(
+    request: http.IncomingMessage,
+    response: http.ServerResponse,
+    rendererRoot: string,
+  ): void {
+    const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+    this.setIsolationHeaders(response);
+    const file = resolveOfficeServerFile(this.artifactDir, rendererRoot, requestUrl.pathname, this.files.fileExists);
+    if (!file) {
+      response.writeHead(404).end();
+      return;
+    }
+    setOfficeResponseHeaders(response, file);
+    this.files.openReadStream(file.localPath).pipe(response);
+  }
+
+  private setIsolationHeaders(response: http.ServerResponse): void {
+    response.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+    response.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+    response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
   }
 
   private async convertOne(name: string, bytes: Uint8Array): Promise<Buffer> {
@@ -196,7 +343,9 @@ export class OfficeConverter {
       this.dispose();
       throw error;
     } finally {
-      if (timeoutId) clearTimeout(timeoutId);
+      // The Promise executor above runs synchronously, so the timer exists
+      // before control can reach this try/finally block.
+      clearTimeout(timeoutId);
     }
   }
 

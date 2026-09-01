@@ -156,6 +156,20 @@ export function selectionAfterSync(
   return pages[0]?.id ?? "";
 }
 
+/** The two pieces of sidebar state that one host reconciliation decides.
+ *
+ * Keeping this pure makes the non-browser rules testable: a poll may change a
+ * title without changing selection, while a vanished selection needs a new
+ * page in the same update. */
+export function syncedBrowserPages(
+  pages: BrowserPage[],
+  activeId: string,
+  live: BrowserTab[],
+): { pages: BrowserPage[]; activeId: string } {
+  const nextPages = reconcilePages(pages, live);
+  return { pages: nextPages, activeId: selectionAfterSync(nextPages, activeId) };
+}
+
 /** The page Rust must be told to show again, or `""` when it already agrees.
  *
  * Rust reports which page is on SCREEN, and picks its own heir whenever the
@@ -173,6 +187,16 @@ export function pageToReassert(live: BrowserTab[], activeId: string): string {
   if (!activeId) return "";
   if (!live.some((p) => p.id === activeId)) return "";
   return live.some((p) => p.id === activeId && p.active) ? "" : activeId;
+}
+
+/** A background reconciliation may update sidebar state but must never switch
+ * the host's visible page. */
+export function activePageToReassert(
+  destinationIsActive: boolean,
+  live: BrowserTab[],
+  activeId: string,
+): string {
+  return destinationIsActive ? pageToReassert(live, activeId) : "";
 }
 
 export interface BrowserPagesApi {
@@ -233,24 +257,21 @@ export function useBrowserPages(
     const sync = async () => {
       const live = await api.browserTabs().catch(() => null);
       if (stop || !live) return;
-      const next = reconcilePages(pagesRef.current, live);
-      if (next !== pagesRef.current) {
-        pagesRef.current = next;
-        setPages(next);
+      const next = syncedBrowserPages(pagesRef.current, activeRef.current, live);
+      if (next.pages !== pagesRef.current) {
+        pagesRef.current = next.pages;
+        setPages(next.pages);
       }
-      const chosen = selectionAfterSync(next, activeRef.current);
-      if (chosen !== activeRef.current) {
-        activeRef.current = chosen;
-        setActiveId(chosen);
+      if (next.activeId !== activeRef.current) {
+        activeRef.current = next.activeId;
+        setActiveId(next.activeId);
       }
       // Rust also says which page it is SHOWING, and the two can drift — see
       // `pageToReassert`. Only ever while this destination is on screen:
       // forcing a page switch in the background would change what the reader
       // finds when they come back.
-      if (active) {
-        const put = pageToReassert(live, chosen);
-        if (put) void api.browserSelectTab(put).catch(() => {});
-      }
+      const put = activePageToReassert(active, live, next.activeId);
+      if (put) void api.browserSelectTab(put).catch(() => {});
     };
     void sync();
     const timer = window.setInterval(() => void sync(), active ? 1200 : 5000);

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { type Dispatch, type SetStateAction, useMemo, useState } from "react";
 import "./json.css";
 
 type Json = null | boolean | number | string | Json[] | { [k: string]: Json };
@@ -29,6 +29,68 @@ function Leaf({ value }: { value: Json }) {
   return <span className={`json-leaf json-${t}`}>{shown}</span>;
 }
 
+function NodeName({ name }: { name: string | null }) {
+  if (name === null) return null;
+  return <span className="json-key">{name}</span>;
+}
+
+function isBranch(value: Json): value is Json[] | { [k: string]: Json } {
+  return value !== null && typeof value === "object";
+}
+
+function childEntries(value: Json[] | { [k: string]: Json }): [string, Json][] {
+  if (Array.isArray(value)) return value.map((child, index) => [String(index), child]);
+  return Object.entries(value);
+}
+
+function LeafRow({ name, value, depth }: { name: string | null; value: Json; depth: number }) {
+  return (
+    <div className="json-row" style={{ paddingLeft: depth * 14 }}>
+      <NodeName name={name} />
+      <Leaf value={value} />
+    </div>
+  );
+}
+
+function BranchChildren({
+  open,
+  entries,
+  shown,
+  depth,
+  setShown,
+}: {
+  open: boolean;
+  entries: [string, Json][];
+  shown: number;
+  depth: number;
+  setShown: Dispatch<SetStateAction<number>>;
+}) {
+  if (!open) return null;
+  const visible = entries.slice(0, shown);
+  return (
+    <>
+      {visible.map(([key, child]) => (
+        <Node key={key} name={key} value={child} depth={depth + 1} />
+      ))}
+      {/* Never a silent cut: say how many are hidden and offer the rest.
+          Drawn as a real outlined control, not as a coloured link — it is
+          the only thing standing between the reader and the rest of the
+          data, and a link-coloured sentence reads as a footnote. */}
+      {entries.length > shown && (
+        <button
+          type="button"
+          className="json-more nb-btn"
+          style={{ marginLeft: (depth + 1) * 14 }}
+          onClick={() => setShown((count) => count + PAGE * 5)}
+        >
+          Show more — {(entries.length - shown).toLocaleString()} of{" "}
+          {entries.length.toLocaleString()} still hidden
+        </button>
+      )}
+    </>
+  );
+}
+
 function Node({
   name,
   value,
@@ -38,23 +100,13 @@ function Node({
   value: Json;
   depth: number;
 }) {
-  const branch = value !== null && typeof value === "object";
+  const branch = isBranch(value);
   const [open, setOpen] = useState(depth < AUTO_EXPAND_DEPTH);
   const [shown, setShown] = useState(PAGE);
 
-  if (!branch) {
-    return (
-      <div className="json-row" style={{ paddingLeft: depth * 14 }}>
-        {name !== null && <span className="json-key">{name}</span>}
-        <Leaf value={value} />
-      </div>
-    );
-  }
+  if (!branch) return <LeafRow name={name} value={value} depth={depth} />;
 
-  const entries: [string, Json][] = Array.isArray(value)
-    ? value.map((v, i) => [String(i), v])
-    : Object.entries(value);
-  const visible = entries.slice(0, shown);
+  const entries = childEntries(value);
 
   return (
     <div className="json-branch">
@@ -68,31 +120,10 @@ function Node({
         <span className="json-caret" aria-hidden>
           {open ? "▾" : "▸"}
         </span>
-        {name !== null && <span className="json-key">{name}</span>}
+        <NodeName name={name} />
         <span className="json-summary">{summary(value)}</span>
       </button>
-      {open && (
-        <>
-          {visible.map(([k, v]) => (
-            <Node key={k} name={k} value={v} depth={depth + 1} />
-          ))}
-          {/* Never a silent cut: say how many are hidden and offer the rest.
-              Drawn as a real outlined control, not as a coloured link — it is
-              the only thing standing between the reader and the rest of the
-              data, and a link-coloured sentence reads as a footnote. */}
-          {entries.length > shown && (
-            <button
-              type="button"
-              className="json-more nb-btn"
-              style={{ marginLeft: (depth + 1) * 14 }}
-              onClick={() => setShown((n) => n + PAGE * 5)}
-            >
-              Show more — {(entries.length - shown).toLocaleString()} of{" "}
-              {entries.length.toLocaleString()} still hidden
-            </button>
-          )}
-        </>
-      )}
+      <BranchChildren open={open} entries={entries} shown={shown} depth={depth} setShown={setShown} />
     </div>
   );
 }

@@ -49,6 +49,7 @@ import {
   streamIdleSecs,
   watchStream,
   type CommandResult,
+  type CmdCtxOpts,
   type RunCommandDeps,
 } from "./chatCommands.js";
 import { insertMessage, listMessages, recentMessages } from "./db-host/messages.js";
@@ -320,6 +321,33 @@ describe("CmdCtx has no dead duplicate toolkit", () => {
     // The one method runCommand itself still reads off a real CmdCtx.
     expect(typeof ctx.unreadCount).toBe("function");
   });
+
+  it("retains every optional command-body dependency supplied by the caller", () => {
+    const generate = vi.fn() as never;
+    const chatStructured = vi.fn() as never;
+    const generateStream = vi.fn() as never;
+    const transcribeAudio = vi.fn() as never;
+    const layoutGraph = vi.fn() as never;
+    const opts: CmdCtxOpts = {
+      model: "qwen3.5:4b",
+      refs: [],
+      args: "",
+      history: "",
+      temperature: null,
+      cancel: new CancelFlag(),
+      turn: new TurnId("ask-injected", "chat-injected"),
+      send: () => {},
+      room: { roomEpoch: () => 1, currentRoomPath: () => null, currentRoom: () => null },
+      generate,
+      chatStructured,
+      generateStream,
+      transcribeAudio,
+      layoutGraph,
+      stepTimeoutMs: 123,
+    };
+    const ctx = new CmdCtx(opts);
+    expect(ctx).toMatchObject({ generate, chatStructured, generateStream, transcribeAudio, layoutGraph, stepTimeoutMs: 123 });
+  });
 });
 
 describe("defaultStreamGenerate", () => {
@@ -437,6 +465,24 @@ describe("runCommand", () => {
     expect(rows[1]!.kind).toBe("turn_error");
     // Runtime errors are visible history, not model context.
     expect(recentMessages(fixture.db, "c1", -1)).toEqual([["user", "#find budget"]]);
+  });
+
+  it("keeps the missing-default-handler refusal for a future catalog entry without a body", async () => {
+    const fixture = freshRoom();
+    const original = Object.prototype.hasOwnProperty;
+    const own = vi.spyOn(Object.prototype, "hasOwnProperty").mockImplementation(function (this: object, name: PropertyKey) {
+      return Object.isFrozen(this) ? false : original.call(this, name);
+    });
+    try {
+      const message = await runCommand(
+        { askId: "a1", chatId: "c1", command: "find", args: "budget", refs: [], raw: "#find budget" },
+        baseDeps(fixture)
+      );
+      expect(message.kind).toBe("turn_error");
+      expect(message.content).toContain("NOT_IMPLEMENTED: #find");
+    } finally {
+      own.mockRestore();
+    }
   });
 
   it("swallows a handler's failure into a stopped marker when the user had already pressed Stop", async () => {
@@ -696,5 +742,73 @@ describe("runCommand", () => {
     expect(message.content).toContain("the engine fell over");
     expect(cancelState.cancels.has("a1")).toBe(false);
     expect(cancelState.cancelTree.has("a1")).toBe(false);
+  });
+
+  it("rethrows a cancelled setup failure after preserving no misleading inline error", async () => {
+    const fixture = freshRoom();
+    const cancelState = createCancelState();
+    const failure = new Error("model setup stopped");
+    await expect(
+      runCommand(
+        { askId: "a1", chatId: "c1", command: "find", args: "", refs: [], raw: "#find" },
+        baseDeps(fixture, {
+          cancelState,
+          listModels: async () => {
+            cancelState.cancels.get("a1")!.store(true);
+            throw failure;
+          },
+        })
+      )
+    ).rejects.toBe(failure);
+    expect(listMessages(fixture.db, "c1").map((message) => message.role)).toEqual(["user"]);
+    expect(cancelState.cancels.has("a1")).toBe(false);
+  });
+
+  it("rethrows a failure when the saved room was closed before it could be recorded", async () => {
+    const fixture = freshRoom();
+    let open = true;
+    const room: TurnRoomSource = {
+      ...fixture.room,
+      currentRoom: () => (open ? { db: fixture.db, path: fixture.path } : null),
+    };
+    const failure = new Error("room disappeared");
+    await expect(
+      runCommand(
+        { askId: "a1", chatId: "c1", command: "find", args: "", refs: [], raw: "#find" },
+        baseDeps(fixture, {
+          room,
+          handlers: {
+            find: async () => {
+              open = false;
+              throw failure;
+            },
+          },
+        })
+      )
+    ).rejects.toBe(failure);
+    expect(listMessages(fixture.db, "c1").map((message) => message.role)).toEqual(["user"]);
+  });
+});
+
+describe("cmdWindows dependency boundary", () => {
+  it("fails loudly if its partition dependency ever returns an invalid UTF-8 span", async () => {
+    vi.resetModules();
+    vi.doMock("./extractionWindow.js", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("./extractionWindow.js")>();
+      return {
+        ...actual,
+        partitionWindows: () => [[0, 1]],
+        sliceUtf8: () => null,
+      };
+    });
+    try {
+      const isolated = await import("./chatCommands.js");
+      expect(() => isolated.cmdWindows("x".repeat(CMD_WINDOW_CHARS + 1))).toThrow(
+        "cmdWindows: partitionWindows produced an invalid span"
+      );
+    } finally {
+      vi.doUnmock("./extractionWindow.js");
+      vi.resetModules();
+    }
   });
 });

@@ -1,0 +1,152 @@
+
+
+/* An alignment line is a statement about the drawing, not part of it: thin,
+   accented, and gone the moment the drag ends. */
+.sk-guide {
+  stroke: var(--accent);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  vector-effect: non-scaling-stroke;
+  opacity: 0.75;
+  pointer-events: none;
+}
+
+/* ----- the empty state, ON THE CANVAS -----
+   Every rule here is scoped to `.sk-stage`, because `.sk-empty` is worn by
+   three unrelated things: this floating offer, the Sketch destination's landing
+   and the Skills list's empty state. Unscoped, the absolute layer below took the
+   other two out of flow and made them transparent to the pointer — the
+   landing's "New sketch" button could be focused but not clicked. */
+.sk-stage .sk-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  /* The dashed card the other two consumers want, drawn around the whole
+     drawing surface, reads as a drop target. */
+  padding: 0;
+  border: 0;
+  /* THE WHOLE LAYER IS TRANSPARENT TO THE POINTER. An offer that swallows the
+     first click on an empty canvas is worse than no offer at all; only the
+     buttons themselves opt back in. */
+  pointer-events: none;
+}
+.sk-stage .sk-empty-cards {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: 720px;
+}
+.sk-stage .sk-empty-card {
+  pointer-events: auto;
+  width: 200px;
+  padding: 18px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--page);
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+.sk-stage .sk-empty-card:hover {
+  background: var(--hover);
+}
+.sk-stage .sk-empty-title {
+  font-family: var(--display);
+  font-size: 14px;
+}
+.sk-stage .sk-empty-copy {
+  color: var(--ink-2);
+  /* The 11px fallback that used to sit here was below --fs-micro's own floor,
+     so the trap it set was a size the app has ruled out. */
+  font-size: var(--fs-micro);
+  line-height: 1.45;
+}
+
+/* ----- the object list ----- */
+.sk-objects {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 10px;
+  border-top: 1px solid var(--line);
+}
+/* The count is also the handle: it says how much there is and opens the lot. */
+.sk-objects-toggle {
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: none;
+  color: var(--faint);
+  font: inherit;
+  font-size: 10.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.sk-objects-toggle:hover {
+  background: var(--hover);
+  color: inherit;
+}
+.sk-objects-toggle[aria-expanded="true"] {
+  color: inherit;
+  border-color: var(--accent);
+}
+/* One row that scrolls, until the count is clicked — then it wraps, up to a
+   height that still leaves most of the window to the drawing. */
+.sk-objects-row {
+  display: flex;
+  flex: 1 1 auto;
+  gap: 4px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.sk-objects-open .sk-objects-row {
+  flex-wrap: wrap;
+  overflow-x: hidden;
+  overflow-y: auto;
+  max-height: 22vh;
+}
+.sk-object {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 3px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--faint);
+  font: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.sk-object:hover {
+  background: var(--hover);
+  color: inherit;
+}
+.sk-object.on {
+  border-color: var(--accent);
+  color: inherit;
+}
+.sk-object-locked {
+  font-style: italic;
+}
+.sk-object-lock {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.4;
+}

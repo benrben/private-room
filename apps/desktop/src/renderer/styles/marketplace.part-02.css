@@ -1,0 +1,492 @@
+
+
+.conn-card-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-3);
+  padding-bottom: var(--sp-3);
+  /* The ruled line across the top of an index card, drawn as a fading
+     pencil stroke rather than a border. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 2%,
+    var(--line-soft) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+
+/* The status dot. It reinforces the state; it never carries it alone — the
+   status text beside it always says the state in words. */
+.conn-dot {
+  width: 9px;
+  height: 9px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--faint);
+}
+.conn-dot.is-connected {
+  background: var(--sem-done);
+}
+.conn-dot.is-connecting {
+  background: var(--sem-pending);
+}
+.conn-dot.is-failed {
+  background: var(--sem-urgent);
+}
+/* Off reads as an empty ring — a shape difference, so "off" survives being
+   read in greyscale. */
+.conn-dot.is-disabled {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--rule-strong);
+}
+
+.conn-name {
+  margin: 0;
+  min-width: 0;
+  color: var(--text-strong);
+  font-size: var(--fs-card);
+  font-weight: 600;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.conn-badges {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+/* "N of M tools on", "connecting…", "off", or the connector's own error —
+   which can be long, so it wraps rather than being clipped to an ellipsis.
+   An error the user cannot read is an error the user cannot fix. */
+.conn-state {
+  flex: 1;
+  min-width: 120px;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  overflow-wrap: anywhere;
+}
+
+.conn-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-left: auto;
+}
+
+.conn-remove {
+  width: 28px;
+  height: 28px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+}
+.conn-remove:hover {
+  color: var(--sem-urgent);
+  border-color: var(--sem-urgent);
+  background-color: color-mix(in srgb, var(--mk-red) 16%, transparent);
+}
+
+/* The armed Remove. Red outline, both answers spelled out — never an icon
+   pair — because removing a connector also erases its saved sign-in and
+   there is no undo. */
+.conn-confirm {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2) var(--sp-1) var(--sp-3);
+  border: 1px solid var(--sem-urgent);
+  border-radius: var(--radius-sm);
+}
+.conn-confirm-q {
+  color: var(--text);
+  font-size: var(--fs-meta);
+}
+
+/* Account authentication lives on the installed connector card. Keep the
+   browser hand-off, fallback link and errors together so a failed remote
+   connector never leaves its recovery action in an unrelated marketplace
+   drawer (GH #33). */
+.conn-oauth {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px dashed var(--rule-strong);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--paper-2) 72%, transparent);
+}
+.conn-oauth-connect {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--rule-strong));
+}
+.conn-oauth-hint {
+  flex: 1 1 280px;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+.conn-oauth .gate-error {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+/* ----- the two per-connector permissions ----- */
+
+.conn-perms {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: var(--sp-4);
+}
+.conn-perm {
+  min-width: 0;
+}
+.conn-perm-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  cursor: pointer;
+}
+.conn-perm-name {
+  color: var(--text);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+}
+.conn-perm-row select {
+  flex: 1;
+  min-width: 160px;
+  font-size: var(--fs-meta);
+  padding: 5px 8px;
+}
+
+/* ----- the tool list ----- */
+
+.conn-tools {
+  border-top: 1px solid var(--line-soft);
+  padding-top: var(--sp-2);
+}
+.conn-tools > summary {
+  cursor: pointer;
+  padding: var(--sp-1) 0;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  user-select: none;
+}
+.conn-tools > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.conn-tools-hint {
+  margin: var(--sp-2) 0 var(--sp-3);
+  max-width: 68ch;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+.conn-tool-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: var(--sp-2) var(--sp-4);
+}
+.conn-tool {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  min-height: 28px;
+  cursor: pointer;
+}
+/* A tool name is an identifier the connector chose. It WRAPS rather than
+   clipping to an ellipsis, which is what it used to do: this is the name the
+   user is deciding whether to let the assistant reach, and a name shown as
+   "github_create_pull_requ…" is a decision made on incomplete information.
+   Any script, any alphabet — the mono face is set here, the text is not
+   touched. */
+.conn-tool code {
+  min-width: 0;
+  font-size: var(--fs-micro);
+  overflow-wrap: anywhere;
+}
+
+/* ----- the unreadable-config notice -----
+   Not a connector: no switch, no Remove, no permissions. Drawn as a flagged
+   note rather than as a card so it cannot be mistaken for a row that has
+   controls somewhere off screen. */
+.conn-notice {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  /* The red edge every marked note in this file carries, so the one row that
+     is a failure and not a connector reads as one at a glance. */
+  box-shadow: inset 3px 0 0 var(--mk-ink, var(--sem-urgent));
+}
+.conn-notice svg {
+  flex: none;
+  margin-top: 2px;
+  color: var(--sem-urgent);
+}
+.conn-notice-text {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  overflow-wrap: anywhere;
+}
+
+/* ==========================================================================
+   7. THE TECHNICAL SECTION
+   The raw `mcpServers` JSON. Genuinely advanced — it bypasses every guided
+   step above — so it lives behind a disclosure, with the warning it has
+   always carried attached as a marked note above the box.
+   ========================================================================== */
+
+.conn-advanced {
+  margin-top: var(--sp-8);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--line-soft);
+}
+.conn-advanced > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  user-select: none;
+}
+.conn-advanced > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.conn-advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin-top: var(--sp-3);
+}
+.conn-advanced-body .mkt-note {
+  margin-top: 0;
+  max-width: 72ch;
+}
+/* Config text is code: mono, exact, never reflowed by the stylesheet. */
+.conn-advanced .mcp-config {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  line-height: 1.55;
+  tab-size: 2;
+}
+.conn-advanced-actions {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+/* ==========================================================================
+   8. MARKETPLACE — GATE AND CONTROLS
+   ========================================================================== */
+
+.mkt {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+/* The opt-in gate. Browsing the catalogue is the one time the app reaches
+   out on its own, so this is a consent card, not a banner. */
+.mkt-gate {
+  display: flex;
+  gap: var(--sp-4);
+  align-items: flex-start;
+  padding: var(--sp-4);
+}
+.mkt-gate-icon {
+  width: 38px;
+  height: 38px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  color: var(--accent);
+  border: 1.5px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent-ghost);
+}
+.mkt-gate-icon svg {
+  width: 20px;
+  height: 20px;
+}
+.mkt-gate-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-2);
+}
+.mkt-gate-title {
+  color: var(--text-strong);
+  font-size: var(--fs-card);
+  font-weight: 600;
+}
+.mkt-gate-copy {
+  margin: 0;
+  max-width: 68ch;
+  color: var(--text);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+
+/* ----- search and filters -----
+   The same shapes as the Find page: one large drawn field, then a strip of
+   circled chips. Two surfaces that both mean "narrow this list" should not
+   be two different controls.
+   ========================================================================== */
+
+.mkt-controls {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+/* .nb-field supplies the drawn border and the double focus outline; only the
+   size is set here, because on this surface the search box is the one
+   persistent control. */
+.mkt-search {
+  min-height: 44px;
+  padding: 6px var(--sp-3);
+  gap: var(--sp-3);
+  border-radius: var(--radius);
+}
+.mkt-search-ico {
+  display: flex;
+  flex: none;
+  color: var(--muted);
+  line-height: 0;
+}
+.mkt-search-ico svg {
+  width: 16px;
+  height: 16px;
+}
+.mkt-search-input {
+  font-size: var(--fs-body);
+  color: var(--text-strong);
+}
+/* 24px is the floor for anything clickable and this glyph is 13px — the
+   padding is what pays the target size, not decoration. */
+.mkt-search-clear {
+  flex: none;
+  display: grid;
+  place-items: center;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+}
+.mkt-search-clear svg {
+  width: 13px;
+  height: 13px;
+}
+.mkt-search-clear:hover {
+  color: var(--text-strong);
+  background-color: var(--hover);
+  border-color: transparent;
+}
+
+.mkt-filters {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+/* --muted, not --faint: the smallest text on a surface has the least room
+   to be low-contrast. */
+.mkt-filter-label {
+  flex: none;
+  margin-right: var(--sp-1);
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+/* A filter is a real <input type="checkbox"> wrapped in a label; the chip is
+   the label's FACE. The input is taken out of flow rather than removed from
+   the accessibility tree — `display: none` would have made it unfocusable
+   and unannounced, which is what it used to be. It keeps its own hit area on
+   top of the chip, so a pointer press lands on the control itself. */
+.mkt-filter {
+  position: relative;
+  display: inline-flex;
+  cursor: pointer;
+}
+.mkt-filter-box {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  opacity: 0;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+}
+/* The face never takes the pointer — the input laid over it does — so its own
+   :hover and :active can never fire and the label's have to stand in for
+   them. Same treatment .nb-chip-btn gives a chip you can actually click. */
+.mkt-filter-face {
+  pointer-events: none;
+}
+.mkt-filter:hover .mkt-filter-face {
+  color: var(--ink);
+  border-color: var(--sketch);
+}
+.mkt-filter:active .mkt-filter-face {
+  transform: translateY(1px);
+}
+.mkt-filter-box:focus-visible + .mkt-filter-face {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.mkt-filter-tick {
+  --nb-ico-size: 0.92em;
+}
+.mkt-optout {
+  margin-left: auto;
+}
+
+/* The result count beside the grid. The app counted them, so the sans. */
+.mkt-count {
+  margin: 0;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+
+.mkt-status {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+.mkt-error {
+  align-items: center;
+  justify-content: space-between;
+}
+.mkt-error button {
+  flex: none;
+}

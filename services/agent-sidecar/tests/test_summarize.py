@@ -10,6 +10,7 @@ Three layers, all in-process (no network, no Ollama, no weights):
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -47,6 +48,16 @@ def test_smart_filter_collapses_repeats_and_blanks() -> None:
     f = summarize.smart_filter(text)
     assert f.count("Annual Report") == 2  # consecutive duplicate collapses
     assert "\n\n\n" not in f
+
+
+def test_smart_filter_noise_boundaries_measure_utf8_bytes() -> None:
+    # Rust's boundary is bytes: 39 symbols are retained, while 40 are filtered.
+    assert summarize.smart_filter("~" * 39) == "~" * 39 + "\n"
+    assert summarize.smart_filter("~" * 40) == ""
+
+    # An unbroken multi-byte word is also measured in bytes, not Python chars.
+    assert summarize.smart_filter("א" * 40) == "א" * 40 + "\n"  # 80 bytes
+    assert summarize.smart_filter("א" * 41) == ""  # 82 bytes
 
 
 def test_read_window_clamps_and_reports_bounds() -> None:
@@ -103,6 +114,18 @@ def test_clean_one_liner_cut_stops_at_a_sentence_or_a_word() -> None:
 
     # A short line is untouched (no ellipsis, no cut).
     assert summarize.clean_one_liner("A lease.") == "A lease."
+
+
+def test_clean_one_liner_truncation_boundaries() -> None:
+    # A terminator at exactly half the limit is usable; one before it is not.
+    usable = "x" * 99 + "." + " remaining words " * 20
+    assert summarize.clean_one_liner(usable) == "x" * 99 + "."
+
+    early = "x" * 98 + "." + " tail" * 30
+    assert summarize.clean_one_liner(early).endswith("…")
+
+    # A single unbroken word keeps one character free for the ellipsis.
+    assert summarize.clean_one_liner("x" * 201) == "x" * 199 + "…"
 
 
 def test_strip_think_spans() -> None:
@@ -185,6 +208,194 @@ class FakeModelClient:
 
 def _tc(**args: Any) -> ToolCall:
     return ToolCall(name="read_text", arguments=dict(args), id="c0")
+
+
+# --- OllamaModelClient's engine split --------------------------------------
+
+
+def _privacy_payload() -> dict[str, Any]:
+    return {"active": True, "rules": [{"real": "Ben Reich", "placeholder": "[Person A]"}]}
+
+
+async def test_summarize_client_external_path_restores_a_private_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_generate_external(model: str, messages: list[Any], *, format: Any = None) -> str:
+        assert model == "claude-cli"
+        assert messages == [{"role": "user", "content": "summarize [Person A]"}]
+        assert format == {"type": "object"}
+        return "notes on [Person A]"
+
+    monkeypatch.setattr("arcelle_sidecar.external_llm.generate_external", fake_generate_external)
+    client = summarize.OllamaModelClient("http://127.0.0.1:11434", _privacy_payload())
+    text, calls = await client._chat(
+        "claude-cli",
+        [{"role": "user", "content": "summarize Ben Reich"}],
+        tools=None,
+        format={"type": "object"},
+        temperature=None,
+        num_ctx=None,
+        keep_alive="30m",
+        think_on=False,
+    )
+    assert text == "notes on Ben Reich"
+    assert calls == []
+
+
+async def test_summarize_client_provider_paths_restore_tools_and_classify_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arcelle_sidecar import provider_api
+
+    made: list[Any] = []
+
+    class FakeProviderChat:
+        def __init__(self, model: str, provider: Any, temperature: float | None) -> None:
+            self.model = model
+            self.provider = provider
+            self.temperature = temperature
+            made.append(self)
+
+        async def stream(self, messages: list[Any], tools: list[Any], on_delta: Any) -> tuple[str, list[ToolCall], Any]:
+            assert messages == [{"role": "user", "content": "find [Person A]"}]
+            assert tools == [{"type": "function", "function": {"name": "search_room"}}]
+            assert await on_delta("ignored") is None
+            return "Found [Person A].", [ToolCall("search_room", {"q": "[Person A]"})], object()
+
+        async def generate(self, messages: list[Any], *, format: Any = None) -> str:
+            assert messages == [{"role": "user", "content": "find [Person A]"}]
+            assert format == {"type": "object"}
+            return "[Person A]'s summary"
+
+    monkeypatch.setattr(provider_api, "OpenAICompatibleChatModel", FakeProviderChat)
+    client = summarize.OllamaModelClient(
+        "http://127.0.0.1:11434", _privacy_payload(), provider=object()
+    )
+    messages = [{"role": "user", "content": "find Ben Reich"}]
+    text, calls = await client.chat_tools(
+        "openrouter::vendor/model",
+        messages,
+        [{"type": "function", "function": {"name": "search_room"}}],
+        temperature=0.2,
+        num_ctx=8_192,
+        keep_alive="30m",
+    )
+    assert text == "Found Ben Reich."
+    assert [(call.name, call.arguments) for call in calls] == [("search_room", {"q": "Ben Reich"})]
+    assert made[0].temperature == 0.2
+
+    text = await client.generate(
+        "openrouter::vendor/model",
+        messages,
+        temperature=None,
+        num_ctx=8_192,
+        keep_alive="30m",
+        format={"type": "object"},
+    )
+    assert text == "Ben Reich's summary"
+
+    class BrokenProviderChat(FakeProviderChat):
+        async def generate(self, messages: list[Any], *, format: Any = None) -> str:
+            raise RuntimeError("provider failed")
+
+    monkeypatch.setattr(provider_api, "OpenAICompatibleChatModel", BrokenProviderChat)
+    with pytest.raises(LlmError, match="provider failed") as caught:
+        await client.generate(
+            "openrouter::vendor/model",
+            messages,
+            temperature=None,
+            num_ctx=8_192,
+            keep_alive="30m",
+        )
+    assert caught.value.code == "ENGINE_ERROR"
+
+
+async def test_summarize_client_local_path_sizes_requests_and_preserves_tool_wire_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ollama
+
+    sent: list[dict[str, Any]] = []
+    replies = [
+        SimpleNamespace(
+            message=SimpleNamespace(
+                content="Found [Person A].",
+                tool_calls=[
+                    SimpleNamespace(function=SimpleNamespace(name="", arguments={})),
+                    SimpleNamespace(
+                        function=SimpleNamespace(name="search_room", arguments={"q": "[Person A]"})
+                    ),
+                ],
+            )
+        ),
+        SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=None)),
+    ]
+
+    class FakeAsyncClient:
+        def __init__(self, host: str) -> None:
+            assert host == "http://127.0.0.1:11434"
+
+        async def chat(self, **kwargs: Any) -> Any:
+            sent.append(kwargs)
+            return replies.pop(0)
+
+    async def native_context_length(model: str, base_url: str) -> int:
+        assert (model, base_url) == ("qwen3:cloud", "http://127.0.0.1:11434")
+        return 8_192
+
+    monkeypatch.setattr(ollama, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(summarize, "native_context_length", native_context_length)
+    client = summarize.OllamaModelClient("http://127.0.0.1:11434", _privacy_payload())
+    text, calls = await client.chat_tools(
+        "qwen3:cloud",
+        [{"role": "user", "content": "find Ben Reich"}],
+        [{"type": "function", "function": {"name": "search_room"}}],
+        temperature=0.2,
+        num_ctx=None,
+        keep_alive="30m",
+    )
+    assert text == "Found Ben Reich."
+    assert [(call.name, call.arguments, call.id) for call in calls] == [
+        ("search_room", {"q": "Ben Reich"}, "call_1")
+    ]
+    assert sent[0]["messages"] == [{"role": "user", "content": "find [Person A]"}]
+    assert sent[0]["options"] == {"num_ctx": 8_192, "temperature": 0.2}
+    assert sent[0]["think"] is True
+    assert sent[0]["stream"] is False
+
+    text = await client.generate(
+        "qwen3-instruct:latest",
+        [{"role": "user", "content": "plain"}],
+        temperature=None,
+        num_ctx=1_024,
+        keep_alive="30m",
+    )
+    assert text == ""
+    assert sent[1]["options"] == {"num_ctx": 1_024}
+    assert sent[1]["think"] is None
+
+
+async def test_summarize_client_local_transport_failure_keeps_the_ollama_error_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ollama
+
+    class FailedAsyncClient:
+        def __init__(self, host: str) -> None:
+            assert host == "http://127.0.0.1:11434"
+
+        async def chat(self, **_kwargs: Any) -> Any:
+            raise ConnectionRefusedError("refused")
+
+    monkeypatch.setattr(ollama, "AsyncClient", FailedAsyncClient)
+    client = summarize.OllamaModelClient("http://127.0.0.1:11434")
+    with pytest.raises(LlmError, match="refused") as caught:
+        await client.generate(
+            "m",
+            [{"role": "user", "content": "hello"}],
+            temperature=None,
+            num_ctx=1_024,
+            keep_alive="30m",
+        )
+    assert caught.value.code == "OLLAMA_DOWN"
 
 
 # --- summarize_one_file: whole (short) file ---------------------------------
@@ -327,6 +538,20 @@ async def test_summarize_answers_every_tool_call_when_the_budget_runs_out() -> N
     assert requested == len(batch)
     assert answered == requested, "every tool call must carry a reply"
     assert any("read budget for this file is used up" in m["content"] for m in sent if m.get("role") == "tool")
+
+
+async def test_summarize_answers_an_unknown_tool_call() -> None:
+    # A provider requires one reply for every announced call, including a call
+    # outside the narrow read_text contract.
+    text = _long_text_with_manifest()
+    unknown = ToolCall(name="read_binary", arguments={}, id="unknown")
+    fake = FakeModelClient(
+        tool_rounds=[("", [unknown]), ("", [])],
+        generates=['{"summary":"A log file."}'],
+    )
+    await summarize.summarize_one_file(fake, "m", "big.log", "text/plain", text, "30m")
+    replies = [m["content"] for m in fake.generate_seen[0]["messages"] if m.get("role") == "tool"]
+    assert replies == ["Unknown tool: only read_text is available."]
 
 
 class _LocalModelClient(FakeModelClient):

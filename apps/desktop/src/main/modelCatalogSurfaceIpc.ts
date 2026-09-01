@@ -83,36 +83,47 @@ function runAntigravityCatalog(): Promise<string> {
   });
 }
 
-function codexModelsFromJson(raw: string): ExternalModelInfo[] {
+function parseCatalogJson(raw: string, source: string): unknown {
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch (error) {
-    throw new Error(`bad JSON from codex: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(`bad JSON from ${source}: ${error instanceof Error ? error.message : String(error)}`);
   }
+  return parsed;
+}
+
+function codexReasoningLevels(row: Record<string, unknown>): string[] {
+  const rawLevels = row.supported_reasoning_levels;
+  if (!Array.isArray(rawLevels)) return [];
+  return rawLevels.map(object).map((level) => level.effort).filter((value): value is string => typeof value === "string");
+}
+
+function codexModelFromRow(item: unknown): ExternalModelInfo | null {
+  const row = object(item);
+  if (row.visibility !== "list" || typeof row.slug !== "string") return null;
+  const levels = codexReasoningLevels(row);
+  return {
+    ...baseModel(row.slug, typeof row.display_name === "string" ? row.display_name : row.slug),
+    efforts: levels,
+    defaultEffort: typeof row.default_reasoning_level === "string" ? row.default_reasoning_level : null,
+    contextWindow: typeof row.context_window === "number" ? row.context_window : null,
+    reasoning: levels.length > 0,
+  };
+}
+
+export function codexModelsFromJson(raw: string): ExternalModelInfo[] {
+  const parsed = parseCatalogJson(raw, "codex");
   const models = object(parsed).models;
   if (!Array.isArray(models)) return [];
   const out: ExternalModelInfo[] = [];
   for (const item of models) {
-    const row = object(item);
-    if (row.visibility !== "list" || typeof row.slug !== "string") continue;
-    const levels = Array.isArray(row.supported_reasoning_levels)
-      ? row.supported_reasoning_levels.map(object).map((level) => level.effort).filter((v): v is string => typeof v === "string")
-      : [];
-    out.push({
-      ...baseModel(row.slug, typeof row.display_name === "string" ? row.display_name : row.slug),
-      efforts: levels,
-      defaultEffort: typeof row.default_reasoning_level === "string" ? row.default_reasoning_level : null,
-      contextWindow: typeof row.context_window === "number" ? row.context_window : null,
-      reasoning: levels.length > 0,
-    });
+    const model = codexModelFromRow(item);
+    if (model) out.push(model);
   }
   return out;
 }
 
 export function antigravityModelsFromJson(raw: string): ExternalModelInfo[] {
-  let parsed: unknown;
-  try { parsed = JSON.parse(raw); } catch (error) {
-    throw new Error(`bad JSON from agy: ${error instanceof Error ? error.message : String(error)}`);
-  }
+  const parsed = parseCatalogJson(raw, "agy");
   const rows = object(object(object(parsed).command).data).models;
   if (!Array.isArray(rows)) return [];
   return rows.flatMap((item) => {
@@ -145,6 +156,60 @@ export interface ModelSelectionValidatorDeps {
 
 const FAILED_VALIDATION_TTL_MS = 60_000;
 
+function validateOllamaSelection(
+  deps: ModelSelectionValidatorDeps,
+  exactId: string,
+): Promise<ModelSelectionValidation> {
+  return deps.probeOllama(exactId).then((probe) => probe.ok
+    ? { selectable: true, reason: null }
+    : {
+        selectable: false,
+        reason: `Ollama could not validate the exact model ID “${exactId}”. ${probe.detail ?? "Refresh the model list and try again."}`,
+      });
+}
+
+async function openrouterModelKnown(
+  deps: ModelSelectionValidatorDeps,
+  exactId: string,
+): Promise<boolean> {
+  if (deps.providerModelKnown(`openrouter::${exactId}`)) return true;
+  const rows = await deps.listProviderModels("openrouter");
+  return rows.some((row) => row.slug === exactId);
+}
+
+async function validateOpenrouterSelection(
+  deps: ModelSelectionValidatorDeps,
+  exactId: string,
+): Promise<ModelSelectionValidation> {
+  if (!await openrouterModelKnown(deps, exactId)) {
+    return {
+      selectable: false,
+      reason: `OpenRouter does not offer the exact model ID “${exactId}” for this account. Refresh the catalog or choose another model.`,
+    };
+  }
+  const probe = await deps.probeProviderModel?.(exactId) ?? { ok: true, detail: null };
+  return probe.ok
+    ? { selectable: true, reason: null }
+    : {
+        selectable: false,
+        reason: `OpenRouter could not run the exact model ID “${exactId}”. ${probe.detail ?? "Choose another model."}`,
+      };
+}
+
+function validateNativeSelection(): ModelSelectionValidation {
+  return { selectable: true, reason: null };
+}
+
+function validateSelection(
+  deps: ModelSelectionValidatorDeps,
+  engine: string,
+  exactId: string,
+): Promise<ModelSelectionValidation> {
+  if (engine === "ollama-local" || engine === "ollama-cloud") return validateOllamaSelection(deps, exactId);
+  if (engine === "openrouter") return validateOpenrouterSelection(deps, exactId);
+  return Promise.resolve(validateNativeSelection());
+}
+
 /**
  * Exact-ID capability check used by the model picker. Successes live for this
  * process; transient failures are retried after one minute. OpenRouter is
@@ -159,43 +224,7 @@ export function createModelSelectionValidator(deps: ModelSelectionValidatorDeps)
     const prior = cache.get(cacheKey);
     if (prior && prior.expiresAt > deps.now()) return prior.result;
 
-    let result: ModelSelectionValidation;
-    if (engine === "ollama-local" || engine === "ollama-cloud") {
-      const probe = await deps.probeOllama(exactId);
-      result = probe.ok
-        ? { selectable: true, reason: null }
-        : {
-            selectable: false,
-            reason: `Ollama could not validate the exact model ID “${exactId}”. ${probe.detail ?? "Refresh the model list and try again."}`,
-          };
-    } else if (engine === "openrouter") {
-      // A prior picker catalog fetch already populated this exact-slug cache.
-      // Otherwise do one authenticated, account-scoped catalog read now. This
-      // is one lazy check for the chosen model, not N probes for N rows.
-      let known = deps.providerModelKnown(`openrouter::${exactId}`);
-      if (known !== true) {
-        const rows = await deps.listProviderModels("openrouter");
-        known = rows.some((row) => row.slug === exactId);
-      }
-      if (!known) {
-        result = {
-            selectable: false,
-            reason: `OpenRouter does not offer the exact model ID “${exactId}” for this account. Refresh the catalog or choose another model.`,
-        };
-      } else {
-        const probe = await deps.probeProviderModel?.(exactId) ?? { ok: true, detail: null };
-        result = probe.ok
-          ? { selectable: true, reason: null }
-          : {
-              selectable: false,
-              reason: `OpenRouter could not run the exact model ID “${exactId}”. ${probe.detail ?? "Choose another model."}`,
-            };
-      }
-    } else {
-      // Native CLI catalogs are produced by the installed CLI itself. Their
-      // listed IDs are already the runtime IDs and need no second provider call.
-      result = { selectable: true, reason: null };
-    }
+    const result = await validateSelection(deps, engine, exactId);
     cache.set(cacheKey, {
       result,
       expiresAt: result.selectable ? Number.POSITIVE_INFINITY : deps.now() + FAILED_VALIDATION_TTL_MS,
@@ -222,67 +251,135 @@ function exclusion(engine: string, reason: string, names: string[]): CreateExclu
   };
 }
 
-export async function listCreateModels(): Promise<CreateCatalog> {
+type CreateCatalogDeps = {
+  ensureMediaLimits(key: string): Promise<void>;
+  limitsFor(slug: string): ReturnType<typeof limitsFor>;
+  listProviderModels(provider: string): Promise<ExternalModelInfo[]>;
+  mediaTableLoaded(): boolean;
+  openrouterKey(): string | null;
+  providerConnected(provider: string): boolean;
+};
+
+const createCatalogDeps: CreateCatalogDeps = {
+  ensureMediaLimits,
+  limitsFor,
+  listProviderModels,
+  mediaTableLoaded,
+  openrouterKey,
+  providerConnected,
+};
+
+type ProviderCreateCatalog = {
+  error: string | null;
+  models: CreateModel[];
+  scanned: number;
+  textOnly: string[];
+};
+
+function asCreateModel(model: ExternalModelInfo, deps: CreateCatalogDeps): CreateModel {
+  return {
+    model: `openrouter::${model.slug}`,
+    slug: model.slug,
+    label: model.label,
+    engine: "openrouter",
+    engineLabel: "OpenRouter",
+    local: false,
+    description: model.description,
+    image: model.imageOutput,
+    video: model.videoOutput,
+    outputPrice: model.outputPrice,
+    limits: deps.limitsFor(model.slug) ?? null,
+  };
+}
+
+function splitProviderCreateModels(
+  catalog: readonly ExternalModelInfo[],
+  deps: CreateCatalogDeps,
+): Pick<ProviderCreateCatalog, "models" | "textOnly"> {
   const models: CreateModel[] = [];
+  const textOnly: string[] = [];
+  for (const model of catalog) {
+    if (!model.imageOutput && !model.videoOutput) textOnly.push(model.slug);
+    else models.push(asCreateModel(model, deps));
+  }
+  return { models, textOnly };
+}
+
+async function providerCreateCatalog(deps: CreateCatalogDeps): Promise<ProviderCreateCatalog> {
+  const key = deps.openrouterKey();
+  if (key) await deps.ensureMediaLimits(key);
+  try {
+    const catalog = await deps.listProviderModels("openrouter");
+    return { ...splitProviderCreateModels(catalog, deps), scanned: catalog.length, error: null };
+  } catch (cause) {
+    return { models: [], textOnly: [], scanned: 0, error: cause instanceof Error ? cause.message : String(cause) };
+  }
+}
+
+function nativeCreateReason(engine: string): string {
+  if (engine === "claude-cli" || engine === "codex-cli" || engine === "antigravity-cli") {
+    return "Reads pictures, cannot make them — vision in, no image out.";
+  }
+  return "Serves chat models. A drawing model is not reachable over its chat API at all, so nothing local can make a picture yet.";
+}
+
+function nativeCreateExclusions(): { excluded: CreateExclusion[]; scanned: number } {
   const excluded: CreateExclusion[] = [];
   let scanned = 0;
-  let error: string | null = null;
-  const anyProvider = providerConnected("openrouter");
-  if (anyProvider) {
-    const key = openrouterKey();
-    if (key) await ensureMediaLimits(key);
-    try {
-      const catalog = await listProviderModels("openrouter");
-      scanned += catalog.length;
-      const textOnly: string[] = [];
-      for (const model of catalog) {
-        if (!model.imageOutput && !model.videoOutput) {
-          textOnly.push(model.slug);
-          continue;
-        }
-        models.push({
-          model: `openrouter::${model.slug}`,
-          slug: model.slug,
-          label: model.label,
-          engine: "openrouter",
-          engineLabel: "OpenRouter",
-          local: false,
-          description: model.description,
-          image: model.imageOutput,
-          video: model.videoOutput,
-          outputPrice: model.outputPrice,
-          limits: limitsFor(model.slug) ?? null,
-        });
-      }
-      const textRow = exclusion("openrouter", "Text output only, per the provider's own catalog.", textOnly);
-      if (textRow) excluded.push(textRow);
-    } catch (cause) {
-      error = cause instanceof Error ? cause.message : String(cause);
-    }
-  }
   for (const decl of DECLARED) {
     if (decl.id === "openrouter") continue;
     scanned += 1;
-    const reason = decl.id === "claude-cli" || decl.id === "codex-cli" || decl.id === "antigravity-cli"
-      ? "Reads pictures, cannot make them — vision in, no image out."
-      : "Serves chat models. A drawing model is not reachable over its chat API at all, so nothing local can make a picture yet.";
-    const row = exclusion(decl.id, reason, [decl.label]);
-    if (row) excluded.push(row);
+    excluded.push(exclusion(decl.id, nativeCreateReason(decl.id), [decl.label])!);
   }
-  if (mediaTableLoaded()) {
-    const unreachable: string[] = [];
-    for (let i = models.length - 1; i >= 0; i -= 1) {
-      if (limitsFor(models[i]!.slug) === undefined) unreachable.push(models.splice(i, 1)[0]!.label);
-    }
-    const row = exclusion(
+  return { excluded, scanned };
+}
+
+function removeUnreachableMediaModels(
+  models: readonly CreateModel[],
+  deps: CreateCatalogDeps,
+): { models: CreateModel[]; unreachable: string[] } {
+  const remaining = [...models];
+  const unreachable: string[] = [];
+  for (let index = remaining.length - 1; index >= 0; index -= 1) {
+    if (deps.limitsFor(remaining[index]!.slug) !== undefined) continue;
+    unreachable.push(remaining.splice(index, 1)[0]!.label);
+  }
+  return { models: remaining, unreachable };
+}
+
+function compareCreateModels(left: CreateModel, right: CreateModel): number {
+  const autoDifference = Number(left.slug.startsWith("openrouter/auto")) - Number(right.slug.startsWith("openrouter/auto"));
+  if (autoDifference !== 0) return autoDifference;
+  return left.label.toLowerCase() < right.label.toLowerCase() ? -1 : 1;
+}
+
+export async function listCreateModels(): Promise<CreateCatalog> {
+  const anyProvider = createCatalogDeps.providerConnected("openrouter");
+  const provider = anyProvider
+    ? await providerCreateCatalog(createCatalogDeps)
+    : { models: [], textOnly: [], scanned: 0, error: null };
+  const excluded: CreateExclusion[] = [];
+  const textRow = exclusion("openrouter", "Text output only, per the provider's own catalog.", provider.textOnly);
+  if (textRow) excluded.push(textRow);
+  const native = nativeCreateExclusions();
+  excluded.push(...native.excluded);
+  const supported = createCatalogDeps.mediaTableLoaded()
+    ? removeUnreachableMediaModels(provider.models, createCatalogDeps)
+    : { models: provider.models, unreachable: [] };
+  const unreachableRow = exclusion(
       "openrouter",
       "Declares pictures on the chat API, but the provider's own picture and video endpoints do not serve it — a call would return no endpoint found.",
-      unreachable,
+      supported.unreachable,
     );
-    if (row) excluded.push(row);
-  }
-  models.sort((a, b) => Number(a.slug.startsWith("openrouter/auto")) - Number(b.slug.startsWith("openrouter/auto")) || (a.label.toLowerCase() < b.label.toLowerCase() ? -1 : 1));
-  return { models, scanned, excluded, anyProvider, error };
+  if (unreachableRow) excluded.push(unreachableRow);
+  supported.models.sort(compareCreateModels);
+  return {
+    models: supported.models,
+    scanned: provider.scanned + native.scanned,
+    excluded,
+    anyProvider,
+    error: provider.error,
+  };
 }
 
 export function registerModelCatalogSurfaceIpc(ipcMain: Pick<IpcMain, "handle">): void {

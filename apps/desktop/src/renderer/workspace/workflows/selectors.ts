@@ -11,6 +11,21 @@ import type { Workflow, WorkflowEdge, WorkflowNode } from "../../apiTypes";
 export const visibleWorkflows = (workflows: Workflow[]): Workflow[] =>
   workflows.filter((w) => w.createdBy !== "script");
 
+function branchOptions(from: WorkflowNode): string[] {
+  if (from.kind === "condition") return ["then", "else"];
+  if (from.kind !== "route") return [];
+  if (!Array.isArray(from.labels)) return [];
+  return (from.labels as string[]).map((label) => String(label).trim()).filter(Boolean);
+}
+
+function firstAvailableBranch(
+  options: string[],
+  existing: WorkflowEdge[],
+): string {
+  const used = new Set(existing.map((edge) => edge.branch ?? ""));
+  return options.find((option) => !used.has(option)) ?? options[0]!;
+}
+
 /** The outcome label a NEW edge off `from` must carry, or undefined when `from`
  * isn't a branch source. Every edge leaving a condition/route has to name its
  * outcome — an unlabelled one is live whichever way the step went, so the step
@@ -27,15 +42,9 @@ export function branchFor(
   existing: WorkflowEdge[],
 ): string | undefined {
   if (!from) return undefined;
-  const options =
-    from.kind === "condition"
-      ? ["then", "else"]
-      : from.kind === "route" && Array.isArray(from.labels)
-        ? (from.labels as string[]).map((l) => String(l).trim()).filter(Boolean)
-        : [];
+  const options = branchOptions(from);
   if (options.length === 0) return undefined;
-  const used = new Set(existing.map((e) => e.branch ?? ""));
-  return options.find((b) => !used.has(b)) ?? options[0];
+  return firstAvailableBranch(options, existing);
 }
 
 /** The dot class for one run-history row's status.

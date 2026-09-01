@@ -79,26 +79,42 @@ export function cosineSimilarity(a: readonly number[], b: readonly number[]): nu
  * from the query, scores `0` — exactly what `blobToEmbedding` +
  * `cosineSimilarity` did for those rows. */
 export function cosineSimilarityBlob(query: readonly number[], blob: Uint8Array): number {
-  if (query.length === 0 || blob.length % 4 !== 0 || blob.length / 4 !== query.length) {
-    return 0;
-  }
-  const buf = Buffer.isBuffer(blob)
-    ? blob
-    : Buffer.from(blob.buffer, blob.byteOffset, blob.byteLength);
+  if (!hasMatchingBlobDimensions(query, blob)) return 0;
+  const totals = blobCosineTotals(query, blobBuffer(blob));
+  return cosineFromTotals(totals);
+}
+
+interface CosineTotals {
+  readonly dot: number;
+  readonly queryMagnitude: number;
+  readonly blobMagnitude: number;
+}
+
+function hasMatchingBlobDimensions(query: readonly number[], blob: Uint8Array): boolean {
+  return query.length > 0 && blob.length % 4 === 0 && blob.length / 4 === query.length;
+}
+
+function blobBuffer(blob: Uint8Array): Buffer {
+  return Buffer.isBuffer(blob) ? blob : Buffer.from(blob.buffer, blob.byteOffset, blob.byteLength);
+}
+
+function blobCosineTotals(query: readonly number[], blob: Buffer): CosineTotals {
   let dot = 0;
-  let na = 0;
-  let nb = 0;
+  let queryMagnitude = 0;
+  let blobMagnitude = 0;
   for (let i = 0; i < query.length; i++) {
     const x = query[i] as number;
-    const y = buf.readFloatLE(i * 4);
+    const y = blob.readFloatLE(i * 4);
     dot += x * y;
-    na += x * x;
-    nb += y * y;
+    queryMagnitude += x * x;
+    blobMagnitude += y * y;
   }
-  if (na === 0 || nb === 0) {
-    return 0;
-  }
-  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+  return { dot, queryMagnitude, blobMagnitude };
+}
+
+function cosineFromTotals(totals: CosineTotals): number {
+  if (totals.queryMagnitude === 0 || totals.blobMagnitude === 0) return 0;
+  return totals.dot / (Math.sqrt(totals.queryMagnitude) * Math.sqrt(totals.blobMagnitude));
 }
 
 // -------------------------------------------------------- backfill + retrieval

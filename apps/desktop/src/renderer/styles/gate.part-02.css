@@ -1,0 +1,459 @@
+
+
+/* The path is technical data: the mono face, and truncated from the LEFT so
+   the file name — the part that identifies the room — always survives.
+   `direction: rtl` is the long-standing trick that moves the ellipsis to the
+   start, and it is kept; what it also did was reorder the path's OWN neutral
+   characters, so "/Users/ben/x.arcelle" rendered as "Users/ben/x.arcelle/",
+   which reads as a directory. The markup now wraps the path in a
+   <bdi dir="ltr"> (see StartScreen.tsx), which isolates it as one left-to-
+   right run inside this right-to-left box: ellipsis still at the start, path
+   spelled the way Finder spells it. */
+.recent-path {
+  max-width: 100%;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+}
+
+/* The date, then whatever the room's own path lets us say about it. */
+.recent-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  max-width: 100%;
+  margin-top: 2px;
+}
+
+/* "Opened 2 hours ago" is a time the app worked out, so it reads in the sans
+   like every other computed fact on the row. */
+.recent-when {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--ink-2);
+}
+
+/* The one row state that needs telling. Amber is "needs attention" in the
+   marker map and the sentence spells out the rest, so the colour never
+   carries it alone. Set in the sans, not the hand: this is an explanation,
+   and explanations are never handwritten. */
+.recent-when.recent-missing {
+  font-family: var(--sans);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--sem-pending);
+  white-space: normal;
+}
+
+/* Remove-from-list: 28px square so it clears the 24px target with its border,
+   and drawn in --ink-2 rather than a faded glyph, which is what it was. */
+.recent-remove {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  min-height: 28px;
+  margin-right: var(--sp-2);
+  padding: 6px;
+  color: var(--ink-2);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  line-height: 0;
+}
+/* A destructive control gets the red outline, never a red wash: on ivory
+   paper a red fill drops the glyph on it to ~4.2:1, and the outline is the
+   house treatment for destructive anyway. */
+.recent-remove:hover {
+  color: var(--sem-urgent);
+  background: none;
+  border-color: var(--sem-urgent);
+}
+
+.recent-clear {
+  margin-top: var(--sp-3);
+  min-height: 24px;
+  padding: var(--sp-1) var(--sp-2);
+  font-size: var(--fs-meta);
+  color: var(--ink-2);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+}
+.recent-clear:hover {
+  color: var(--text);
+  background-color: var(--accent-ghost);
+  border-color: transparent;
+}
+
+/* ==========================================================================
+   5. THE FORM SCREENS (create / unlock)
+   ========================================================================== */
+
+/* The frame goes on the FORM, not on the page: the mark and the wordmark stay
+   on bare paper and what is drawn is the thing you have to fill in. */
+.gate-form {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin-top: var(--sp-4);
+  padding: var(--sp-6);
+  text-align: left;
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius-lg);
+}
+/* The quick pen redraw: a second stroke a couple of px out, as though the pen
+   went round the box twice. Decorative, so it is a pseudo-element and never
+   hit-tested. */
+.gate-form::after {
+  content: "";
+  position: absolute;
+  inset: calc(var(--redraw) * -1);
+  border: 1px solid color-mix(in srgb, var(--sketch) 30%, transparent);
+  border-radius: inherit;
+  pointer-events: none;
+}
+/* Inside a gap-spaced column the lead line only needs its own tightening. */
+.gate-form .gate-sub {
+  margin: 0;
+}
+/* Submit and Back read as one pair of choices rather than a stack of slabs. */
+.gate-form .gate-actions {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-1);
+}
+.gate-form .gate-actions > button {
+  flex: 1 1 auto;
+  min-height: 40px;
+}
+
+/* The recovery affordance under the password field: a quiet ink button with
+   its key glyph. Centred on itself rather than stretched, because the form is
+   a column flex container and would otherwise blow this text button out to
+   full width, at which point it stops reading as the secondary path. Laid out
+   here rather than in the inline style it used to carry, and written as a
+   descendant so its padding beats base.css's `button.subtle`, which would
+   leave the target under the 24px floor. */
+.gate-form .recovery-forgot {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: var(--sp-1) var(--sp-2);
+  font-size: var(--fs-meta);
+}
+
+/* A recovery code is data the user has to transcribe exactly, so it is typed
+   in the same mono face it was shown and printed in — an O and a 0 have to be
+   tellable apart. base.css puts every input in the sans; this is the one
+   deliberate exception on the gate. */
+.gate-code-input {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.06em;
+}
+
+.gate-hint {
+  margin: 0;
+  font-size: var(--fs-meta);
+  color: var(--ink-2);
+}
+
+/* Instruction copy is never set small — this was 12px. */
+.gate-note {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+/* The create screen's warning is the one thing on that screen a user cannot
+   undo later, so it carries a caution marker down its edge. The words do the
+   telling; the marker only makes them hard to skip past. */
+.gate-note-warn {
+  padding-left: var(--sp-3);
+  color: var(--text);
+  box-shadow: inset 3px 0 0 var(--sem-pending-fill);
+}
+
+/* ----- template + role pickers ----- */
+.tpl-picker {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  text-align: left;
+}
+
+.tpl-label {
+  font-size: var(--fs-micro);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-2);
+}
+
+.tpl-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+/* The chip itself is .nb-chip / .nb-chip-btn, including the circled "on"
+   treatment; only the size is local, because a template is a choice you make
+   once and deserves a bigger target than a dense filter chip. Nothing about
+   the border, fill or selected state is redeclared here — it would silently
+   win over the primitive, which loads earlier. */
+.tpl-chip {
+  min-height: 30px;
+  padding: 4px 13px;
+  font-size: var(--fs-meta);
+}
+
+.tpl-blurb {
+  margin: 0;
+  min-height: 1.4em;
+  font-size: var(--fs-meta);
+  color: var(--ink-2);
+}
+
+/* ==========================================================================
+   6. PASSWORD STRENGTH  (shared with Settings → Lock & password)
+   The bar never carries the judgement on its own: `strength.label` writes
+   Weak / Okay / Strong beside it and the criteria list says what is missing.
+   ========================================================================== */
+
+/* Always laid out, so the confirm field below never jumps when the meter
+   appears; `.reserved` (no password yet) hides it while keeping its space. */
+.pw-feedback.reserved {
+  visibility: hidden;
+}
+
+.pw-meter {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+/* A pencil-outlined track, so the sheet shows through the empty part of the
+   measure the way it does through every other measured thing here. */
+.pw-meter-track {
+  flex: 1;
+  height: 7px;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rule) 70%, transparent);
+  border-radius: 999px 999px 999px 999px / 7px 5px 7px 5px;
+  overflow: hidden;
+}
+
+/* The fill is full-strength ink, not a marker wash: a wash measures ~1.7:1 on
+   ivory and a strength bar is meaningful non-text that owes 3:1. */
+.pw-meter-fill {
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  transition:
+    width var(--dur-slow) var(--ease-pen),
+    background-color var(--dur-slow) var(--ease-pen);
+}
+
+.pw-meter-label {
+  min-width: 46px;
+  font-size: var(--fs-micro);
+  color: var(--ink-2);
+  text-align: right;
+}
+
+.pw-meter.weak .pw-meter-fill {
+  width: 33%;
+  background-color: var(--sem-urgent);
+}
+.pw-meter.okay .pw-meter-fill {
+  width: 66%;
+  background-color: var(--sem-pending);
+}
+.pw-meter.strong .pw-meter-fill {
+  width: 100%;
+  background-color: var(--sem-done);
+}
+
+.pw-criteria {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: var(--sp-2) 0 0;
+  padding: 0;
+  text-align: left;
+}
+.pw-criteria li {
+  font-size: var(--fs-micro);
+  color: var(--ink-2);
+}
+/* Green is "done" in the marker map. The ✓ / ○ is real text in the row, so a
+   screen reader still hears which criteria are met — the colour reinforces a
+   signal that is already there rather than being the signal. */
+.pw-criteria li.met {
+  color: var(--sem-done);
+}
+
+/* ==========================================================================
+   7. ERRORS  (the app's error banner — see the header note)
+   ========================================================================== */
+
+/* A drawn red outline with no fill. The wash it used to carry put the message
+   at 4.45:1 on ivory paper — under the floor — and a transparent banner also
+   survives being dropped onto a panel or a raised card, which is where most
+   of the call sites outside this screen put it. */
+.gate-error {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--sem-urgent);
+  text-align: left;
+  background: transparent;
+  border: 1px solid var(--sem-urgent);
+  border-radius: var(--radius-sm);
+  animation: gate-error-in var(--dur) var(--ease-pen);
+}
+
+/* The round badge some call sites put before the message. Charcoal-on-red in
+   light, ivory-on-red in dark: 4.83:1 and 5.76:1. */
+.gate-error-ic {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  font-size: var(--fs-micro);
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+  color: var(--page);
+  background: var(--sem-urgent);
+  border-radius: 50%;
+}
+
+/* The banner used to arrive on a five-step shake. A shake is a bounce, it
+   runs past the 260ms this system allows, and it moves the very words the
+   user has to read. It now arrives the way every other drawn thing does. */
+@keyframes gate-error-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+}
+
+/* An invalid field is edged in the same red as the message under it, with the
+   second stroke just inside the border that a focused field gets. */
+.gate input.invalid {
+  border-color: var(--sem-urgent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sem-urgent) 42%, transparent);
+}
+
+/* ==========================================================================
+   8. THE ONE-TIME RECOVERY CODE
+   The only opaque, occluding surface on this screen, so the only one that
+   gets a veil and a shadow. The sheet inside it is `.recovery-sheet`, which
+   Settings shares and misc-moonshot-cards.css owns.
+   ========================================================================== */
+
+.gate-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-6);
+  /* The same scrim as every other modal in the app (settings.css), and for
+     the same reason a literal rgba rather than a token: a veil has to darken
+     BOTH themes, and every paper and ink token inverts between them. No
+     backdrop blur — `.settings-backdrop` does without one, and the Print /
+     Save-PDF path (misc-moonshot-cards.css) hides the whole app by
+     visibility, which is not guaranteed to switch a backdrop filter off. */
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.gate-backdrop-panel {
+  width: min(420px, 100%);
+}
+
+/* The sheet's title line: its key glyph beside the words. */
+.gate-sheet-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ==========================================================================
+   9. THE SEAL HANDOFF
+   A successful unlock fades the composition out while seal.css blooms the
+   keyhole over it. Timed from the seal's OWN duration token so the sheet has
+   finished going at the moment App.tsx swaps in the workspace, rather than
+   being three-quarters faded when it is replaced. seal.css is imported by
+   App.tsx, so the token is always defined; the literal is the fallback.
+   ========================================================================== */
+
+.gate.entering .gate-card {
+  animation: gate-out var(--seal-unlock-dur, 0.52s) var(--seal-ease, ease)
+    forwards;
+}
+
+.gate.entering .gate-logo svg {
+  animation: logo-bloom var(--seal-unlock-dur, 0.52s) var(--seal-ease, ease)
+    forwards;
+}
+
+@keyframes gate-out {
+  30% {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.02);
+  }
+}
+
+@keyframes logo-bloom {
+  40% {
+    transform: scale(1.12);
+    opacity: 1;
+  }
+  to {
+    transform: scale(1.34);
+    opacity: 0;
+  }
+}
+
+/* ----- reduced motion -----
+   Every transition above lands on its finished state when switched off, and
+   App.tsx never sets `entering` under reduced motion so the seal cannot play
+   at all — it is neutralised here as well, the way seal.css does it. */
+@media (prefers-reduced-motion: reduce) {
+  .gate-action,
+  .recent-row,
+  .pw-meter-fill {
+    transition: none;
+  }
+  .gate-action:active:not(:disabled) {
+    transform: none;
+  }
+  .gate-error {
+    animation: none;
+  }
+  .gate.entering .gate-card,
+  .gate.entering .gate-logo svg {
+    animation: none;
+  }
+}

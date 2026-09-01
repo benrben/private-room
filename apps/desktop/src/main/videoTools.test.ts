@@ -31,6 +31,7 @@ import {
   registerVideoIpc,
   runAvconvert,
   saveVideoFrame,
+  saveVideoFrameInRoom,
   splitName,
   stampForName,
   trimmedName,
@@ -69,6 +70,19 @@ describe("validateSpan", () => {
 
   it("carries MIN_TRIM_SECS's own value into the refusal message", () => {
     expect(() => validateSpan(4.0, 4.0, null)).toThrow(`${MIN_TRIM_SECS}s`);
+  });
+
+  it("keeps the distinct validation messages and only clamps a valid overrun", () => {
+    expect(() => validateSpan(Number.NaN, 2, null)).toThrow(
+      "The trim points aren't real numbers."
+    );
+    expect(() => validateSpan(-0.1, 2, null)).toThrow(
+      "A trim can't start before the beginning of the video."
+    );
+    expect(() => validateSpan(5, 6, 5)).toThrow(
+      "The trim starts at 5.0s but the video is only 5.0s long."
+    );
+    expect(validateSpan(4, 12, 5)).toEqual([4, 5]);
   });
 });
 
@@ -485,6 +499,24 @@ describe("probeVideoMeta", () => {
     expect(result).toEqual(FULL_META);
     expect(getMediaMeta(db, id)).toBeNull();
   });
+
+  it("returns a successful probe even when its best-effort cache recheck throws", async () => {
+    freshRoom();
+    const { id } = insertVideoFile();
+    let roomLookups = 0;
+    const unstableRoom: RoomSource = {
+      currentRoom: () => {
+        roomLookups += 1;
+        if (roomLookups === 3) throw new Error("room manager closed");
+        return { db, path: roomPath };
+      },
+      roomEpoch: () => 1,
+    };
+    await expect(probeVideoMeta(unstableRoom, id, () => Promise.resolve(FULL_META))).resolves.toEqual(
+      FULL_META
+    );
+    expect(getMediaMeta(db, id)).toBeNull();
+  });
 });
 
 // ============================================================================
@@ -530,6 +562,28 @@ describe("videoTrim", () => {
     await expect(videoTrim(roomSource({ open: true, epoch: 1 }), id, 10, 12)).rejects.toThrow(
       "video is only 5.0s long"
     );
+  });
+
+  it("an emit that throws does not fail a successful trim", async () => {
+    freshRoom();
+    const { id } = insertVideoFile("clip.mov", Buffer.from("source video"));
+    const converted = Buffer.from("converted video");
+    const convert = vi.fn(async (_source: string, destination: string) => {
+      await fs.promises.writeFile(destination, converted);
+    });
+    const emit = vi.fn(() => {
+      throw new Error("no window");
+    });
+
+    const file = await videoTrim(roomSource({ open: true, epoch: 1 }), id, 1, 3, {
+      convert,
+      emit,
+      probe: () => Promise.resolve(null),
+    });
+
+    expect(file.name).toBe("clip (trim 0-01 to 0-03).mov");
+    expect(convert).toHaveBeenCalledOnce();
+    expect(emit).toHaveBeenCalledWith("room-files-changed", undefined);
   });
 
   (canRunRealAvconvert ? describe : describe.skip)(
@@ -630,15 +684,6 @@ describe("videoTrim", () => {
         const emit = vi.fn();
         await videoTrim(roomSource({ open: true, epoch: 1 }), id, 1, 3, { emit });
         expect(emit).toHaveBeenCalledWith("room-files-changed", undefined);
-      });
-
-      it("an emit that throws does not fail a successful trim", async () => {
-        freshRoom();
-        const { id } = insertVideoFile("clip.mov", fixtureClipBytes!);
-        const emit = vi.fn(() => {
-          throw new Error("no window");
-        });
-        await expect(videoTrim(roomSource({ open: true, epoch: 1 }), id, 1, 3, { emit })).resolves.toBeTruthy();
       });
 
       it("calls enqueueStt with the new clip's own JobMeta", async () => {
@@ -818,6 +863,21 @@ describe("saveVideoFrame", () => {
     const padded = `  ${TINY_PNG.toString("base64")}\n`;
     const file = saveVideoFrame(roomSource({ open: true, epoch: 1 }), id, padded, 5);
     expect(file.mimeType).toBe("image/png");
+  });
+
+  it("keeps the asynchronous room-file path's payload refusals and successful notification", async () => {
+    freshRoom();
+    const { id } = insertVideoFile("talk.mp4");
+    const room = roomSource({ open: true, epoch: 1 });
+    await expect(saveVideoFrameInRoom(room, id, "bad", 5)).rejects.toThrow("valid image data");
+    await expect(saveVideoFrameInRoom(room, id, Buffer.from("not png").toString("base64"), 5)).rejects.toThrow(
+      "didn't arrive as a PNG"
+    );
+    const emit = vi.fn();
+    await expect(saveVideoFrameInRoom(room, id, TINY_PNG.toString("base64"), 5, emit)).resolves.toMatchObject({
+      name: "talk @ 0-05.png",
+    });
+    expect(emit).toHaveBeenCalledWith("room-files-changed", undefined);
   });
 });
 
@@ -1061,5 +1121,137 @@ describe.skipIf(!canRunRealAvconvert)("probeVideoMeta / videoTrim against REAL c
       FULL_META
     );
     expect(probe).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ============================================================================
+// Native failure seams — short deterministic substitutes for OS failures that
+// avconvert/the filesystem cannot reliably induce on a developer machine.
+// ============================================================================
+
+type ExecFailure = Error & {
+  code?: string | number;
+  stderr?: string;
+  signal?: NodeJS.Signals | null;
+};
+
+async function loadVideoToolsWithExecFailures(failures: ExecFailure[]) {
+  vi.resetModules();
+  vi.doMock("node:child_process", () => ({
+    execFile: (...args: unknown[]) => {
+      const callback = args.at(-1) as (error: ExecFailure, stdout: string, stderr: string) => void;
+      const failure = failures.shift();
+      if (failure === undefined) throw new Error("unexpected avconvert attempt");
+      callback(failure, "", "");
+    },
+  }));
+  return import("./videoTools.js");
+}
+
+function restoreVideoToolsNativeMocks(): void {
+  vi.doUnmock("node:child_process");
+  vi.doUnmock("node:fs");
+  vi.doUnmock("node:fs/promises");
+  vi.doUnmock("./textUtil.js");
+  vi.resetModules();
+}
+
+describe("video native failure boundaries", () => {
+  it("keeps spawn failures distinct from completed converter failures", async () => {
+    try {
+      const tools = await loadVideoToolsWithExecFailures([
+        Object.assign(new Error("missing"), { code: "ENOENT" }),
+        Object.assign(new Error("permission denied"), { code: "EACCES" }),
+      ]);
+      await expect(tools.runAvconvert("in.mov", "out.mov", 0, 1)).rejects.toThrow(
+        "This Mac has no /usr/bin/avconvert"
+      );
+      await expect(tools.runAvconvert("in.mov", "out.mov", 0, 1)).rejects.toThrow(
+        "The video couldn't be trimmed: permission denied"
+      );
+    } finally {
+      restoreVideoToolsNativeMocks();
+    }
+  });
+
+  it("reports signal and unknown completed exits after trying both presets", async () => {
+    try {
+      const tools = await loadVideoToolsWithExecFailures([
+        Object.assign(new Error("stopped"), { signal: "SIGTERM" as NodeJS.Signals }),
+        new Error("unknown"),
+      ]);
+      await expect(tools.runAvconvert("in.mov", "out.mov", 0, 1)).rejects.toThrow(
+        "PresetHighestQuality exited with unknown exit"
+      );
+    } finally {
+      restoreVideoToolsNativeMocks();
+    }
+  });
+
+  it("returns no metadata and refuses a trim when private temp staging fails", async () => {
+    try {
+      vi.resetModules();
+      vi.doMock("./textUtil.js", async (importOriginal) => ({
+        ...(await importOriginal()),
+        writePrivate: () => false,
+      }));
+      const tools = await import("./videoTools.js");
+      freshRoom();
+      const { id } = insertVideoFile();
+      const room = roomSource({ open: true, epoch: 1 });
+      await expect(tools.probeVideoMeta(room, id, () => Promise.resolve(FULL_META))).resolves.toBeNull();
+      await expect(tools.videoTrim(room, id, 0, 1)).rejects.toThrow(
+        "The video couldn't be staged: the temp file could not be created."
+      );
+    } finally {
+      restoreVideoToolsNativeMocks();
+    }
+  });
+
+  it("rejects empty, oversized, and unreadable converter results before publication", async () => {
+    let readResult: Buffer | { length: number } | Error = Buffer.alloc(0);
+    try {
+      vi.resetModules();
+      vi.doMock("node:child_process", () => ({
+        execFile: (...args: unknown[]) => {
+          const callback = args.at(-1) as (error: Error | null, stdout: string, stderr: string) => void;
+          callback(null, "", "");
+        },
+      }));
+      vi.doMock("node:fs", async (importOriginal) => ({
+        ...(await importOriginal()),
+        existsSync: () => true,
+      }));
+      vi.doMock("node:fs/promises", async (importOriginal) => ({
+        ...(await importOriginal()),
+        readFile: async () => {
+          if (readResult instanceof Error) throw readResult;
+          return readResult;
+        },
+      }));
+      const tools = await import("./videoTools.js");
+
+      freshRoom();
+      const empty = insertVideoFile("clip");
+      await expect(tools.videoTrim(roomSource({ open: true, epoch: 1 }), empty.id, 0, 1, {
+        probe: () => Promise.resolve(null),
+      })).rejects.toThrow("The trim produced an empty file");
+
+      readResult = { length: 1_000_000_001 };
+      freshRoom();
+      const tooLarge = insertVideoFile();
+      await expect(tools.videoTrim(roomSource({ open: true, epoch: 1 }), tooLarge.id, 0, 1, {
+        probe: () => Promise.resolve(null),
+      })).rejects.toThrow("larger than the 953 MB limit");
+
+      readResult = new Error("missing output");
+      freshRoom();
+      const unreadable = insertVideoFile();
+      await expect(tools.videoTrim(roomSource({ open: true, epoch: 1 }), unreadable.id, 0, 1, {
+        probe: () => Promise.resolve(null),
+      })).rejects.toThrow("The trimmed video couldn't be read back: missing output");
+    } finally {
+      restoreVideoToolsNativeMocks();
+    }
   });
 });

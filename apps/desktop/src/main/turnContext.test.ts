@@ -76,6 +76,7 @@ describe("hard no-tools/no-sources policy", () => {
   it("does not close tools merely because a simple question needs none", () => {
     expect(explicitlyProhibitsToolsOrSources("Explain what a database is.")).toBe(false);
     expect(resolveTurnEvidencePolicy("Explain it", "Do not read files.")).toBe("no-tools-no-sources");
+    expect(resolveTurnEvidencePolicy("Explain it")).toBe("normal");
   });
 
   it("uses the minimal system prompt in hard mode", () => {
@@ -115,6 +116,11 @@ describe("explicitlyNamedRoomFiles", () => {
     expect(explicitlyNamedRoomFiles("Use Archive/summary.md", inventory)).toEqual([
       "Archive/summary.md",
     ]);
+  });
+
+  it("does not search an empty question or an empty inventory", () => {
+    expect(explicitlyNamedRoomFiles("  ", inventory)).toEqual([]);
+    expect(explicitlyNamedRoomFiles("notes.md", [])).toEqual([]);
   });
 });
 
@@ -158,6 +164,7 @@ describe("isPureSaveReference / isBareSaveReference / requestedFileName", () => 
     expect(isBareSaveReference("save the quarterly report file")).toBe(false);
     expect(isBareSaveReference("what does the contract say about rent")).toBe(false);
     expect(isBareSaveReference(`save this: ${"x".repeat(200)}`)).toBe(false);
+    expect(isPureSaveReference("what does the contract say about rent")).toBe(false);
   });
 
   it("requested file names are extracted", () => {

@@ -439,6 +439,30 @@ describe("streamAnswer", () => {
     }
   });
 
+  it("redacts every visible event form and silently drops malformed deltas", async () => {
+    const { send, events } = recordingSender();
+    const answer = await streamAnswer(
+      baseReq(),
+      depsFor({
+        send,
+        privacyPolicy: protectedPolicy,
+        runViaSidecar: async (_request, options) => {
+          options.onEvent("ask-round", { v: "replacement" });
+          options.onEvent("ask-step", { v: "working" });
+          options.onEvent("ask-delta", "Ben Reich");
+          options.onEvent("ask-delta", null);
+          options.onEvent("ask-delta", { v: 42 });
+          return fakeOutcome({ kind: "done", text: "Ben Reich" });
+        },
+      })
+    );
+
+    expect(events.some(([event]) => event === "ask-round")).toBe(true);
+    expect(events.some(([event]) => event === "ask-step")).toBe(true);
+    expect(JSON.stringify(events)).not.toContain("Ben Reich");
+    expect(answer).toBe("[Person A]");
+  });
+
   it("an explicit privacy bypass sends no policy and keeps the answer unchanged", async () => {
     let seen: RunViaSidecarRequest | null = null;
     const answer = await streamAnswer(
@@ -476,6 +500,14 @@ describe("streamAnswer", () => {
     );
     expect(text).toContain("hit an error and stopped mid-run: boom");
     expect(text).toContain("Any change shown here was already applied.");
+  });
+
+  it("retains a whitespace partial before the terminal failure note", async () => {
+    const text = await streamAnswer(
+      baseReq(),
+      depsFor({ runViaSidecar: async () => fakeOutcome({ kind: "failed", text: "  ", error: "boom" }) })
+    );
+    expect(text.startsWith("  *(The agent hit an error")).toBe(true);
   });
 
   it("an empty final picks the honest notice from what the runtime KNOWS", async () => {
@@ -584,6 +616,18 @@ describe("streamAnswer", () => {
       depsFor({ runViaSidecar: async () => fakeOutcome({ kind: "done", text: "ok" }) })
     );
     expect(effects.tokenUsage).toEqual({ total_tokens: 7 });
+  });
+
+  it("merges a reported sidecar plan alongside usage", async () => {
+    const effects = createToolEffects();
+    await streamAnswer(
+      baseReq({ effects }),
+      depsFor({
+        runViaSidecar: async () => fakeOutcome({ kind: "done", text: "ok", usage: { tokens: 12 }, plan: { step: "search" } }),
+      })
+    );
+    expect(effects.tokenUsage).toEqual({ tokens: 12 });
+    expect(effects.agentPlan).toEqual({ step: "search" });
   });
 
   // `runViaSidecar` throws for exactly one failure class — `ensureUp` could not
@@ -954,6 +998,23 @@ describe("ask", () => {
     expect(files[0]?.extracted_text).toBe("Roses are red...");
   });
 
+  it("keeps a pure-save reply when the best-effort file notification fails", async () => {
+    const db = freshRoomDb();
+    const chat = createChat(db);
+    insertMessage(db, chat.id, "assistant", "A saved answer", [], null);
+    const room = makeRoomSource({ db, path: "/rooms/a.roomai" });
+
+    const msg = await ask(
+      { askId: "ask-save-notify", chatId: chat.id, question: "save that as a file", attachments: [], viewing: null, privacyBypass: false },
+      askDeps(room, createCancelState(), () => {}, {
+        notifyFilesChanged: () => { throw new Error("window closed"); },
+      })
+    );
+
+    expect(msg.content).toBe('Saved your previous answer to the room as "Saved answer.md".');
+    expect(db.prepare("SELECT name FROM files").all()).toEqual([{ name: "Saved answer.md" }]);
+  });
+
   it("the pure-save fast path publishes a normal file in a workspace room", async () => {
     const parent = mkdtempSync(path.join(os.tmpdir(), "turn-workspace-"));
     tmpDirs.push(parent);
@@ -1109,6 +1170,31 @@ describe("ask", () => {
       askDeps(room, createCancelState(), () => {}, { groundingPass })
     );
     expect(groundingPass).not.toHaveBeenCalled();
+  });
+
+  it("keeps the answer unmarked when the deferred grounding pass declines", async () => {
+    const db = freshRoomDb();
+    const chat = createChat(db);
+    const room = makeRoomSource({ db, path: "/rooms/a.roomai" });
+    const img = insertFile(db, "receipt.png", "image/png", Buffer.from([1, 2, 3]), null, "upload");
+    const groundingPass = vi.fn(async () => null);
+    const { send, events } = recordingSender();
+
+    const msg = await ask(
+      {
+        askId: "ask-ground-none",
+        chatId: chat.id,
+        question: "where is the total on the image?",
+        attachments: [img.id],
+        viewing: null,
+        privacyBypass: false,
+      },
+      askDeps(room, createCancelState(), send, { groundingPass })
+    );
+
+    expect(groundingPass).toHaveBeenCalledTimes(1);
+    expect(msg.effects).toBeNull();
+    expect(stepLabels(events)).not.toContain("Marked the image");
   });
 
   // CHG-19 + CHG-17: the pass is DEFERRED to after the answer, which is exactly

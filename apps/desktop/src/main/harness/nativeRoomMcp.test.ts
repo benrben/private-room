@@ -206,6 +206,33 @@ describe("native Room MCP exposure", () => {
     await expect(factory(context(root))).rejects.toThrow(/baseline is complete/i);
   });
 
+  it("rejects unmatched rooms, protected writes, and unsafe native workspace roots", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-native-mcp-guards-"));
+    roots.push(root);
+    const mirror = path.join(root, "mirror");
+    const missingRoom = createNativeRoomMcpFactory({ room: null } as unknown as RoomManagerState, () => dispatcher());
+    await expect(missingRoom(context(root))).rejects.toThrow(
+      "The native Room MCP bridge requires the matching unlocked workspace room.",
+    );
+
+    const readOnly = stateWith(root, { baseline_completed: 1, status: "running", write_enabled: 1 });
+    readOnly.room!.readOnly = true;
+    await expect(createNativeRoomMcpFactory(readOnly, () => dispatcher())(context(root))).rejects.toThrow(
+      "The native Room MCP bridge cannot start before its rollback baseline is complete.",
+    );
+
+    const factory = createNativeRoomMcpFactory(
+      stateWith(root, { baseline_completed: 1, status: "running", write_enabled: 0 }),
+      () => dispatcher(),
+    );
+    await expect(factory(context(root, { privacyMode: "cloud-redacted", writeEnabled: false }))).rejects.toThrow(
+      "Cloud Privacy native runs require the redacted workspace mirror.",
+    );
+    await expect(factory(context(mirror, { privacyMode: "cloud-direct", writeEnabled: false }))).rejects.toThrow(
+      "Direct native runs require the real verified workspace.",
+    );
+  });
+
   it.each(["codex", "claude"] as const)(
     "teaches %s to use native file tools without exposing private state",
     async (provider) => {
@@ -373,6 +400,7 @@ describe("native Room MCP exposure", () => {
     const payload = await listed.json() as { result: { tools: ToolSpec[] } };
     expect(payload.result.tools.map((tool) => tool.name)).toEqual(["organize_files"]);
     await exposure.stop();
+    await expect(exposure.stop()).resolves.toBeUndefined();
     await expect(fetch(exposure.url)).rejects.toThrow();
   });
 });

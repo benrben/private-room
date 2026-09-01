@@ -57,20 +57,25 @@ than redefined, per the porting brief.
 
 from __future__ import annotations
 
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from arcelle_sidecar.diar.cluster import (
     AUTO_MAX_SPEAKERS,
-    SPLIT_MIN_VOICE_FRAMES,
     cluster,
     cluster_gated,
 )
 from arcelle_sidecar.diar.embed import VoicePrint, is_neural
+from arcelle_sidecar.diar.label_split import (
+    _backfill_unknown_labels as _backfill_unknown_labels,
+    _nearest_window_id as _nearest_window_id,
+    _piece_text as _piece_text,
+    _piece_voice as _piece_voice,
+    _voice_cuts as _voice_cuts,
+    split_by_voice as _split_by_voice,
+)
 from arcelle_sidecar.diar.recognize import KnownVoice, identity_print, recognize_groups
-from arcelle_sidecar.diar.windows import span_print
-from arcelle_sidecar.rec.meta import RecSegment, RecWord
+from arcelle_sidecar.rec.meta import RecSegment
 
 __all__ = [
     "Naming",
@@ -146,21 +151,32 @@ def _move_names(names: dict[str, str], moves: list[tuple[str, str]]) -> None:
     """
     if not names or not moves:
         return
+    next_names = _moved_names(names, moves)
+    _keep_unmoved_names(next_names, names, moves)
+    names.clear()
+    names.update(next_names)
+
+
+def _moved_names(names: dict[str, str], moves: list[tuple[str, str]]) -> dict[str, str]:
     next_names: dict[str, str] = {}
     for frm, to in moves:
         if frm in names:
             # A later mover in `moves` overwrites an earlier one's target.
             next_names[to] = names[frm]
-    moved_from = {frm for frm, _to in moves}
+    return next_names
+
+
+def _keep_unmoved_names(
+    next_names: dict[str, str], names: dict[str, str], moves: list[tuple[str, str]]
+) -> None:
     # Labels no group moved away from keep their name -- unless a mover has
     # already claimed that label, whose name wins (`setdefault` only fills a
     # gap, exactly like Rust's `or_insert_with`).
+    moved_from = {frm for frm, _to in moves}
     for label, name in names.items():
         if label in moved_from:
             continue
         next_names.setdefault(label, name)
-    names.clear()
-    names.update(next_names)
 
 
 def _fold_leader(counts: dict[str, int]) -> tuple[str, int] | None:
@@ -176,6 +192,126 @@ def _fold_leader(counts: dict[str, int]) -> tuple[str, int] | None:
     return best
 
 
+def _group_frames(segments: list[RecSegment], group: list[int]) -> int:
+    total = 0
+    for slot in group:
+        voice = segments[slot].voice
+        total += voice.voiced_frames if voice is not None else 0
+    return total
+
+
+def _you_group_index(segments: list[RecSegment], in_room: list[list[int]]) -> int | None:
+    """Pick the last group tied for the largest microphone-frame count."""
+    you: int | None = None
+    best_frames = -1
+    for index, group in enumerate(in_room):
+        frames = _group_frames(segments, group)
+        if frames >= best_frames:
+            best_frames = frames
+            you = index
+    return you
+
+
+def _group_start(group: list[int]) -> float | int:
+    return min(group) if group else float("inf")
+
+
+def _ordered_other_groups(
+    in_room: list[list[int]], in_meeting: list[list[int]], you: int | None
+) -> list[list[int]]:
+    others = [group for index, group in enumerate(in_room) if index != you]
+    others.extend(in_meeting)
+    others.sort(key=_group_start)  # stable, matches Rust's sort_by_key
+    return others
+
+
+def _available_speaker_counts(
+    segments: list[RecSegment], group: list[int], taken: list[str]
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for slot in group:
+        label = segments[slot].speaker
+        if label.startswith("Speaker ") and label not in taken:
+            counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def _next_speaker_name(taken: list[str]) -> str:
+    number = 1
+    while f"Speaker {number}" in taken:
+        number += 1
+    return f"Speaker {number}"
+
+
+def _speaker_name(counts: dict[str, int], taken: list[str]) -> str:
+    leader = _fold_leader(counts)
+    if leader is not None and leader[1] >= 2:
+        return leader[0]
+    return _next_speaker_name(taken)
+
+
+def _named_groups(
+    segments: list[RecSegment],
+    in_room: list[list[int]],
+    in_meeting: list[list[int]],
+) -> list[tuple[list[int], str]]:
+    # Whoever does most of the talking into this Mac's microphone is its
+    # owner. Rust's `max_by_key` returns the LAST maximum on a tie.
+    you = _you_group_index(segments, in_room)
+    # Everyone else is numbered, room and meeting alike -- the transcript
+    # reads as one conversation, because it is one.
+    others = _ordered_other_groups(in_room, in_meeting, you)
+    taken: list[str] = []
+    named: list[tuple[list[int], str]] = []
+    for group in others:
+        name = _speaker_name(_available_speaker_counts(segments, group, taken), taken)
+        taken.append(name)
+        named.append((group, name))
+    if you is not None:
+        named.append((in_room[you], "You"))
+    return named
+
+
+def _group_label_counts(segments: list[RecSegment], group: list[int]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for slot in group:
+        label = segments[slot].speaker
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def _name_move(segments: list[RecSegment], group: list[int], name: str) -> tuple[str, str] | None:
+    leader = _fold_leader(_group_label_counts(segments, group))
+    if leader is None or leader[0] == name:
+        return None
+    return leader[0], name
+
+
+def _append_new_move(moves: list[tuple[str, str]], move: tuple[str, str] | None) -> None:
+    """Keep only the first destination when one voice splits into groups."""
+    if move is not None and not any(previous == move[0] for previous, _name in moves):
+        moves.append(move)
+
+
+def _name_moves(
+    segments: list[RecSegment], named: list[tuple[list[int], str]]
+) -> list[tuple[str, str]]:
+    moves: list[tuple[str, str]] = []
+    for group, name in named:
+        _append_new_move(moves, _name_move(segments, group, name))
+    return moves
+
+
+def _write_group_names(segments: list[RecSegment], named: list[tuple[list[int], str]]) -> bool:
+    changed = False
+    for group, name in named:
+        for slot in group:
+            if segments[slot].speaker != name:
+                segments[slot].speaker = name
+                changed = True
+    return changed
+
+
 def _apply_names(
     segments: list[RecSegment],
     in_room: list[list[int]],
@@ -188,78 +324,16 @@ def _apply_names(
     `split_by_voice` (sub-window groups): one naming brain, two clusterings.
     """
 
-    def group_frames(g: list[int]) -> int:
-        total = 0
-        for s in g:
-            v = segments[s].voice
-            total += v.voiced_frames if v is not None else 0
-        return total
-
-    # Whoever does most of the talking into this Mac's microphone is its
-    # owner. Rust's `max_by_key` returns the LAST maximum on a tie -- `>=`
-    # below re-takes the lead on every tie, landing on the last index too.
-    you: int | None = None
-    best_frames = -1
-    for i, g in enumerate(in_room):
-        f = group_frames(g)
-        if f >= best_frames:
-            best_frames = f
-            you = i
-
-    # Everyone else is numbered, room and meeting alike -- the transcript
-    # reads as one conversation, because it is one.
-    others: list[list[int]] = [g for i, g in enumerate(in_room) if i != you]
-    others.extend(in_meeting)
-    others.sort(key=lambda g: min(g) if g else float("inf"))  # stable, matches Rust's sort_by_key
-
     # Names are STICKY: each group keeps the number most of its phrases
     # already show on screen whenever it can. Renumbering everyone by first
     # appearance after every re-cluster made a mid-meeting merge shuffle the
     # labels of people who never changed -- which reads as misrecognition.
-    taken: list[str] = []
-    named: list[tuple[list[int], str]] = []
-    for g in others:
-        counts: dict[str, int] = {}
-        for slot in g:
-            label = segments[slot].speaker
-            if label.startswith("Speaker ") and label not in taken:
-                counts[label] = counts.get(label, 0) + 1
-        # Strictly-greater scan: a tie keeps the label heard EARLIEST (counts
-        # are in phrase order) -- the one that's been on screen longest. A
-        # label backed by a single phrase isn't established, though: keeping
-        # it preserves whatever number the live pass happened to mint, so it
-        # takes the lowest free number instead.
-        leader = _fold_leader(counts)
-        if leader is not None and leader[1] >= 2:
-            name = leader[0]
-        else:
-            n = 1
-            while True:
-                candidate = f"Speaker {n}"
-                if candidate not in taken:
-                    name = candidate
-                    break
-                n += 1
-        taken.append(name)
-        named.append((g, name))
-    if you is not None:
-        named.append((in_room[you], "You"))
+    named = _named_groups(segments, in_room, in_meeting)
 
     # What each group was CALLED before this pass -- the label most of its
     # phrases show on screen -- so the user's name for that voice can follow
     # it to whatever label it is about to get.
-    moves: list[tuple[str, str]] = []
-    for group, name in named:
-        counts = {}
-        for slot in group:
-            label = segments[slot].speaker
-            counts[label] = counts.get(label, 0) + 1
-        leader = _fold_leader(counts)
-        was = leader[0] if leader is not None else None
-        # A voice that split in two: only the first piece inherits the name,
-        # rather than the same person appearing twice under it.
-        if was is not None and was != name and not any(f == was for f, _to in moves):
-            moves.append((was, name))
+    moves = _name_moves(segments, named)
     _move_names(naming.names, moves)
     # A name whose voice left the transcript entirely was just dropped by
     # `_move_names`; a GUESS about it has to go with it, or a stale guess
@@ -267,12 +341,7 @@ def _apply_names(
     naming.recognized.intersection_update(naming.names.values())
 
     changed = _recognize(segments, named, naming)
-    for group, name in named:
-        for slot in group:
-            if segments[slot].speaker != name:
-                segments[slot].speaker = name
-                changed = True
-    return changed
+    return _write_group_names(segments, named) or changed
 
 
 def _recognize(
@@ -295,37 +364,112 @@ def _recognize(
     """
     if not naming.known:
         return False
-    typed = [n for n in naming.names.values() if n not in naming.recognized]
-    open_idx = [
-        i
-        for i in range(len(named))
-        if named[i][1] != "You"
-        and (named[i][1] not in naming.names or naming.names[named[i][1]] in naming.recognized)
-    ]
-    centroids: list[VoicePrint | None] = []
-    for i in open_idx:
-        group = named[i][0]
-        prints = [segments[s].voice for s in group if segments[s].voice is not None]
-        centroids.append(identity_print(prints))
-
+    typed = _typed_names(naming)
+    open_indexes = _open_recognition_indexes(named, naming)
+    centroids = _recognition_centroids(segments, named, open_indexes)
     changed = False
     picks = recognize_groups(centroids, naming.known, typed)
-    for i, picked in zip(open_idx, picks):
-        label = named[i][1]
-        if picked is not None:
-            if naming.names.get(label) != picked:
-                naming.names[label] = picked
-                changed = True
-            naming.recognized.add(picked)
-        else:
-            # Nothing saved matches this voice any more -- a guess the
-            # meeting has since talked out of. Withdraw it; "Speaker 3" is
-            # true and a stale name is not.
-            if label in naming.names:
-                gone = naming.names.pop(label)
-                naming.recognized.discard(gone)
-                changed = True
+    for index, picked in zip(open_indexes, picks):
+        if _apply_recognition_pick(named[index][1], picked, naming):
+            changed = True
     return changed
+
+
+def _typed_names(naming: Naming) -> list[str]:
+    return [name for name in naming.names.values() if name not in naming.recognized]
+
+
+def _recognition_is_open(label: str, naming: Naming) -> bool:
+    known_name = naming.names.get(label)
+    return label != "You" and (known_name is None or known_name in naming.recognized)
+
+
+def _open_recognition_indexes(named: list[tuple[list[int], str]], naming: Naming) -> list[int]:
+    return [
+        index for index, (_group, label) in enumerate(named) if _recognition_is_open(label, naming)
+    ]
+
+
+def _group_centroid(segments: list[RecSegment], group: list[int]) -> VoicePrint | None:
+    prints = [segments[slot].voice for slot in group if segments[slot].voice is not None]
+    return identity_print(prints)
+
+
+def _recognition_centroids(
+    segments: list[RecSegment],
+    named: list[tuple[list[int], str]],
+    open_indexes: list[int],
+) -> list[VoicePrint | None]:
+    return [_group_centroid(segments, named[index][0]) for index in open_indexes]
+
+
+def _remember_recognized_name(label: str, picked: str, naming: Naming) -> bool:
+    changed = naming.names.get(label) != picked
+    if changed:
+        naming.names[label] = picked
+    naming.recognized.add(picked)
+    return changed
+
+
+def _withdraw_recognized_name(label: str, naming: Naming) -> bool:
+    if label not in naming.names:
+        return False
+    gone = naming.names.pop(label)
+    naming.recognized.discard(gone)
+    return True
+
+
+def _apply_recognition_pick(label: str, picked: str | None, naming: Naming) -> bool:
+    if picked is not None:
+        return _remember_recognized_name(label, picked, naming)
+    # Nothing saved matches this voice any more -- a guess the meeting has
+    # since talked out of. Withdraw it; "Speaker 3" is true and a stale name
+    # is not.
+    return _withdraw_recognized_name(label, naming)
+
+
+def _lane_voice_indexes(segments: list[RecSegment], lane: str) -> list[int]:
+    return [
+        index
+        for index, segment in enumerate(segments)
+        if segment.source == lane and segment.voice is not None
+    ]
+
+
+def _newest_generation_indexes(segments: list[RecSegment], indexes: list[int]) -> list[int]:
+    if not any(is_neural(segments[index].voice.vec) for index in indexes):  # type: ignore[union-attr]
+        return indexes
+    return [
+        index
+        for index in indexes
+        if is_neural(segments[index].voice.vec)  # type: ignore[union-attr]
+    ]
+
+
+def _max_cluster_id(ids: list[int | None]) -> int:
+    max_id = -1
+    for cluster_id in ids:
+        if cluster_id is not None and cluster_id > max_id:
+            max_id = cluster_id
+    return max_id
+
+
+def _cluster_groups(indexes: list[int], ids: list[int | None]) -> list[list[int]]:
+    max_id = _max_cluster_id(ids)
+    groups: list[list[int]] = [[] for _ in range(max_id + 1)]
+    for slot, cluster_id in zip(indexes, ids):
+        if cluster_id is not None:
+            groups[cluster_id].append(slot)
+    return groups
+
+
+def _cluster_lane_voices(
+    segments: list[RecSegment], indexes: list[int], cap: int
+) -> list[list[int]]:
+    prints = [segments[index].voice for index in indexes]
+    spans = [(segments[index].t0, segments[index].t1) for index in indexes]
+    ids = cluster(prints, spans, cap)  # type: ignore[arg-type]
+    return _cluster_groups(indexes, ids)
 
 
 def _lane_voices(segments: list[RecSegment], lane: str, cap: int) -> list[list[int]]:
@@ -339,45 +483,10 @@ def _lane_voices(segments: list[RecSegment], lane: str, cap: int) -> list[list[i
     like legacy rows with no print. (A silent print is generation-less -- it
     clusters to nothing either way.)
     """
-    idx = [i for i in range(len(segments)) if segments[i].source == lane and segments[i].voice is not None]
-    if any(is_neural(segments[i].voice.vec) for i in idx):  # type: ignore[union-attr]
-        idx = [i for i in idx if is_neural(segments[i].voice.vec)]  # type: ignore[union-attr]
-    if not idx:
+    indexes = _newest_generation_indexes(segments, _lane_voice_indexes(segments, lane))
+    if not indexes:
         return []
-    prints = [segments[i].voice for i in idx]
-    spans = [(segments[i].t0, segments[i].t1) for i in idx]
-    ids = cluster(prints, spans, cap)  # type: ignore[arg-type]
-    max_id = -1
-    for cid in ids:
-        if cid is not None and cid > max_id:
-            max_id = cid
-    groups: list[list[int]] = [[] for _ in range(max_id + 1)]
-    for slot, cid in zip(idx, ids):
-        if cid is not None:
-            groups[cid].append(slot)
-    return groups
-
-
-# ------------------------------------------------------------ the split pass
-
-
-def _nearest_window_id(
-    wins: list[tuple[int, tuple[int, int]]], ids: list[int | None], mid: int
-) -> int | None:
-    """The cluster id of whichever window's center sits nearest `mid` (ties
-    keep the FIRST window in `wins`'s order, matching Rust's
-    `Iterator::min_by_key`, which returns the first minimum); `None` when
-    `wins` is empty."""
-    best_k: int | None = None
-    best_dist: int | None = None
-    for k, (b, e) in wins:
-        dist = abs((b + e) // 2 - mid)
-        if best_dist is None or dist < best_dist:
-            best_dist = dist
-            best_k = k
-    if best_k is None:
-        return None
-    return ids[best_k]
+    return _cluster_lane_voices(segments, indexes, cap)
 
 
 def split_by_voice(
@@ -399,110 +508,11 @@ def split_by_voice(
     place when this returns True (matching Rust's `*segments = rebuilt;`),
     left completely untouched when it returns False.
     """
-    cap = max_speakers if max_speakers != 0 else AUTO_MAX_SPEAKERS
-    seg_wins: list[list[tuple[int, int, VoicePrint]]] = [wins_for(s) for s in segments]
-
-    # plan[i]: the pieces segment i becomes -- (lane voice, (start, end)
-    # word range) -- or None/[] to keep it untouched (legacy rows,
-    # window-less phrases).
-    plan: list[list[tuple[int | None, tuple[int, int]]] | None] = [None] * len(segments)
-    lane_voice_count = [0, 0]
-    for lane_no, lane in enumerate(("mic", "sys")):
-        idx = [i for i in range(len(segments)) if segments[i].source == lane and seg_wins[i]]
-        prints: list[VoicePrint] = []
-        spans: list[tuple[int, int]] = []
-        owner: list[int] = []
-        for i in idx:
-            for b, e, p in seg_wins[i]:
-                prints.append(p)
-                spans.append((b, e))
-                owner.append(i)
-        if len(prints) < 2:
-            continue
-        ids = cluster_gated(prints, spans, cap, SPLIT_MIN_VOICE_FRAMES)
-        max_id = -1
-        for cid in ids:
-            if cid is not None and cid > max_id:
-                max_id = cid
-        lane_voice_count[lane_no] = max_id + 1
-
-        for i in idx:
-            wins = [(k, spans[k]) for k in range(len(prints)) if owner[k] == i]
-            seg = segments[i]
-            # Each word takes the voice of the window whose center is
-            # nearest; unknowns (silence, weak windows) never cut a turn --
-            # they ride with the voice already speaking.
-            labels: list[int | None] = []
-            last: int | None = None
-            for w in seg.words:
-                mid = (w.t0 + w.t1) // 2
-                best = _nearest_window_id(wins, ids, mid)
-                if best is None:
-                    best = last
-                last = best
-                labels.append(best)
-            first_known = next((label for label in labels if label is not None), None)
-            if first_known is not None:
-                labels = [label if label is not None else first_known for label in labels]
-
-            cuts: list[tuple[int | None, tuple[int, int]]] = []
-            start = 0
-            for w in range(1, len(labels)):
-                if labels[w] != labels[start]:
-                    cuts.append((labels[start], (start, w)))
-                    start = w
-            if labels:
-                cuts.append((labels[start], (start, len(labels))))
-            plan[i] = cuts
-
-    # Rebuild the transcript: a multi-voice phrase becomes its pieces --
-    # words, timings, text and prints all follow the cut.
-    rebuilt: list[RecSegment] = []
-    groups: list[list[list[int]]] = [
-        [[] for _ in range(lane_voice_count[0])],
-        [[] for _ in range(lane_voice_count[1])],
-    ]
-    split_any = False
-    for i, seg in enumerate(segments):
-        lane_no = 0 if seg.source == "mic" else 1
-        cuts = plan[i]
-        if cuts:  # non-empty -- Rust's `Some(cuts) if !cuts.is_empty()`
-            many = len(cuts) > 1
-            split_any = split_any or many
-            for voice, (start, end) in cuts:
-                words: list[RecWord] = list(seg.words[start:end])
-                t0 = seg.t0 if start == 0 else (words[0].t0 if words else seg.t0)
-                t1 = seg.t1 if end == len(seg.words) else (words[-1].t1 if words else seg.t1)
-                if many:
-                    parts = [w.w.strip() for w in words]
-                    text = " ".join(p for p in parts if p)
-                else:
-                    text = seg.text
-                piece_print = span_print(seg_wins[i], t0, t1)
-                if piece_print is None:
-                    piece_print = seg.voice
-                if voice is not None:
-                    groups[lane_no][voice].append(len(rebuilt))
-                rebuilt.append(
-                    RecSegment(
-                        id=str(uuid.uuid4()) if many else seg.id,
-                        source=seg.source,
-                        speaker=seg.speaker,
-                        t0=t0,
-                        t1=t1,
-                        text=text,
-                        words=words,
-                        lang=seg.lang,
-                        voice=piece_print,
-                    )
-                )
-        else:
-            # See module docstring's "untouched-segment clone" deviation.
-            rebuilt.append(seg)
-
-    mic_groups, sys_groups = groups
-    renamed = _apply_names(rebuilt, mic_groups, sys_groups, naming)
-    if split_any or renamed:
-        segments[:] = rebuilt
-        return True
-    return False
+    return _split_by_voice(
+        segments,
+        max_speakers,
+        naming,
+        wins_for,
+        _apply_names,
+        cluster_gated,
+    )

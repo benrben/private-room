@@ -167,26 +167,33 @@ def _items(parsed: Any, key: str) -> list[dict[str, Any]]:
     return []
 
 
-async def read_window(req: RecReadMapRequest) -> dict[str, Any]:
-    """Read one window of a meeting. Never raises for a bad model reply — a lost
-    window comes back ``skipped=True`` so the count Rust reports stays honest."""
-    turns = truncate_bytes(req.turns, TURNS_CAP)
-    if not turns.strip():
-        return {"chapters": [], "highlights": [], "notes": [], "thread": req.thread, "skipped": False}
+def _empty_window(req: RecReadMapRequest) -> dict[str, Any]:
+    return {
+        "chapters": [],
+        "highlights": [],
+        "notes": [],
+        "thread": req.thread,
+        "skipped": False,
+    }
 
+
+def _previous_thread(req: RecReadMapRequest) -> str:
+    if not req.thread.strip():
+        return ""
+    thread = truncate_bytes(req.thread, THREAD_CAP)
+    return f"What has happened in this meeting so far:\n{thread}\n\n"
+
+
+def _window_messages(req: RecReadMapRequest, turns: str) -> list[Message]:
     where = f"Part {req.part + 1} of {req.total}"
-    so_far = (
-        f"What has happened in this meeting so far:\n{truncate_bytes(req.thread, THREAD_CAP)}\n\n"
-        if req.thread.strip()
-        else ""
-    )
-    messages: list[Message] = [
+    file_name = f' "{req.file_name}"' if req.file_name else ""
+    return [
         system_message(_SYSTEM),
         user_message(
             f"{where} of the meeting"
-            + (f' "{req.file_name}"' if req.file_name else "")
+            + file_name
             + ".\n\n"
-            + so_far
+            + _previous_thread(req)
             + "Lines:\n"
             + turns
             + "\n\nReport what happened in these lines. Also write 'thread': two or "
@@ -195,54 +202,80 @@ async def read_window(req: RecReadMapRequest) -> dict[str, Any]:
         ),
     ]
 
-    primed = prime_schema(messages, _SCHEMA)
-    parsed: Any = _SKIP
+
+
+async def _read_once(req: RecReadMapRequest, messages: list[Message]) -> Any:
+    try:
+        raw = await llm.generate(
+            req.model,
+            messages,
+            req.base_url,
+            temperature=READ_TEMPERATURE,
+            num_predict=READ_PREDICT,
+            keep_alive=req.keep_alive,
+            format=_SCHEMA,
+            privacy=req.privacy,
+            provider=req.provider,
+        )
+    except llm.LlmError as exc:
+        # A fatal engine error parks the whole job for Resume; anything else
+        # is a one-off this read survives.
+        if _is_fatal(exc.code):
+            raise
+        return _SKIP
+    try:
+        return json.loads(recover_json(raw))
+    except (json.JSONDecodeError, ValueError):
+        return _SKIP
+
+
+async def _read_reply(req: RecReadMapRequest, messages: list[Message]) -> Any:
     for attempt in range(2):
-        try:
-            raw = await llm.generate(
-                req.model,
-                primed,
-                req.base_url,
-                temperature=READ_TEMPERATURE,
-                num_predict=READ_PREDICT,
-                keep_alive=req.keep_alive,
-                format=_SCHEMA,
-                privacy=req.privacy,
-                provider=req.provider,
-            )
-        except llm.LlmError as exc:
-            # A fatal engine error parks the whole job for Resume; anything else
-            # is a one-off this read survives.
-            if _is_fatal(exc.code):
-                raise
-            if attempt == 0:
-                continue
-            parsed = _SKIP
-            break
-        try:
-            parsed = json.loads(recover_json(raw))
-            break
-        except (json.JSONDecodeError, ValueError):
-            if attempt == 0:
-                continue
-            parsed = _SKIP
+        parsed = await _read_once(req, messages)
+        if parsed is not _SKIP:
+            return parsed
+        if attempt == 0:
+            continue
+    return _SKIP
 
-    if parsed is _SKIP:
-        # The incoming thread flows on, so the next window still reads in
-        # context even though this one was lost.
-        return {
-            "chapters": [],
-            "highlights": [],
-            "notes": [],
-            "thread": req.thread,
-            "skipped": True,
-        }
 
+def _skipped_window(req: RecReadMapRequest) -> dict[str, Any]:
+    # The incoming thread flows on, so the next window still reads in context
+    # even though this one was lost.
+    return {
+        "chapters": [],
+        "highlights": [],
+        "notes": [],
+        "thread": req.thread,
+        "skipped": True,
+    }
+
+
+def _window_thread(parsed: Any, req: RecReadMapRequest) -> str:
     thread = parsed.get("thread") if isinstance(parsed, dict) else None
+    value = thread if isinstance(thread, str) else req.thread
+    return truncate_bytes(value, THREAD_CAP)
+
+
+def _window_result(parsed: Any, req: RecReadMapRequest) -> dict[str, Any]:
     return {
         "chapters": _items(parsed, "chapters"),
         "highlights": _items(parsed, "highlights"),
         "notes": _items(parsed, "notes"),
-        "thread": truncate_bytes(thread if isinstance(thread, str) else req.thread, THREAD_CAP),
+        "thread": _window_thread(parsed, req),
         "skipped": False,
     }
+
+
+async def read_window(req: RecReadMapRequest) -> dict[str, Any]:
+    """Read one window of a meeting. Never raises for a bad model reply — a lost
+    window comes back ``skipped=True`` so the count Rust reports stays honest."""
+    turns = truncate_bytes(req.turns, TURNS_CAP)
+    if not turns.strip():
+        return _empty_window(req)
+
+    messages = _window_messages(req, turns)
+    parsed = await _read_reply(req, prime_schema(messages, _SCHEMA))
+    if parsed is _SKIP:
+        return _skipped_window(req)
+    return _window_result(parsed, req)

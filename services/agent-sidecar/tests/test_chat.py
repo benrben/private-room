@@ -6,6 +6,7 @@ No network — we build the LangChain objects and inspect them.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
@@ -21,6 +22,7 @@ from arcelle_sidecar.chat import OllamaChatModel, _chunk_text, _to_langchain
 from arcelle_sidecar.config import KEEP_ALIVE_WARM
 from arcelle_sidecar.messages import Message
 from arcelle_sidecar.model_limits import NUM_CTX_BUCKETS, max_num_ctx, pick_num_ctx
+from arcelle_sidecar.privacy import PrivacyPolicy
 
 
 async def _no_native_length(model: str, base_url: str) -> int | None:
@@ -84,6 +86,62 @@ async def test_ollama_vision_false_refuses_before_opening_a_model_request() -> N
         )
 
 
+async def test_generate_stream_keeps_the_native_request_and_skips_empty_deltas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tool-less endpoint has the same wire contract as one-shot generation."""
+    import ollama
+
+    class _StreamingClient:
+        request: dict[str, object] = {}
+
+        def __init__(self, host: str = "", **kwargs: object) -> None:
+            self.host = host
+
+        async def chat(self, **kwargs: object) -> _FakeStream:
+            type(self).request = dict(kwargs)
+            return _FakeStream(
+                [
+                    SimpleNamespace(message=SimpleNamespace(content="")),
+                    SimpleNamespace(message=SimpleNamespace(content="Hello ")),
+                    SimpleNamespace(message=SimpleNamespace(content="there")),
+                ]
+            )
+
+    monkeypatch.setattr(ollama, "AsyncClient", _StreamingClient)
+    model = OllamaChatModel(
+        "qwen3.5:4b",
+        "http://127.0.0.1:11434",
+        temperature=0.2,
+        num_ctx=8_192,
+        num_predict=32,
+        keep_alive="5m",
+    )
+
+    deltas = [
+        delta
+        async for delta in model.generate_stream(
+            [{"role": "system", "content": "brief"}, {"role": "user", "content": "hi"}],
+            format={"type": "object"},
+            images=["image-data"],
+        )
+    ]
+
+    assert deltas == ["Hello ", "there"]
+    assert _StreamingClient.request == {
+        "model": "qwen3.5:4b",
+        "messages": [
+            {"role": "system", "content": "brief"},
+            {"role": "user", "content": "hi", "images": ["image-data"]},
+        ],
+        "format": {"type": "object"},
+        "options": {"num_ctx": 8_192, "num_predict": 32, "temperature": 0.2},
+        "keep_alive": "5m",
+        "think": False,
+        "stream": True,
+    }
+
+
 def test_chunk_text_handles_str_and_blocks() -> None:
     assert _chunk_text("hello") == "hello"
     assert _chunk_text([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]) == "ab"
@@ -100,6 +158,9 @@ def test_model_params_are_pinned() -> None:
     # HLT-5: the chat model stays warm across the conversation.
     assert llm.keep_alive == KEEP_ALIVE_WARM == "30m"
     assert llm.temperature == 0.7
+
+    sized = m._llm(8_192)
+    assert sized.num_ctx == 8_192
 
 
 def test_pick_num_ctx_buckets_and_caps() -> None:
@@ -314,6 +375,99 @@ async def test_stream_delivers_everything_when_not_cancelled() -> None:
     assert content == "t0t1t2t3t4"
 
 
+async def test_stream_restores_private_tool_calls_and_ignores_an_unnamed_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cloud tool call must use real values locally, never its placeholders."""
+    monkeypatch.setattr(chat_module, "native_context_length", _no_native_length)
+    tool_chunk = AIMessageChunk(
+        content="son A]",
+        tool_calls=[
+            {
+                "name": "search_room",
+                "args": {"query": "[Person A]"},
+                "id": "call-1",
+                "type": "tool_call",
+            },
+            {"name": "", "args": {}, "id": "ignored", "type": "tool_call"},
+        ],
+    )
+    stream = _FakeStream([AIMessageChunk(content="[Per"), tool_chunk])
+    m = OllamaChatModel("qwen3:cloud", "http://127.0.0.1:11434")
+    m.privacy = PrivacyPolicy(active=True, rules=[("Ben", "[Person A]")])
+    sent_messages: list[object] = []
+    bound_tools: list[dict[str, object]] = []
+
+    class _LLM:
+        def bind_tools(self, tools: list[dict[str, object]]) -> "_LLM":
+            bound_tools.extend(tools)
+            return self
+
+        def astream(self, messages: list[object]) -> _FakeStream:
+            sent_messages.extend(messages)
+            return stream
+
+    m._llm = lambda num_ctx=None: _LLM()  # type: ignore[method-assign, assignment]
+    delivered: list[str] = []
+
+    async def on_delta(delta: str) -> None:
+        delivered.append(delta)
+
+    tools: list[dict[str, object]] = [{"type": "function", "function": {"name": "search_room"}}]
+    content, calls, _ = await m.stream(
+        [{"role": "user", "content": "Find Ben"}], tools, on_delta
+    )
+
+    assert sent_messages[0].content == "Find [Person A]"
+    assert bound_tools == tools
+    assert delivered == ["Ben"]
+    assert content == "Ben"
+    assert [(call.name, call.arguments, call.id) for call in calls] == [
+        ("search_room", {"query": "Ben"}, "call-1"),
+    ]
+
+
+async def test_stream_ignores_foreign_chunks_and_keeps_local_tool_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider oddity cannot turn into a tool call or alter its arguments."""
+    monkeypatch.setattr(chat_module, "native_context_length", _no_native_length)
+    stream = _FakeStream(
+        [
+            object(),
+            AIMessageChunk(
+                content="done",
+                tool_calls=[
+                    {
+                        "name": "search_room",
+                        "args": {"query": "rent"},
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+        ]
+    )
+    m = OllamaChatModel("m", "http://127.0.0.1:11434")
+    _fake_llm(m, stream)
+    delivered: list[str] = []
+
+    async def on_delta(delta: str) -> None:
+        delivered.append(delta)
+
+    content, calls, _ = await m.stream(
+        [{"role": "user", "content": "Find rent"}],
+        [{"type": "function", "function": {"name": "search_room"}}],
+        on_delta,
+    )
+
+    assert delivered == ["done"]
+    assert content == "done"
+    assert [(call.name, call.arguments) for call in calls] == [
+        ("search_room", {"query": "rent"}),
+    ]
+
+
 class _StalledStream:
     """A stream that yields nothing and never ends — a wedged daemon.
 
@@ -335,6 +489,38 @@ class _StalledStream:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class _CleanupFailureStream:
+    """A stalled read whose cancellation and close both fail."""
+
+    def __init__(self) -> None:
+        self.close_attempts = 0
+
+    def __aiter__(self) -> "_CleanupFailureStream":
+        return self
+
+    async def __anext__(self):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as exc:
+            raise RuntimeError("read cleanup failed") from exc
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def aclose(self) -> None:
+        self.close_attempts += 1
+        raise RuntimeError("stream close failed")
+
+
+class _NoCloseStalledStream:
+    """An older provider iterator that has no async close hook."""
+
+    def __aiter__(self) -> "_NoCloseStalledStream":
+        return self
+
+    async def __anext__(self):
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")  # pragma: no cover
 
 
 async def test_stop_lands_on_a_stream_that_never_sends_a_chunk(
@@ -364,6 +550,56 @@ async def test_stop_lands_on_a_stream_that_never_sends_a_chunk(
     assert content == ""  # nothing arrived, so nothing is claimed
     assert calls == []
     assert stream.closed is True  # the wedged read was closed, not orphaned
+
+
+async def test_stop_keeps_stream_cleanup_failures_best_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider's failed cleanup cannot turn Stop into an engine error."""
+    monkeypatch.setattr(chat_module, "native_context_length", _no_native_length)
+    stream = _CleanupFailureStream()
+    m = OllamaChatModel("m", "http://127.0.0.1:11434")
+    _fake_llm(m, stream)  # type: ignore[arg-type]
+    cancel = _Cancel()
+
+    async def press_stop() -> None:
+        await asyncio.sleep(0.05)
+        cancel.cancel()
+
+    async def on_delta(_: str) -> None:  # pragma: no cover - nothing streams
+        raise AssertionError("a stalled stream delivers no deltas")
+
+    asyncio.create_task(press_stop())
+    content, calls, _ = await asyncio.wait_for(
+        m.stream([{"role": "user", "content": "hi"}], [], on_delta, cancel),
+        timeout=5,
+    )
+    assert (content, calls, stream.close_attempts) == ("", [], 1)
+
+
+async def test_stop_does_not_require_an_async_close_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop still returns for provider iterators that cannot be explicitly closed."""
+    monkeypatch.setattr(chat_module, "native_context_length", _no_native_length)
+    stream = _NoCloseStalledStream()
+    m = OllamaChatModel("m", "http://127.0.0.1:11434")
+    _fake_llm(m, stream)  # type: ignore[arg-type]
+    cancel = _Cancel()
+
+    async def press_stop() -> None:
+        await asyncio.sleep(0.05)
+        cancel.cancel()
+
+    async def on_delta(_: str) -> None:  # pragma: no cover - nothing streams
+        raise AssertionError("a stalled stream delivers no deltas")
+
+    asyncio.create_task(press_stop())
+    content, calls, _ = await asyncio.wait_for(
+        m.stream([{"role": "user", "content": "hi"}], [], on_delta, cancel),
+        timeout=5,
+    )
+    assert (content, calls) == ("", [])
 
 
 async def test_a_silent_stream_ends_as_an_engine_error_not_an_empty_answer(
@@ -419,6 +655,45 @@ async def test_stream_surfaces_real_usage_when_ollama_reports_it(
     assert usage.input_tokens == 123
     # The truthful ceiling is the requested window, not a display default.
     assert usage.max_context == 8_192
+
+
+async def test_round_usage_preserves_its_context_and_ratio_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Usage accounting keeps the call window and only learns local ratios."""
+    observations: list[tuple[int, int]] = []
+
+    async def native_window(model: str, base_url: str) -> int | None:
+        return 65_536
+
+    monkeypatch.setattr(chat_module, "native_context_length", native_window)
+    monkeypatch.setattr(
+        chat_module,
+        "observe_token_ratio",
+        lambda sent, tokens: observations.append((sent, tokens)),
+    )
+    model = OllamaChatModel("m", "http://127.0.0.1:11434")
+    reported = await model._round_usage(
+        SimpleNamespace(usage_metadata={"input_tokens": 13}), sent_bytes=26
+    )
+    assert reported.is_real is True
+    assert reported.input_tokens == 13
+    assert reported.max_context == 65_536
+    assert observations == [(26, 13)]
+
+    model._last_num_ctx = 4_096
+    remembered = await model._round_usage(None)
+    assert remembered == chat_module.RoundUsage(None, 4_096, False)
+    assert (await model._round_usage(SimpleNamespace(usage_metadata={}), 8_192)).is_real is False
+
+    await model._round_usage(SimpleNamespace(usage_metadata={"input_tokens": 3}), sent_bytes=0)
+    cloud = OllamaChatModel("m:cloud", "http://127.0.0.1:11434")
+    await cloud._round_usage(SimpleNamespace(usage_metadata={"input_tokens": 3}), 32_768, 8)
+    assert observations == [(26, 13)]
+
+    monkeypatch.setattr(chat_module, "native_context_length", _no_native_length)
+    unknown = OllamaChatModel("m", "http://127.0.0.1:11434")
+    assert (await unknown._round_usage(None)).max_context == 128_000
 
 
 async def test_stream_reports_the_window_the_call_actually_ran_in(
@@ -628,6 +903,125 @@ class _RecordingClient:
 
         type(self).last = dict(kwargs)
         return SimpleNamespace(message=SimpleNamespace(content="ok"))
+
+
+async def test_digest_uses_its_own_fixed_prompt_options_and_think_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A digest is bookkeeping, with a fixed compact request and no turn state."""
+    import ollama
+
+    from arcelle_sidecar.compaction import DIGEST_NUM_PREDICT, DIGEST_PROMPT
+
+    monkeypatch.setattr(ollama, "AsyncClient", _RecordingClient)
+    model = OllamaChatModel(
+        "qwen3.5:4b",
+        "http://fake-ollama",
+        num_ctx=12_345,
+        keep_alive="7m",
+    )
+
+    assert await model._digest("old turn details") == "ok"
+
+    assert _RecordingClient.last == {
+        "model": "qwen3.5:4b",
+        "messages": [
+            {"role": "system", "content": DIGEST_PROMPT},
+            {"role": "user", "content": "old turn details"},
+        ],
+        "options": {
+            "num_predict": DIGEST_NUM_PREDICT,
+            "temperature": 0,
+            "num_ctx": 12_345,
+        },
+        "keep_alive": "7m",
+        "think": False,
+        "stream": False,
+    }
+    assert model._last_num_ctx == 12_345
+
+
+async def test_digest_propagates_a_fabricated_client_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ollama
+
+    class FailingDigestClient:
+        def __init__(self, host: str = "", **kwargs: object) -> None:
+            pass
+
+        async def chat(self, **kwargs: object) -> None:
+            raise RuntimeError("digest request failed")
+
+    monkeypatch.setattr(ollama, "AsyncClient", FailingDigestClient)
+    model = OllamaChatModel("m", "http://fake-ollama", num_ctx=8_192)
+
+    with pytest.raises(RuntimeError, match="digest request failed"):
+        await model._digest("old turn details")
+
+
+async def test_generate_preserves_its_fitted_native_wire_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One-shot work has the same options and image attachment contract as before."""
+    import ollama
+
+    monkeypatch.setattr(ollama, "AsyncClient", _RecordingClient)
+    model = OllamaChatModel(
+        "qwen3.5:4b",
+        "http://fake-ollama",
+        temperature=0.2,
+        num_ctx=12_345,
+        num_predict=321,
+        keep_alive="7m",
+    )
+    messages: list[Message] = [
+        {"role": "system", "content": "Follow the schema."},
+        {"role": "user", "content": "Inspect this", "images": ["existing-image"]},
+    ]
+
+    assert await model.generate(
+        messages,
+        format={"type": "object"},
+        images=["new-image"],
+    ) == "ok"
+
+    assert _RecordingClient.last == {
+        "model": "qwen3.5:4b",
+        "messages": [
+            {"role": "system", "content": "Follow the schema."},
+            {
+                "role": "user",
+                "content": "Inspect this",
+                "images": ["existing-image", "new-image"],
+            },
+        ],
+        "format": {"type": "object"},
+        "options": {"num_ctx": 12_345, "num_predict": 321, "temperature": 0.2},
+        "keep_alive": "7m",
+        "think": False,
+        "stream": False,
+    }
+    assert messages[1]["images"] == ["existing-image"]
+
+
+async def test_generate_propagates_a_fabricated_client_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ollama
+
+    class FailingGenerateClient:
+        def __init__(self, host: str = "", **kwargs: object) -> None:
+            pass
+
+        async def chat(self, **kwargs: object) -> None:
+            raise RuntimeError("generation request failed")
+
+    monkeypatch.setattr(ollama, "AsyncClient", FailingGenerateClient)
+    model = OllamaChatModel("m", "http://fake-ollama", num_ctx=8_192)
+
+    with pytest.raises(RuntimeError, match="generation request failed"):
+        await model.generate([{"role": "user", "content": "hello"}])
 
 
 async def test_a_one_shot_job_cuts_its_own_payload_to_the_window_it_asked_for(

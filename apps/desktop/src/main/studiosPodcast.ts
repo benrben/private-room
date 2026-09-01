@@ -223,24 +223,37 @@ export function renderPodcastHtml(title: string, turns: readonly PodcastTurn[]):
  * returning render function ported so far in this tree.
  */
 export function fallbackPodcast(raw: string, label: string): string {
-  const titleField = jsonStrField(raw, "title");
-  const title = titleField !== null && titleField !== "" ? titleField : label.trim();
+  const turns = usablePodcastTurns(raw);
+  requirePodcastTurns(turns, "The model didn't return a usable script — try a different file.");
+  return renderPodcastHtml(podcastTitle(raw, label.trim()), turns);
+}
+
+function podcastTitle(raw: string, fallback: string): string {
+  const title = jsonStrField(raw, "title");
+  return title !== null && title !== "" ? title : fallback;
+}
+
+function usablePodcastTurns(raw: string): PodcastTurn[] {
   const turns: PodcastTurn[] = [];
-  for (const t of jsonArray(raw, "turns")) {
-    const speakerRaw = valueStr(t, "speaker");
-    const speaker = speakerRaw === "" ? "Host" : speakerRaw;
-    // The model states the name twice — as the field and again inside the
-    // text. Strip it here, or the page prints the speaker in its own margin
-    // column AND again inside the sentence.
-    const line = stripSpeakerLabel(valueStr(t, "line"), speaker);
-    if (line !== "") {
-      turns.push({ speaker, line });
-    }
+  for (const value of jsonArray(raw, "turns")) {
+    const turn = usablePodcastTurn(value);
+    if (turn !== null) turns.push(turn);
   }
-  if (turns.length === 0) {
-    throw new Error("The model didn't return a usable script — try a different file.");
-  }
-  return renderPodcastHtml(title, turns);
+  return turns;
+}
+
+function usablePodcastTurn(value: unknown): PodcastTurn | null {
+  const speakerValue = valueStr(value, "speaker");
+  const speaker = speakerValue === "" ? "Host" : speakerValue;
+  // The model states the name twice — as the field and again inside the text.
+  // Strip it here, or the page prints the speaker in its own margin column
+  // AND again inside the sentence.
+  const line = stripSpeakerLabel(valueStr(value, "line"), speaker);
+  return line === "" ? null : { speaker, line };
+}
+
+function requirePodcastTurns(turns: readonly PodcastTurn[], message: string): void {
+  if (turns.length === 0) throw new Error(message);
 }
 
 // ============================================================================
@@ -406,40 +419,27 @@ export function defaultVoiceIds(db: Database.Database): string[] {
  * "the script had no usable turns")`.
  */
 export function storePodcast(db: Database.Database, fileId: string, raw: string): void {
-  const titleField = jsonStrField(raw, "title");
-  const title = titleField !== null && titleField !== "" ? titleField : "Podcast";
-
-  const turns: PodcastTurn[] = [];
-  for (const t of jsonArray(raw, "turns")) {
-    const speakerRaw = valueStr(t, "speaker");
-    const speaker = speakerRaw === "" ? "Host" : speakerRaw;
-    // The model states the name twice — as the field and again inside the
-    // text. Strip it here, or the host reads their own name aloud.
-    const line = stripSpeakerLabel(valueStr(t, "line"), speaker);
-    if (line !== "") {
-      turns.push({ speaker, line });
-    }
-  }
-  if (turns.length === 0) {
-    throw new Error("the script had no usable turns");
-  }
-
+  const turns = usablePodcastTurns(raw);
+  requirePodcastTurns(turns, "the script had no usable turns");
   // The model's own `hosts` roster leads, because it is the one place the
   // cast is stated rather than inferred; the turns fill in anyone it forgot
   // to list but did give lines to.
-  const declared: PodcastTurn[] = [];
-  for (const h of jsonArray(raw, "hosts")) {
-    const name = valueStr(h, "name");
-    if (name !== "") {
-      declared.push({ speaker: name, line: "" });
-    }
-  }
+  const declared = declaredPodcastHosts(raw);
   const ordered: PodcastTurn[] = [...declared, ...turns];
   const cast: PodcastHost[] = castFromTurns(ordered, defaultVoiceIds(db));
   // Fold every line's speaker onto the cast's spelling BEFORE storing, so the
   // voice lookup, the audio transcript and the panel all join on one string.
   normalizeTurnSpeakers(turns, cast);
-  savePodcast(db, fileId, title, turns, cast);
+  savePodcast(db, fileId, podcastTitle(raw, "Podcast"), turns, cast);
+}
+
+function declaredPodcastHosts(raw: string): PodcastTurn[] {
+  const hosts: PodcastTurn[] = [];
+  for (const value of jsonArray(raw, "hosts")) {
+    const name = valueStr(value, "name");
+    if (name !== "") hosts.push({ speaker: name, line: "" });
+  }
+  return hosts;
 }
 
 // ============================================================================

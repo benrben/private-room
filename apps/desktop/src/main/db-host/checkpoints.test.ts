@@ -356,6 +356,10 @@ describe("writeCheckpoint + reconcile + performSwap, real fixture room round tri
 
       const db = openRoom(roomPath, FIXTURE_PASSWORD);
       const meta = writeCheckpoint(db, dir, "  my checkpoint  ", false);
+
+      // Whitespace-only names retain the user-facing default rather than
+      // creating an empty manifest label.
+      const unnamed = writeCheckpoint(db, dir, "   ", true);
       db.close();
 
       // The name is trimmed.
@@ -363,6 +367,8 @@ describe("writeCheckpoint + reconcile + performSwap, real fixture room round tri
       expect(meta.auto).toBe(false);
       expect(meta.sizeBytes).toBeGreaterThan(0);
       expect(isAppTimestamp(meta.createdAt)).toBe(true);
+      expect(unnamed.name).toBe(`Checkpoint — ${nowDate()}`);
+      expect(unnamed.auto).toBe(true);
 
       const ckPath = checkpointFilePath(dir, meta.id);
       expect(existsSync(ckPath)).toBe(true);
@@ -623,6 +629,35 @@ describe("reconcile", () => {
 });
 
 describe("pruneAutoCheckpoints", () => {
+  it("sorts a reverse-ordered manifest before pruning", () => {
+    withFreshTmpDir(() => {
+      const dir = path.join(tmpDir, "room.checkpoints");
+      mkdirSync(dir, { recursive: true });
+      const newer: CheckpointMeta = {
+        id: "newer",
+        name: "newer",
+        createdAt: formatEpoch(1_800_000_000),
+        sizeBytes: 1,
+        auto: true,
+      };
+      const older: CheckpointMeta = {
+        id: "older",
+        name: "older",
+        createdAt: formatEpoch(1_700_000_000),
+        sizeBytes: 1,
+        auto: true,
+      };
+      for (const entry of [newer, older]) {
+        writeFileSync(checkpointFilePath(dir, entry.id), entry.id);
+      }
+      writeManifest(dir, { v: 1, entries: [newer, older] });
+
+      pruneAutoCheckpoints(dir, 1);
+
+      expect(readManifest(dir).entries.map((entry) => entry.id)).toEqual(["newer"]);
+    });
+  });
+
   it("keeps_exactly_n_newest_auto_entries_and_leaves_non_auto_entries_untouched", () => {
     withFreshTmpDir(() => {
       const dir = path.join(tmpDir, "room.checkpoints");

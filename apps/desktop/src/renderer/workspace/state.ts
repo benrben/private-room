@@ -1,6 +1,5 @@
 import { useCallback, useRef, useState } from "react";
 import {
-  AiActionDef,
   AiStatus,
   AskPrivacy,
   AskTokenUsage,
@@ -9,15 +8,11 @@ import {
   Specialist,
   ExternalModelInfo,
   FileMeta,
-  FileMetaSuggestion,
   TrashedFile,
   EditApproveRequest,
   FileVersion,
   Provenance,
   Folder,
-  FrontPage,
-  Job,
-  OrganizedRecord,
   BrowseConsentRequest,
   McpApproveRequest,
   McpServerStatus,
@@ -26,12 +21,6 @@ import {
   Podcast,
   RoomInfo,
   SearchResults,
-  ScriptInfo,
-  ScriptApproveRequest,
-  SkillSummary,
-  StudioPrompts,
-  Workflow,
-  WorkflowNodeEvent,
 } from "../api";
 import {
   applyEvent,
@@ -46,9 +35,10 @@ import {
 } from "./runIdentity";
 import { AutocompleteState } from "./composer";
 import { type FileSort, loadFileSort, saveFileSort } from "./fileSort";
-import { OpenFile, Toast, WorkArea } from "./types";
+import { OpenFile, Toast } from "./types";
 import { clearToastsAbout, stackToast, toastLifeMs } from "./toastStack";
 import type { HarnessUiRuns } from "./harnessUi";
+import { useWorkspaceActivityState } from "./activityState";
 
 /** How many error messages the bug-report sheet may offer. Enough to cover the
  * run-up to a failure, few enough that the sheet stays readable — the user has
@@ -459,174 +449,7 @@ export function useWorkspaceState(_info: RoomInfo) {
   const recheckTimer = useRef<number | undefined>(undefined);
   const prevModelRef = useRef<string>("");
   const userPickedModelRef = useRef(false);
-  const [showMemoryIntro, setShowMemoryIntro] = useState(false);
-  const [showMap, setShowMap] = useState(false);
-  const showMapRef = useRef(false);
-  showMapRef.current = showMap;
-  // Shell redesign: the activity-rail area. map/workflows/scripts still key
-  // off their show* flags (which many actions clear against each other);
-  // this adds home/recordings/memory, and "files" as the default lens.
-  const [area, setArea] = useState<WorkArea>("files");
-  // Right-pane tab: chat is the resting state; studio and activity are the
-  // contextual tools. Approvals/jobs pull attention to "activity".
-  const [aiTab, setAiTab] = useState<"chat" | "studio" | "activity">("chat");
-  // Library-pane tab: browse the room vs. manage the AI's evidence set.
-  const [libraryTab, setLibraryTab] = useState<"browse" | "sources" | "trash">(
-    "browse",
-  );
-  // "New creation" (the Creations sidebar header, ⌘T in Create). A creation is
-  // COMPOSED rather than created, so there is no object to open — "new" means
-  // an empty composer. A counter, not a boolean: pressing it twice in a row has
-  // to clear twice, and a flag that was already true would do nothing the
-  // second time. The Create page watches it and resets its prompt.
-  const [newCreationSeq, setNewCreationSeq] = useState(0);
-  const bumpNewCreation = useCallback(() => setNewCreationSeq((n) => n + 1), []);
-  // Which creation the Creations sidebar has selected, when it is a job rather
-  // than a finished file (a finished one is just the open file). Null = the
-  // composer is what the workspace shows.
-  const [selectedCreationJob, setSelectedCreationJob] = useState<string | null>(null);
-  // Wave 4a (Idea 2): the full-pane Workflows view, mirroring showMap (+ ref for
-  // the mount-once Escape handler). `wfDetailId` selects a workflow inside it.
-  const [showWorkflows, setShowWorkflows] = useState(false);
-  const showWorkflowsRef = useRef(false);
-  showWorkflowsRef.current = showWorkflows;
-  const [wfDetailId, setWfDetailId] = useState<string | null>(null);
-  // The room's workflows (one source of truth for the page, top bar, and the
-  // file-header Actions menu). Loaded on mount, refreshed on workflows-changed.
-  const [workflows, setWorkflows] = useState<Workflow[]>([]);
-  // Wave 5 (Idea 13): the full-pane Scripts view (mirrors showWorkflows) + the
-  // scripts index (one source of truth for the page, the file-header Run button,
-  // and the header/global shortcut bars). Loaded on mount, refreshed on
-  // room-files-changed / workflows-changed.
-  const [showScripts, setShowScripts] = useState(false);
-  const showScriptsRef = useRef(false);
-  showScriptsRef.current = showScripts;
-  const [scripts, setScripts] = useState<ScriptInfo[]>([]);
-  // Skills are their own encrypted library (not files/folders). Only metadata
-  // lives here; the selected SKILL.md + resource tree is loaded on demand.
-  const [skills, setSkills] = useState<SkillSummary[]>([]);
-  const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
-  // Queued script-run consent cards, mirroring mcpApprovals.
-  const [scriptApprovals, setScriptApprovals] = useState<ScriptApproveRequest[]>([]);
-  // Per-job map of node id → live status, driving the pipeline animation.
-  const [wfNodeStatus, setWfNodeStatus] = useState<
-    Record<string, Record<string, WorkflowNodeEvent>>
-  >({});
-  // The file-header Actions menu. (The top bar's own pinned-workflows popover
-  // moved into `openMenu` above, with every other menu that bar can raise.)
-  const [qaFileMenuOpen, setQaFileMenuOpen] = useState(false);
-  // Wave 5 (Idea 13): the file-header "Scripts" shortcut menu open flag.
-  const [qaScriptMenuOpen, setQaScriptMenuOpen] = useState(false);
-  const [showHelp, setShowHelp] = useState(false);
-  const [fp, setFp] = useState<FrontPage | null>(null);
-  const [fpSuggestions, setFpSuggestions] = useState<string[]>([]);
-  // ADD-31: live import queue (null when idle) for the sidebar strip.
-  const [importProgress, setImportProgress] = useState<{
-    done: number;
-    total: number;
-    name: string;
-  } | null>(null);
-  // What the ASSISTANT changed about how the room is organised, newest first —
-  // Activity's record of the one kind of room change that leaves no job behind.
-  //
-  // Session-only, and deliberately so. It is a convenience for the reader who
-  // steps away mid-turn, not an audit trail: the room's durable record of every
-  // agent act is the chat transcript, and a second one on disk would be a
-  // second thing to keep true, to migrate, and to leak. Capped for the same
-  // reason the error log is — a panel is not an archive.
-  const [organized, setOrganized] = useState<OrganizedRecord[]>([]);
-  // ADD-30: unfinished background jobs + their live progress (sidebar cards).
-  const [jobs, setJobs] = useState<Job[]>([]);
-  const [jobProgress, setJobProgress] = useState<
-    Record<string, { label: string; done: number; total: number }>
-  >({});
-  // The summary command can take seconds to RESOLVE on a cold local model
-  // (Ollama waking, listing models); this optimistic flag shows a "Starting…"
-  // card the instant the button is pressed, so a click is never silent.
-  const [summaryStarting, setSummaryStarting] = useState(false);
-  // AUDIT 262: what a Studio job is doing RIGHT NOW ("Reading the material…",
-  // "Building the deck — a local model can take a few minutes…"). The backend
-  // has always named each step, and nothing was listening: a run that takes
-  // minutes on a local model sat on "Starting…" the whole way through, and the
-  // step that says "your cloud AI is writing (content leaves this Mac)" — a
-  // privacy statement, not a nicety — was never shown at all. "" = no step
-  // reported since the last job ended.
-  /** The Studio's current stage, and whether it keeps content on this Mac.
-   * The flag rides with the words because the pane draws a privacy
-   * consequence differently from a progress aside — see apiTypes' StudioStep. */
-  const [studioStep, setStudioStep] = useState<{ text: string; local: boolean }>({
-    text: "",
-    local: true,
-  });
-  // AUDIT 262: file names whose scanned pages are being read right now. The
-  // `ocr-progress` event existed from the first build with nothing listening,
-  // so a vision pass that takes minutes on a local model looked like nothing at
-  // all was happening. Names, not a count: "Reading X" is the answer to "why is
-  // this slow", and a bare number is not.
-  const [ocrFiles, setOcrFiles] = useState<string[]>([]);
-  const [studioDefaults, setStudioDefaults] = useState<StudioPrompts | null>(
-    null,
-  );
-  const [studioPrompt, setStudioPrompt] = useState<{
-    kind: "flashcards" | "mindmap" | "podcast";
-    scope?: string;
-    text: string;
-  } | null>(null);
-  const studioPromptRef = useRef<HTMLTextAreaElement>(null);
-  const [studioAc, setStudioAc] = useState<AutocompleteState | null>(null);
-  const [aiActionDefs, setAiActionDefs] = useState<AiActionDef[] | null>(null);
-  const [aiPrompt, setAiPrompt] = useState<{
-    def: AiActionDef;
-    scope: string | null;
-    refs: string[] | null;
-    text: string;
-    question: string;
-  } | null>(null);
-  const [aiBusy, setAiBusy] = useState(false);
-  // The running AI action's cancel id. Studio builds have had a Stop button all
-  // along; Summarize/Research/Translate/Fact-check had none, and their modal's
-  // Cancel went grey while the run held the window — so a room-wide Summarize
-  // on a local model could not be ended at all. Null when nothing is running.
-  const [aiOpId, setAiOpId] = useState<string | null>(null);
-  const [aiStopping, setAiStopping] = useState(false);
-  const [memSuggestion, setMemSuggestion] = useState<{ fact: string } | null>(
-    null,
-  );
-  const [importSuggestions, setImportSuggestions] = useState<
-    { fileId: string; current: string; suggestion: FileMetaSuggestion }[]
-  >([]);
-  // ADD-27: the workspace-wide live recording session (survives view/file
-  // switches; null when nothing records). ADD-28: the feedback modal flag.
-  const [recLive, setRecLive] = useState<{ fileId: string; status: string } | null>(null);
-  // Timers and event closures need the CURRENT session without re-arming:
-  // the auto-lock interval must see a recording the instant it starts.
-  const recLiveRef = useRef<{ fileId: string; status: string } | null>(null);
-  recLiveRef.current = recLive;
-  // Stop→saved drain: which phase the save is in and how many phrase decodes
-  // remain, plus when it began (for the sidebar card's elapsed clock). The
-  // audio is already durable when this is non-null — that's the whole point
-  // of surfacing it. Null outside a save.
-  const [recSave, setRecSave] = useState<{
-    stage: "transcribing" | "writing";
-    remaining: number;
-    startedAt: string;
-  } | null>(null);
-  // ADD-18 status of imported media transcriptions, keyed by file NAME (the
-  // backend's stt-progress payload): processing | done | none | model-missing.
-  const [sttStatus, setSttStatus] = useState<Record<string, string>>({});
-  const [showFeedback, setShowFeedback] = useState(false);
-  // Idea 3: the room's spoken voice — chat-header toggles + per-message Play.
-  const [autoSpeak, setAutoSpeak] = useState(false);
-  const [handsFree, setHandsFree] = useState(false);
-  const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null);
-  // The turn-audio-done listener (hands-free re-arm) is registered once at
-  // mount; it must see the current toggle without re-subscribing.
-  const handsFreeRef = useRef(false);
-  handsFreeRef.current = handsFree;
-  // Pending hands-free arm attempt (the done signal can fire while `asking`
-  // is still closing — the listener defers via this single-flight timer).
-  const armTimerRef = useRef<number | null>(null);
-
+  const activityState = useWorkspaceActivityState();
   // Stable identity: several mount-time event subscriptions (the rec-* set
   // among them) list pushToast as an effect dependency — a per-render
   // function would tear them down and back up on every render, and a fast
@@ -734,35 +557,9 @@ export function useWorkspaceState(_info: RoomInfo) {
     chatRef, seededRef, toastSeq, errorLogRef, openFileRef, showSearchRef, showSettingsRef,
     exportWarnedRef, autolockRef, lastActivityRef,
     askingRef, prevAskingRef, activeChatIdRef, recheckTimer, prevModelRef,
-    userPickedModelRef, showMemoryIntro, setShowMemoryIntro,
-    showMap, setShowMap, showMapRef, showHelp, setShowHelp,
-    area, setArea, aiTab, setAiTab, libraryTab, setLibraryTab,
-    newCreationSeq, bumpNewCreation,
-    selectedCreationJob, setSelectedCreationJob,
-    showWorkflows, setShowWorkflows, showWorkflowsRef, wfDetailId, setWfDetailId,
-    workflows, setWorkflows, wfNodeStatus, setWfNodeStatus,
-    showScripts, setShowScripts, showScriptsRef, scripts, setScripts,
-    skills, setSkills, selectedSkillId, setSelectedSkillId,
-    scriptApprovals, setScriptApprovals,
-    qaFileMenuOpen, setQaFileMenuOpen,
-    qaScriptMenuOpen, setQaScriptMenuOpen,
-    fp, setFp, fpSuggestions, setFpSuggestions,
-    importProgress, setImportProgress,
-    organized, setOrganized,
-    jobs, setJobs, jobProgress, setJobProgress,
-    summaryStarting, setSummaryStarting,
-    studioStep, setStudioStep,
-    ocrFiles, setOcrFiles,
-    studioDefaults, setStudioDefaults, studioPrompt, setStudioPrompt,
-    studioPromptRef, studioAc, setStudioAc, aiActionDefs, setAiActionDefs,
-    aiPrompt, setAiPrompt, aiBusy, setAiBusy,
-    aiOpId, setAiOpId, aiStopping, setAiStopping,
-    memSuggestion, setMemSuggestion,
-    importSuggestions, setImportSuggestions, pushToast, dismissToast, forgetToastsAbout,
-    recLive, setRecLive, recLiveRef, recSave, setRecSave,
-    sttStatus, setSttStatus, showFeedback, setShowFeedback,
-    autoSpeak, setAutoSpeak, handsFree, setHandsFree, handsFreeRef,
-    armTimerRef, speakingMsgId, setSpeakingMsgId,
+    userPickedModelRef,
+    pushToast, dismissToast, forgetToastsAbout,
+    ...activityState,
   };
 }
 

@@ -72,36 +72,52 @@ def _ascii_lower(s: str) -> str:
     return "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in s)
 
 
-def strip_html(html: str) -> str:
-    s = html
+def _region_for(s: str, tag: str) -> str | None:
+    """Return one complete content region, retaining its surrounding tags."""
+    lower = _ascii_lower(s)
+    open_pos = lower.find(tag)
+    if open_pos == -1:
+        return None
+    close = f"</{tag[1:]}>"
+    close_pos = lower.rfind(close)
+    if close_pos < open_pos:
+        return None
+    return s[open_pos : close_pos + len(close)]
+
+
+def _content_region(s: str) -> str:
     for tag in _REGION_TAGS:
-        lower = _ascii_lower(s)
-        open_pos = lower.find(tag)
-        if open_pos == -1:
-            continue
-        close = f"</{tag[1:]}>"
-        rel = lower.rfind(close)
-        if rel == -1:
-            continue
         # A malformed page can put the closing tag before the opening one;
         # slicing backwards would be wrong, so leave `s` whole.
-        if rel >= open_pos:
-            s = s[open_pos : rel + len(close)]
-            break
+        region = _region_for(s, tag)
+        if region is not None:
+            return region
+    return s
 
+
+def _add_breaks(s: str) -> str:
     for tag in _BREAK_TAGS:
         s = s.replace(tag, f"{tag}\n")
+    return s
 
+
+def _without_chrome_pair(s: str, open_tag: str, close_tag: str) -> str:
+    while True:
+        lower = _ascii_lower(s)
+        start = lower.find(open_tag)
+        if start == -1:
+            return s
+        close_pos = lower.find(close_tag, start)
+        if close_pos == -1:
+            return s
+        s = s[:start] + s[close_pos + len(close_tag) :]
+
+
+def _without_chrome(s: str) -> str:
     for open_tag, close_tag in _CHROME_PAIRS:
-        while True:
-            lower = _ascii_lower(s)
-            start = lower.find(open_tag)
-            if start == -1:
-                break
-            found = lower.find(close_tag, start)
-            if found == -1:
-                break
-            end = found + len(close_tag)
-            s = s[:start] + s[end:]
+        s = _without_chrome_pair(s, open_tag, close_tag)
+    return s
 
-    return strip_tags(s)
+
+def strip_html(html: str) -> str:
+    return strip_tags(_without_chrome(_add_breaks(_content_region(html))))

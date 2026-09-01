@@ -30,6 +30,10 @@ describe("nativeCliExecutable", () => {
       ARCELLE_CLAUDE_PATH: "/managed/claude",
     }, "/unused")).toBe("/managed/claude");
   });
+
+  it("falls back to the bare provider command when no search directory has it", () => {
+    expect(nativeCliExecutable("claude", { PATH: "" }, "/definitely-not-an-arcelle-home")).toBe("claude");
+  });
 });
 
 describe("nativeHarnessModel", () => {

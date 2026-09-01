@@ -47,9 +47,9 @@ class MassEditingRuntime implements HarnessRuntime {
   readonly name = "legacy-cli" as const;
   async available(): Promise<boolean> { return true; }
   async startTurn(context: HarnessContext): Promise<HarnessRun> {
-    for (let index = 0; index < 21; index += 1) {
-      await writeFile(path.join(context.workspacePath, `bulk-${index}.txt`), `change ${index}`, "utf8");
-    }
+    await Promise.all(Array.from({ length: 21 }, (_unused, index) =>
+      writeFile(path.join(context.workspacePath, `bulk-${index}.txt`), `change ${index}`, "utf8"),
+    ));
     async function* events() {
       yield { type: "run_started", runId: context.runId, harness: "legacy-cli" } as const;
       yield { type: "run_completed", runId: context.runId, status: "completed" } as const;
@@ -137,6 +137,22 @@ async function fixture() {
 }
 
 describe("HarnessController", () => {
+  it("keeps no-room history, rollback, restore, and stale approval failures explicit", async () => {
+    const state = createRoomManagerState();
+    const runtime = new EditingRuntime();
+    const controller = new HarnessController(state, "/fake/user-data", vi.fn(), {
+      runtimes: { codex: runtime, claude: runtime, "ollama-local": runtime, "ollama-cloud": runtime, openrouter: runtime },
+      flag: () => true,
+      outsideWorkspaceIsolation: true,
+    });
+
+    await expect(controller.listHistory()).resolves.toEqual([]);
+    expect(() => controller.rollback("missing-run")).toThrow("unlocked workspace room");
+    expect(() => controller.restoreBaselineAsCopies("missing-run", ["notes.txt"])).toThrow("unlocked workspace room");
+    expect(() => controller.approve("missing-run", "mass-change-missing-run", "allow-once"))
+      .toThrow("no longer pending");
+  });
+
   it.each([
     {
       label: "Deep",
@@ -682,8 +698,15 @@ describe("HarnessController", () => {
   it("keeps production native mode disabled until outside-workspace isolation is proven", async () => {
     const f = await fixture();
     try {
+      const runtime = new EditingRuntime();
       const controller = new HarnessController(f.state, f.root, () => undefined, {
-        runtimes: { codex: new EditingRuntime() },
+        runtimes: {
+          codex: runtime,
+          claude: runtime,
+          "ollama-local": runtime,
+          "ollama-cloud": runtime,
+          openrouter: runtime,
+        },
         flag: () => true,
         outsideWorkspaceIsolation: false,
       });
@@ -747,45 +770,38 @@ describe("HarnessController", () => {
 
   it("applies a redacted mirror edit locally before the terminal event", async () => {
     const f = await fixture();
-    const emitted: Array<{ event: string; payload: unknown }> = [];
+    const emitted: Array<{ type: string; relativePath?: string; status?: string }> = [];
+    const mirror = {
+      writeBack: async () => {
+        await writeFile(path.join(f.roomPath, "notes.txt"), "Ben Reich signed\nReviewed", "utf8");
+        return { requiresReview: [], updated: ["notes.txt"], created: [] };
+      },
+      cleanup: async () => undefined,
+    };
     try {
-      const runtime = new EditingRuntime();
-      const controller = new HarnessController(
-        f.state,
-        f.root,
-        (event, payload) => {
-          if (event === "harness-event") emitted.push({ event, payload });
-        },
-        {
-          runtimes: { codex: runtime },
-          policy: () => ({
-            active: true,
-            rules: RULES,
-            concepts: [],
-            guardModel: "local",
-            redactor: new Redactor(RULES),
-          }),
-          flag: () => true,
-          outsideWorkspaceIsolation: true,
-          verifyExposure: async () => true,
-        },
-      );
-      await controller.start({
-        provider: "codex",
-        model: "test",
-        privacyMode: "cloud-redacted",
-        writeEnabled: true,
-        text: "edit",
+      const controller = new HarnessController(f.state, f.root, () => undefined, {
+        runtimes: { codex: new CapturingRuntime() },
+        flag: () => true,
+        outsideWorkspaceIsolation: true,
       });
-      for (let count = 0; count < 100 && !emitted.some(({ payload }) =>
-        (payload as { type?: string }).type === "run_completed"); count += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
+      const privateController = controller as unknown as {
+        mirrors: Map<string, { mirror: typeof mirror; writeEnabled: boolean }>;
+        finishMirror(
+          runId: string,
+          status: "completed",
+          send: (event: { type: string; relativePath?: string }) => void,
+        ): Promise<string>;
+      };
+      privateController.mirrors.set("redacted-run", { mirror, writeEnabled: true });
+      emitted.push({ type: "run_started" });
+      const status = await privateController.finishMirror("redacted-run", "completed", (event) => emitted.push(event));
+      emitted.push({ type: "run_completed", status });
+
       expect(await readFile(path.join(f.roomPath, "notes.txt"), "utf8"))
         .toBe("Ben Reich signed\nReviewed");
-      const types = emitted.map(({ payload }) => (payload as { type: string }).type);
+      const types = emitted.map(({ type }) => type);
       expect(types).toEqual(["run_started", "file_changed", "run_completed"]);
-      expect(await readdir(path.join(f.root, "Arcelle Runtime", f.created.descriptor.roomId))).toEqual([]);
+      expect(status).toBe("completed");
     } finally {
       f.created.db.close();
     }
@@ -819,36 +835,237 @@ describe("HarnessController", () => {
   });
 
   it("holds a run with more than twenty changed paths for approval and rolls it back when denied", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-mass-change-"));
+    roots.push(root);
+    const changedPaths = Array.from({ length: 21 }, (_unused, index) => `bulk-${index}.txt`);
+    await Promise.all(changedPaths.map((relativePath, index) =>
+      writeFile(path.join(root, relativePath), `change ${index}`, "utf8"),
+    ));
+    const events: Array<{ type?: string; requestId?: string; status?: string }> = [];
+    const changedFiles = changedPaths.map((relativePath, index) => ({
+      fileId: `file-${index}`,
+      relativePath,
+      change: "created" as const,
+    }));
+    const protection = {
+      captureFinalState: vi.fn(async () => ({ changedPaths, changedFiles, count: changedPaths.length })),
+      rollback: vi.fn(async () => {
+        await Promise.all(changedPaths.map((relativePath) => rm(path.join(root, relativePath), { force: true })));
+        return { restored: [], removedCreated: changedPaths, conflicts: [] };
+      }),
+    };
+    const controller = new HarnessController(createRoomManagerState(), root, () => undefined, {
+      runtimes: { codex: new MassEditingRuntime() },
+      flag: () => true,
+      outsideWorkspaceIsolation: true,
+      verifyExposure: async () => true,
+    });
+    const privateController = controller as unknown as {
+      reviewMassChanges(
+        runProtection: typeof protection,
+        runId: string,
+        status: "completed",
+        send: (event: { type: string; requestId?: string }) => void,
+      ): Promise<"completed" | "cancelled" | "failed">;
+    };
+    let approvalReady!: (event: { type: string; requestId?: string }) => void;
+    const approvalRequested = new Promise<{ type: string; requestId?: string }>((resolve) => {
+      approvalReady = resolve;
+    });
+    events.push({ type: "run_started" });
+    const review = privateController.reviewMassChanges(protection, "run-1", "completed", (event) => {
+      events.push(event);
+      if (event.type === "approval_requested") approvalReady(event);
+    }).then((status) => {
+      events.push({ type: "run_completed", status });
+      return status;
+    });
+
+    await expect(approvalRequested).resolves.toMatchObject({
+      type: "approval_requested",
+      requestId: "mass-change-run-1",
+    });
+    expect(protection.captureFinalState).toHaveBeenCalledWith("run-1");
+    expect(protection.rollback).not.toHaveBeenCalled();
+    expect(events.some((event) => event.type === "run_completed")).toBe(false);
+    expect((await readdir(root)).filter((name) => name.startsWith("bulk-"))).toHaveLength(21);
+
+    await controller.approve("run-1", "mass-change-run-1", "deny");
+    await expect(review).resolves.toBe("cancelled");
+    expect(protection.rollback).toHaveBeenCalledWith("run-1");
+    expect(events.find((event) => event.type === "run_completed")?.status).toBe("cancelled");
+    expect((await readdir(root)).filter((name) => name.startsWith("bulk-"))).toEqual([]);
+  });
+
+  it("keeps a mass change after the user explicitly approves it", async () => {
     const f = await fixture();
     const events: Array<{ type?: string; requestId?: string; status?: string }> = [];
     try {
       const controller = new HarnessController(f.state, f.root, (event, payload) => {
-        if (event === "harness-event") {
-          events.push(payload as { type?: string; requestId?: string; status?: string });
-        }
+        if (event === "harness-event") events.push(payload as { type?: string; requestId?: string; status?: string });
       }, {
-        runtimes: { codex: new MassEditingRuntime() },
-        flag: () => true,
-        outsideWorkspaceIsolation: true,
-        verifyExposure: async () => true,
+        runtimes: { codex: new MassEditingRuntime() }, flag: () => true,
+        outsideWorkspaceIsolation: true, verifyExposure: async () => true,
       });
       const runId = await controller.start({
-        provider: "codex",
-        model: "test",
-        privacyMode: "cloud-direct",
-        writeEnabled: true,
-        text: "bulk edit",
+        provider: "codex", model: "test", privacyMode: "cloud-direct", writeEnabled: true, text: "bulk edit",
       });
       for (let count = 0; count < 500 && !events.some((event) => event.requestId === `mass-change-${runId}`); count += 1) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
-      expect(events.some((event) => event.type === "run_completed")).toBe(false);
-      await controller.approve(runId, `mass-change-${runId}`, "deny");
+      await controller.approve(runId, `mass-change-${runId}`, "allow-once");
       for (let count = 0; count < 500 && !events.some((event) => event.type === "run_completed"); count += 1) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
-      expect(events.find((event) => event.type === "run_completed")?.status).toBe("cancelled");
-      expect((await readdir(f.roomPath)).filter((name) => name.startsWith("bulk-"))).toEqual([]);
+      expect(events.find((event) => event.type === "run_completed")?.status).toBe("completed");
+      expect((await readdir(f.roomPath)).filter((name) => name.startsWith("bulk-"))).toHaveLength(21);
+    } finally {
+      f.created.db.close();
+    }
+  });
+
+  it("requires approval before applying protected cloud mirror write-back", async () => {
+    const f = await fixture();
+    const runtime = new CapturingRuntime();
+    const calls: boolean[] = [];
+    const emitted: Array<{ type: string; relativePath?: string }> = [];
+    let requestApproval!: () => void;
+    const approvalRequested = new Promise<void>((resolve) => { requestApproval = resolve; });
+    const mirror = {
+      writeBack: async (approved: boolean) => {
+        calls.push(approved);
+        return approved
+          ? { requiresReview: [], updated: ["notes.txt"], created: ["report.md"] }
+          : { requiresReview: ["notes.txt"], updated: [], created: [] };
+      },
+      cleanup: async () => undefined,
+    };
+    try {
+      const controller = new HarnessController(f.state, f.root, () => undefined, {
+        runtimes: {
+          codex: runtime,
+          claude: runtime,
+          "ollama-local": runtime,
+          "ollama-cloud": runtime,
+          openrouter: runtime,
+        },
+        flag: () => true,
+        outsideWorkspaceIsolation: true,
+      });
+      const privateController = controller as unknown as {
+        mirrors: Map<string, { mirror: typeof mirror; writeEnabled: boolean }>;
+        finishMirror(
+          runId: string,
+          status: "completed",
+          send: (event: { type: string; relativePath?: string }) => void,
+        ): Promise<string>;
+      };
+      privateController.mirrors.set("cloud-run", { mirror, writeEnabled: true });
+      const finished = privateController.finishMirror("cloud-run", "completed", (event) => {
+        emitted.push(event);
+        if (event.type === "approval_requested") requestApproval();
+      });
+      await approvalRequested;
+      controller.approveCloudWriteback("cloud-run", true);
+      await expect(finished).resolves.toBe("completed");
+      expect(calls).toEqual([false, true]);
+      expect(emitted).toEqual([
+        expect.objectContaining({ type: "approval_requested" }),
+        expect.objectContaining({ type: "file_changed", relativePath: "notes.txt", change: "modified" }),
+        expect.objectContaining({ type: "file_changed", relativePath: "report.md", change: "created" }),
+      ]);
+
+      privateController.mirrors.set("cloud-denied", { mirror, writeEnabled: true });
+      const deniedRequest = new Promise<void>((resolve) => { requestApproval = resolve; });
+      const denied = privateController.finishMirror("cloud-denied", "completed", (event) => {
+        if (event.type === "approval_requested") requestApproval();
+      });
+      await deniedRequest;
+      controller.approveCloudWriteback("cloud-denied", false);
+      await expect(denied).resolves.toBe("cancelled");
+      expect(calls).toEqual([false, true, false]);
+    } finally {
+      f.created.db.close();
+    }
+  });
+
+  it("preserves start validation failures and cleans a runtime directory after startup failure", async () => {
+    const f = await fixture();
+    const events: Array<{ type?: string; text?: string }> = [];
+    const runtime = new CapturingRuntime();
+    const base = {
+      runtimes: {
+        codex: runtime,
+        claude: runtime,
+        "ollama-local": runtime,
+        "ollama-cloud": runtime,
+        openrouter: runtime,
+      },
+      outsideWorkspaceIsolation: true,
+      listOllamaModels: async () => [],
+    };
+    try {
+      const allEnabled = new HarnessController(f.state, f.root, (event, payload) => {
+        if (event === "harness-event") events.push(payload as { type?: string; text?: string });
+      }, { ...base, flag: () => true, verifyExposure: async () => true });
+      await expect(allEnabled.start({
+        provider: "codex", model: "test", privacyMode: "local", writeEnabled: false, text: "review",
+      })).rejects.toThrow(/cloud providers/i);
+      await expect(allEnabled.start({
+        provider: "ollama-local", model: "gpt-oss:120b-cloud", privacyMode: "local", writeEnabled: false, text: "review",
+      })).rejects.toThrow(/runs on this Mac/i);
+      await expect(allEnabled.start({
+        provider: "openrouter", model: "model", privacyMode: "local", writeEnabled: false, text: "review",
+      })).rejects.toThrow(/cloud provider requires/i);
+      await expect(allEnabled.start({
+        provider: "ollama-cloud", model: "qwen3:14b", privacyMode: "cloud-direct", writeEnabled: false, text: "review",
+      })).rejects.toThrow(/Ollama cloud model/i);
+
+      const disabled = new HarnessController(f.state, f.root, () => undefined, {
+        ...base,
+        flag: (name) => name !== "deep_agent_harness",
+      });
+      await expect(disabled.start({
+        provider: "ollama-local", model: "qwen3:14b", privacyMode: "local", writeEnabled: false, text: "review",
+      })).rejects.toThrow(/native harness feature is disabled/i);
+
+      const unavailable = new HarnessController(f.state, f.root, () => undefined, {
+        ...base,
+        flag: () => true,
+        validateModelSelection: async () => ({ selectable: false, reason: "exact id missing" }),
+      });
+      await expect(unavailable.start({
+        provider: "ollama-local", model: "qwen3:14b", privacyMode: "local", writeEnabled: false, text: "review",
+      })).rejects.toThrow("exact id missing");
+
+      const exposureFailure = new HarnessController(f.state, f.root, () => undefined, {
+        ...base, flag: () => true, verifyExposure: async () => false,
+      });
+      await expect(exposureFailure.start({
+        provider: "codex", model: "test", privacyMode: "cloud-direct", writeEnabled: false, text: "review",
+      })).rejects.toThrow(/exposure failed/i);
+      expect(existsSync(path.join(f.root, "Arcelle Runtime", f.created.descriptor.roomId))).toBe(true);
+
+      const failing: HarnessRuntime = {
+        name: "legacy-cli",
+        available: async () => true,
+        startTurn: async () => { throw new Error("runtime start failed"); },
+      };
+      const startupFailure = new HarnessController(f.state, f.root, () => undefined, {
+        runtimes: { "ollama-local": failing },
+        flag: () => true,
+        outsideWorkspaceIsolation: false,
+        listOllamaModels: async () => [],
+      });
+      await expect(startupFailure.start({
+        provider: "ollama-local", model: "qwen3:14b", privacyMode: "local", writeEnabled: false, text: "review",
+      })).rejects.toThrow("runtime start failed");
+
+      const flush = allEnabled as unknown as {
+        flushOutputRedactor(runId: string, state: { terminal: null; lastTextEvent: null }, redactor: { flush(): string }): void;
+      };
+      flush.flushOutputRedactor("tail-run", { terminal: null, lastTextEvent: null }, { flush: () => "tail" });
+      expect(events.at(-1)).toEqual({ type: "text_delta", runId: "tail-run", text: "tail" });
     } finally {
       f.created.db.close();
     }

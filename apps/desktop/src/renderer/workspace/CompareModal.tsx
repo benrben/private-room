@@ -5,6 +5,13 @@ import { WSActions } from "./actions";
 import DiffView, { isRtlDominant } from "../viewers/DiffView";
 import { useFocusTrap } from "../settings/useFocusTrap";
 
+type Compare = Exclude<WSState["compare"], null>;
+
+interface ComparePresentation {
+  bothText: boolean;
+  rtl: boolean;
+}
+
 /** Idea 11: a read-only side-by-side diff of one saved version against the
  * file's current text. Cribs the house modal pattern (ApproveCard): backdrop
  * div, role="dialog" aria-modal, a focus trap, backdrop click closes.
@@ -22,7 +29,6 @@ export default function CompareModal({
   // out left-to-right. Default is the Monaco diff (bidi-correct per line).
   const [plain, setPlain] = useState(false);
   const [armed, setArmed] = useState(false);
-
   const open = compare !== null;
   useEffect(() => {
     if (!open) return;
@@ -33,104 +39,205 @@ export default function CompareModal({
 
   if (!compare) return null;
 
-  const bothText =
-    compare.versionText !== null && compare.currentText !== null;
-  const rtl = isRtlDominant(
-    (compare.versionText ?? "") + (compare.currentText ?? ""),
-  );
+  const presentation = comparePresentation(compare);
+  const close = () => s.setCompare(null);
+  const restore = () => {
+    setArmed(false);
+    void a.restoreVersion(compare.versionId);
+    close();
+  };
 
   return (
-    <div className="compare-backdrop" onClick={() => s.setCompare(null)}>
-      <ComparePanel
-        label={`Compare — ${compare.fileName}`}
-        onClose={() => s.setCompare(null)}
-      >
-        <div className="compare-head">
-          <div className="compare-title">
-            <span className="compare-name" dir="auto">
-              {compare.fileName}
-            </span>
-            <span className="compare-sub">
-              {compare.cause} · {formatWhen(compare.savedAt)} vs. now
-            </span>
-          </div>
-          <div className="compare-head-actions">
-            {bothText && (
-              <button
-                className="subtle"
-                title={
-                  plain
-                    ? "Show the side-by-side diff"
-                    : "Show plain scrollable panes (better for Hebrew/Arabic)"
-                }
-                onClick={() => setPlain((p) => !p)}
-              >
-                {plain ? "Diff view" : "Plain view"}
-              </button>
-            )}
-            {/* The modal's own Restore — armed, and data-agent-blocked so the
-                agent driver can never confirm it (parity with the popover). */}
-            {!armed ? (
-              <button
-                className="subtle"
-                data-agent-blocked
-                onClick={() => setArmed(true)}
-              >
-                Restore this version
-              </button>
-            ) : (
-              <span className="compare-confirm" data-agent-blocked>
-                <button
-                  className="primary"
-                  onClick={() => {
-                    setArmed(false);
-                    void a.restoreVersion(compare.versionId);
-                    s.setCompare(null);
-                  }}
-                >
-                  Restore
-                </button>
-                <button className="subtle" onClick={() => setArmed(false)}>
-                  Cancel
-                </button>
-              </span>
-            )}
-            <button className="subtle" onClick={() => s.setCompare(null)}>
-              Close
-            </button>
-          </div>
-        </div>
-        <div className="compare-body">
-          {!bothText ? (
-            <div className="compare-empty">
-              This version has no text to compare.
-            </div>
-          ) : plain ? (
-            <div className="compare-plain">
-              <pre className="compare-pane" dir="auto">
-                <div className="compare-pane-label">This version</div>
-                {compare.versionText}
-              </pre>
-              <pre className="compare-pane" dir="auto">
-                <div className="compare-pane-label">Now</div>
-                {compare.currentText}
-              </pre>
-            </div>
-          ) : (
-            <DiffView
-              key={compare.versionId}
-              original={compare.versionText ?? ""}
-              modified={compare.currentText ?? ""}
-              fileName={compare.fileName}
-            />
-          )}
-          {rtl && !plain && bothText && (
-            <div className="compare-rtl-hint">
-              Right-to-left text — try “Plain view” if the diff reads awkwardly.
-            </div>
-          )}
-        </div>
+    <div className="compare-backdrop" onClick={close}>
+      <ComparePanel label={`Compare — ${compare.fileName}`} onClose={close}>
+        <CompareHeader
+          armed={armed}
+          compare={compare}
+          onClose={close}
+          onRestore={restore}
+          plain={plain}
+          setArmed={setArmed}
+          setPlain={setPlain}
+          showViewToggle={presentation.bothText}
+        />
+        <CompareBody compare={compare} plain={plain} presentation={presentation} />
       </ComparePanel>
+    </div>
+  );
+}
+
+function comparePresentation(compare: Compare): ComparePresentation {
+  return {
+    bothText: compare.versionText !== null && compare.currentText !== null,
+    rtl: isRtlDominant((compare.versionText ?? "") + (compare.currentText ?? "")),
+  };
+}
+
+function CompareHeader({
+  armed,
+  compare,
+  onClose,
+  onRestore,
+  plain,
+  setArmed,
+  setPlain,
+  showViewToggle,
+}: {
+  armed: boolean;
+  compare: Compare;
+  onClose: () => void;
+  onRestore: () => void;
+  plain: boolean;
+  setArmed: (armed: boolean) => void;
+  setPlain: (next: (plain: boolean) => boolean) => void;
+  showViewToggle: boolean;
+}) {
+  return (
+    <div className="compare-head">
+      <div className="compare-title">
+        <span className="compare-name" dir="auto">
+          {compare.fileName}
+        </span>
+        <span className="compare-sub">
+          {compare.cause} · {formatWhen(compare.savedAt)} vs. now
+        </span>
+      </div>
+      <div className="compare-head-actions">
+        <CompareViewToggle plain={plain} setPlain={setPlain} visible={showViewToggle} />
+        <RestoreControls
+          armed={armed}
+          onArm={() => setArmed(true)}
+          onCancel={() => setArmed(false)}
+          onRestore={onRestore}
+        />
+        <button className="subtle" onClick={onClose}>
+          Close
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function CompareViewToggle({
+  plain,
+  setPlain,
+  visible,
+}: {
+  plain: boolean;
+  setPlain: (next: (plain: boolean) => boolean) => void;
+  visible: boolean;
+}) {
+  if (!visible) return null;
+  const title = plain
+    ? "Show the side-by-side diff"
+    : "Show plain scrollable panes (better for Hebrew/Arabic)";
+  return (
+    <button
+      className="subtle"
+      title={title}
+      onClick={() => setPlain((current) => !current)}
+    >
+      {plain ? "Diff view" : "Plain view"}
+    </button>
+  );
+}
+
+function RestoreControls({
+  armed,
+  onArm,
+  onCancel,
+  onRestore,
+}: {
+  armed: boolean;
+  onArm: () => void;
+  onCancel: () => void;
+  onRestore: () => void;
+}) {
+  if (!armed) {
+    return (
+      <button className="subtle" data-agent-blocked onClick={onArm}>
+        Restore this version
+      </button>
+    );
+  }
+  return (
+    <span className="compare-confirm" data-agent-blocked>
+      <button className="primary" onClick={onRestore}>
+        Restore
+      </button>
+      <button className="subtle" onClick={onCancel}>
+        Cancel
+      </button>
+    </span>
+  );
+}
+
+function CompareBody({
+  compare,
+  plain,
+  presentation,
+}: {
+  compare: Compare;
+  plain: boolean;
+  presentation: ComparePresentation;
+}) {
+  return (
+    <div className="compare-body">
+      <CompareContent bothText={presentation.bothText} compare={compare} plain={plain} />
+      <CompareRtlHint bothText={presentation.bothText} plain={plain} rtl={presentation.rtl} />
+    </div>
+  );
+}
+
+function CompareContent({
+  bothText,
+  compare,
+  plain,
+}: {
+  bothText: boolean;
+  compare: Compare;
+  plain: boolean;
+}) {
+  if (!bothText) {
+    return <div className="compare-empty">This version has no text to compare.</div>;
+  }
+  if (plain) {
+    return (
+      <div className="compare-plain">
+        <pre className="compare-pane" dir="auto">
+          <div className="compare-pane-label">This version</div>
+          {compare.versionText}
+        </pre>
+        <pre className="compare-pane" dir="auto">
+          <div className="compare-pane-label">Now</div>
+          {compare.currentText}
+        </pre>
+      </div>
+    );
+  }
+  return (
+    <DiffView
+      key={compare.versionId}
+      original={compare.versionText!}
+      modified={compare.currentText!}
+      fileName={compare.fileName}
+    />
+  );
+}
+
+function CompareRtlHint({
+  bothText,
+  plain,
+  rtl,
+}: {
+  bothText: boolean;
+  plain: boolean;
+  rtl: boolean;
+}) {
+  if (plain || !bothText || !rtl) return null;
+  return (
+    <div className="compare-rtl-hint">
+      Right-to-left text — try “Plain view” if the diff reads awkwardly.
     </div>
   );
 }

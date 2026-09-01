@@ -1,0 +1,478 @@
+
+@media (prefers-reduced-motion: reduce) {
+  .activity-progress span.indeterminate {
+    animation: none;
+    /* Keep the 40% stub. `width: 100%` filled the track for a job whose
+       position is precisely what is NOT known, so the one reader who cannot
+       see the animation was shown a finished bar over work that had barely
+       started. Reduced motion removes the movement, never the meaning. */
+    opacity: 0.5;
+  }
+}
+
+/* ----- Room home (center) -----
+   Home itself is `.rh-*` in workspace.css now (the broadsheet rebuild). The
+   `.home-*` band that used to live here — view/inner/head/section/list/row —
+   went with it and is deleted; nothing in the tree referenced it any more.
+
+   These two rules stay because the SHORTCUTS SHEET still uses them:
+   Overlays.tsx draws every keyboard row as `brief-row info`. The severity
+   variants and the dot went with Home, which is where they were read. */
+
+.brief-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px var(--sp-3);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  font-size: var(--fs-meta);
+  color: var(--text);
+}
+.brief-text {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.45;
+}
+
+/* ----- Memory area (center) ----- */
+
+.memory-view {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.memory-view-inner {
+  width: min(100% - 48px, 640px);
+  margin: 0 auto;
+  padding: 40px 0 80px;
+}
+.memory-view-head h1 {
+  margin: 0 0 var(--sp-2);
+  color: var(--text-strong);
+  font-size: 24px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+.memory-view-sub {
+  margin: 0 0 22px;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: 1.6;
+}
+.memory-view .memory-add {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 18px;
+}
+.memory-view .memory-add input {
+  flex: 1;
+  min-width: 0;
+}
+.memory-view .memory-group {
+  margin-bottom: 6px;
+}
+.memory-view .memory-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: var(--sp-2) var(--sp-1);
+  border-bottom: 1px solid var(--line-soft);
+  font-size: var(--fs-meta);
+  color: var(--text);
+  line-height: 1.5;
+}
+.memory-view .memory-row-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+.memory-view .memory-row-when {
+  font-size: var(--fs-micro);
+  color: var(--faint);
+}
+.memory-view .memory-row.editing {
+  align-items: center;
+}
+.memory-view .memory-edit-input {
+  flex: 1;
+  min-width: 0;
+}
+.memory-view .memory-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+  opacity: 0;
+}
+.memory-view .memory-row:hover .memory-actions,
+.memory-view .memory-row:focus-within .memory-actions {
+  opacity: 1;
+}
+.memory-view-empty {
+  margin: 26px 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  text-align: center;
+}
+.memory-scratch-note {
+  margin-top: 30px;
+  padding-top: 6px;
+}
+.memory-scratch-note p {
+  margin: var(--sp-1) 0 10px;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  line-height: 1.55;
+}
+
+/* --- Tabs -----------------------------------------------------------------
+   The strip sits ABOVE the centre pane's measured rect. That is load-bearing,
+   not cosmetic: the private browser is a native child webview positioned from
+   that rect, and nothing can paint over a native webview — a strip that
+   overlapped it would disappear behind the page.
+
+   It holds DOCUMENTS, not places: the rail navigates (see the head of this
+   file). What that buys visually is the whole reason for this block — with
+   nine area tabs gone and the generic sheet glyph off the file ones, a tab is
+   wide enough to be a readable title in the body size, which is what a tab is
+   FOR. Pages keep the globe, because a web page really is a different kind of
+   thing from a room file and the strip mixes the two. */
+.tab-strip-wrap {
+  display: flex;
+  align-items: stretch;
+  min-height: 34px;
+  min-width: 0;
+  background: transparent;
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+.tab-strip {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  min-width: 0;
+  padding: 0 6px;
+  background: transparent;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  /* Takes whatever width the two edge columns don't. Without this the
+     scrolling box sized to its content like any other flex child and the
+     wrap grew past the pane instead of the box scrolling inside it. */
+  flex: 1 1 auto;
+}
+.tab-strip::-webkit-scrollbar {
+  display: none;
+}
+/* "There are more this way." A pen arrow, not a fade over the edge: the
+   strip is transparent so the sheet runs under it, and a gradient to an
+   opaque colour would be a grey block sitting on the paper.
+   A column beside the scrolling box, not a `position: sticky` mark inside
+   it. Sticky was tried first and measurably failed: a sticky child keeps its
+   box at its ORIGINAL, pre-scroll flow position for layout purposes (that's
+   all `.tab-strip[data-more-start]` used to reserve) and only repaints it
+   pinned to the viewport edge once scrolled — so the reserved gutter was
+   only ever correct at scrollLeft 0. One scroll tick past that, whichever
+   tab had scrolled into the same pixels painted right through the arrow, and
+   rendering both versions and sampling pixels showed the sticky mark sitting
+   on top of a tab's own first characters at every scroll offset beyond a
+   few px, growing deeper the further you scrolled. A plain flex column next
+   to the scrolling box can't do that: `.tab-strip`'s own overflow clip ends
+   exactly where this column begins, so no tab pixel can ever land here, at
+   any scroll offset — the gutter is real, not merely reserved-looking at
+   rest. Toggled with `visibility`, never mounted and unmounted, so the
+   scrolling box's own scrollWidth — the number that decides whether there IS
+   more — cannot be changed by the mark that reports it. */
+.tab-edge {
+  flex: 0 0 auto;
+  align-self: center;
+  visibility: hidden;
+  --nb-ico-size: 13px;
+  width: 13px;
+  height: 13px;
+  margin: 0 5px;
+  color: var(--muted);
+}
+.tab-edge-start {
+  transform: scaleX(-1);
+}
+.tab-strip-wrap[data-more-start] .tab-edge-start,
+.tab-strip-wrap[data-more-end] .tab-edge-end {
+  visibility: visible;
+}
+/* Tabs read as clipped paper: the top corners are rounded unevenly, the bottom
+   sits flush on the rule, and the current one is marked with a marker swipe
+   along its base — the same pen the rail draws down its edge, turned on its
+   side because these are horizontal and text-led. */
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 220px;
+  /* Do NOT let a tab shrink to fit. The strip scrolls — that is what the two
+     pen arrows at its ends are for — and a flex row that shrinks instead
+     divides the shortfall equally, so opening the ninth file quietly squeezed
+     all nine down to a few characters each. Below about 130px a title stops
+     being a title, so past that the strip scrolls and every tab stays
+     readable. */
+  flex: 0 0 auto;
+  min-width: 130px;
+  min-height: 34px;
+  padding: 0 6px 0 11px;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  cursor: default;
+  user-select: none;
+  white-space: nowrap;
+  position: relative;
+  transition: color var(--dur-fast) var(--ease-pen),
+    background var(--dur-fast) var(--ease-pen);
+}
+.tab:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.tab.is-current {
+  background: color-mix(in srgb, var(--raised) 55%, transparent);
+  color: var(--text-strong);
+  font-weight: 500;
+}
+.tab.is-current::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  bottom: -1px;
+  height: 3px;
+  border-radius: 2px 3px 2px 4px / 3px 2px 4px 2px;
+  /* The same swipe the rail draws vertically, and it starts in the accent ink
+     for the same reason: 3:1 in both themes for the one mark that says which
+     document you are looking at. It tapers into the marker fill and away. */
+  background: linear-gradient(
+    92deg,
+    var(--accent) 3%,
+    var(--accent-fill) 62%,
+    color-mix(in srgb, var(--accent-fill) 28%, transparent) 100%
+  );
+  transform-origin: left center;
+  animation: nb-draw var(--dur) var(--ease-pen);
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .tab {
+    transition: none;
+  }
+  .tab.is-current::after {
+    animation: none;
+  }
+}
+.tab.is-dragging {
+  opacity: 0.5;
+}
+.tab:focus-visible {
+  /* Inset, because the strip clips its own overflow — an offset ring on the
+     first or last tab would be scrolled away rather than drawn. */
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.tab-icon {
+  display: flex;
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+.tab.is-current .tab-icon {
+  color: var(--accent-2);
+}
+/* End truncation, plain and standard: the head is kept, the tail takes the
+   ellipsis. This used to be two elements (a shrinking head plus a held
+   fixed-length tail) so a name's last few characters would always survive —
+   which backfires on prose titles, where the words that actually tell two
+   tabs apart sit right after a shared opening rather than in a fixed last
+   few characters; the old scheme cut exactly that stretch out of both and
+   left two look-alike fragments standing in for two different files. One
+   element and the platform's own ellipsis keeps the opening intact instead. */
+.tab-title {
+  /* Takes the free width, so Close is pinned to the tab's right edge. Without
+     this the title sized to its text and Close sat wherever the text ended —
+     which, once tabs stopped shrinking below 130px, put the close target in
+     the MIDDLE of a short tab. A click aimed at "Ideas" closed it. */
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 24px: closing a tab is a target like any other, and it used to be 16. It
+   stays invisible until the tab is hovered or current, so a strip at rest is
+   still a row of titles. */
+.tab-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 4px 2px 5px 3px / 3px 5px 2px 4px;
+  background: transparent;
+  color: var(--muted);
+  opacity: 0;
+  cursor: pointer;
+}
+.tab:hover .tab-close,
+.tab.is-current .tab-close,
+.tab-close:focus-visible {
+  opacity: 1;
+}
+.tab-close:hover {
+  background: var(--selected);
+  color: var(--text-strong);
+}
+.tab-new {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  flex: 0 0 auto;
+  align-self: center;
+  min-width: 24px;
+  min-height: 24px;
+  margin-left: var(--sp-1);
+  padding: 3px 7px;
+  border: none;
+  border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.tab-new:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+/* ---------- render safety net (ErrorBoundary) ----------
+   Root: a full-window recovery card instead of the blank window a thrown
+   render used to leave behind. Pane: an inline note, so one broken pane
+   never reads as "the app is gone". */
+.crash-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-8);
+  background: var(--bg);
+  color: var(--text);
+}
+.crash-card {
+  max-width: 520px;
+  padding: var(--sp-6);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--panel);
+}
+.crash-card h2 {
+  margin: 0 0 10px;
+  font-size: 17px;
+  color: var(--text-strong);
+}
+.crash-card p {
+  margin: 0 0 14px;
+  font-size: var(--fs-meta);
+  line-height: 1.5;
+  color: var(--muted);
+}
+.crash-actions {
+  display: flex;
+  gap: var(--sp-2);
+  margin-top: 14px;
+}
+.crash-pane {
+  margin: var(--sp-4);
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  font-size: var(--fs-meta);
+  color: var(--muted);
+  overflow: auto;
+}
+.crash-pane p {
+  margin: 0 0 10px;
+}
+.crash-detail {
+  max-height: 160px;
+  margin: 0;
+  padding: var(--sp-2) 10px;
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--faint);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-micro);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow: auto;
+}
+
+/* ---------- launch-time update download ----------
+   Drawn imperatively by updater.ts (no screen is guaranteed to be mounted),
+   so it only needs the tokens to match whichever theme is on. */
+.update-progress {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 9500;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  width: 260px;
+  padding: var(--sp-3) 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: 0 8px 24px var(--shadow);
+  color: var(--text);
+  font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.update-progress-track {
+  height: 4px;
+  border-radius: 3px 2px 4px 2px / 2px 4px 2px 3px;
+  background: var(--hover);
+  overflow: hidden;
+}
+.update-progress-fill {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: 3px 2px 4px 2px / 2px 4px 2px 3px;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+/* A quiet membership mark on a destination's own row — "Home lists this too".
+   Deliberately not a colour alone: the words are the carrier, and the tint
+   only reinforces them. */
+.nav-chip {
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}

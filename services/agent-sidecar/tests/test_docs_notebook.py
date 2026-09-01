@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 
+from arcelle_sidecar.docs import notebook
 from arcelle_sidecar.docs.notebook import extract_ipynb
 
 
@@ -62,3 +63,38 @@ def test_non_utf8_encoded_json_reads_as_nothing() -> None:
     nb = {"cells": [{"cell_type": "markdown", "source": "hello"}]}
     assert extract_ipynb(json.dumps(nb).encode("utf-16")) is None
     assert extract_ipynb(b"\xef\xbb\xbf" + json.dumps(nb).encode("utf-8")) is None
+
+
+def test_notebook_skips_malformed_cells_and_unreadable_output() -> None:
+    nb = {
+        "cells": [
+            None,
+            {"cell_type": 3, "source": "unknown cell type"},
+            {"cell_type": "markdown", "source": 3, "outputs": 3},
+            {"cell_type": "raw", "source": [3, "raw cell"]},
+            {
+                "cell_type": "code",
+                "source": "",
+                "outputs": [None, {"data": {"image/png": "blob"}}, {"data": "not data"}],
+            },
+        ]
+    }
+
+    assert extract_ipynb(json.dumps(nb).encode()) == "[cell 2]\nunknown cell type\n\nraw cell\n\n"
+
+
+def test_notebook_requires_a_cell_array() -> None:
+    assert extract_ipynb(b"[]") is None
+    assert extract_ipynb(b'{"cells": {}}') is None
+
+
+def test_notebook_cap_preserves_whole_utf8_characters(monkeypatch) -> None:
+    monkeypatch.setattr(notebook, "_MAX_DERIVED_CHARS", 5)
+    nb = {
+        "cells": [
+            {"cell_type": "markdown", "source": "\u00e9\u00e9\u00e9"},
+            {"cell_type": "markdown", "source": "ignored after the cap"},
+        ]
+    }
+
+    assert extract_ipynb(json.dumps(nb).encode()) == "\u00e9\u00e9\n"

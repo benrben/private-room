@@ -1,0 +1,492 @@
+/* ---------- paper ----------
+   The sheet the whole application is drawn on, plus the set of notebook
+   primitives every feature stylesheet composes from.
+
+   THE SIGNATURE: one sheet, not stacked surfaces. The dotted grid runs
+   edge to edge across the window and the panes are FRAMES drawn onto it,
+   not filled boxes butted against each other. A panel earns its identity
+   from its drawn border, not from a background colour. Only things that
+   genuinely float — popovers, menus, modals, toasts — get an opaque fill,
+   because they have to occlude what is underneath them.
+
+   All decoration here is deterministic: irregularity comes from fixed
+   asymmetric radii and fixed offsets, never from runtime randomness, so a
+   frame looks identical on every render. Every decorative mark is a
+   pseudo-element with pointer-events:none, so none of it is hit-testable
+   and none of it reaches assistive technology.
+
+   ----- how to use this file -----
+
+   These are OPT-IN classes. Element defaults for bare button/input live in
+   base.css; nothing here restyles an element selector, so a feature
+   stylesheet composes what it wants and inherits nothing it didn't ask for.
+
+   Two custom properties form the whole configuration surface:
+
+     --mk      a RAW marker hue (--mk-green, --sem-done-fill, …). Every
+               primitive applies its OWN alpha to it, so the same value can
+               drive a 60%-alpha highlight and a 34%-alpha tape strip. Never
+               pass a pre-mixed translucent colour — it would be mixed twice.
+     --mk-ink  the contrast-safe INK of that same hue, for anything that has
+               to carry a word or act as a 3:1 boundary.
+
+   Set both marker properties at once with a semantic class
+   (.nb-sem-done, .nb-sem-urgent, …) rather than by hand — then "green means
+   complete" is a fact the stylesheet enforces.
+
+   ----- the contrast rule that shapes most of this file -----
+
+   Marker FILLS are absorbed ink: at their spec alphas a light-mode marker
+   measures ~1.7:1 against paper. That is intentional and it is why a fill is
+   never allowed to be the only signal. Anything that must be identifiable —
+   a chart bar, a control edge, a focus ring, a status word — is drawn in
+   --mk-ink or in a full-strength token, never in a wash.
+
+   ----- theme -----
+
+   Nothing below names a colour. Every value resolves through a token, so the
+   library flips with :root[data-theme="light"] without a single override.
+   There is deliberately no light-mode block at the end of this file; if you
+   ever need one, the rule above it is probably wrong.
+
+   ----- namespace warning -----
+
+   src/viewers/notebook.css independently owns .nb-view, .nb-cell, .nb-code,
+   .nb-gutter, .nb-body, .nb-md, .nb-raw, .nb-out, .nb-error, .nb-muted and
+   .nb-img for the Jupyter viewer. Those names are NOT part of this library
+   and must never be defined here. */
+
+/* ----- the sheet -----
+   Dots plus a very faint cross-hatch grain. Pure CSS gradients — no bitmap,
+   nothing to download, nothing to decode at startup.
+
+   Painted on <html>, not on <body> and not on a pseudo-element. Two earlier
+   attempts failed in the engine the app actually ships on:
+
+     background-attachment: fixed on <body> — correct, but uncompositable: it
+     repaints the whole gradient stack on every scroll and made long lists
+     stutter.
+
+     a position:fixed body::before at z-index -1 — worked in Chrome, invisible
+     in WKWebView. <body> carries its own background (CSS, plus an inline one
+     from theme.ts's anti-flash guard), so a negative-z-index child paints
+     BEHIND it and is covered. Chrome happened to propagate body's background
+     to the canvas and leave body itself transparent; WebKit does not.
+
+   On <html> the paper simply IS the canvas. It cannot be covered, it needs no
+   stacking context, and because html/body are overflow:hidden — every pane
+   scrolls internally — it never scrolls, so there is nothing to repaint. */
+html {
+  background-color: var(--page);
+  background-image:
+    /* grain: two off-axis hatches, barely there */
+    repeating-linear-gradient(
+      64deg,
+      color-mix(in srgb, var(--ink) 2%, transparent) 0 1px,
+      transparent 1px 4px
+    ),
+    repeating-linear-gradient(
+      -51deg,
+      color-mix(in srgb, var(--ink) 1.6%, transparent) 0 1px,
+      transparent 1px 6px
+    ),
+    /* the dotted rule */ radial-gradient(circle at 1px 1px, var(--grid-dot) 1.1px, transparent 1.2px);
+  background-size:
+    auto,
+    auto,
+    var(--grid-gap) var(--grid-gap);
+}
+
+/* Settings → Interface → Canvas texture: Off.
+   The dot is already transparent via --grid-dot (tokens.css), so this only
+   has to take out the two hatches — and it does so by replacing the whole
+   background-image stack rather than by trying to null individual layers,
+   which cannot be done in CSS. The page COLOUR is untouched: "off" means no
+   tooth, not a different paper. */
+:root[data-texture="off"] {
+  background-image: none;
+}
+
+/* Transparent, so the sheet on <html> shows through. */
+body {
+  background-color: transparent;
+}
+
+/* ==========================================================================
+   1. FRAMES, PANELS, CARDS
+   The drawn boundary is the whole identity system: a pane is a frame on the
+   sheet, and the dots keep showing through it. Reach for a fill only in
+   section 9, where something genuinely floats.
+   ========================================================================== */
+
+/* ----- hand-drawn frame -----
+   An asymmetric border-radius makes a rectangle read as drawn rather than
+   computed, without warping it enough to break alignment. The optional
+   second outline is the "quick pen redraw" from the spec.
+
+   The stroke WIDTH stays uniform on all four sides on purpose. Varying it by
+   a fraction of a pixel is invisible at 2x (the device-pixel rounding eats
+   it) and varying it by a whole pixel stops reading as pen pressure and
+   starts reading as a bug. Asymmetric radii plus the optional redraw are the
+   entire irregularity budget.
+
+   Four fixed signatures so a run of sibling cards does not look stamped;
+   `nb-frame` cycles them by position, which keeps it deterministic.
+
+   THE SPREAD NARROWED IN THE VISUAL PASS, from 9-12px to 9-11px around the
+   10px `--radius`. The frames are now the ONLY asymmetric corners in the app
+   — `--radius` and its siblings went symmetric, taking ~225 controls with
+   them — so what used to be one wobble among many is now the whole of the
+   drawn identity, and it has to carry that without a grid of eight cards
+   reading as unstable. ±1px is enough to see up close on a single frame and
+   not enough to notice as a pattern across a page.
+
+   These are literals rather than calc() off `--radius`, because eight nested
+   calc()s per rule is a real cost to every future reader and the tie is worth
+   less than the legibility. `visualRegister.test.mjs` is what holds them
+   within 1px of the token — the guarantee lives there instead. */
+.nb-frame {
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: 11px 9px 11px 10px / 10px 11px 9px 11px;
+  position: relative;
+}
+.nb-frame--b {
+  border-radius: 9px 11px 10px 11px / 11px 10px 11px 9px;
+}
+.nb-frame--c {
+  border-radius: 11px 10px 9px 11px / 9px 11px 11px 10px;
+}
+.nb-frame--d {
+  border-radius: 10px 11px 11px 9px / 11px 9px 10px 11px;
+}
+/* On a container of frames: rotates the four signatures by position, so the
+   author does not have to hand-label every child. 4n+1 keeps the base. */
+.nb-frame-set > *:nth-child(4n + 2) {
+  border-radius: 9px 11px 10px 11px / 11px 10px 11px 9px;
+}
+.nb-frame-set > *:nth-child(4n + 3) {
+  border-radius: 11px 10px 9px 11px / 9px 11px 11px 10px;
+}
+.nb-frame-set > *:nth-child(4n + 4) {
+  border-radius: 10px 11px 11px 9px / 11px 9px 10px 11px;
+}
+
+/* A quieter frame for dense chrome: pencil weight rather than pen. --rule is
+   2.55:1 in dark, which is a divider, NOT a control boundary — do not put
+   this on anything the user clicks or types into. Use .nb-field or .nb-btn,
+   which are drawn in --rule-strong and clear 3:1. */
+.nb-frame-soft {
+  border: 1px solid var(--line);
+  border-radius: 9px 8px 9px 8px / 8px 9px 8px 9px;
+}
+
+/* The redraw: a second stroke offset a couple of px, as though the pen went
+   round twice. Decorative only. Occasional by design — a page where every
+   box is redrawn reads as noise.
+
+   NOTHING WEARS THIS CLASS. The three redraws in the app each hand-roll the
+   same ::after locally (gate.css, browser.css, marketplace.css), which is why
+   the visual pass found no global doubled-outline motif to remove: there never
+   was one. Kept as the library's statement of the recipe those three follow —
+   if a fourth is ever wanted, it belongs here rather than in a fourth copy. */
+.nb-redraw::after {
+  content: "";
+  position: absolute;
+  inset: calc(var(--redraw) * -1);
+  border: 1px solid color-mix(in srgb, var(--sketch) 34%, transparent);
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+/* ----- pane -----
+   The frame a whole region of the app is drawn inside. Transparent, so the
+   dotted sheet runs straight through it: this is the difference between the
+   notebook and a stack of grey boxes. */
+.nb-panel {
+  background: transparent;
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius-lg);
+  position: relative;
+}
+
+/* ----- card -----
+   A single item drawn on the sheet. The border sits at 72% of the pen at
+   rest and goes to full strength on hover, which reads as the pen pressing
+   harder rather than as a colour change. Even at 72% it measures ~6.9:1 in
+   dark and ~5.2:1 in light, so a clickable card still clears the 3:1 that
+   WCAG 1.4.11 asks of a component boundary. */
+.nb-card {
+  background: transparent;
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-radius: var(--radius);
+  padding: var(--sp-4);
+  position: relative;
+  transition: border-color var(--dur-fast) var(--ease-pen);
+}
+.nb-card:hover {
+  border-color: var(--sketch);
+}
+/* ----- taped note -----
+   A note stuck to the page with a strip of matte tape across the top-left.
+   The strip is a wash of --ink, which is the one recipe that reads correctly
+   in both themes without a per-theme override: 11% of warm ivory lightens
+   the charcoal sheet, 11% of charcoal greys the ivory sheet, and real tape
+   does exactly that to whatever is under it.
+
+   The strip hangs above the element's top edge, so an ancestor with
+   overflow:hidden will shear it off.
+
+   Not to be confused with .nb-tape, which is a small tape-strip BADGE.
+   .nb-taped is a container; .nb-tape is a label. */
+.nb-taped {
+  position: relative;
+}
+.nb-taped::before {
+  content: "";
+  position: absolute;
+  top: -7px;
+  left: 18px;
+  width: 58px;
+  height: 15px;
+  background: color-mix(in srgb, var(--ink) 11%, transparent);
+  box-shadow:
+    inset 1px 0 0 color-mix(in srgb, var(--ink) 7%, transparent),
+    inset -1px 0 0 color-mix(in srgb, var(--ink) 7%, transparent);
+  border-radius: 1px 2px 1px 2px;
+  transform: rotate(-3deg);
+  pointer-events: none;
+}
+
+/* ----- clipped paper -----
+   A drawn paper clip hooked over the top edge. Half of it hangs above the
+   element, so give the element (or its parent) room to overflow. Uses
+   ::before, so an element cannot be both .nb-taped and .nb-clip. */
+.nb-clip {
+  position: relative;
+}
+.nb-clip::before {
+  content: "";
+  position: absolute;
+  top: -11px;
+  right: 18px;
+  width: 20px;
+  height: 20px;
+  color: var(--ink-2);
+  transform: rotate(22deg);
+  --nb-glyph: var(--nb-glyph-clip);
+  pointer-events: none;
+}
+
+/* ==========================================================================
+   2. MARKER MARKS
+   Highlights, underlines, edges, tape, circles. Colour here always rides
+   with a word or a shape — never alone.
+   ========================================================================== */
+
+/* ----- semantic setters -----
+   The whole marker vocabulary in one class. Put one of these on any element
+   that consumes --mk / --mk-ink (mark, swash, underline, edge, tape, chip,
+   circled, bar, progress, dial) and it picks up both the fill and the ink of
+   that meaning at once.
+
+     saved    pink    personal, saved, editorial, AI attribution
+     pending  yellow  pending, notable, needs review, caution
+     done     green   complete, verified, approved, positive
+     linked   blue    linked, informational, active, connected
+     urgent   red     recording, urgent, failed, error */
+.nb-sem-saved {
+  --mk: var(--sem-saved-fill);
+  --mk-ink: var(--sem-saved);
+}
+.nb-sem-pending {
+  --mk: var(--sem-pending-fill);
+  --mk-ink: var(--sem-pending);
+}
+.nb-sem-done {
+  --mk: var(--sem-done-fill);
+  --mk-ink: var(--sem-done);
+}
+.nb-sem-linked {
+  --mk: var(--sem-linked-fill);
+  --mk-ink: var(--sem-linked);
+}
+.nb-sem-urgent {
+  --mk: var(--sem-urgent-fill);
+  --mk-ink: var(--sem-urgent);
+}
+
+/* Hue setters, for the rare mark that is identity rather than status — the
+   five token-budget categories, the seven search engines. If the colour is
+   saying something, use the semantic class above instead. */
+.nb-mark-pink {
+  --mk: var(--mk-berry);
+  --mk-ink: var(--mk-berry-ink);
+}
+.nb-mark-yellow {
+  --mk: var(--mk-yellow);
+  --mk-ink: var(--mk-yellow-ink);
+}
+.nb-mark-green {
+  --mk: var(--mk-green);
+  --mk-ink: var(--mk-green-ink);
+}
+.nb-mark-blue {
+  --mk: var(--mk-blue);
+  --mk-ink: var(--mk-blue-ink);
+}
+.nb-mark-red {
+  --mk: var(--mk-red);
+  --mk-ink: var(--mk-red-ink);
+}
+
+/* ----- marker highlight -----
+   Translucent, uneven, absorbed into the paper. The alpha ramp across the
+   run is what stops it reading as a flat UI fill: the stroke is heavier
+   where the pen started and lighter where it lifted.
+
+   The text sitting on the stroke is forced to --ink-strong because a
+   highlighted word is an emphatic word and it has to clear 4.5:1 over the
+   densest part of the mark — plain --ink measures 4.34:1 over a dark-mode
+   yellow at peak alpha, which misses. A caller that genuinely needs another
+   colour (a marked word inside a coloured run) passes --mk-text and takes
+   responsibility for the ratio. */
+.nb-mark {
+  background-image: linear-gradient(
+    100deg,
+    transparent 0.4%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 60%, transparent) 1.2%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 47%, transparent) 42%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 60%, transparent) 76%,
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 37%, transparent) 96%,
+    transparent 99%
+  );
+  /* The UA stylesheet fills <mark> with its own yellow, which would sit
+     under this gradient and turn every hue into mustard. Cleared explicitly
+     so the class works on a semantic <mark> and not just on a <span>. */
+  background-color: transparent;
+  background-repeat: no-repeat;
+  background-size: 100% 100%;
+  border-radius: 3px 7px 4px 6px / 6px 4px 7px 3px;
+  padding: 0.05em 0.22em;
+  margin: 0 -0.1em;
+  color: var(--mk-text, var(--ink-strong));
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+/* ----- marker underline -----
+   THE universal active signal: rail items, tabs, chips, pane headers and
+   settings nav all use this one idiom instead of the mix of left spines,
+   fills and border swaps the app used to carry. The stroke is thicker at
+   the start and tapers, like a swipe. Defaults to the pen; pass --mk for a
+   status-coloured stroke. */
+.nb-underline {
+  position: relative;
+}
+.nb-underline::after {
+  content: "";
+  position: absolute;
+  left: -2px;
+  right: -2px;
+  bottom: -3px;
+  height: 3px;
+  border-radius: 2px 3px 2px 4px / 3px 2px 4px 2px;
+  background: linear-gradient(
+    92deg,
+    var(--mk, var(--accent-fill)) 0%,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 72%, transparent) 68%,
+    color-mix(in srgb, var(--mk, var(--accent-fill)) 28%, transparent) 100%
+  );
+  transform-origin: left center;
+  pointer-events: none;
+}
+/* ----- category edge -----
+   A marker stroke down one edge, for rows that belong to a category or
+   carry a state. A fill this thin cannot clear 3:1 in light mode, so it is
+   ALWAYS paired with a word — never the only signal. */
+.nb-edge {
+  box-shadow: inset 3px 0 0 var(--mk, var(--mk-berry));
+}
+
+/* ----- taped label -----
+   A status badge that reads as a small strip of tape stuck to the page.
+   Text is --ink over a 34% wash, which measures 7.8:1 in dark and better in
+   light, so the word carries the meaning and the colour only reinforces it. */
+.nb-tape {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px var(--sp-2);
+  font-size: var(--fs-micro);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--mk, var(--mk-yellow)) 34%, transparent);
+  border-radius: 2px 3px 2px 4px / 4px 2px 3px 2px;
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--mk, var(--mk-yellow)) 46%, transparent);
+}
+
+/* ----- circled count -----
+   Notification counts in a hand-circled ring: an ellipse that is not quite
+   closed to the same radius on any corner. Drawn in --mk-ink (never a fill),
+   because the ring is the boundary AND the number is text.
+
+   The RING is the hand; the digit inside it is not. A count is a fact the app
+   arrived at, and the reserve list below keeps computed facts in the sans —
+   the pen drew the circle, nobody wrote the number. */
+.nb-circled {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  font-size: 12px;
+  color: var(--mk-ink, var(--accent));
+  border: 1.5px solid var(--mk-ink, var(--accent));
+  border-radius: 60% 55% 58% 62% / 58% 62% 55% 60%;
+}
+
+/* ==========================================================================
+   3. HANDWRITING AND NOTES
+
+   ONE RULE, and it is a rule about AUTHORSHIP rather than about length:
+
+     The hand is for words a PERSON wrote, and for the app speaking in its own
+     voice at an empty moment. It is never for a fact the app computed.
+
+   So: margin notes, the wordmark, empty-state directions, the composer's own
+   prompt, a short conversational message, text a person typed onto a sketch.
+   NEVER a date, a count, a duration, a timestamp, a speaker the diarizer
+   named, a progress line, a heading a model wrote — and never instructions,
+   settings copy, transcripts, articles, tables, code, URLs, paths or long
+   answers, which were already out.
+
+   WHY IT CHANGED. The older rule read "annotations, dates, counts, durations,
+   short labels…", which is a rule about how MUCH text there is. Under it the
+   hand reached 71 sites and stopped saying anything by being everywhere: a
+   duration rendered in handwriting claims a person noted it down, and no
+   person did. Authorship is the distinction the reader can actually see, and
+   it is the one that keeps the hand meaning something where it survives — 27
+   sites, each of them words somebody wrote.
+   ========================================================================== */
+
+.nb-hand {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  color: var(--ink-2);
+}
+.nb-hand-lg {
+  font-family: var(--hand);
+  font-size: var(--fs-hand-lg);
+  line-height: 1.3;
+}
+
+/* A page's handwritten subtitle, with the marker swipe under it. */
+.nb-subtitle {
+  font-family: var(--hand);
+  font-size: 17px;
+  color: var(--ink-2);
+  display: inline-block;
+  position: relative;
+  padding-bottom: 2px;
+}

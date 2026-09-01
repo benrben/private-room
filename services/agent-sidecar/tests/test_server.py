@@ -227,6 +227,145 @@ async def test_run_output_gate_redacts_local_final_and_unmapped_canary() -> None
     assert mcp.list_calls == 0
     assert mcp.calls == []
 
+async def test_run_cloud_privacy_without_concepts_still_attaches_and_reports_policy() -> None:
+    """The exact-rule door needs no local guard model before streaming starts."""
+    chat = FakeChatModel([Round(content="safe answer")])
+    app = app_with(chat, FakeMCP())
+    body = {
+        **BODY,
+        "model": "qwen3.5:cloud",
+        "privacy": {
+            "active": True,
+            "rules": [{"real": "Ben Reich", "placeholder": "[Person A]"}],
+        },
+    }
+
+    async with client_for(app) as c:
+        response = await c.post("/run", json=body)
+
+    events = [json.loads(line) for line in response.text.splitlines()]
+    assert chat.privacy.active is True
+    assert events[-1]["t"] == "privacy"
+
+
+async def test_run_live_guard_adds_ephemeral_rules_before_the_cloud_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful local concept scan becomes request-scoped exact redaction."""
+    chat = FakeChatModel([Round(content="safe answer")])
+    seen: dict[str, Any] = {}
+
+    class Scan:
+        entities = [{"text": "Nora Vale", "category": "person"}]
+
+    async def fake_scan(
+        text: str,
+        *,
+        model: str,
+        base_url: str,
+        concepts: list[str],
+        known: list[str],
+    ) -> Scan:
+        seen.update(
+            text=text,
+            model=model,
+            base_url=base_url,
+            concepts=concepts,
+            known=known,
+        )
+        return Scan()
+
+    monkeypatch.setattr(server.privacy_scan_mod, "scan_text", fake_scan)
+    app = app_with(chat, FakeMCP())
+    body = {
+        **BODY,
+        "model": "qwen3.5:cloud",
+        "privacy": {
+            "active": True,
+            "concepts": ["financial details"],
+            "guard_model": "qwen3.5:4b",
+        },
+    }
+
+    async with client_for(app) as c:
+        response = await c.post("/run", json=body)
+
+    assert response.status_code == 200
+    assert seen["text"] == BODY["question"]
+    assert seen["model"] == "qwen3.5:4b"
+    assert seen["concepts"] == ["financial details"]
+    assert ("Nora Vale", "[Hidden 1]") in chat.privacy.rules
+
+
+async def test_run_continues_when_the_best_effort_live_guard_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exact room rules still protect a cloud round when the local scan fails."""
+    async def unavailable(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("scanner unavailable")
+
+    monkeypatch.setattr(server.privacy_scan_mod, "scan_text", unavailable)
+    chat = FakeChatModel([Round(content="safe answer")])
+    app = app_with(chat, FakeMCP())
+    body = {
+        **BODY,
+        "model": "qwen3.5:cloud",
+        "privacy": {
+            "active": True,
+            "rules": [{"real": "Ben Reich", "placeholder": "[Person A]"}],
+            "concepts": ["financial details"],
+            "guard_model": "qwen3.5:4b",
+        },
+    }
+
+    async with client_for(app) as c:
+        response = await c.post("/run", json=body)
+
+    assert response.status_code == 200
+    assert chat.privacy.rules == [("Ben Reich", "[Person A]")]
+
+
+async def test_run_releases_a_safe_long_delta_from_an_active_output_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stream redactor eventually releases text beyond its bounded suffix."""
+    long_delta = "x" * 321
+
+    async def events(_req: Any, _deps_factory: Any) -> Any:
+        yield {"t": "delta", "v": long_delta, "node": "main"}
+        yield {"t": "final", "v": "done"}
+
+    monkeypatch.setattr(server, "stream_events", events)
+    app = app_with(FakeChatModel([]), FakeMCP())
+    async with client_for(app) as c:
+        response = await c.post("/run", json={**BODY, "privacy": {"active": True}})
+
+    events_on_wire = [json.loads(line) for line in response.text.splitlines()]
+    assert {"t": "delta", "v": "x", "node": "main", "run_id": "run-1"} in events_on_wire
+
+
+async def test_run_converts_a_room_bridge_transport_failure_to_ndjson_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bridge failure remains a terminal stream event and still frees the run."""
+    async def bridge_failure(_req: Any, _deps_factory: Any) -> Any:
+        if False:  # keeps this an async generator while preserving the failure path
+            yield {"t": "final", "v": "unused"}
+        raise httpx.ConnectError("bridge unavailable")
+
+    monkeypatch.setattr(server, "stream_events", bridge_failure)
+    mcp = FakeMCP()
+    app = app_with(FakeChatModel([]), mcp)
+    async with client_for(app) as c:
+        response = await c.post("/run", json=BODY)
+
+    assert [json.loads(line) for line in response.text.splitlines()] == [
+        {"t": "error", "v": "bridge unavailable", "run_id": "run-1"}
+    ]
+    assert mcp.closed is True
+    assert len(app.state.registry) == 0
+
+
 async def test_every_line_is_one_json_object() -> None:
     chat = FakeChatModel(
         [Round(content="multi\nline\nanswer"), Round(content="multi\nline\nanswer")]
@@ -584,6 +723,23 @@ def test_host_routing_wins_over_local_routing(host_says: dict, expected: bool) -
     req = RunRequest(model="m", question="edit the lease", routing=host_says)  # type: ignore[arg-type]
     assert req.resolved_routing()[0] is expected
     assert req.resolved_write() is expected
+
+
+def test_host_routing_overrides_each_local_lane() -> None:
+    """Every explicit host lane wins independently of its local classifier."""
+    req = RunRequest(
+        model="m",
+        question="edit the lease and make a workflow from my MCP skills",
+        routing={
+            "write": False,
+            "ui": True,
+            "jobs": False,
+            "skills": False,
+            "connectors": False,
+        },
+    )
+
+    assert req.resolved_routing() == (False, True, False, False, False)
 
 
 def test_the_agent_run_scans_the_question_for_one_lane_only(

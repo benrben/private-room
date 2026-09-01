@@ -220,228 +220,305 @@ export default function PodcastPanel({
     setSaved(false);
   }
 
+  return (
+    <PodcastPanelContent
+      a={a}
+      autoCast={autoCast}
+      cast={cast}
+      editHost={editHost}
+      loading={loading}
+      preview={preview}
+      previewing={previewing}
+      readError={readError}
+      record={record}
+      s={s}
+      saveCast={saveCast}
+      saved={saved}
+      script={script}
+      voices={voices}
+      voicesError={voicesError}
+    />
+  );
+}
+
+type EditHost = (index: number, patch: Partial<PodcastHost>) => void;
+type PreviewHost = (index: number, host: PodcastHost) => Promise<void>;
+
+interface PodcastPanelContentProps {
+  a: WSActions;
+  autoCast: () => void;
+  cast: PodcastHost[];
+  editHost: EditHost;
+  loading: boolean;
+  preview: PreviewHost;
+  previewing: number | null;
+  readError: string;
+  record: () => Promise<void>;
+  s: WSState;
+  saveCast: () => Promise<void>;
+  saved: boolean;
+  script: Podcast | null;
+  voices: NeuralVoiceInfo[];
+  voicesError: boolean;
+}
+
+function PodcastPanelContent({ loading, readError, script, ...props }: PodcastPanelContentProps) {
   if (loading) return <div className="pod-panel">Loading the script…</div>;
+  if (readError) return <PodcastReadError error={readError} />;
+  if (!script) return <PodcastMissingScript />;
+  return <PodcastScriptPanel {...props} script={script} />;
+}
 
-  if (readError) {
-    return (
-      <div className="pod-panel">
-        <p className="set-note set-note--flag nb-sem-urgent" role="alert">
-          This script couldn't be read just now ({readError}). Nothing was
-          changed — reopen the page to try again.
-        </p>
-      </div>
-    );
-  }
-
-  // A podcast PAGE with no row: generated before scripts were stored as data.
-  // Say exactly that, and say the way forward, rather than showing a Record
-  // button that would fail on a script with no readable turns.
-  if (!script) {
-    return (
-      <div className="pod-panel">
-        <p className="settings-hint">
-          This page has no script attached, so it can't be cast or recorded.
-          Podcast scripts made before voices existed are pages only — generate
-          the podcast again from the Studio shelf and the new one will have
-          voices.
-        </p>
-      </div>
-    );
-  }
-
-  const { multilingual, byLanguage } = groupVoices(voices);
-  const recorded = script.audioFileId;
-  const dirty = JSON.stringify(cast) !== JSON.stringify(script.cast);
-
+function PodcastReadError({ error }: { error: string }) {
   return (
     <div className="pod-panel">
-      <div className="pod-head">
-        <h3>{script.title}</h3>
-        <span className="settings-hint">
-          {script.turns.length} turns · {cast.length} host
-          {cast.length === 1 ? "" : "s"}
-        </span>
-      </div>
-
-      {/* The data boundary, first and unfoldable — same doctrine as Settings →
-          Spoken voice, which states it before the picker rather than under a
-          disclosure. */}
-      <div className="voice-boundary set-note set-note--flag set-note--lead nb-sem-urgent">
-        <span className="nb-tape set-note-tag">Recording uses a cloud voice</span>{" "}
-        — every line of this script is sent to Microsoft's Edge TTS service to
-        be spoken. Nothing else goes with it, and nothing is sent until you
-        press Preview or Record.
-      </div>
-
-      {/* THE TRAP, named before the button and not after it. */}
-      {s.privacyOn && (
-        <p className="set-note set-note--flag nb-sem-pending" role="note">
-          This room's privacy door is on, so names in the script are replaced
-          before they are spoken — a preview and the finished recording will
-          both say “Person A” where the script says a real name. Turn the door
-          off in Settings → Cloud privacy first if you want the real names read
-          aloud.
-        </p>
-      )}
-      {!s.webOn && (
-        <p className="set-note set-note--flag nb-sem-urgent" role="alert">
-          This room is offline, so it can't be recorded — speaking sends each
-          line to an online voice service. Turn on Settings → Online features
-          to record. You can still cast the hosts now.
-        </p>
-      )}
-
-      <div className="pod-cast">
-        {cast.map((host, i) => (
-          <div className="pod-host" key={i}>
-            <div className="pod-host-row">
-              <input
-                className="pod-host-name"
-                value={host.name}
-                dir="auto"
-                aria-label={`Host ${i + 1} name`}
-                onChange={(e) => editHost(i, { name: e.target.value })}
-              />
-              <button
-                className="chip-btn"
-                title={`Send a short line to the voice service and hear it in ${host.name || "this host"}'s voice`}
-                aria-label={`Preview ${host.name}`}
-                onClick={() => void preview(i, host)}
-              >
-                {previewing === i ? (
-                  <StopIcon size={12} />
-                ) : (
-                  <PlayIcon size={12} />
-                )}
-              </button>
-            </div>
-            <select
-              className="chat-select"
-              aria-label={`Voice for ${host.name}`}
-              value={host.voice}
-              onChange={(e) => editHost(i, { voice: e.target.value })}
-            >
-              <option value="">Default — Andrew · multilingual</option>
-              {/* A saved voice the catalog no longer lists still needs an
-                  option, or the select silently jumps to Default and the user
-                  saves a change they never made. */}
-              {host.voice && !voices.some((v) => v.id === host.voice) && (
-                <option value={host.voice}>
-                  {voiceName(host.voice)} — saved voice
-                </option>
-              )}
-              {multilingual.length > 0 && (
-                <optgroup label="Multilingual — reads any language">
-                  {multilingual.map((v) => (
-                    <option key={v.id} value={v.id}>
-                      {optionLabel(v)} · {languageLabel(v.locale)}
-                    </option>
-                  ))}
-                </optgroup>
-              )}
-              {byLanguage.map(([lang, group]) => (
-                <optgroup key={lang} label={lang}>
-                  {group.map((v) => (
-                    <option key={v.id} value={v.id}>
-                      {optionLabel(v)}
-                    </option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
-            <div className="pod-host-prosody">
-              <label>
-                <span className="settings-hint">Speed</span>
-                <select
-                  aria-label={`Speaking speed for ${host.name}`}
-                  value={host.rate}
-                  onChange={(e) => editHost(i, { rate: e.target.value })}
-                >
-                  <option value="">Normal</option>
-                  <option value="-10%">Slower</option>
-                  <option value="+15%">Faster</option>
-                  <option value="+25%">Fastest</option>
-                </select>
-              </label>
-              <label>
-                <span className="settings-hint">Pitch</span>
-                <select
-                  aria-label={`Pitch for ${host.name}`}
-                  value={host.pitch}
-                  onChange={(e) => editHost(i, { pitch: e.target.value })}
-                >
-                  <option value="">Normal</option>
-                  <option value="-6Hz">Lower</option>
-                  <option value="+6Hz">Higher</option>
-                </select>
-              </label>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {/* A disabled button must say why it is disabled. Without this the
-          catalog failing to load looked identical to the feature being broken:
-          the picker was empty, Suggest was greyed, and nothing on screen
-          mentioned a failed request. */}
-      {voicesError && voices.length === 0 && (
-        <p className="set-note set-note--flag nb-sem-urgent" role="alert">
-          The voice list couldn't be loaded, so each host is reading in the
-          default voice. Check your connection and reopen this panel to try
-          again — the script and its lines are unaffected.
-        </p>
-      )}
-
-      <div className="pod-actions">
-        <button
-          className="subtle"
-          onClick={autoCast}
-          disabled={voices.length === 0}
-          title={
-            voices.length === 0
-              ? "The voice catalog hasn't loaded — check your connection"
-              : "Give each host a different voice automatically"
-          }
-        >
-          Suggest voices
-        </button>
-        <button className="primary btn-ic" onClick={() => void saveCast()} disabled={!dirty}>
-          {saved && !dirty ? (
-            <>
-              <CircleCheckIcon size={14} /> Saved
-            </>
-          ) : (
-            "Save cast"
-          )}
-        </button>
-      </div>
-
-      <div className="pod-record">
-        <button
-          className="primary btn-ic"
-          disabled={!s.webOn || dirty}
-          title={
-            !s.webOn
-              ? "This room is offline — recording sends each line to an online voice service"
-              : dirty
-                ? "Save the cast first, so the recording uses the voices you picked"
-                : "Record every line in its host's voice"
-          }
-          onClick={() => void record()}
-        >
-          <MicIcon size={14} /> {recorded ? "Record again" : "Record the episode"}
-        </button>
-        {recorded && (
-          <button className="subtle" onClick={() => void a.viewFile(recorded)}>
-            Open the recording
-          </button>
-        )}
-      </div>
-      <p className="settings-hint">
-        Recording takes a few minutes — each line is spoken separately. It runs
-        in the background, and the finished episode lands in this room as an
-        audio file with a clickable transcript.
+      <p className="set-note set-note--flag nb-sem-urgent" role="alert">
+        This script couldn't be read just now ({error}). Nothing was changed — reopen the page to try again.
       </p>
+    </div>
+  );
+}
+
+function PodcastMissingScript() {
+  return (
+    <div className="pod-panel">
+      <p className="settings-hint">
+        This page has no script attached, so it can't be cast or recorded. Podcast scripts made before voices
+        existed are pages only — generate the podcast again from the Studio shelf and the new one will have voices.
+      </p>
+    </div>
+  );
+}
+
+type PodcastScriptPanelProps = Omit<PodcastPanelContentProps, "loading" | "readError" | "script"> & {
+  script: Podcast;
+};
+
+function PodcastScriptPanel({ a, autoCast, cast, editHost, preview, previewing, record, s, saveCast, saved, script, voices, voicesError }: PodcastScriptPanelProps) {
+  const { multilingual, byLanguage } = groupVoices(voices);
+  const dirty = JSON.stringify(cast) !== JSON.stringify(script.cast);
+  return (
+    <div className="pod-panel">
+      <PodcastHeader cast={cast} script={script} />
+      <PodcastCloudBoundary />
+      <PodcastNotices privacyOn={s.privacyOn} webOn={s.webOn} />
+      <PodcastCastEditor
+        byLanguage={byLanguage}
+        cast={cast}
+        editHost={editHost}
+        multilingual={multilingual}
+        preview={preview}
+        previewing={previewing}
+        voices={voices}
+      />
+      <VoiceCatalogError failed={voicesError} voices={voices} />
+      <PodcastCastActions autoCast={autoCast} dirty={dirty} onSaveCast={saveCast} saved={saved} voices={voices} />
+      <PodcastRecordActions a={a} dirty={dirty} onRecord={record} recorded={script.audioFileId} webOn={s.webOn} />
+      <p className="settings-hint">
+        Recording takes a few minutes — each line is spoken separately. It runs in the background, and the finished
+        episode lands in this room as an audio file with a clickable transcript.
+      </p>
+    </div>
+  );
+}
+
+function PodcastHeader({ cast, script }: { cast: PodcastHost[]; script: Podcast }) {
+  return (
+    <div className="pod-head">
+      <h3>{script.title}</h3>
+      <span className="settings-hint">
+        {script.turns.length} turns · {cast.length} host{cast.length === 1 ? "" : "s"}
+      </span>
+    </div>
+  );
+}
+
+function PodcastCloudBoundary() {
+  return (
+    <div className="voice-boundary set-note set-note--flag set-note--lead nb-sem-urgent">
+      <span className="nb-tape set-note-tag">Recording uses a cloud voice</span>{" "}
+      — every line of this script is sent to Microsoft's Edge TTS service to be spoken. Nothing else goes with it,
+      and nothing is sent until you press Preview or Record.
+    </div>
+  );
+}
+
+function PodcastNotices({ privacyOn, webOn }: { privacyOn: boolean | null; webOn: boolean }) {
+  return (
+    <>
+      {privacyOn && (
+        <p className="set-note set-note--flag nb-sem-pending" role="note">
+          This room's privacy door is on, so names in the script are replaced before they are spoken — a preview and
+          the finished recording will both say “Person A” where the script says a real name. Turn the door off in
+          Settings → Cloud privacy first if you want the real names read aloud.
+        </p>
+      )}
+      {!webOn && (
+        <p className="set-note set-note--flag nb-sem-urgent" role="alert">
+          This room is offline, so it can't be recorded — speaking sends each line to an online voice service. Turn on
+          Settings → Online features to record. You can still cast the hosts now.
+        </p>
+      )}
+    </>
+  );
+}
+
+function PodcastCastEditor({
+  byLanguage,
+  cast,
+  editHost,
+  multilingual,
+  preview,
+  previewing,
+  voices,
+}: {
+  byLanguage: ReturnType<typeof groupVoices>["byLanguage"];
+  cast: PodcastHost[];
+  editHost: EditHost;
+  multilingual: NeuralVoiceInfo[];
+  preview: PreviewHost;
+  previewing: number | null;
+  voices: NeuralVoiceInfo[];
+}) {
+  return (
+    <div className="pod-cast">
+      {cast.map((host, i) => (
+        <div className="pod-host" key={i}>
+          <div className="pod-host-row">
+            <input
+              className="pod-host-name"
+              value={host.name}
+              dir="auto"
+              aria-label={`Host ${i + 1} name`}
+              onChange={(e) => editHost(i, { name: e.target.value })}
+            />
+            <button
+              className="chip-btn"
+              title={`Send a short line to the voice service and hear it in ${host.name || "this host"}'s voice`}
+              aria-label={`Preview ${host.name}`}
+              onClick={() => void preview(i, host)}
+            >
+              {previewing === i ? <StopIcon size={12} /> : <PlayIcon size={12} />}
+            </button>
+          </div>
+          <select
+            className="chat-select"
+            aria-label={`Voice for ${host.name}`}
+            value={host.voice}
+            onChange={(e) => editHost(i, { voice: e.target.value })}
+          >
+            <option value="">Default — Andrew · multilingual</option>
+            {host.voice && !voices.some((v) => v.id === host.voice) && (
+              <option value={host.voice}>{voiceName(host.voice)} — saved voice</option>
+            )}
+            {multilingual.length > 0 && (
+              <optgroup label="Multilingual — reads any language">
+                {multilingual.map((v) => (
+                  <option key={v.id} value={v.id}>{optionLabel(v)} · {languageLabel(v.locale)}</option>
+                ))}
+              </optgroup>
+            )}
+            {byLanguage.map(([lang, group]) => (
+              <optgroup key={lang} label={lang}>
+                {group.map((v) => <option key={v.id} value={v.id}>{optionLabel(v)}</option>)}
+              </optgroup>
+            ))}
+          </select>
+          <PodcastProsody host={host} index={i} editHost={editHost} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PodcastProsody({ host, index, editHost }: { host: PodcastHost; index: number; editHost: EditHost }) {
+  return (
+    <div className="pod-host-prosody">
+      <label>
+        <span className="settings-hint">Speed</span>
+        <select aria-label={`Speaking speed for ${host.name}`} value={host.rate} onChange={(e) => editHost(index, { rate: e.target.value })}>
+          <option value="">Normal</option>
+          <option value="-10%">Slower</option>
+          <option value="+15%">Faster</option>
+          <option value="+25%">Fastest</option>
+        </select>
+      </label>
+      <label>
+        <span className="settings-hint">Pitch</span>
+        <select aria-label={`Pitch for ${host.name}`} value={host.pitch} onChange={(e) => editHost(index, { pitch: e.target.value })}>
+          <option value="">Normal</option>
+          <option value="-6Hz">Lower</option>
+          <option value="+6Hz">Higher</option>
+        </select>
+      </label>
+    </div>
+  );
+}
+
+function VoiceCatalogError({ failed, voices }: { failed: boolean; voices: NeuralVoiceInfo[] }) {
+  if (!failed || voices.length) return null;
+  return (
+    <p className="set-note set-note--flag nb-sem-urgent" role="alert">
+      The voice list couldn't be loaded, so each host is reading in the default voice. Check your connection and
+      reopen this panel to try again — the script and its lines are unaffected.
+    </p>
+  );
+}
+
+function PodcastCastActions({
+  autoCast,
+  dirty,
+  onSaveCast,
+  saved,
+  voices,
+}: {
+  autoCast: () => void;
+  dirty: boolean;
+  onSaveCast: () => Promise<void>;
+  saved: boolean;
+  voices: NeuralVoiceInfo[];
+}) {
+  return (
+    <div className="pod-actions">
+      <button
+        className="subtle"
+        onClick={autoCast}
+        disabled={voices.length === 0}
+        title={voices.length === 0 ? "The voice catalog hasn't loaded — check your connection" : "Give each host a different voice automatically"}
+      >
+        Suggest voices
+      </button>
+      <button className="primary btn-ic" onClick={() => void onSaveCast()} disabled={!dirty}>
+        {saved && !dirty ? <><CircleCheckIcon size={14} /> Saved</> : "Save cast"}
+      </button>
+    </div>
+  );
+}
+
+function PodcastRecordActions({
+  a,
+  dirty,
+  onRecord,
+  recorded,
+  webOn,
+}: {
+  a: WSActions;
+  dirty: boolean;
+  onRecord: () => Promise<void>;
+  recorded: string | null;
+  webOn: boolean;
+}) {
+  const title = !webOn
+    ? "This room is offline — recording sends each line to an online voice service"
+    : dirty
+      ? "Save the cast first, so the recording uses the voices you picked"
+      : "Record every line in its host's voice";
+  return (
+    <div className="pod-record">
+      <button className="primary btn-ic" disabled={!webOn || dirty} title={title} onClick={() => void onRecord()}>
+        <MicIcon size={14} /> {recorded ? "Record again" : "Record the episode"}
+      </button>
+      {recorded && <button className="subtle" onClick={() => void a.viewFile(recorded)}>Open the recording</button>}
     </div>
   );
 }

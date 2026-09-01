@@ -182,6 +182,7 @@ def test_stock_hallucination_punctuation_edges_are_stripped() -> None:
     # Quotes/punctuation at sentence edges are stripped before the STOCK
     # membership check runs.
     assert is_stock_hallucination('"Please subscribe!"') is True
+    assert is_stock_hallucination("(Thank you)") is True
 
 
 def test_stock_hallucination_partial_match_is_not_enough() -> None:
@@ -276,3 +277,7 @@ def test_merge_token_words_emoji_split_across_non_boundary() -> None:
 def test_merge_token_words_timing_is_first_t0_and_last_t1() -> None:
     pieces = [(b" abc", 10, 20), (b"def", 20, 30), (b"ghi", 30, 45)]
     assert merge_token_words(pieces) == [("abcdefghi", 10, 45)]
+
+
+def test_merge_token_words_removes_every_trailing_newline() -> None:
+    assert merge_token_words([(b" word\n\n", 10, 20)]) == [("word", 10, 20)]

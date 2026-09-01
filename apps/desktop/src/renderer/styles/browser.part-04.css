@@ -1,0 +1,491 @@
+
+.bsearch-fuse i.on[data-engine="marginalia"] { background: var(--eng-marginalia); }
+.bsearch-fuse i.on[data-engine="wikipedia"] { background: var(--eng-wikipedia); }
+.bsearch-fuse i.on[data-engine="ddg-ia"] { background: var(--eng-ddgia); }
+.bsearch-fuse i.on[data-engine="news"] { background: var(--eng-news); }
+
+@keyframes bsearch-grow {
+  from { transform: scaleX(0); opacity: 0; }
+}
+
+.bsearch-meta {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  font-variant-numeric: tabular-nums;
+}
+
+.bsearch-meta .sep { color: var(--faint); margin: 0 5px; }
+.bsearch-meta .privacy { color: var(--accent-2); }
+/* Degraded, not broken: readable enough to notice, quiet enough not to alarm
+   when five of seven engines answered perfectly well. */
+.bsearch-meta .bsearch-blocked { color: var(--amber); cursor: help; }
+.bsearch-meta .hint {
+  color: var(--faint);
+  border-bottom: 1px dotted var(--faint);
+  cursor: help;
+}
+
+/* ---- ask + summary invitations ----
+   Pink is AI attribution across the product, so both invitations to hand work
+   to the assistant are drawn in the pen. The edge is the accent INK, not the
+   soft wash it used to be: --accent-soft is 18% pink and measures ~1.5:1,
+   which is fine behind a word and nowhere near the 3:1 a control boundary
+   owes. */
+.bsearch-ask,
+.bsearch-summary-ask {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  padding: 10px 14px;
+  text-align: left;
+  color: var(--text);
+  background-color: transparent;
+  background-image: linear-gradient(105deg, var(--accent-ghost), transparent 72%);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-lg);
+  font: inherit;
+  font-size: var(--fs-body);
+  cursor: pointer;
+  transition:
+    background-color var(--dur-fast) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen);
+}
+
+.bsearch-ask:hover,
+.bsearch-summary-ask:hover {
+  background-color: transparent;
+  background-image: linear-gradient(105deg, var(--accent-soft), transparent 72%);
+  border-color: var(--accent);
+}
+
+.bsearch-ask svg,
+.bsearch-summary-ask svg { color: var(--accent); flex: none; }
+.bsearch-ask b,
+.bsearch-summary-ask b { color: var(--text-strong); font-weight: 600; }
+
+/* ---- the AI summary ----
+   A drawn card with the pen down its leading edge: pink is what this product
+   marks AI attribution with, and the "written on this Mac" note beside the
+   heading says the same thing in words. */
+.bsearch-summary {
+  padding: 12px 15px 13px;
+  background: transparent;
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 60%, transparent);
+  border-radius: var(--radius-lg);
+  box-shadow: inset 3px 0 0 var(--sem-saved);
+}
+
+.bsearch-summary-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 7px;
+  color: var(--text-strong);
+  font-size: var(--fs-meta);
+}
+
+.bsearch-summary-head svg { color: var(--accent); }
+.bsearch-summary-note {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  font-weight: 400;
+}
+
+.bsearch-summary-text {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+
+.bsearch-summary-busy,
+.bsearch-summary-error { margin: 0; font-size: var(--fs-meta); color: var(--muted); }
+.bsearch-summary-error { color: var(--sem-urgent); }
+
+/* A citation is a control, not decoration: it jumps to the result it came
+   from, because a summary you cannot check against its sources has no
+   business sitting above them. */
+.bsearch-cite {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 var(--sp-1);
+  margin: 0 2px;
+  vertical-align: baseline;
+  color: var(--accent-2);
+  background: var(--accent-soft);
+  border: none;
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.bsearch-cite:hover { background: var(--accent); color: var(--accent-ink); }
+
+/* ---- cards ----
+   Drawn frames on the sheet rather than filled boxes. The border sits at 72%
+   of the pen at rest and goes to full strength on hover — the pen pressing
+   harder, not a colour change — which is .nb-card's recipe and still measures
+   ~6.9:1 dark / ~5.2:1 light, well over the 3:1 a clickable boundary owes. */
+.bsearch-duo { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.bsearch-rows { display: flex; flex-direction: column; gap: var(--sp-2); }
+
+.bsearch-card {
+  position: relative;
+  background: transparent;
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  cursor: pointer;
+  outline: none;
+  animation: bsearch-enter var(--dur-slow) var(--ease-pen) both;
+  transition:
+    transform var(--dur-fast) var(--ease-pen),
+    box-shadow var(--dur-fast) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen);
+}
+
+@keyframes bsearch-enter {
+  from { opacity: 0; transform: translateY(6px); }
+}
+
+/* Lifted off the sheet by 2px, which is the top of the range the system
+   allows a card. */
+.bsearch-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--sketch);
+  box-shadow: 0 6px 18px var(--shadow-lift);
+}
+
+/* Selected reads as circled: the pen on the edge and a second stroke just
+   inside it, so it looks gone-round-twice rather than merely tinted. */
+.bsearch-card.sel,
+.bsearch-card:focus-visible {
+  border-color: var(--accent);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent),
+    0 6px 18px var(--shadow-lift);
+}
+
+.bsearch-card h3 {
+  margin: 0;
+  color: var(--text-strong);
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.bsearch-card:hover h3,
+.bsearch-card.sel h3 {
+  text-decoration: underline;
+  text-decoration-color: var(--accent-soft);
+  text-underline-offset: 3px;
+}
+
+.bsearch-body { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; }
+
+/* tier 1 — the feature card */
+.bsearch-card.feature { display: grid; grid-template-columns: minmax(0, 1fr) 244px; }
+.bsearch-card.feature .bsearch-body { padding: 15px 17px 13px; gap: 5px; }
+.bsearch-card.feature h3 { font-size: 17.5px; }
+.bsearch-card.feature .bsearch-img { min-height: 168px; }
+.bsearch-card.feature .bsearch-snippet { -webkit-line-clamp: 2; }
+.bsearch-card.feature .bsearch-metarow { margin-top: auto; padding-top: 6px; }
+
+.bsearch-eyebrow {
+  color: var(--accent-2);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+/* tier 2 — the two-up row */
+.bsearch-card.duo { display: flex; flex-direction: column; }
+.bsearch-card.duo .bsearch-img { height: 108px; }
+.bsearch-card.duo .bsearch-body { padding: 11px 13px 12px; flex: 1; }
+.bsearch-card.duo h3 { font-size: 14.5px; }
+.bsearch-card.duo .bsearch-snippet { -webkit-line-clamp: 2; }
+.bsearch-card.duo .bsearch-metarow { margin-top: auto; padding-top: 5px; }
+
+/* tier 3 — compact rows */
+.bsearch-card.row { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 12px; padding: 11px 13px; }
+.bsearch-card.row .bsearch-img { width: 62px; height: 62px; border-radius: var(--radius); }
+.bsearch-card.row h3 { font-size: 13.5px; }
+.bsearch-card.row .bsearch-snippet { -webkit-line-clamp: 1; font-size: var(--fs-meta); }
+
+/* ---- the image slot ----
+   Fixed size, always present: the preview fades in when the enrich pass lands
+   so nothing on the page moves. A page with no og:image keeps its monogram —
+   that is the designed state, not a failure. */
+.bsearch-img {
+  position: relative;
+  flex: none;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--raised) 55%, transparent);
+}
+
+.bsearch-img.waiting {
+  background-image: linear-gradient(
+    100deg,
+    transparent 40%,
+    color-mix(in srgb, var(--ink) 7%, transparent) 50%,
+    transparent 60%
+  );
+  background-size: 200% 100%;
+  animation: bsearch-shimmer 1.4s linear infinite;
+}
+
+@keyframes bsearch-shimmer {
+  to { background-position: -200% 0; }
+}
+
+.bsearch-img img,
+.bsearch-mono {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  animation: bsearch-fade var(--dur-slow) var(--ease-pen) both;
+}
+
+/* The preview is REPORTED, not decorated: no zoom on hover, so what is on the
+   card is what the page published. */
+.bsearch-img img { object-fit: cover; }
+
+/* The monogram tile. Its hue is DATA — a stable hash of the host, so the same
+   site keeps the same tile between searches — which is why it cannot be a
+   token. The component passes only the hue; the lightness is solved here, per
+   theme, because one lightness cannot clear contrast on both papers. */
+.bsearch-mono {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, hsl(var(--mono-h, 0), 40%, 55%) 20%, transparent);
+  color: hsl(var(--mono-h, 0), 34%, 76%);
+  font-size: 24px;
+  font-weight: 700;
+}
+
+:root[data-theme="light"] .bsearch-mono {
+  color: hsl(var(--mono-h, 0), 46%, 30%);
+}
+
+@keyframes bsearch-fade {
+  from { opacity: 0; }
+}
+
+/* ---- card meta ---- */
+
+/* The address of the result, so it is mono: this is the line that answers
+   "whose page is this", and the host is a security signal like any other.
+
+   A BLOCK, not a flex row, and that is the whole point: text-overflow does
+   nothing to a flex container's overflowing items, so the old version clipped
+   the breadcrumb mid-character with no ellipsis at all. As one line of text
+   the tail — the deep path — is what gets the ellipsis, and the host, which
+   comes first, always survives. Truncate the path, never the origin. */
+.bsearch-crumb {
+  display: block;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  line-height: 1.6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bsearch-crumb b { color: var(--text); font-weight: 600; }
+.bsearch-crumb i { font-style: normal; color: var(--faint); margin: 0 3px; }
+.bsearch-favicon {
+  width: 13px;
+  height: 13px;
+  margin-right: 5px;
+  vertical-align: -2px;
+  border-radius: 3px 2px 4px 2px / 2px 4px 2px 3px;
+}
+
+/* --muted rather than an opacity on --text: a real token is contrast-checked
+   against every ground, a faded one is not. */
+.bsearch-snippet {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: var(--fs-body);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.bsearch-metarow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  min-height: 26px;
+  margin-top: 5px;
+}
+
+/* The consensus dial: every engine owns a fixed wedge, so agreement is
+   readable by SHAPE. Google cannot show you this; we can. The geometry comes
+   from the component and is never adjusted here. */
+.bsearch-dial {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  flex: none;
+  -webkit-mask: radial-gradient(farthest-side, transparent 52%, #000 54%);
+  mask: radial-gradient(farthest-side, transparent 52%, #000 54%);
+}
+
+.bsearch-engn { font-size: var(--fs-micro); color: var(--faint); white-space: nowrap; }
+
+.bsearch-date {
+  padding: 1px 7px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Relevance, drawn as a marker stroke in a pencil track: the track shows the
+   full extent so a short bar still reads as "out of this much". The width is
+   set by the component from the score and is never rounded up to a visible
+   minimum — that would overstate a weak result. */
+.bsearch-rel {
+  width: 50px;
+  height: 4px;
+  border-radius: 3px 4px 2px 3px / 3px 2px 4px 3px;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rule) 70%, transparent);
+  overflow: hidden;
+}
+
+.bsearch-rel i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent-fill);
+  box-shadow: inset 0 0 0 1px var(--accent);
+  transform-origin: left;
+  animation: bsearch-grow var(--dur-slow) 0.2s var(--ease-pen) both;
+}
+
+.bsearch-inroom {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  color: var(--sem-done);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.bsearch-acts { margin-left: auto; display: flex; gap: var(--sp-1); opacity: 0; transition: opacity var(--dur-fast) var(--ease-pen); }
+.bsearch-card:hover .bsearch-acts,
+.bsearch-card.sel .bsearch-acts,
+.bsearch-card.peeked .bsearch-acts { opacity: 1; }
+/* A keyboard user must be able to reach an action that only appears on hover;
+   without this the button takes focus while still invisible. */
+.bsearch-acts:focus-within { opacity: 1; }
+
+.bsearch-acts .browser-btn { width: 26px; min-width: 26px; min-height: 26px; height: 26px; padding: 0; }
+/* "Already in the room" survives the pointer: the plain hover rule is more
+   specific than a single class, so the done state has to claim hover too. */
+.bsearch-add.done,
+.bsearch-add.done:hover:not(:disabled) { color: var(--sem-done); border-color: var(--sem-done); }
+
+.bsearch-spin {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  animation: bsearch-spin 0.8s linear infinite;
+}
+
+@keyframes bsearch-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ---- peek ---- */
+.bsearch-peek {
+  margin-top: 9px;
+  padding: 10px var(--sp-3);
+  background: transparent;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  animation: bsearch-enter var(--dur-fast) var(--ease-pen) both;
+}
+
+.bsearch-peek-head {
+  margin-bottom: 6px;
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.03em;
+}
+
+.bsearch-peek p {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  max-height: 190px;
+  overflow-y: auto;
+}
+
+/* ---- states ---- */
+.bsearch-empty {
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.bsearch-empty svg { color: var(--faint); }
+.bsearch-empty h2 { margin: 10px 0 var(--sp-1); font-size: var(--fs-card); color: var(--text-strong); }
+.bsearch-empty p { margin: 0 auto; max-width: 52ch; font-size: var(--fs-body); line-height: var(--lh-body); }
+
+.bsearch-error {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 13px;
+  color: var(--text);
+  border: 1px solid var(--sem-urgent);
+  border-radius: var(--radius);
+  box-shadow: inset 3px 0 0 var(--sem-urgent);
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--sem-urgent-fill) 16%, transparent) 0%,
+    color-mix(in srgb, var(--sem-urgent-fill) 8%, transparent) 100%
+  );
+  font-size: var(--fs-meta);
+}
+
+.bsearch-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1) 14px;
+  padding-top: 10px;
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 2%,
+    var(--line-soft) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}

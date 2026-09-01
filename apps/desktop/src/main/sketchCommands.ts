@@ -44,24 +44,18 @@
 
 import type Database from "better-sqlite3-multiple-ciphers";
 import { createHash } from "node:crypto";
-import path from "node:path";
 import { Readable } from "node:stream";
 import {
   availableName,
   type FileMeta,
-  getFileBytes,
   getFileMeta,
   getFileName,
-  inTransaction,
   insertFile,
-  listFiles,
   markSectionOnly,
-  renameFile,
   setFileExtractedText,
   updateFileContent,
 } from "./db-host/files.js";
 import { snapshotFileVersion } from "./db-host/versions.js";
-import { extensionOf } from "./editMatchExtraction.js";
 import { extractText } from "./editMatch.js";
 import { runsOnThisMac } from "./capabilities.js";
 import { modelSetting } from "./gatherContext.js";
@@ -82,8 +76,23 @@ import {
   toSvg,
 } from "./sketchDoc.js";
 import { toPng } from "./sketchRaster.js";
-import { createRoomFile, readRoomFile, writeRoomFile } from "./workspace/roomContent.js";
-import type { WorkspaceService } from "./workspace/workspaceService.js";
+import {
+  drawTarget,
+  drawTargetInRoom,
+  errMessage,
+  insertSketch,
+  insertSketchInRoom,
+  load,
+  loadInRoom,
+  resolve,
+  save,
+  SKETCH_EXT,
+  trimEndMatches,
+  type SketchRoom,
+} from "./sketchStore.js";
+import { createRoomFile, writeRoomFile } from "./workspace/roomContent.js";
+
+export { SKETCH_EXT, type SketchRoom } from "./sketchStore.js";
 
 // ------------------------------------------------------------------- shell
 
@@ -99,10 +108,6 @@ function ok(text: string): SketchToolOutcome {
 
 function fail(error: string): SketchToolOutcome {
   return { ok: false, error };
-}
-
-function errMessage(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
 }
 
 /** `let _ = window.emit(...)` — a best-effort UI notification that must never
@@ -121,310 +126,6 @@ function asString(v: unknown): string {
   return typeof v === "string" ? v : "";
 }
 
-// ------------------------------------------------------------------ naming
-
-/** The extension that makes a room file a drawing. */
-export const SKETCH_EXT = "sketch";
-
-function isSketch(name: string): boolean {
-  return extensionOf(name) === SKETCH_EXT;
-}
-
-/** The MIME a drawing carries. The viewer is picked by EXTENSION, so this is
- * only what the Library shows and what an export would carry — but naming it
- * honestly is what stops a `.sketch` being treated as arbitrary JSON by
- * anything that reads the column instead of the name. */
-const SKETCH_MIME = "application/json";
-
-/** Rust's `str::trim_end_matches` strips the pattern REPEATEDLY
- * (`"a.sketch.sketch".trim_end_matches(".sketch")` is `"a"`, not
- * `"a.sketch"`); `endsWith`/`slice` alone would strip one. */
-function trimEndMatches(s: string, suffix: string): string {
-  let out = s;
-  while (suffix !== "" && out.endsWith(suffix)) {
-    out = out.slice(0, out.length - suffix.length);
-  }
-  return out;
-}
-
-function sketchName(nameRaw: string): string {
-  const trimmed = rustTrim(nameRaw);
-  const n = trimmed === "" ? "Sketch" : trimmed;
-  return isSketch(n) ? n : `${n}.${SKETCH_EXT}`;
-}
-
-function nameList(all: ReadonlyArray<readonly [string, string]>): string {
-  return all.map(([, n]) => n).join(", ");
-}
-
-// ------------------------------------------------------- room file access
-
-/** Every drawing in the room, NEWEST FIRST — `listFiles` orders by
- * `created_at DESC` (as Rust's `db::list_files` does), and
- * {@link takeEmptySketch} depends on that being true. */
-function listSketches(db: Database.Database): Array<[string, string]> {
-  return listFiles(db)
-    .filter((f) => isSketch(f.name))
-    .map((f): [string, string] => [f.id, f.name]);
-}
-
-function load(db: Database.Database, id: string): Sketch {
-  const bytes = getFileBytes(db, id);
-  return sketchFromJson(bytes === null ? "" : bytes.toString("utf8"));
-}
-
-/** `commands::files::store_file_bytes` — the single write path for changing
- * an existing file's bytes: snapshot the CURRENT bytes into version history
- * tagged with `cause`, then overwrite, in ONE transaction. */
-function storeFileBytes(db: Database.Database, id: string, bytes: Uint8Array, text: string | null, cause: string): void {
-  inTransaction(db, () => {
-    snapshotFileVersion(db, id, cause);
-    updateFileContent(db, id, bytes, text);
-  });
-}
-
-/** Write a drawing back. Goes through `storeFileBytes` like every other
- * content write in the app, so a drawing the agent changed can be recovered
- * from version history exactly like one the user typed over. */
-function save(db: Database.Database, id: string, doc: Sketch, cause: string): void {
-  storeFileBytes(db, id, Buffer.from(sketchToJson(doc), "utf8"), sketchExtractedText(doc), cause);
-}
-
-function insertSketch(db: Database.Database, name: string, doc: Sketch, source: string): FileMeta {
-  const unique = availableName(db, sketchName(name));
-  const json = sketchToJson(doc);
-  return insertFile(db, unique, SKETCH_MIME, Buffer.from(json, "utf8"), sketchExtractedText(doc), source);
-}
-
-export interface SketchRoom {
-  db: Database.Database;
-  path: string;
-  workspace?: WorkspaceService;
-}
-
-async function loadInRoom(room: SketchRoom, id: string): Promise<Sketch> {
-  const bytes = (await readRoomFile(room, id)).bytes;
-  return sketchFromJson(bytes === null ? "" : bytes.toString("utf8"));
-}
-
-async function insertSketchInRoom(
-  room: SketchRoom,
-  name: string,
-  doc: Sketch,
-  source: string,
-): Promise<FileMeta> {
-  const unique = availableName(room.db, sketchName(name));
-  const json = sketchToJson(doc);
-  return createRoomFile(
-    room,
-    unique,
-    SKETCH_MIME,
-    Buffer.from(json, "utf8"),
-    sketchExtractedText(doc),
-    source,
-  );
-}
-
-async function renameSketchInRoom(room: SketchRoom, id: string, name: string): Promise<void> {
-  if (room.workspace === undefined) {
-    renameFile(room.db, id, name);
-    return;
-  }
-  const row = room.db.prepare(
-    "SELECT relative_path, content_sha256 FROM files WHERE id = ? AND trashed_at IS NULL",
-  ).get(id) as { relative_path: string | null; content_sha256: string | null } | undefined;
-  if (row?.relative_path === null || row?.relative_path === undefined) {
-    throw new Error("That drawing is no longer in this room.");
-  }
-  const parent = path.posix.dirname(row.relative_path);
-  await room.workspace.move(
-    id,
-    parent === "." ? name : path.posix.join(parent, name),
-    row.content_sha256 ?? undefined,
-  );
-}
-
-// --------------------------------------------------------------- resolving
-
-/**
- * Why a name did not land on a drawing — Rust's `Unresolved`, collapsed into
- * one discriminated return.
- *
- * The three answers lead different ways, and the difference was being thrown
- * away: an unknown name may be created, an ambiguous one must go back to the
- * model. `tool_draw` matched on `Err(_)` and so answered an ambiguity by
- * starting a THIRD drawing — or by renaming a blank one — while the diagram
- * the user meant sat untouched under a name they never chose.
- */
-type ResolveResult =
-  | { ok: true; id: string; name: string }
-  | { ok: false; kind: "not_found" | "ambiguous" | "failed"; message: string };
-
-/**
- * Find the drawing the model means.
- *
- * Exact name, then a fragment, then — if the room holds exactly one drawing —
- * that one. The last rule is what makes `name` effectively optional in
- * practice: the overwhelmingly common case is a room with one sketch open,
- * and making the model repeat its name is a turn spent on bookkeeping.
- *
- * Ambiguity is reported rather than guessed. The room's generic
- * `findFileLike` resolves a fragment to the NEWEST match, which for files the
- * agent itself just created means a typo silently retargets the wrong
- * drawing — so this does not use it.
- */
-function resolveNamed(db: Database.Database, nameRaw: string): ResolveResult {
-  let all: Array<[string, string]>;
-  try {
-    all = listSketches(db);
-  } catch (e) {
-    return { ok: false, kind: "failed", message: errMessage(e) };
-  }
-  if (all.length === 0) {
-    return {
-      ok: false,
-      kind: "not_found",
-      message: "This room has no drawings yet. Use `draw` with a new name to start one.",
-    };
-  }
-  const want = rustTrim(nameRaw);
-  if (want === "") {
-    if (all.length === 1) {
-      const only = all[0] as [string, string];
-      return { ok: true, id: only[0], name: only[1] };
-    }
-    return { ok: false, kind: "ambiguous", message: `Which drawing? This room has ${all.length}: ${nameList(all)}.` };
-  }
-  // Full Unicode lowercasing here, matching the Rust source's own
-  // `to_lowercase()` — unlike the script parser, which is ASCII-only.
-  const lower = want.toLowerCase();
-  const stem = rustTrim(trimEndMatches(lower, `.${SKETCH_EXT}`));
-  const exact = all.find(([, n]) => n.toLowerCase() === lower);
-  if (exact !== undefined) {
-    return { ok: true, id: exact[0], name: exact[1] };
-  }
-  const stemHit = all.find(([, n]) => trimEndMatches(n.toLowerCase(), `.${SKETCH_EXT}`) === stem);
-  if (stemHit !== undefined) {
-    return { ok: true, id: stemHit[0], name: stemHit[1] };
-  }
-  const hits = all.filter(([, n]) => n.toLowerCase().includes(stem));
-  if (hits.length === 1) {
-    const hit = hits[0] as [string, string];
-    return { ok: true, id: hit[0], name: hit[1] };
-  }
-  if (hits.length === 0) {
-    return {
-      ok: false,
-      kind: "not_found",
-      message: `There is no drawing called "${want}". This room has: ${nameList(all)}.`,
-    };
-  }
-  return {
-    ok: false,
-    kind: "ambiguous",
-    message: `"${want}" matches ${hits.length} drawings: ${nameList(hits)}. Use the full name.`,
-  };
-}
-
-/** The same lookup, throwing on any failure — the shape every caller but
- * `draw` wants. Ported from `resolve`. */
-function resolve(db: Database.Database, name: string): [string, string] {
-  const r = resolveNamed(db, name);
-  if (r.ok) {
-    return [r.id, r.name];
-  }
-  throw new Error(r.message);
-}
-
-/**
- * Claim a blank sketch and give it the name the drawing is about.
- *
- * Returns `null` when every sketch in the room has something on it.
- * Deliberately picks the NEWEST blank one: it is the one the user most likely
- * just made and is looking at.
- */
-function takeEmptySketch(db: Database.Database, name: string): [string, string] | null {
-  const blank = listSketches(db).find(([id]) => {
-    try {
-      return load(db, id).elements.length === 0;
-    } catch {
-      // A drawing whose bytes will not parse is not a blank page to claim.
-      return false;
-    }
-  });
-  if (blank === undefined) {
-    return null;
-  }
-  const [id] = blank;
-  const wanted = availableName(db, sketchName(name));
-  renameFile(db, id, wanted);
-  return [id, wanted];
-}
-
-/**
- * The drawing a `draw` call is about: an existing one, an empty one claimed,
- * or a new file — and which of the three it was.
- *
- * An unknown name is a NEW drawing rather than an error. The result says
- * which happened, because a typo that quietly created "Login flwo" beside the
- * real drawing is otherwise invisible until the user opens the Library.
- *
- * An unknown name is a new drawing — but not necessarily a new FILE. The
- * common way this feature is used is: press "New sketch", look at the blank
- * page, ask for a diagram. Creating a second file there is correct by the
- * letter and wrong by every other measure — the user watches a blank canvas
- * while their diagram lands somewhere they have to go and find, and the page
- * they started is left behind as litter (live QA 2026-08-13). So an EMPTY
- * sketch is claimed and renamed rather than orphaned. Only an empty one: a
- * drawing with anything on it is work, and work is never silently
- * repurposed. And an AMBIGUOUS name claims nothing at all — it goes back to
- * the model, which is the only place the answer is.
- */
-function drawTarget(db: Database.Database, name: string): [string, string, boolean] {
-  const r = resolveNamed(db, name);
-  if (r.ok) {
-    return [r.id, r.name, false];
-  }
-  if (r.kind === "not_found") {
-    const taken = takeEmptySketch(db, name);
-    if (taken !== null) {
-      return [taken[0], taken[1], false];
-    }
-    const meta = insertSketch(db, name, defaultSketch(), "generated");
-    // Section-only, exactly like one the user starts. A drawing is a drawing
-    // whoever made it: filing the assistant's in Home while the user's own
-    // stays in Sketches would make the rule depend on who held the pen.
-    markSectionOnly(db, meta.id, "sketch");
-    return [meta.id, meta.name, true];
-  }
-  throw new Error(r.message);
-}
-
-async function takeEmptySketchInRoom(room: SketchRoom, name: string): Promise<[string, string] | null> {
-  for (const [id] of listSketches(room.db)) {
-    try {
-      if ((await loadInRoom(room, id)).elements.length !== 0) continue;
-      const wanted = availableName(room.db, sketchName(name));
-      await renameSketchInRoom(room, id, wanted);
-      return [id, wanted];
-    } catch {
-      // A drawing that cannot be read is not a blank page to claim.
-    }
-  }
-  return null;
-}
-
-async function drawTargetInRoom(room: SketchRoom, name: string): Promise<[string, string, boolean]> {
-  if (room.workspace === undefined) return drawTarget(room.db, name);
-  const resolved = resolveNamed(room.db, name);
-  if (resolved.ok) return [resolved.id, resolved.name, false];
-  if (resolved.kind !== "not_found") throw new Error(resolved.message);
-  const taken = await takeEmptySketchInRoom(room, name);
-  if (taken !== null) return [taken[0], taken[1], false];
-  const meta = await insertSketchInRoom(room, name, defaultSketch(), "generated");
-  markSectionOnly(room.db, meta.id, "sketch");
-  return [meta.id, meta.name, true];
-}
 
 // ---------------------------------------------------------------------------
 // Commands the page calls
@@ -636,6 +337,50 @@ export interface SketchToolEffects {
   visionChat: boolean;
 }
 
+function describedDrawing(doc: Sketch, name: string): string {
+  let out = describe(doc, name);
+  if (doc.elements.length > 0 && layoutReport(doc).length === 0) {
+    out += "\nNothing measures wrong: no overlaps, nothing off the page, every shape labelled.\n";
+  }
+  return out;
+}
+
+function shouldAttachDrawing(effects: SketchToolEffects, doc: Sketch): boolean {
+  return effects.visionChat && doc.elements.length > 0;
+}
+
+function pictureIsBlocked(model: string | null): boolean {
+  if (model === null) return false;
+  if (runsOnThisMac(model)) return false;
+  return activePolicy() !== null;
+}
+
+async function readDrawingResult(
+  doc: Sketch,
+  name: string,
+  model: string | null,
+  effects: SketchToolEffects,
+): Promise<SketchToolOutcome> {
+  let out = describedDrawing(doc, name);
+  if (!shouldAttachDrawing(effects, doc)) return ok(out);
+  if (pictureIsBlocked(model)) {
+    out +=
+      "\n(Not showing you the picture: this room's privacy door keeps images on this Mac. " +
+      "The measurements above describe the same drawing.)";
+    return ok(out);
+  }
+  try {
+    const png = await toPng(doc);
+    effects.pendingImages.push(png.toString("base64"));
+    out += "\nThe drawing is attached as a picture — look at it before you change anything.";
+  } catch (e) {
+    // A rendering failure must not lose the report, which is the greater half
+    // of the answer and is already built.
+    out += `\n(The picture could not be drawn: ${errMessage(e)})`;
+  }
+  return ok(out);
+}
+
 /**
  * Look at a drawing.
  *
@@ -668,38 +413,7 @@ export async function execReadDrawing(
   } catch (e) {
     return fail(errMessage(e));
   }
-
-  let out = describe(doc, real);
-  if (doc.elements.length > 0 && layoutReport(doc).length === 0) {
-    out += "\nNothing measures wrong: no overlaps, nothing off the page, every shape labelled.\n";
-  }
-  if (!effects.visionChat || doc.elements.length === 0) {
-    return ok(out);
-  }
-
-  // The pixels are this room's own drawing, so the door that governs them is
-  // the one that governs its documents. A cloud model gets the text — which
-  // passes the redaction door like any other tool result — and is told
-  // plainly that it is not being shown the picture, rather than being handed
-  // an image the door will strip and then asked to describe it.
-  const localChat = model === null || runsOnThisMac(model);
-  if (!localChat && activePolicy() !== null) {
-    out +=
-      "\n(Not showing you the picture: this room's privacy door keeps images on this Mac. " +
-      "The measurements above describe the same drawing.)";
-    return ok(out);
-  }
-
-  try {
-    const png = await toPng(doc);
-    effects.pendingImages.push(png.toString("base64"));
-    out += "\nThe drawing is attached as a picture — look at it before you change anything.";
-  } catch (e) {
-    // A rendering failure must not lose the report, which is the greater half
-    // of the answer and is already built.
-    out += `\n(The picture could not be drawn: ${errMessage(e)})`;
-  }
-  return ok(out);
+  return readDrawingResult(doc, real, model, effects);
 }
 
 export async function execReadDrawingInRoom(
@@ -720,27 +434,7 @@ export async function execReadDrawingInRoom(
   } catch (e) {
     return fail(errMessage(e));
   }
-
-  let out = describe(doc, real);
-  if (doc.elements.length > 0 && layoutReport(doc).length === 0) {
-    out += "\nNothing measures wrong: no overlaps, nothing off the page, every shape labelled.\n";
-  }
-  if (!effects.visionChat || doc.elements.length === 0) return ok(out);
-  const localChat = model === null || runsOnThisMac(model);
-  if (!localChat && activePolicy() !== null) {
-    out +=
-      "\n(Not showing you the picture: this room's privacy door keeps images on this Mac. " +
-      "The measurements above describe the same drawing.)";
-    return ok(out);
-  }
-  try {
-    const png = await toPng(doc);
-    effects.pendingImages.push(png.toString("base64"));
-    out += "\nThe drawing is attached as a picture — look at it before you change anything.";
-  } catch (e) {
-    out += `\n(The picture could not be drawn: ${errMessage(e)})`;
-  }
-  return ok(out);
+  return readDrawingResult(doc, real, model, effects);
 }
 
 /**
@@ -764,6 +458,38 @@ export async function execReadDrawingInRoom(
  * "fixed", because the editor and the agent must agree about what a failed
  * draw leaves behind.
  */
+function emitDrawingEvents(
+  emit: EmitFn | undefined,
+  id: string,
+  name: string,
+  outcome: ScriptOutcome,
+  doc: Sketch,
+): void {
+  emitSafely(emit, "agent-open-file", { id });
+  emitSafely(emit, "sketch-drawn", {
+    fileId: id,
+    name,
+    added: outcome.added,
+    changed: outcome.changed,
+    removed: outcome.removed,
+    steps: outcome.steps,
+    doc: sketchToJson(doc),
+  });
+  emitSafely(emit, "room-files-changed", undefined);
+}
+
+function drawResultText(created: boolean, name: string, outcome: ScriptOutcome, doc: Sketch): string {
+  const opened = created ? `Started "${name}" and ` : "";
+  let message = `${opened}${scriptOutcomeSummary(outcome)} on "${name}". The page now holds ${doc.elements.length} thing(s).`;
+  const notes = layoutReport(doc);
+  if (notes.length > 0) {
+    message += "\n\nWorth fixing:\n";
+    for (const note of notes.slice(0, 8)) message += `- ${note}\n`;
+    message += DRAW_FOLLOWUP;
+  }
+  return message;
+}
+
 export function execDraw(db: Database.Database, args: Record<string, unknown>, emit?: EmitFn): SketchToolOutcome {
   const name = rustTrim(asString(args.name));
   const script = asString(args.script);
@@ -790,30 +516,8 @@ export function execDraw(db: Database.Database, args: Record<string, unknown>, e
   } catch (e) {
     return fail(errMessage(e));
   }
-
-  emitSafely(emit, "agent-open-file", { id });
-  emitSafely(emit, "sketch-drawn", {
-    fileId: id,
-    name: real,
-    added: outcome.added,
-    changed: outcome.changed,
-    removed: outcome.removed,
-    steps: outcome.steps,
-    doc: sketchToJson(doc),
-  });
-  emitSafely(emit, "room-files-changed", undefined);
-
-  const opened = created ? `Started "${real}" and ` : "";
-  let msg = `${opened}${scriptOutcomeSummary(outcome)} on "${real}". The page now holds ${doc.elements.length} thing(s).`;
-  const notes = layoutReport(doc);
-  if (notes.length > 0) {
-    msg += "\n\nWorth fixing:\n";
-    for (const n of notes.slice(0, 8)) {
-      msg += `- ${n}\n`;
-    }
-    msg += DRAW_FOLLOWUP;
-  }
-  return ok(msg);
+  emitDrawingEvents(emit, id, real, outcome, doc);
+  return ok(drawResultText(created, real, outcome, doc));
 }
 
 export async function execDrawInRoom(
@@ -850,26 +554,6 @@ export async function execDrawInRoom(
   } catch (e) {
     return fail(errMessage(e));
   }
-
-  emitSafely(emit, "agent-open-file", { id });
-  emitSafely(emit, "sketch-drawn", {
-    fileId: id,
-    name: real,
-    added: outcome.added,
-    changed: outcome.changed,
-    removed: outcome.removed,
-    steps: outcome.steps,
-    doc: sketchToJson(doc),
-  });
-  emitSafely(emit, "room-files-changed", undefined);
-
-  const opened = created ? `Started "${real}" and ` : "";
-  let msg = `${opened}${scriptOutcomeSummary(outcome)} on "${real}". The page now holds ${doc.elements.length} thing(s).`;
-  const notes = layoutReport(doc);
-  if (notes.length > 0) {
-    msg += "\n\nWorth fixing:\n";
-    for (const note of notes.slice(0, 8)) msg += `- ${note}\n`;
-    msg += DRAW_FOLLOWUP;
-  }
-  return ok(msg);
+  emitDrawingEvents(emit, id, real, outcome, doc);
+  return ok(drawResultText(created, real, outcome, doc));
 }

@@ -86,6 +86,14 @@ describe("putWebSearch / getFreshWebSearch", () => {
 });
 
 describe("pruneWebCache", () => {
+  it("absorbs a failed best-effort sweep without undoing the write", () => {
+    const db = freshRoom();
+    db.prepare("DROP TABLE web_images").run();
+    expect(() => saveWebPage(db, "https://page.example/", "Page", "text")).not.toThrow();
+    expect(getFreshWebPage(db, "https://page.example/")?.text).toBe("text");
+    db.close();
+  });
+
   it("sweeps stale rows on the next write, keeping the fresh one", () => {
     const db = freshRoom();
     saveWebPage(db, "https://old.example/", "Old", "old text");

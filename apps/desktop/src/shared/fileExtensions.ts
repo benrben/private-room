@@ -32,6 +32,27 @@ const SPECIAL_TEXT_EXTENSION_SET: ReadonlySet<string> = new Set([
   "txt", "md", "markdown", "json", "csv", "tsv", "log",
 ]);
 
+const EARLY_FILE_LABELS: ReadonlyMap<string, string> = new Map([
+  ["pdf", "PDF"], ["ai", "PDF"],
+  ["md", "note"], ["markdown", "note"],
+  ["csv", "sheet"], ["tsv", "sheet"], ["xlsx", "sheet"], ["xls", "sheet"], ["ods", "sheet"],
+  ["json", "data"], ["jsonl", "data"], ["ndjson", "data"],
+]);
+
+const LATE_FILE_LABELS: ReadonlyMap<string, string> = new Map([
+  ["docx", "document"], ["doc", "document"],
+  ["html", "HTML"], ["htm", "HTML"],
+  ["pptx", "presentation"], ["ppt", "presentation"], ["odp", "presentation"],
+  ["epub", "book"], ["mobi", "book"], ["azw", "book"], ["azw3", "book"], ["fb2", "book"], ["cbz", "book"],
+  ["zip", "archive"], ["7z", "archive"], ["rar", "archive"], ["tar", "archive"], ["gz", "archive"],
+  ["ipynb", "notebook"],
+  ["eml", "message"], ["msg", "message"],
+  ["srt", "subtitles"], ["vtt", "subtitles"],
+  ["svg", "drawing"],
+  ["log", "log"],
+  ["txt", "text"], ["org", "text"], ["rst", "text"],
+]);
+
 export function isTextExtension(extension: string): boolean {
   return TEXT_EXTENSION_SET.has(extension.toLowerCase());
 }
@@ -49,22 +70,9 @@ export function isCodeTextExtension(extension: string): boolean {
 /** Human Library-row label for an extension, after MIME-level media checks. */
 export function fileExtensionLabel(extension: string): string | null {
   const ext = extension.toLowerCase();
-  if (["pdf", "ai"].includes(ext)) return "PDF";
-  if (["md", "markdown"].includes(ext)) return "note";
-  if (["csv", "tsv", "xlsx", "xls", "ods"].includes(ext)) return "sheet";
-  if (["json", "jsonl", "ndjson"].includes(ext)) return "data";
+  const early = EARLY_FILE_LABELS.get(ext);
+  if (early !== undefined) return early;
   if (isScriptExtension(ext)) return "script";
   if (isCodeTextExtension(ext)) return "code";
-  if (["docx", "doc"].includes(ext)) return "document";
-  if (["html", "htm"].includes(ext)) return "HTML";
-  if (["pptx", "ppt", "odp"].includes(ext)) return "presentation";
-  if (["epub", "mobi", "azw", "azw3", "fb2", "cbz"].includes(ext)) return "book";
-  if (["zip", "7z", "rar", "tar", "gz"].includes(ext)) return "archive";
-  if (ext === "ipynb") return "notebook";
-  if (["eml", "msg"].includes(ext)) return "message";
-  if (["srt", "vtt"].includes(ext)) return "subtitles";
-  if (ext === "svg") return "drawing";
-  if (ext === "log") return "log";
-  if (["txt", "org", "rst"].includes(ext)) return "text";
-  return null;
+  return LATE_FILE_LABELS.get(ext) ?? null;
 }

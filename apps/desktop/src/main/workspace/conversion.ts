@@ -19,13 +19,22 @@ import { vacuum } from "../db-host/rekey.js";
 import { sha256File } from "./hash.js";
 import { scanWorkspaceManifest } from "./manifest.js";
 import {
+  PHASE_META,
+  conversionTempRoot,
+  loadReport,
+  planPaths,
+  type ConversionRename,
+  type ConversionSkipped,
+  type PersistedReport,
+} from "./conversionPlan.js";
+import {
   DATABASE_FILE,
   MARKER_FILE,
   OBJECTS_DIR,
   TEMP_DIR,
   WORKSPACE_FORMAT_VERSION,
 } from "./roomLayout.js";
-import { pathKey, PRIVATE_DIR } from "./pathSafety.js";
+import { PRIVATE_DIR } from "./pathSafety.js";
 import {
   WorkspaceOperationReporter,
   type WorkspaceOperationProgressOptions,
@@ -33,22 +42,10 @@ import {
 import type { WorkspaceMarker } from "./types.js";
 
 const SOURCE_HASH_META = "workspace_conversion_source_sha256";
-const PHASE_META = "workspace_conversion_phase";
-const REPORT_META = "workspace_conversion_report";
 const ROOM_ID_META = "workspace_room_id";
 const CHUNK_BYTES = 1024 * 1024;
 
-export interface ConversionRename {
-  fileId: string;
-  originalPath: string;
-  convertedPath: string;
-}
-
-export interface ConversionSkipped {
-  fileId: string;
-  name: string;
-  reason: string;
-}
+export type { ConversionRename, ConversionSkipped } from "./conversionPlan.js";
 
 export interface WorkspaceConversionReport {
   sourcePath: string;
@@ -65,108 +62,11 @@ export interface WorkspaceConversionHooks extends WorkspaceOperationProgressOpti
   afterFile?: (fileId: string) => void | Promise<void>;
 }
 
-interface PlannedRow {
+interface WorkspaceCopyRow {
   id: string;
-  name: string;
-  missing_bytes: number;
-  folder_id: string | null;
-}
-
-interface PersistedReport {
-  renamed: ConversionRename[];
-  skipped: ConversionSkipped[];
-}
-
-function conversionTempRoot(destinationPath: string): string {
-  const resolved = path.resolve(destinationPath);
-  return path.join(path.dirname(resolved), `.${path.basename(resolved)}.arcelle-conversion.tmp`);
-}
-
-function safeComponent(raw: string, fallback: string): string {
-  let value = raw.normalize("NFC")
-    .replace(/[\u0000-\u001f<>:"/\\|?*]/g, "_")
-    .replace(/[. ]+$/g, "")
-    .trim();
-  if (value === "" || value === "." || value === "..") value = fallback;
-  if (value.toLocaleLowerCase("en-US") === PRIVATE_DIR) value = `${value}_files`;
-  value = [...value].slice(0, 180).join("").replace(/[. ]+$/g, "");
-  return value === "" ? fallback : value;
-}
-
-function availableRelativePath(desired: string, used: Set<string>): string {
-  const extension = path.posix.extname(desired);
-  const stem = desired.slice(0, desired.length - extension.length);
-  for (let number = 1; number <= 10_000; number += 1) {
-    const candidate = number === 1 ? desired : `${stem} (${number})${extension}`;
-    const key = pathKey(candidate);
-    if (!used.has(key)) {
-      used.add(key);
-      return candidate;
-    }
-  }
-  throw new Error(`Could not create a unique workspace path for ${desired}.`);
-}
-
-function loadReport(db: Database.Database): PersistedReport {
-  const raw = getMeta(db, REPORT_META);
-  if (raw === null) return { renamed: [], skipped: [] };
-  try {
-    const parsed = JSON.parse(raw) as PersistedReport;
-    return {
-      renamed: Array.isArray(parsed.renamed) ? parsed.renamed : [],
-      skipped: Array.isArray(parsed.skipped) ? parsed.skipped : [],
-    };
-  } catch {
-    throw new Error("The saved workspace conversion report is damaged.");
-  }
-}
-
-function persistReport(db: Database.Database, report: PersistedReport): void {
-  setMeta(db, REPORT_META, JSON.stringify(report));
-}
-
-function planPaths(db: Database.Database): PersistedReport {
-  const folderRows = db.prepare("SELECT id, name FROM folders ORDER BY rowid")
-    .all() as Array<{ id: string; name: string }>;
-  const usedFolders = new Set<string>();
-  const folders = new Map<string, { original: string; converted: string }>();
-  for (const folder of folderRows) {
-    const safe = availableRelativePath(safeComponent(folder.name, "Folder"), usedFolders);
-    folders.set(folder.id, { original: folder.name, converted: safe });
-    db.prepare("UPDATE folders SET name = ? WHERE id = ?").run(safe, folder.id);
-  }
-
-  const rows = db.prepare(
-    `SELECT id, name, original_bytes IS NULL AS missing_bytes, folder_id FROM files
-     WHERE trashed_at IS NULL ORDER BY rowid`,
-  ).all() as PlannedRow[];
-  const usedPaths = new Set<string>();
-  const report: PersistedReport = { renamed: [], skipped: [] };
-  const update = db.prepare(
-    "UPDATE files SET name = ?, relative_path = ?, path_key = ? WHERE id = ?",
-  );
-  for (const row of rows) {
-    if (row.missing_bytes === 1) {
-      report.skipped.push({
-        fileId: row.id,
-        name: row.name,
-        reason: "This legacy row has no current file bytes.",
-      });
-      continue;
-    }
-    const fileName = safeComponent(row.name, `File-${row.id.slice(0, 8)}`);
-    const folder = row.folder_id === null ? null : folders.get(row.folder_id) ?? null;
-    const originalPath = folder === null ? row.name : `${folder.original}/${row.name}`;
-    const desired = folder === null ? fileName : `${folder.converted}/${fileName}`;
-    const convertedPath = availableRelativePath(desired, usedPaths);
-    update.run(path.posix.basename(convertedPath), convertedPath, pathKey(convertedPath), row.id);
-    if (convertedPath !== originalPath) {
-      report.renamed.push({ fileId: row.id, originalPath, convertedPath });
-    }
-  }
-  persistReport(db, report);
-  setMeta(db, PHASE_META, "planned");
-  return report;
+  path_key: string;
+  content_sha256: string;
+  size_bytes: number;
 }
 
 async function syncDirectory(directory: string): Promise<void> {
@@ -261,27 +161,231 @@ async function exportPendingFiles(
   return converted;
 }
 
-async function validateWorkspaceCopy(db: Database.Database, tempRoot: string): Promise<number> {
-  const rows = db.prepare(
+function workspaceCopyRows(db: Database.Database): WorkspaceCopyRow[] {
+  return db.prepare(
     `SELECT id, path_key, content_sha256, size_bytes FROM files
      WHERE trashed_at IS NULL AND storage_kind = 'workspace'`,
-  ).all() as Array<{ id: string; path_key: string; content_sha256: string; size_bytes: number }>;
-  const manifest = await scanWorkspaceManifest(tempRoot);
-  if (manifest.size !== rows.length) {
-    throw new Error(`Conversion validation found ${manifest.size} files but expected ${rows.length}.`);
+  ).all() as WorkspaceCopyRow[];
+}
+
+function validateManifestCount(manifestSize: number, expected: number): void {
+  if (manifestSize !== expected) {
+    throw new Error(`Conversion validation found ${manifestSize} files but expected ${expected}.`);
   }
+}
+
+function validateManifestRow(
+  manifest: ReadonlyMap<string, { sha256: string; sizeBytes: number }>,
+  row: WorkspaceCopyRow,
+): void {
+  const file = manifest.get(row.path_key);
+  if (file === undefined || file.sha256 !== row.content_sha256 || file.sizeBytes !== row.size_bytes) {
+    throw new Error(`Conversion validation failed for file ${row.id}.`);
+  }
+}
+
+function validateManifestRows(
+  manifest: ReadonlyMap<string, { sha256: string; sizeBytes: number }>,
+  rows: readonly WorkspaceCopyRow[],
+): void {
   for (const row of rows) {
-    const file = manifest.get(row.path_key);
-    if (file === undefined || file.sha256 !== row.content_sha256 || file.sizeBytes !== row.size_bytes) {
-      throw new Error(`Conversion validation failed for file ${row.id}.`);
-    }
+    validateManifestRow(manifest, row);
   }
+}
+
+function remainingLiveBlobCount(db: Database.Database): number {
   const remaining = db.prepare(
     `SELECT count(*) AS count FROM files
      WHERE trashed_at IS NULL AND original_bytes IS NOT NULL`,
   ).get() as { count: number };
-  if (remaining.count !== 0) throw new Error("Conversion validation found live file bytes still stored in SQLCipher.");
+  return remaining.count;
+}
+
+function validateNoLiveBlobs(db: Database.Database): void {
+  if (remainingLiveBlobCount(db) !== 0) {
+    throw new Error("Conversion validation found live file bytes still stored in SQLCipher.");
+  }
+}
+
+async function validateWorkspaceCopy(db: Database.Database, tempRoot: string): Promise<number> {
+  const rows = workspaceCopyRows(db);
+  const manifest = await scanWorkspaceManifest(tempRoot);
+  validateManifestCount(manifest.size, rows.length);
+  validateManifestRows(manifest, rows);
+  validateNoLiveBlobs(db);
   return rows.length;
+}
+
+interface ConversionPaths {
+  source: string;
+  destination: string;
+  tempRoot: string;
+  privateRoot: string;
+  dbPath: string;
+  resumed: boolean;
+}
+
+interface ConversionPhaseResult {
+  report: PersistedReport;
+  convertedFiles: number;
+}
+
+function validateConversionDestination(source: string, destination: string): void {
+  if (source === destination) {
+    throw new Error("Choose a different destination folder for the workspace.");
+  }
+  if (existsSync(destination)) {
+    throw new Error("A file or folder already exists at the destination.");
+  }
+}
+
+function verifyLegacySource(source: string, password: string): void {
+  const verified = openRoomReadonly(source, password);
+  try {
+    const sealed = verified.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sealed_package_meta'",
+    ).get();
+    if (sealed !== undefined) {
+      throw new Error("This is a sealed backup. Use sealed import instead of legacy conversion.");
+    }
+  } finally {
+    verified.close();
+  }
+}
+
+function conversionPaths(source: string, destination: string): ConversionPaths {
+  const tempRoot = conversionTempRoot(destination);
+  const privateRoot = path.join(tempRoot, PRIVATE_DIR);
+  return {
+    source,
+    destination,
+    tempRoot,
+    privateRoot,
+    dbPath: path.join(privateRoot, DATABASE_FILE),
+    resumed: existsSync(tempRoot),
+  };
+}
+
+async function prepareConversionRoot(paths: ConversionPaths): Promise<void> {
+  if (!paths.resumed) {
+    await mkdir(path.join(paths.privateRoot, OBJECTS_DIR), { recursive: true, mode: 0o700 });
+    await mkdir(path.join(paths.privateRoot, TEMP_DIR), { recursive: true, mode: 0o700 });
+    await copyFile(paths.source, paths.dbPath);
+  }
+  // copyFile preserves the legacy database's mode. Older rooms may be 0644,
+  // and a resumable conversion may already contain such a copied database.
+  // Repair it before opening any private state and before the workspace can
+  // ever be published.
+  await chmod(paths.dbPath, 0o600);
+}
+
+function validateRecordedSourceHash(db: Database.Database, sourceHash: string): void {
+  const recordedSourceHash = getMeta(db, SOURCE_HASH_META);
+  if (recordedSourceHash !== null && recordedSourceHash !== sourceHash) {
+    throw new Error("The legacy source changed after this conversion started. Remove the temporary conversion and try again.");
+  }
+  if (recordedSourceHash === null) {
+    setMeta(db, SOURCE_HASH_META, sourceHash);
+  }
+}
+
+function ensureWorkspaceRoomMetadata(
+  db: Database.Database,
+  existingRoomId: string | null,
+  destination: string,
+): string {
+  if (existingRoomId !== null) {
+    return existingRoomId;
+  }
+  const roomId = randomUUID();
+  setMeta(db, ROOM_ID_META, roomId);
+  setMeta(db, "room_kind", "workspace-folder");
+  setMeta(db, "workspace_format_version", String(WORKSPACE_FORMAT_VERSION));
+  setMeta(db, "name", path.basename(destination));
+  return roomId;
+}
+
+function planConversionPaths(
+  db: Database.Database,
+  progress: WorkspaceOperationReporter,
+): PersistedReport {
+  let report = loadReport(db);
+  progress.emit("planning", getMeta(db, PHASE_META) === null ? 0 : 1, 1);
+  if (getMeta(db, PHASE_META) === null) {
+    report = planPaths(db);
+  }
+  progress.emit("planning", 1, 1);
+  return report;
+}
+
+async function runConversionPhases(
+  db: Database.Database,
+  tempRoot: string,
+  hooks: WorkspaceConversionHooks,
+  progress: WorkspaceOperationReporter,
+): Promise<ConversionPhaseResult> {
+  const report = planConversionPaths(db, progress);
+  setMeta(db, PHASE_META, "exporting");
+  await exportPendingFiles(db, tempRoot, hooks, progress);
+  progress.emit("validating", 0, 1);
+  const convertedFiles = await validateWorkspaceCopy(db, tempRoot);
+  progress.emit("validating", 1, 1);
+  setMeta(db, PHASE_META, "validated");
+  vacuum(db);
+  setMeta(db, PHASE_META, "complete");
+  return { report, convertedFiles };
+}
+
+async function writeWorkspaceMarker(privateRoot: string, roomId: string): Promise<void> {
+  const marker: WorkspaceMarker = {
+    format: "arcelle-workspace",
+    formatVersion: WORKSPACE_FORMAT_VERSION,
+    roomId,
+  };
+  const markerPath = path.join(privateRoot, MARKER_FILE);
+  await writeFile(markerPath, `${JSON.stringify(marker, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+    flag: existsSync(markerPath) ? "w" : "wx",
+  });
+}
+
+async function publishConvertedWorkspace(
+  paths: ConversionPaths,
+  sourceHash: string,
+  progress: WorkspaceOperationReporter,
+): Promise<void> {
+  if (await sha256File(paths.source) !== sourceHash) {
+    throw new Error("The legacy source changed during conversion. The workspace was not published.");
+  }
+  progress.emit("publishing", 0, 1);
+  await rename(paths.tempRoot, paths.destination);
+  await syncDirectory(path.dirname(paths.destination));
+  progress.emit("publishing", 1, 1);
+}
+
+function closeAfterFailedConversion(db: Database.Database): void {
+  try {
+    db.close();
+  } catch {
+    // Keep the resumable temp workspace even if the failed DB close is noisy.
+  }
+}
+
+function conversionReport(
+  paths: ConversionPaths,
+  roomId: string,
+  phases: ConversionPhaseResult,
+): WorkspaceConversionReport {
+  return {
+    sourcePath: paths.source,
+    destinationPath: paths.destination,
+    roomId,
+    convertedFiles: phases.convertedFiles,
+    renamed: phases.report.renamed,
+    skipped: phases.report.skipped,
+    resumed: paths.resumed,
+  };
 }
 
 /**
@@ -298,95 +402,25 @@ async function convertLegacyRoomToWorkspaceCore(
   progress.emit("scanning", 0, null);
   const source = path.resolve(sourcePath);
   const destination = path.resolve(destinationPath);
-  if (source === destination) throw new Error("Choose a different destination folder for the workspace.");
-  if (existsSync(destination)) throw new Error("A file or folder already exists at the destination.");
-  const verified = openRoomReadonly(source, password);
-  try {
-    const sealed = verified.prepare(
-      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sealed_package_meta'",
-    ).get();
-    if (sealed !== undefined) {
-      throw new Error("This is a sealed backup. Use sealed import instead of legacy conversion.");
-    }
-  } finally {
-    verified.close();
-  }
+  validateConversionDestination(source, destination);
+  verifyLegacySource(source, password);
   const sourceHash = await sha256File(source);
-  const tempRoot = conversionTempRoot(destination);
-  const privateRoot = path.join(tempRoot, PRIVATE_DIR);
-  const dbPath = path.join(privateRoot, DATABASE_FILE);
-  const resumed = existsSync(tempRoot);
+  const paths = conversionPaths(source, destination);
+  await prepareConversionRoot(paths);
 
-  if (!resumed) {
-    await mkdir(path.join(privateRoot, OBJECTS_DIR), { recursive: true, mode: 0o700 });
-    await mkdir(path.join(privateRoot, TEMP_DIR), { recursive: true, mode: 0o700 });
-    await copyFile(source, dbPath);
-  }
-  // copyFile preserves the legacy database's mode. Older rooms may be 0644,
-  // and a resumable conversion may already contain such a copied database.
-  // Repair it before opening any private state and before the workspace can
-  // ever be published.
-  await chmod(dbPath, 0o600);
-
-  const db = openRoom(dbPath, password);
-  let roomId = getMeta(db, ROOM_ID_META);
+  const db = openRoom(paths.dbPath, password);
+  const existingRoomId = getMeta(db, ROOM_ID_META);
   try {
     migrate(db);
-    const recordedSourceHash = getMeta(db, SOURCE_HASH_META);
-    if (recordedSourceHash !== null && recordedSourceHash !== sourceHash) {
-      throw new Error("The legacy source changed after this conversion started. Remove the temporary conversion and try again.");
-    }
-    if (recordedSourceHash === null) setMeta(db, SOURCE_HASH_META, sourceHash);
-    if (roomId === null) {
-      roomId = randomUUID();
-      setMeta(db, ROOM_ID_META, roomId);
-      setMeta(db, "room_kind", "workspace-folder");
-      setMeta(db, "workspace_format_version", String(WORKSPACE_FORMAT_VERSION));
-      setMeta(db, "name", path.basename(destination));
-    }
-
-    let report = loadReport(db);
-    progress.emit("planning", getMeta(db, PHASE_META) === null ? 0 : 1, 1);
-    if (getMeta(db, PHASE_META) === null) report = planPaths(db);
-    progress.emit("planning", 1, 1);
-    setMeta(db, PHASE_META, "exporting");
-    await exportPendingFiles(db, tempRoot, hooks, progress);
-    progress.emit("validating", 0, 1);
-    const convertedFiles = await validateWorkspaceCopy(db, tempRoot);
-    progress.emit("validating", 1, 1);
-    setMeta(db, PHASE_META, "validated");
-    vacuum(db);
-    setMeta(db, PHASE_META, "complete");
-
-    const marker: WorkspaceMarker = {
-      format: "arcelle-workspace",
-      formatVersion: WORKSPACE_FORMAT_VERSION,
-      roomId: roomId!,
-    };
-    await writeFile(path.join(privateRoot, MARKER_FILE), `${JSON.stringify(marker, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-      flag: existsSync(path.join(privateRoot, MARKER_FILE)) ? "w" : "wx",
-    });
+    validateRecordedSourceHash(db, sourceHash);
+    const roomId = ensureWorkspaceRoomMetadata(db, existingRoomId, paths.destination);
+    const phases = await runConversionPhases(db, paths.tempRoot, hooks, progress);
+    await writeWorkspaceMarker(paths.privateRoot, roomId);
     db.close();
-    if (await sha256File(source) !== sourceHash) {
-      throw new Error("The legacy source changed during conversion. The workspace was not published.");
-    }
-    progress.emit("publishing", 0, 1);
-    await rename(tempRoot, destination);
-    await syncDirectory(path.dirname(destination));
-    progress.emit("publishing", 1, 1);
-    return {
-      sourcePath: source,
-      destinationPath: destination,
-      roomId: roomId!,
-      convertedFiles,
-      renamed: report.renamed,
-      skipped: report.skipped,
-      resumed,
-    };
+    await publishConvertedWorkspace(paths, sourceHash, progress);
+    return conversionReport(paths, roomId, phases);
   } catch (error) {
-    try { db.close(); } catch { /* keep the resumable temp workspace */ }
+    closeAfterFailedConversion(db);
     throw error;
   }
 }
@@ -423,8 +457,5 @@ export async function convertLegacyRoomToWorkspace(
 export async function discardWorkspaceConversion(destinationPath: string): Promise<void> {
   const destination = path.resolve(destinationPath);
   const tempRoot = conversionTempRoot(destination);
-  if (path.dirname(tempRoot) !== path.dirname(destination)) {
-    throw new Error("The conversion temporary path is invalid.");
-  }
   await rm(tempRoot, { recursive: true, force: true });
 }

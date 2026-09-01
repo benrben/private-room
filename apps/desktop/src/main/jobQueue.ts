@@ -205,7 +205,7 @@ export function notImplementedRowStarter(kind: string): RowStarter {
 }
 
 /** Read a string field off a stored plan blob, or `null` if it isn't one. */
-function planString(plan: unknown, key: string): string | null {
+export function planString(plan: unknown, key: string): string | null {
   if (typeof plan !== "object" || plan === null || Array.isArray(plan)) {
     return null;
   }
@@ -297,53 +297,89 @@ type Started =
 /** The single dispatcher: read a job row, resolve its {@link RowStarter}, and
  * start it. Ported from `start_job_from_row`. */
 async function startJobFromRow(deps: JobQueueDeps, jobId: string): Promise<Started> {
-  const room = deps.rooms.current();
-  if (room === null) {
-    // The row itself is unreadable (there is no room to read it from), so it
-    // cannot be marked 'error' either — re-picking it would loop, so stop.
-    freeSlot(deps.state, jobId);
-    return "stuck";
-  }
-  let job: Job;
-  try {
-    job = getJob(room.db, jobId);
-  } catch {
-    freeSlot(deps.state, jobId);
-    return "stuck";
-  }
-  const roomPath = room.path;
-
+  const row = queuedJobRow(deps, jobId);
+  if (row === null) return stuckStart(deps, jobId);
   const cancel = new CancelFlag();
   deps.cancelState.jobCancels.set(jobId, cancel);
+  const starter = rowStarterFor(deps, row.job.kind);
+  const result = await protectedRowStart(starter, deps, row.job, row.roomPath, cancel);
+  return startedRowOutcome(deps, jobId, result);
+}
 
-  const starter =
-    deps.starters.get(job.kind) ??
-    (KNOWN_JOB_KINDS.has(job.kind)
-      ? notImplementedRowStarter(job.kind)
-      : async (): Promise<RowStartResult> => ({ kind: "error", message: UNKNOWN_JOB_KIND }));
+interface QueuedJobRow {
+  readonly job: Job;
+  readonly roomPath: string;
+}
 
-  let result: RowStartResult;
+function queuedJobRow(deps: JobQueueDeps, jobId: string): QueuedJobRow | null {
+  const room = deps.rooms.current();
+  if (room === null) return null;
   try {
-    result = await starter(deps, job, roomPath, cancel);
+    return { job: getJob(room.db, jobId), roomPath: room.path };
+  } catch {
+    return null;
+  }
+}
+
+function stuckStart(deps: JobQueueDeps, jobId: string): Started {
+  // The row itself is unreadable (there is no room to read it from), so it
+  // cannot be marked 'error' either — re-picking it would loop, so stop.
+  freeSlot(deps.state, jobId);
+  return "stuck";
+}
+
+function rowStarterFor(deps: JobQueueDeps, kind: string): RowStarter {
+  return deps.starters.get(kind) ?? unregisteredRowStarter(kind);
+}
+
+function unregisteredRowStarter(kind: string): RowStarter {
+  return KNOWN_JOB_KINDS.has(kind) ? notImplementedRowStarter(kind) : unknownRowStarter();
+}
+
+function unknownRowStarter(): RowStarter {
+  return async (): Promise<RowStartResult> => ({ kind: "error", message: UNKNOWN_JOB_KIND });
+}
+
+async function protectedRowStart(
+  starter: RowStarter,
+  deps: JobQueueDeps,
+  job: Job,
+  roomPath: string,
+  cancel: CancelFlag,
+): Promise<RowStartResult> {
+  try {
+    return await starter(deps, job, roomPath, cancel);
   } catch (err) {
     // A starter that throws is a poisoned row, not a broken queue: letting the
     // rejection escape would reject `pump` (usually called unawaited from a
     // runner's epilogue) and leave the slot reserved for the rest of the
     // session, wedging every later job. Rust cannot reach this state — its
     // starters return `Result` — so this is the port's equivalent guarantee.
-    result = { kind: "error", message: err instanceof Error ? err.message : String(err) };
+    return { kind: "error", message: err instanceof Error ? err.message : String(err) };
   }
+}
 
+async function startedRowOutcome(
+  deps: JobQueueDeps,
+  jobId: string,
+  result: RowStartResult,
+): Promise<Started> {
   if (result.kind === "runner") {
     return "runner";
   }
-  if (result.kind === "immediate") {
-    // Finished without a runner: drop the flag and free the slot so the pump
-    // continues.
-    deps.cancelState.jobCancels.delete(jobId);
-    freeSlot(deps.state, jobId);
-    return "continue";
-  }
+  if (result.kind === "immediate") return immediateRowOutcome(deps, jobId);
+  return poisonedRowOutcome(deps, jobId, result.message);
+}
+
+function immediateRowOutcome(deps: JobQueueDeps, jobId: string): Started {
+  // Finished without a runner: drop the flag and free the slot so the pump
+  // continues.
+  deps.cancelState.jobCancels.delete(jobId);
+  freeSlot(deps.state, jobId);
+  return "continue";
+}
+
+function poisonedRowOutcome(deps: JobQueueDeps, jobId: string, message: string): Started {
   // Poisoned row: mark it 'error' (the Sidebar shows Retry), drop the flag,
   // free the slot, and let the caller pump the next queued row. If the room
   // refused that write — or the room went away underneath us — the row is STILL
@@ -353,7 +389,7 @@ async function startJobFromRow(deps: JobQueueDeps, jobId: string): Promise<Start
   let marked = false;
   if (writeRoom !== null) {
     try {
-      setJobStatus(writeRoom.db, jobId, "error", result.message);
+      setJobStatus(writeRoom.db, jobId, "error", message);
       marked = true;
     } catch {
       marked = false;
@@ -405,22 +441,7 @@ export async function finishAndPump(deps: JobQueueDeps, jobId: string): Promise<
 export async function pump(deps: JobQueueDeps): Promise<void> {
   const picked = new Set<string>();
   for (;;) {
-    if (!slotFreeForThisRoom(deps.state, deps.rooms)) {
-      return; // slot busy — the running job's epilogue will pump next
-    }
-    const room = deps.rooms.current();
-    if (room === null) {
-      return;
-    }
-    let nextId: string | null;
-    try {
-      nextId = unfinishedJobs(room.db).find((j) => j.status === "queued")?.id ?? null;
-    } catch {
-      // A failed READ is not "nothing is waiting": treat it as a stop, never as
-      // an empty queue, so a transient DB error can't silently retire the queue
-      // for the rest of the session (the next finishAndPump retries).
-      return;
-    }
+    const nextId = nextQueuedId(deps);
     if (nextId === null || picked.has(nextId)) {
       return;
     }
@@ -431,6 +452,24 @@ export async function pump(deps: JobQueueDeps): Promise<void> {
     if ((await startJobFromRow(deps, nextId)) !== "continue") {
       return; // Runner: its epilogue pumps next. Stuck: don't spin on it.
     }
+  }
+}
+
+function nextQueuedId(deps: JobQueueDeps): string | null {
+  if (!slotFreeForThisRoom(deps.state, deps.rooms)) return null;
+  const room = deps.rooms.current();
+  if (room === null) return null;
+  return queuedJobId(room.db);
+}
+
+function queuedJobId(db: Database.Database): string | null {
+  try {
+    return unfinishedJobs(db).find((job) => job.status === "queued")?.id ?? null;
+  } catch {
+    // A failed READ is not "nothing is waiting": treat it as a stop, never as
+    // an empty queue, so a transient DB error can't silently retire the queue
+    // for the rest of the session (the next finishAndPump retries).
+    return null;
   }
 }
 

@@ -1,0 +1,374 @@
+
+/* A failed job's TITLE goes back to ordinary ink. The failure is stated by the
+   red "Failed" tape and by the reason underneath it; painting the title red as
+   well only made the one line naming the job the hardest line to read. */
+.pane-ai .activity-row.job.error .activity-row-title {
+  color: var(--text-strong);
+}
+
+/* ----- the record, below the fold -----
+   Decision #12: the live manager and the audit log are two places, and the
+   boundary has to be readable without reading a row. A dashed pencil rule is
+   the notebook's own mark for "the fold in a truncated list", and every entry
+   below it is indented behind a pencil spine. */
+.pane-ai .activity-history,
+.pane-ai .activity-organized {
+  margin-top: var(--sp-8);
+  padding-top: var(--sp-2);
+  border-top: 0;
+  background-image: repeating-linear-gradient(
+    to right,
+    var(--rule) 0 6px,
+    transparent 6px 11px
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+.pane-ai .activity-history .activity-group-title,
+.pane-ai .activity-organized .activity-group-title {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  margin-top: var(--sp-3);
+}
+/* In the flex heading the tick becomes a flex item, so the row's own gap
+   already spaces it and its inline margin would double up. */
+.pane-ai .activity-history .activity-group-title::before,
+.pane-ai .activity-organized .activity-group-title::before {
+  margin-inline-end: 0;
+}
+/* The "showing 25 of 30" aside — a count the list worked out, so the sans.
+   text-transform is cleared because the heading it sits inside is uppercase,
+   and a tally shouted in capitals reads as a heading of its own. */
+.pane-ai .activity-history-note {
+  color: var(--ink-2);
+  font-size: var(--fs-micro);
+  letter-spacing: 0;
+  text-transform: none;
+  opacity: 1;
+}
+.pane-ai .activity-row.history {
+  padding-left: var(--sp-3);
+  border-left: 0;
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--rule) 80%, transparent);
+}
+.pane-ai .activity-row.history .activity-row-title {
+  color: var(--text);
+  font-weight: 400;
+}
+
+/* D4: a collapsed same-day/same-name run group. The expanded runs sit in
+   their own indented well below the summary so "show runs" reads as opening
+   a drawer under the row it belongs to, not as starting a new list. Each run
+   inside keeps its normal `.activity-row.history` look — nothing about a
+   single run's own styling changes just because it's inside a group. */
+.pane-ai .activity-history-group-runs {
+  margin: var(--sp-2) 0 0 var(--sp-3);
+  padding-left: var(--sp-3);
+  border-left: 1px dashed color-mix(in srgb, var(--rule) 70%, transparent);
+  display: flex;
+  flex-direction: column;
+}
+.pane-ai .activity-history-group-runs .activity-row.history {
+  padding-left: 0;
+  box-shadow: none;
+}
+
+/* Native workspace agents use the Activity journal's existing visual
+   language. The launcher is an outlined work area; run results remain normal
+   journal rows so they do not become a second, provider-specific UI. */
+.pane-ai .harness-runner > .activity-group-title:first-child {
+  margin-top: var(--sp-4);
+}
+.pane-ai .harness-disclosure {
+  padding: var(--sp-2);
+  border-left: 2px solid var(--sem-pending);
+  color: var(--text);
+}
+.pane-ai .harness-compose {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.pane-ai .harness-options,
+.pane-ai .harness-actions {
+  display: flex;
+  align-items: end;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.pane-ai .harness-options > label:not(.harness-write-toggle) {
+  display: flex;
+  flex: 1 1 110px;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+}
+.pane-ai .harness-options select,
+.pane-ai .harness-options input,
+.pane-ai .harness-compose textarea {
+  width: 100%;
+  min-width: 0;
+}
+.pane-ai .harness-write-toggle {
+  flex: 1 0 100%;
+  margin: 0;
+}
+.pane-ai .harness-run {
+  margin-top: var(--sp-2);
+}
+.pane-ai .harness-output {
+  max-height: 240px;
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-2);
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  background: var(--hover);
+  border-radius: var(--radius-xs);
+  font: var(--fs-meta)/var(--lh-body) var(--mono);
+}
+.pane-ai .harness-approval,
+.pane-ai .harness-conflicts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--sem-pending);
+  border-radius: var(--radius);
+}
+.pane-ai .harness-approval span,
+.pane-ai .harness-conflicts p {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+.pane-ai .harness-changes {
+  margin-top: var(--sp-2);
+  color: var(--text);
+  font-size: var(--fs-meta);
+}
+.pane-ai .harness-changes summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.pane-ai .harness-changes ul {
+  margin: var(--sp-1) 0 0;
+  padding-left: var(--sp-5);
+}
+
+/* ----- nothing yet -----
+   The one place on this tab the hand takes a whole paragraph: an empty state
+   is a direction, and the direction is the notebook talking. */
+.pane-ai .activity-empty {
+  margin: var(--sp-8) var(--sp-2) 0;
+  padding-top: var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-2);
+  text-align: center;
+  color: var(--ink-muted);
+  background-image: repeating-linear-gradient(
+    to right,
+    var(--rule) 0 6px,
+    transparent 6px 11px
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+.pane-ai .activity-empty p {
+  margin: 0;
+  max-width: 30ch;
+  color: var(--ink-2);
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+}
+
+/* ==========================================================================
+   4. THE NARROW COLUMN
+   At the layout's floor the column is around 180px. Nothing here may overflow
+   it sideways: metadata sheds, rows stack, nothing scrolls horizontally.
+   ========================================================================== */
+
+@container (max-width: 300px) {
+  .pane-ai .studio-tab-view,
+  .pane-ai .activity-view {
+    padding-inline: var(--sp-2);
+  }
+  /* The card's state moves under its title rather than squeezing the title to
+     four characters. */
+  .pane-ai .studio-row {
+    grid-template-columns: 26px minmax(0, 1fr);
+    row-gap: var(--sp-1);
+    padding: var(--sp-2);
+  }
+  .pane-ai .studio-row-icon {
+    width: 26px;
+    height: 26px;
+  }
+  .pane-ai .studio-row-title {
+    font-size: var(--fs-body);
+  }
+  .pane-ai .studio-row-state {
+    grid-column: 2;
+    justify-self: start;
+  }
+  /* A title that cannot fit on one line wraps instead of ellipsing away. */
+  .pane-ai .activity-row-title {
+    white-space: normal;
+    overflow: visible;
+    overflow-wrap: anywhere;
+  }
+  .pane-ai .activity-row-foot {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+}
+
+/* ==========================================================================
+   5. MOTION
+   Everything above moves once, briefly, in response to a pointer. Switching
+   it off lands on the resting state, never on a half-drawn one.
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  .pane-ai .studio-row,
+  .pane-ai .activity-progress span {
+    transition: none;
+  }
+  .pane-ai .studio-row:hover:not(:disabled),
+  .pane-ai .studio-row:active:not(:disabled) {
+    transform: none;
+  }
+}
+
+/* ==========================================================================
+   6. PODCAST VOICES
+   The cast list for a generated podcast script: one card per host, a voice
+   each, and the two notices that must be read before the Record button.
+
+   The notices come FIRST in the source and first on screen, because both are
+   about what leaves this Mac and both are surprising after the fact. They
+   reuse the settings note idioms (.set-note / .nb-sem-*) rather than inventing
+   a panel-local warning style — one vocabulary for consequences, wherever the
+   user meets them.
+   ========================================================================== */
+
+.pane-ai .pod-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: 0 2px var(--sp-4);
+}
+.pane-ai .pod-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.pane-ai .pod-head h3 {
+  margin: 0;
+  font-size: var(--fs-body);
+  font-weight: 600;
+  color: var(--text-strong);
+  overflow-wrap: anywhere;
+}
+.pane-ai .pod-cast {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+/* One host, one card. A drawn frame rather than a fill: these are editable
+   fields, and a filled card reads as a status. */
+.pane-ai .pod-host {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius);
+  background-color: var(--hover);
+}
+.pane-ai .pod-host-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* The host's NAME is the join key between a line and a voice, so it is the
+   most important editable thing on the card and is set at reading size. */
+.pane-ai .pod-host-name {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-body);
+  font-weight: 600;
+  color: var(--text-strong);
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--line-soft);
+  padding: 2px 0;
+}
+.pane-ai .pod-host-name:focus {
+  outline: none;
+  border-bottom-color: var(--accent);
+}
+.pane-ai .pod-host-prosody {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.pane-ai .pod-host-prosody label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.pane-ai .pod-host-prosody select {
+  font-size: var(--fs-micro);
+  padding: 3px 5px;
+}
+.pane-ai .pod-actions,
+.pane-ai .pod-record {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+/* The record row sits above its own rule: it is the one irreversible-ish act
+   on this panel (minutes of work, and text leaving the Mac), so it is visually
+   separated from the editing above rather than being the next button along. */
+.pane-ai .pod-record {
+  padding-top: 10px;
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+/* A lease conflict is room-wide, so the notice sits under the toolbar rather
+   than inside one editor or one agent card. */
+.workspace-readonly-banner {
+  padding: 8px 16px;
+  border-bottom: 1px solid color-mix(in srgb, var(--amber, #9a6a18) 42%, transparent);
+  background: color-mix(in srgb, var(--amber, #9a6a18) 10%, var(--paper, #fff));
+  color: var(--ink, #222);
+  font-size: 12px;
+  line-height: 1.4;
+}

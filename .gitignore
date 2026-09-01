@@ -54,6 +54,12 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage*
+coverage/
+# Quality-loop state and rendered reports are local run artifacts. The reviewed
+# gate and dependency configuration under `.quality/` remains committed.
+.quality/quality-gate-report.html
+.quality/quality-gate-state.json
 # Local virtualenvs, if a dev creates one inside the repo tree.
 .venv/
 venv/
@@ -83,3 +89,7 @@ services/agent-sidecar/dist/
 
 # Build, visual-test, and local QA output has one repository-level home.
 .artifacts/
+
+# The unit-test prehook compiles runtime assets here for Vitest. Production
+# packaging compiles independently into dist_package.
+apps/desktop/dist_main/

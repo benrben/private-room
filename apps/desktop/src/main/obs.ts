@@ -132,9 +132,19 @@
  *   incrementally alongside those features.
  */
 
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
+export {
+  Sink,
+  debug,
+  filterFrom,
+  info,
+  init,
+  logDir,
+  logPath,
+  previousLogPath,
+  warn,
+  type FilterResult,
+  type LogLevel,
+} from "./obsSink.js";
 
 // --------------------------------------------------------------- constants
 
@@ -156,15 +166,6 @@ export const LOG_ENV = "ARCELLE_LOG";
  * sidecar's stderr mirror: the run that just died is usually the one worth
  * reading, and truncating on launch destroys it. */
 export const MAX_LOG_BYTES = 4 * 1024 * 1024;
-
-/** The one target every event in this module uses. One target, so the
- * filter below is the whole story. */
-const TARGET = "arcelle";
-
-/** The default filter. Quiet enough to ship: our own events at `info`, and
- * nothing at all from dependencies — the file has to stay readable by the
- * person attaching it to a bug report. */
-const DEFAULT_FILTER = "arcelle=info";
 
 /** The closed set of error kinds. Every one is a literal, which is what
  * makes {@link errKind} safe by construction. Exact list and order as the
@@ -224,30 +225,36 @@ class Val {
   }
 
   toString(): string {
-    const s = this.shape;
-    switch (s.kind) {
-      case "id":
-      case "model":
-      case "state":
-        return quoted(s.value);
-      case "count":
-      case "bytes":
-      case "ms":
-        return String(s.value);
-      case "flag":
-        return s.value ? "true" : "false";
-      case "ids":
-        // Entries were already shape-checked by `id()` (or replaced with
-        // UNLOGGABLE), so — matching the Rust Display impl exactly — they
-        // are never individually re-quoted here.
-        return `[${s.value.join(" ")}]`;
-      /* istanbul ignore next -- exhaustiveness guard, not a reachable branch */
-      default: {
-        const never: never = s;
-        return never;
-      }
-    }
+    return renderValue(this.shape);
   }
+}
+
+type QuotedShape = Extract<Shape, { readonly kind: "id" | "model" | "state" }>;
+type NumericShape = Extract<Shape, { readonly kind: "count" | "bytes" | "ms" }>;
+type IdListShape = Extract<Shape, { readonly kind: "ids" }>;
+
+function isQuotedShape(shape: Shape): shape is QuotedShape {
+  return shape.kind === "id" || shape.kind === "model" || shape.kind === "state";
+}
+
+function isNumericShape(shape: Shape): shape is NumericShape {
+  return shape.kind === "count" || shape.kind === "bytes" || shape.kind === "ms";
+}
+
+function renderIds(shape: IdListShape): string {
+  return `[${shape.value.join(" ")}]`;
+}
+
+function unreachableShape(shape: never): never {
+  return shape;
+}
+
+function renderValue(shape: Shape): string {
+  if (isQuotedShape(shape)) return quoted(shape.value);
+  if (isNumericShape(shape)) return String(shape.value);
+  if (shape.kind === "flag") return shape.value ? "true" : "false";
+  if (shape.kind === "ids") return renderIds(shape);
+  return unreachableShape(shape);
 }
 
 export type { Val };
@@ -346,17 +353,24 @@ function looksLikeAFilename(s: string): boolean {
   return ext.length >= 1 && ext.length <= 5 && /^[A-Za-z]+$/.test(ext);
 }
 
+function hasValidModelLength(s: string): boolean {
+  return s.length > 0 && s.length <= 96;
+}
+
+function startsLikeModelPath(s: string): boolean {
+  return s.startsWith("/") || s.startsWith(".") || s.startsWith("~");
+}
+
+function isSafeModel(s: string): boolean {
+  if (!hasValidModelLength(s)) return false;
+  if (startsLikeModelPath(s) || s.includes("..")) return false;
+  if (looksLikeAFilename(s)) return false;
+  if (looksLikeACredential(s)) return false;
+  return MODEL_RE.test(s);
+}
+
 function checkedModel(s: string): string {
-  const startsBad = s.startsWith("/") || s.startsWith(".") || s.startsWith("~");
-  const ok =
-    s.length > 0 &&
-    s.length <= 96 &&
-    !startsBad &&
-    !s.includes("..") &&
-    !looksLikeAFilename(s) &&
-    !looksLikeACredential(s) &&
-    MODEL_RE.test(s);
-  return ok ? s : UNLOGGABLE;
+  return isSafeModel(s) ? s : UNLOGGABLE;
 }
 
 /** A model or provider identifier (`qwen3.5:4b`, `anthropic/claude-opus-4`,
@@ -369,63 +383,15 @@ export function model(s: string): Val {
 
 // --------------------------------------------------------------------- state
 
-/**
- * Rejects the general `string` type, keeping only a string LITERAL type (or a
- * union of them) — TypeScript's closest approximation of Rust's
- * `&'static str`, which by construction can only be a literal baked into our
- * own source, never a value computed from a room. `string extends S` is true
- * only when `S` has been widened all the way to the base `string` type (i.e.
- * the argument was some runtime-computed value, not a literal expression or a
- * `const` binding TypeScript kept a literal type for), so the conditional
- * resolves to `never` in exactly that case — a compile error at the call
- * site, not a runtime check.
- *
- * This is a real, adversarially-found gap this file used to leave open: the
- * first version of `state()`/`oneOf()` took a plain `string`/`string[]` and
- * only said "we trust the caller" in a doc comment, which is a promise, not a
- * boundary — indistinguishable in practice from `Val::State(filename)`
- * compiling in the original Rust hole this module exists to close. This type
- * makes the boundary something a caller cannot spell, same standard the Rust
- * source holds itself to for `Val` — with one honest caveat: an explicit
- * `as string` (on a value already widened to `string`) still fails to
- * compile, but `as any` — TypeScript's universal type-system escape hatch —
- * defeats every check on every function in this file, not just this one, the
- * same way `unsafe` can defeat any Rust invariant. That is a property of the
- * language, not a hole specific to this function.
- */
-type Literal<S extends string> = string extends S ? never : S;
+/** Reject a widened runtime string while accepting literals and literal unions. */
+export type Literal<S extends string> = string extends S ? never : S;
 
-/** A compile-time literal: an enum name, an outcome, a phase.
- *
- * Rust's version of this takes a `&'static str`, which by construction can
- * only be a literal baked into our own source — never something that came
- * out of a room. {@link Literal} is TypeScript's closest equivalent: a
- * literal expression (`state("done")`), a literal union
- * (`state(cond ? "a" : "b")`), or a `const` binding TypeScript inferred a
- * literal type for (`state(SOME_CONST)`) all compile; a `string`-typed
- * variable computed at runtime does not. Use {@link oneOf} instead whenever
- * the value genuinely originates at runtime. */
+/** A compile-time enum name, outcome, or phase; use {@link oneOf} for runtime values. */
 export function state<S extends string>(s: Literal<S>): Val {
   return Val.make({ kind: "state", value: s as string });
 }
 
-/**
- * {@link Literal}, applied to every element of a whitelist array at once.
- *
- * Rust's `one_of` takes `allowed: &[&'static str]` — the whitelist itself
- * must be built from compile-time literals, so a caller cannot smuggle room
- * content through by constructing the "whitelist" at runtime to already
- * contain the value being checked (`one_of(secret, &[secret])` cannot even
- * compile there, because a value with `'static` lifetime cannot in practice
- * be produced from a room's contents). The first TypeScript version of
- * `oneOf` typed `allowed` as a plain `readonly string[]`, which enforced
- * nothing: `oneOf(secret, [secret])` compiled and returned `secret` itself,
- * verbatim, wrapped as a `state` `Val` — a complete bypass of the one helper
- * whose entire job is turning a runtime string into something safe. Requiring
- * every element to satisfy {@link Literal} closes that: a whitelist array has
- * to be written out of literals at the call site (as every whitelist in this
- * codebase already is), so it can never contain the very value under test.
- */
+/** Require every whitelist entry to remain a compile-time literal. */
 type LiteralArray<A extends readonly string[]> = string extends A[number] ? never : A;
 
 /** A RUNTIME string collapsed onto a caller-supplied whitelist.
@@ -500,23 +466,32 @@ function hasAny(haystack: string, needles: readonly string[]): boolean {
   return needles.some((n) => haystack.includes(n));
 }
 
-function classifyErrKind(s: string): string {
-  if (s.trim().length === 0) {
-    return "none";
+type ErrorRule = readonly [kind: string, needles: readonly string[]];
+
+const ERROR_RULES: readonly ErrorRule[] = [
+  ["timeout", ERRKIND_TIMEOUT],
+  ["cancelled", ERRKIND_CANCELLED],
+  ["rate_limited", ERRKIND_RATE_LIMITED],
+  ["denied", ERRKIND_DENIED],
+  ["no_credential", ERRKIND_NO_CREDENTIAL],
+  ["not_found", ERRKIND_NOT_FOUND],
+  ["network", ERRKIND_NETWORK],
+  ["upstream_error", ERRKIND_UPSTREAM],
+  ["out_of_memory", ERRKIND_OOM],
+  ["too_large", ERRKIND_TOO_LARGE],
+  ["malformed", ERRKIND_MALFORMED],
+];
+
+function firstErrorRule(message: string): string | null {
+  for (const [kind, needles] of ERROR_RULES) {
+    if (hasAny(message, needles)) return kind;
   }
-  const t = s.toLowerCase();
-  if (hasAny(t, ERRKIND_TIMEOUT)) return "timeout";
-  if (hasAny(t, ERRKIND_CANCELLED)) return "cancelled";
-  if (hasAny(t, ERRKIND_RATE_LIMITED)) return "rate_limited";
-  if (hasAny(t, ERRKIND_DENIED)) return "denied";
-  if (hasAny(t, ERRKIND_NO_CREDENTIAL)) return "no_credential";
-  if (hasAny(t, ERRKIND_NOT_FOUND)) return "not_found";
-  if (hasAny(t, ERRKIND_NETWORK)) return "network";
-  if (hasAny(t, ERRKIND_UPSTREAM)) return "upstream_error";
-  if (hasAny(t, ERRKIND_OOM)) return "out_of_memory";
-  if (hasAny(t, ERRKIND_TOO_LARGE)) return "too_large";
-  if (hasAny(t, ERRKIND_MALFORMED)) return "malformed";
-  return "other";
+  return null;
+}
+
+function classifyErrKind(s: string): string {
+  if (s.trim().length === 0) return "none";
+  return firstErrorRule(s.toLowerCase()) ?? "other";
 }
 
 /** Reduce an error message to its KIND — one of {@link ERR_KINDS}, never the
@@ -549,7 +524,7 @@ export function errKind(s: string): Val {
  * Used internally, after a checked entry point ({@link render}, the
  * module-level `info`/`warn`/`debug`) has already forced its own caller to
  * supply literal keys — see {@link CheckedFields}. */
-type PlainFields = readonly (readonly [string, Val])[];
+export type PlainFields = readonly (readonly [string, Val])[];
 
 /**
  * {@link Literal}, applied to the KEY half of one `[key, Val]` field tuple,
@@ -582,7 +557,7 @@ type CheckedField<Entry> = Entry extends readonly [infer K, infer V]
  * the module doc: "Event names and field names are `&'static str` for the
  * same reason"); this is that same closure, ported.
  */
-type CheckedFields<F extends PlainFields> = {
+export type CheckedFields<F extends PlainFields> = {
   readonly [I in keyof F]: CheckedField<F[I]>;
 };
 
@@ -612,370 +587,4 @@ function renderLine(event: string, fields: PlainFields): string {
     line += ` ${k}=${v.toString()}`;
   }
   return line;
-}
-
-// ------------------------------------------------------------------- the file
-
-/** Where the host's event log lives — beside the sidecar's stderr mirror
- * (ported elsewhere), so "the logs" is one folder and not a scavenger hunt. */
-export function logPath(): string {
-  return path.join(os.tmpdir(), "arcelle-host.log");
-}
-
-/** The previous session's host log, kept for exactly the reason the
- * sidecar's is: the interesting session is usually the one that just
- * ended. */
-export function previousLogPath(): string {
-  return path.join(os.tmpdir(), "arcelle-host.prev.log");
-}
-
-/** The folder holding both logs, for the Settings affordance that reveals
- * it. */
-export function logDir(): string {
-  return os.tmpdir();
-}
-
-function renameQuiet(from: string, to: string): void {
-  try {
-    fs.renameSync(from, to);
-  } catch {
-    // No previous generation, or the rename failed (e.g. cross-device on an
-    // odd TMPDIR setup): same doctrine as the Rust `let _ = fs::rename(...)`
-    // — a rotation that cannot happen must not fail the app.
-  }
-}
-
-function openFreshQuiet(p: string): number | null {
-  try {
-    // "w": create if missing, truncate if present, open for writing.
-    return fs.openSync(p, "w");
-  } catch {
-    return null;
-  }
-}
-
-/** One of the levels the `ARCELLE_LOG` filter can resolve to for our
- * target, ordered least to most verbose except `off` which is more
- * restrictive than all of them. Mirrors `tracing::Level` plus
- * `LevelFilter::OFF`. */
-export type LogLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
-
-const LEVEL_RANK: Record<LogLevel, number> = {
-  off: -1,
-  error: 0,
-  warn: 1,
-  info: 2,
-  debug: 3,
-  trace: 4,
-};
-
-/**
- * A size-capped file with one generation of rotation. Deliberately
- * hand-rolled rather than reaching for a rolling-log package: those never
- * delete anything, and an app that runs for days would grow a log nobody can
- * attach anywhere.
- *
- * Gates `info`/`warn`/`debug` on a settable {@link LogLevel} — mirroring the
- * real module's reliance on `tracing`'s ambient level filter for every
- * event, not only the hand-rolled fast-path check the Rust `debug` function
- * adds for itself. A fresh `Sink` defaults to `"info"` (the shipped
- * default), so `info`/`warn` fire out of the box and `debug` does not, until
- * {@link Sink.setLevel} says otherwise — including `"off"`, which silences
- * all three, matching the doc comment's claim that an explicit "be quiet" is
- * a real answer.
- */
-export class Sink {
-  private readonly filePath: string;
-  private readonly prevPath: string;
-  private fd: number | null;
-  private written = 0;
-  private level: LogLevel = "info";
-
-  constructor(filePath: string, prevPath: string) {
-    this.filePath = filePath;
-    this.prevPath = prevPath;
-    // Rotate on open, not truncate — see `previousLogPath`.
-    renameQuiet(this.filePath, this.prevPath);
-    this.fd = openFreshQuiet(this.filePath);
-  }
-
-  /** Set the effective level for this sink — what `init()` resolves from
-   * {@link filterFrom} once `ARCELLE_LOG` has been read. */
-  setLevel(level: LogLevel): void {
-    this.level = level;
-  }
-
-  private enabled(msgLevel: "info" | "warn" | "debug"): boolean {
-    return LEVEL_RANK[this.level] >= LEVEL_RANK[msgLevel];
-  }
-
-  private rotate(): void {
-    if (this.fd !== null) {
-      try {
-        fs.closeSync(this.fd);
-      } catch {
-        // A failing close must not fail the app.
-      }
-      this.fd = null;
-    }
-    renameQuiet(this.filePath, this.prevPath);
-    this.fd = openFreshQuiet(this.filePath);
-    this.written = 0;
-  }
-
-  /** The low-level append used by `info`/`warn`/`debug`, and directly by
-   * tests exercising rotation. Rotates first if this write would cross the
-   * cap; `written` only advances when a file handle actually exists, so a
-   * sink that could never open a file (full disk, sandboxed temp dir) stays
-   * a permanent, silent no-op rather than rotating on every call. */
-  writeRaw(data: string): void {
-    const buf = Buffer.from(data, "utf8");
-    if (this.written + buf.length > MAX_LOG_BYTES) {
-      this.rotate();
-    }
-    if (this.fd !== null) {
-      try {
-        fs.writeSync(this.fd, buf);
-        this.written += buf.length;
-      } catch {
-        // A logging failure must never fail the app: a full disk or a
-        // sandboxed temp dir means we lose the line, not the turn.
-      }
-    }
-  }
-
-  /** A decision worth keeping. `event` and every field KEY must be
-   * compile-time literals — see {@link Literal} / {@link CheckedFields}. */
-  info<E extends string, const F extends PlainFields>(event: Literal<E>, fields: CheckedFields<F>): void {
-    if (!this.enabled("info")) {
-      return;
-    }
-    this.writeRaw(formatLine("INFO", event as string, fields as unknown as PlainFields));
-  }
-
-  /** Something went wrong but the app carried on. */
-  warn<E extends string, const F extends PlainFields>(event: Literal<E>, fields: CheckedFields<F>): void {
-    if (!this.enabled("warn")) {
-      return;
-    }
-    this.writeRaw(formatLine("WARN", event as string, fields as unknown as PlainFields));
-  }
-
-  /** Detail for a live investigation — off by default (see
-   * `DEFAULT_FILTER`). The line is not even rendered unless the resolved
-   * level admits `debug`, because this fires on paths that run per tool
-   * call. */
-  debug<E extends string, const F extends PlainFields>(event: Literal<E>, fields: CheckedFields<F>): void {
-    if (!this.enabled("debug")) {
-      return;
-    }
-    this.writeRaw(formatLine("DEBUG", event as string, fields as unknown as PlainFields));
-  }
-
-  /** Release the underlying file handle. Not part of the Rust surface
-   * (there, dropping the `Sink` closes it); exposed here so tests can clean
-   * up deterministically instead of waiting on GC. */
-  close(): void {
-    if (this.fd !== null) {
-      try {
-        fs.closeSync(this.fd);
-      } catch {
-        // ignore
-      }
-      this.fd = null;
-    }
-  }
-}
-
-function formatLine(level: string, event: string, fields: PlainFields): string {
-  // UTC timestamp, millisecond precision, `Z` suffix — Date#toISOString
-  // already produces exactly the same shape as the Rust module's pinned
-  // chrono format ("%Y-%m-%dT%H:%M:%S%.3fZ").
-  return `${new Date().toISOString()} ${level} ${renderLine(event, fields)}\n`;
-}
-
-// --------------------------------------------------------------- the filter
-
-function parseLevelWord(word: string): LogLevel | null {
-  switch (word.trim().toLowerCase()) {
-    case "off":
-    case "error":
-    case "warn":
-    case "info":
-    case "debug":
-    case "trace":
-      return word.trim().toLowerCase() as LogLevel;
-    default:
-      return null;
-  }
-}
-
-interface ParsedDirectives {
-  defaultLevel: LogLevel | null;
-  targets: Map<string, LogLevel>;
-}
-
-/** A deliberately small stand-in for `tracing_subscriber::filter::Targets`'
- * grammar — this module's log format does not need a real `Targets` parser,
- * only the OBSERVABLE behavior {@link filterFrom} reproduces below. A
- * directive with no `=` is either a bare level word (sets the default level
- * for every target) or, failing that, a literal target name implicitly at
- * `trace` (mirroring the real crate's permissiveness: almost anything that
- * isn't a level word parses as *some* target name). A directive with `=`
- * must have a recognized level after it, or the WHOLE string fails to
- * parse — same as the real crate rejecting `arcelle=debag`. */
-function tryParseDirectives(s: string): ParsedDirectives | null {
-  const parts = s
-    .split(",")
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
-  if (parts.length === 0) {
-    return null;
-  }
-  const result: ParsedDirectives = { defaultLevel: null, targets: new Map() };
-  for (const part of parts) {
-    const eq = part.indexOf("=");
-    if (eq === -1) {
-      const lvl = parseLevelWord(part);
-      if (lvl !== null) {
-        result.defaultLevel = lvl;
-      } else {
-        result.targets.set(part, "trace");
-      }
-    } else {
-      const target = part.slice(0, eq);
-      const levelStr = part.slice(eq + 1);
-      const lvl = parseLevelWord(levelStr);
-      if (lvl === null) {
-        return null;
-      }
-      result.targets.set(target, lvl);
-    }
-  }
-  return result;
-}
-
-/** The resolved level for our own target under a set of directives: an
- * explicit `arcelle=<level>` wins, then a blanket default level, then
- * `"info"` as a last resort (unreachable in practice — see
- * {@link filterFrom}, which only calls this once one of the two is known to
- * be present). */
-function resolveLevel(parsed: ParsedDirectives): LogLevel {
-  return parsed.targets.get(TARGET) ?? parsed.defaultLevel ?? "info";
-}
-
-/** The result of resolving a requested `ARCELLE_LOG` value: whether it was
- * honored, and the effective {@link LogLevel} for our target under it. */
-export interface FilterResult {
-  understood: boolean;
-  level: LogLevel;
-}
-
-/**
- * Resolve `ARCELLE_LOG` into an effective filter, and say whether the
- * request was honored.
- *
- * The subtlety this exists to close: the real `Targets` type accepts far
- * more than it should. `"not a filter!!"` and `"ARCELLE=debug"` (wrong case)
- * both PARSE — as a target with that literal name — so naive parsing
- * reports success and installs a filter that matches nothing we ever emit.
- * The result would be a 0-byte host log with no error anywhere, reached by
- * the single most likely user action: turning the logging up and mistyping
- * it.
- *
- * So a parsed filter is only honored if it can actually SPEAK about us: it
- * names our target (`arcelle`), or it sets a default level that reaches
- * every target. `arcelle=off` names us and is therefore respected — an
- * explicit "be quiet" is a real answer; a typo is not.
- */
-export function filterFrom(requested: string | undefined | null): FilterResult {
-  // `DEFAULT_FILTER` ("arcelle=info") always parses; used both when the env
-  // is unset and as the fallback when a requested value is not honored.
-  const defaultParsed = tryParseDirectives(DEFAULT_FILTER) as ParsedDirectives;
-
-  if (requested === undefined || requested === null) {
-    return { understood: true, level: resolveLevel(defaultParsed) };
-  }
-  const parsed = tryParseDirectives(requested);
-  if (parsed !== null) {
-    const namesTarget = parsed.targets.has(TARGET);
-    const hasDefault = parsed.defaultLevel !== null;
-    if (namesTarget || hasDefault) {
-      return { understood: true, level: resolveLevel(parsed) };
-    }
-  }
-  return { understood: false, level: resolveLevel(defaultParsed) };
-}
-
-// -------------------------------------------------------------------- init
-
-let defaultSink: Sink | null = null;
-let started = false;
-
-/**
- * Install the host log. Idempotent — a second call is a no-op, so a
- * re-entrant startup path cannot fight over the one log file.
- *
- * Not unit-tested directly against the real filesystem, matching the Rust
- * source's own precedent: no test in `obs.rs` calls `init()` either, since
- * it always resolves to the machine's real temp directory with no injection
- * seam — `filterFrom` (the decision logic) and `Sink` (the file behavior)
- * are the testable pieces, and `init` is the thin, deliberately un-mocked
- * wiring between them and the live environment.
- */
-export function init(appVersion: string): void {
-  if (started) {
-    return;
-  }
-  started = true;
-
-  const requested = process.env[LOG_ENV];
-  const { understood, level } = filterFrom(requested);
-
-  const sink = new Sink(logPath(), previousLogPath());
-  sink.setLevel(level);
-  defaultSink = sink;
-
-  sink.info("host.start", [
-    ["version", model(appVersion)],
-    ["log", state("arcelle-host.log")],
-    // Whether ARCELLE_LOG was honored, in the file itself. A log that is
-    // quieter than the reader expects has to say why in the one place the
-    // reader is already looking.
-    ["filter", state(understood ? "as asked" : "default")],
-  ]);
-  if (!understood) {
-    sink.warn("host.log_filter_ignored", [
-      ["env", state(LOG_ENV)],
-      ["bytes", bytes(requested === undefined ? 0 : Buffer.byteLength(requested, "utf8"))],
-    ]);
-  }
-}
-
-/** A decision worth keeping. No-op until {@link init} has installed a sink —
- * the same "worst case we run with no host log" fallback the Rust source
- * falls back to when its subscriber install fails. `event` and every field
- * KEY must be compile-time literals — see {@link Literal} /
- * {@link CheckedFields} — matching Rust's `&'static str` on both. */
-export function info<E extends string, const F extends PlainFields>(
-  event: Literal<E>,
-  fields: CheckedFields<F>,
-): void {
-  defaultSink?.info<E, F>(event, fields);
-}
-
-/** Something went wrong but the app carried on. */
-export function warn<E extends string, const F extends PlainFields>(
-  event: Literal<E>,
-  fields: CheckedFields<F>,
-): void {
-  defaultSink?.warn<E, F>(event, fields);
-}
-
-/** Detail for a live investigation — off by default. */
-export function debug<E extends string, const F extends PlainFields>(
-  event: Literal<E>,
-  fields: CheckedFields<F>,
-): void {
-  defaultSink?.debug<E, F>(event, fields);
 }

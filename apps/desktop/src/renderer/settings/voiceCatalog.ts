@@ -102,6 +102,50 @@ export function groupVoices(voices: NeuralVoiceInfo[]): GroupedVoices {
   };
 }
 
+function prioritizedVoicePool(voices: NeuralVoiceInfo[]): NeuralVoiceInfo[] {
+  return [
+    ...voices.filter(isMultilingual),
+    ...voices.filter((voice) => !isMultilingual(voice)),
+  ];
+}
+
+function preferredVoiceIds(
+  pool: NeuralVoiceInfo[],
+  preferred?: string,
+): string[] {
+  const preferredVoice = preferred && pool.find((voice) => voice.id === preferred);
+  return preferredVoice ? [preferredVoice.id] : [];
+}
+
+function lastPickedGender(
+  pool: NeuralVoiceInfo[],
+  picked: string[],
+): string | undefined {
+  const lastId = picked[picked.length - 1];
+  return pool.find((voice) => voice.id === lastId)?.gender;
+}
+
+function isUnusedOppositeGenderVoice(
+  voice: NeuralVoiceInfo,
+  picked: string[],
+  lastGender: string | undefined,
+): boolean {
+  if (picked.includes(voice.id)) return false;
+  if (!voice.gender || !lastGender) return false;
+  return voice.gender !== lastGender;
+}
+
+function nextDistinctVoice(
+  pool: NeuralVoiceInfo[],
+  picked: string[],
+): NeuralVoiceInfo | undefined {
+  const lastGender = lastPickedGender(pool, picked);
+  return (
+    pool.find((voice) => isUnusedOppositeGenderVoice(voice, picked, lastGender)) ??
+    pool.find((voice) => !picked.includes(voice.id))
+  );
+}
+
 /** Pick `count` voices that are as distinguishable from each other as the
  * catalog allows — the seed a fresh cast is offered.
  *
@@ -120,28 +164,11 @@ export function suggestDistinctVoices(
   count: number,
   preferred?: string,
 ): string[] {
-  const pool = [
-    ...voices.filter(isMultilingual),
-    ...voices.filter((v) => !isMultilingual(v)),
-  ];
-  const picked: string[] = [];
-  const lead = preferred && pool.find((v) => v.id === preferred);
-  if (lead) picked.push(lead.id);
+  const pool = prioritizedVoicePool(voices);
+  const picked = preferredVoiceIds(pool, preferred);
   while (picked.length < count) {
-    const lastGender = picked.length
-      ? pool.find((v) => v.id === picked[picked.length - 1])?.gender
-      : undefined;
-    const next =
-      // Prefer an unused voice of the OTHER gender…
-      pool.find(
-        (v) =>
-          !picked.includes(v.id) &&
-          v.gender &&
-          lastGender &&
-          v.gender !== lastGender,
-      ) ??
-      // …then any unused voice at all…
-      pool.find((v) => !picked.includes(v.id));
+    // Prefer an unused voice of the OTHER gender, then any unused voice.
+    const next = nextDistinctVoice(pool, picked);
     // …and if the catalog is smaller than the cast, stop rather than repeat:
     // an empty id means "the product default" everywhere else, which is a
     // truthful "not chosen" rather than a duplicate pretending to be a choice.

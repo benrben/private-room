@@ -35,6 +35,11 @@ interface ActiveRun {
   writeEnabled: boolean;
 }
 
+interface RunOutcome {
+  final: HarnessFinalStatus;
+  failure: string;
+}
+
 export type HarnessFinalStatus = "completed" | "cancelled" | "failed";
 
 export interface HarnessRunLifecycle {
@@ -59,20 +64,40 @@ export class HarnessOrchestrator {
   }
 
   async start(input: StartHarnessTurn): Promise<{ runId: string; events: AsyncIterable<HarnessEvent> }> {
-    const runtime = this.runtimes.get(input.provider);
+    const runtime = await this.availableRuntime(input.provider);
+    this.requireAvailableLease(input.writeEnabled);
+    const runId = this.newRunId(input.runId);
+    const context = this.contextFor(runId, input);
+    const run = await this.startRuntime(runtime, context, input);
+    return this.activateRun(runId, run, runtime, input);
+  }
+
+  private async availableRuntime(provider: string): Promise<HarnessRuntime> {
+    const runtime = this.runtimes.get(provider);
     if (runtime === undefined || !(await runtime.available())) {
-      throw new Error(`The ${input.provider} harness is not available.`);
+      throw new Error(`The ${provider} harness is not available.`);
     }
-    if (input.writeEnabled && this.active.size > 0) {
+    return runtime;
+  }
+
+  private requireAvailableLease(writeEnabled: boolean): void {
+    if (writeEnabled && this.active.size > 0) {
       throw new Error("Another agent run currently holds the room write lease.");
     }
-    if (!input.writeEnabled && [...this.active.values()].some((entry) => entry.writeEnabled)) {
+    if (!writeEnabled && [...this.active.values()].some((entry) => entry.writeEnabled)) {
       throw new Error("A write-enabled agent run currently holds the room write lease.");
     }
-    const runId = input.runId ?? randomUUID();
+  }
+
+  private newRunId(requestedRunId: string | undefined): string {
+    const runId = requestedRunId ?? randomUUID();
     if (!/^[A-Za-z0-9_-]{1,100}$/.test(runId)) throw new Error("The agent run ID is invalid.");
     if (this.active.has(runId)) throw new Error("That agent run ID is already active.");
-    const context: HarnessContext = {
+    return runId;
+  }
+
+  private contextFor(runId: string, input: StartHarnessTurn): HarnessContext {
+    return {
       runId,
       roomId: input.roomId,
       provider: input.provider,
@@ -84,60 +109,112 @@ export class HarnessOrchestrator {
       exposureVerified: input.exposureVerified,
       systemPrompt: input.systemPrompt,
     };
+  }
+
+  private async startRuntime(
+    runtime: HarnessRuntime,
+    context: HarnessContext,
+    input: StartHarnessTurn,
+  ): Promise<HarnessRun> {
     if (this.protection !== null) await this.protection.createBaseline(context);
-    let run: HarnessRun;
     try {
-      run = await runtime.startTurn(context, { text: input.text, threadId: input.threadId } satisfies HarnessInput);
+      return await runtime.startTurn(context, { text: input.text, threadId: input.threadId } satisfies HarnessInput);
     } catch (error) {
-      if (this.protection !== null) await this.protection.finish(runId, "failed");
+      if (this.protection !== null) await this.protection.finish(context.runId, "failed");
       throw error;
     }
+  }
+
+  private activateRun(
+    runId: string,
+    run: HarnessRun,
+    runtime: HarnessRuntime,
+    input: StartHarnessTurn,
+  ): { runId: string; events: AsyncIterable<HarnessEvent> } {
     this.active.set(runId, { run, runtime, writeEnabled: input.writeEnabled });
     const output = new AsyncEventQueue<HarnessEvent>();
-    void (async () => {
-      let final: HarnessFinalStatus = "failed";
-      let failure = "The agent harness ended without a completion event.";
-      try {
-        for await (const event of run.events) {
-          // A provider terminal event is provisional until cloud write-back
-          // and the mandatory filesystem reconciliation both succeed.
-          if (event.type === "run_completed") final = event.status;
-          else if (event.type === "run_failed") {
-            final = "failed";
-            failure = event.error;
-          } else output.push(event);
-        }
-      } finally {
-        try {
-          const lifecycleStatus = await this.lifecycle.beforeFinish?.(
-            runId,
-            final,
-            (event) => output.push(event),
-          );
-          if (lifecycleStatus !== undefined) final = lifecycleStatus;
-        } catch (error) {
-          final = "failed";
-          failure = safeFinalizationFailure("write-back");
-        }
-        if (this.protection !== null) {
-          try { await this.protection.finish(runId, final); }
-          catch (error) {
-            final = "failed";
-            failure = safeFinalizationFailure("reconciliation");
-          }
-        }
-        this.active.delete(runId);
-        if (final === "failed") {
-          const providerFailure = failure === "The agent harness ended without a completion event."
-            ? safeProviderFailure(input.provider)
-            : failure;
-          output.push({ type: "run_failed", runId, error: providerFailure });
-        }
-        else output.push({ type: "run_completed", runId, status: final });
-        output.end();
-      }
-    })();
+    void this.relayEvents(runId, run, input.provider, output);
     return { runId, events: output };
+  }
+
+  private async relayEvents(
+    runId: string,
+    run: HarnessRun,
+    provider: string,
+    output: AsyncEventQueue<HarnessEvent>,
+  ): Promise<void> {
+    const outcome: RunOutcome = {
+      final: "failed",
+      failure: "The agent harness ended without a completion event.",
+    };
+    try {
+      for await (const event of run.events) this.applyRunEvent(event, outcome, output);
+    } finally {
+      await this.applyLifecycle(runId, outcome, output);
+      await this.finishProtection(runId, outcome);
+      this.active.delete(runId);
+      this.pushTerminalEvent(runId, provider, outcome, output);
+      output.end();
+    }
+  }
+
+  private applyRunEvent(
+    event: HarnessEvent,
+    outcome: RunOutcome,
+    output: AsyncEventQueue<HarnessEvent>,
+  ): void {
+    // A provider terminal event is provisional until cloud write-back and the
+    // mandatory filesystem reconciliation both succeed.
+    if (event.type === "run_completed") {
+      outcome.final = event.status;
+      return;
+    }
+    if (event.type === "run_failed") {
+      outcome.final = "failed";
+      outcome.failure = event.error;
+      return;
+    }
+    output.push(event);
+  }
+
+  private async applyLifecycle(
+    runId: string,
+    outcome: RunOutcome,
+    output: AsyncEventQueue<HarnessEvent>,
+  ): Promise<void> {
+    try {
+      const lifecycleStatus = await this.lifecycle.beforeFinish?.(runId, outcome.final, (event) => output.push(event));
+      if (lifecycleStatus !== undefined) outcome.final = lifecycleStatus;
+    } catch (error) {
+      outcome.final = "failed";
+      outcome.failure = safeFinalizationFailure("write-back");
+    }
+  }
+
+  private async finishProtection(runId: string, outcome: RunOutcome): Promise<void> {
+    if (this.protection === null) return;
+    try {
+      await this.protection.finish(runId, outcome.final);
+    } catch (error) {
+      outcome.final = "failed";
+      outcome.failure = safeFinalizationFailure("reconciliation");
+    }
+  }
+
+  private pushTerminalEvent(
+    runId: string,
+    provider: string,
+    outcome: RunOutcome,
+    output: AsyncEventQueue<HarnessEvent>,
+  ): void {
+    if (outcome.final === "failed") {
+      const error = outcome.failure === "The agent harness ended without a completion event."
+        ? safeProviderFailure(provider)
+        : outcome.failure;
+      output.push({ type: "run_failed", runId, error });
+      return;
+    }
+    output.push({ type: "run_completed", runId, status: outcome.final });
   }
 
   async approve(runId: string, requestId: string, decision: ApprovalDecision): Promise<void> {

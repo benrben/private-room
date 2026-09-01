@@ -1,0 +1,482 @@
+
+.sk-file-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line) 2%,
+    var(--line) 98%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+.sk-file-head > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.sk-file-head strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+}
+.sk-file-head small {
+  color: var(--faint);
+  font-size: var(--fs-micro);
+}
+.sk-file-head > span {
+  flex: none;
+  display: flex;
+  gap: 6px;
+}
+/* The file's own text, exactly as it is on disk: mono, no wrapping games, no
+   transform, nothing that could make the buffer look like something other
+   than what a save would write. */
+.sk-file > textarea {
+  flex: 1;
+  min-height: 0;
+  resize: none;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  padding: var(--sp-4);
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  line-height: 1.6;
+  tab-size: 2;
+}
+.sk-file > textarea:focus {
+  box-shadow: none;
+}
+/* A borderless full-bleed textarea still owes a visible focus indicator, and
+   the previous rule set `outline: 0` on it unconditionally — which, loading
+   after base.css at equal specificity, removed the app's focus ring from the
+   one control this pane exists for. The ring is drawn INSIDE the box
+   (negative offset) so the flush edges cannot clip it. */
+.sk-file > textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -3px;
+}
+.sk-binary-note {
+  margin: auto;
+  max-width: 30ch;
+  color: var(--muted);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  text-align: center;
+}
+
+/* ----- narrow column -----
+   Below this the two-column editor stops fitting, so the folder pane folds
+   away and the resource editor takes the full width. Kept as a viewport
+   query rather than a container query because .sk-editor is itself the
+   container: a container cannot query its own size. */
+@media (max-width: 860px) {
+  .sk-editor-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .sk-res {
+    display: none;
+  }
+  .sk-file {
+    right: 0;
+  }
+}
+
+/* The card grid needs nothing here — auto-fill with a 288px minimum drops to
+   one column on its own. These are the three things that do not: the masthead
+   pair, the dated stamp's alignment, and the builder's row. */
+@container sk-page (max-width: 560px) {
+  .sk-masthead {
+    flex-direction: column;
+    gap: var(--sp-4);
+  }
+  .sk-stamp {
+    align-items: flex-start;
+    text-align: left;
+    padding-top: 0;
+  }
+  .sk-compose-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
+/* ==========================================================================
+   3. MEMORY — PINNED INDEX CARDS
+   Everything the assistant has been told, drawn as the card index it is:
+   one card per memory, a pin at the corner, the category on a drawn tab, and
+   the date in the hand.
+
+   ----- about the category colours -----
+
+   The five marker meanings are PRODUCT-WIDE: pink saved, yellow pending,
+   green done, blue linked, red urgent. A memory's category is not a status —
+   "fact", "project" and "instruction" are all equally current, equally
+   approved, equally not-pending — so painting them yellow/green/blue would
+   import a meaning the product uses elsewhere and make a plain fact look like
+   something waiting on the reader.
+
+   Exactly one category maps onto a marker honestly: pink is "personal", and a
+   preference is definitionally a personal standing note. That one gets the
+   marker. Every other category takes the neutral graphite treatment and is
+   carried by the WORD instead, which is also the conclusion sidebar-search.css
+   reached for the sidebar's own category pill.
+   ========================================================================== */
+
+.mem-view {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: transparent;
+  container-type: inline-size;
+  container-name: mem-page;
+}
+.mem-inner {
+  width: min(100% - 48px, 760px);
+  margin: 0 auto;
+  padding: var(--sp-8) 0 72px;
+}
+
+.mem-masthead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-6);
+  padding-bottom: var(--sp-4);
+  margin-bottom: var(--sp-4);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line) 2%,
+    var(--line) 97%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1.5px;
+  background-position: left bottom;
+}
+.mem-masthead-main {
+  min-width: 0;
+}
+.mem-title {
+  margin: 0 0 var(--sp-2);
+  color: var(--text-strong);
+  font-size: var(--fs-page);
+  font-family: var(--display);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.08;
+}
+/* A privacy statement, so: never the hand, never small. --fs-lead is the rung
+   the type scale reserves for intro and instruction copy. */
+.mem-lead {
+  margin: 0;
+  max-width: 56ch;
+  color: var(--muted);
+  font-size: var(--fs-lead);
+  line-height: var(--lh-body);
+}
+.mem-stamp {
+  flex: none;
+  padding-top: 6px;
+  font-size: var(--fs-card);
+  line-height: 1.15;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* ----- adding one -----
+   The blank card at the front of the index: a dashed frame, because it is not
+   a card yet, holding the field, the mic, the category and the button. */
+
+.mem-add {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-4);
+  padding: var(--sp-3);
+  border: var(--stroke-w) dashed var(--rule);
+  border-radius: var(--radius);
+}
+.mem-add > input {
+  flex: 1 1 16rem;
+  min-width: 0;
+}
+.mem-add .memory-cat-select {
+  flex: none;
+  max-width: 9rem;
+  font-size: var(--fs-micro);
+}
+
+.mem-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-6);
+}
+.mem-tools .search-field {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+
+/* ----- groups ----- */
+
+.mem-group {
+  margin: 0 0 var(--sp-6);
+}
+.mem-group-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding-bottom: var(--sp-2);
+  margin: 0 0 var(--sp-3);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 2%,
+    var(--line-soft) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+.mem-group-head h2 {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.mem-group-head .nb-circled {
+  margin-left: auto;
+}
+
+.mem-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--sp-3);
+}
+
+/* ----- the card -----
+   Deliberately NOT tilted. .nb-tilt-set would make a run of these read as
+   pinned scraps, but .nb-lift's hover is also a transform, and the second
+   transform replaces the first — every card would snap square the moment the
+   pointer touched it. The pin glyph and the drawn card carry the metaphor;
+   the rotation is not worth a control that jumps. */
+
+.mem-card {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--sp-1) var(--sp-3);
+  /* The graphite spine of an index card. --rule-strong is the 3:1 stroke, so
+     the tab is legible as a boundary rather than being a wash that vanishes
+     on ivory. Categories that map onto a marker meaning override it below. */
+  box-shadow: inset 3px 0 0 var(--rule-strong);
+}
+/* Pink is "personal" product-wide, and a preference is a personal standing
+   note — the one category that earns a marker rather than graphite. The word
+   still rides with it on the tab, so the colour is never the only signal. */
+.mem-card.is-preference {
+  box-shadow: inset 3px 0 0 var(--sem-saved);
+}
+.mem-card-pin {
+  grid-row: 1;
+  grid-column: 1;
+  margin-top: 2px;
+  color: var(--faint);
+  --nb-ico-size: 14px;
+}
+.mem-card.is-preference .mem-card-pin {
+  color: var(--sem-saved);
+}
+/* The memory's own words. This is content the user (or the assistant) typed,
+   so it is set in the interface sans at body size — never the hand — and
+   `dir="auto"` in the markup lets a Hebrew or Arabic memory lay itself out
+   right-to-left without the stylesheet guessing. */
+.mem-card-body {
+  grid-row: 1;
+  grid-column: 2;
+  min-width: 0;
+  color: var(--text);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  overflow-wrap: anywhere;
+}
+.mem-card-foot {
+  grid-row: 2;
+  grid-column: 2;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px var(--sp-2);
+  margin-top: 2px;
+}
+/* An outlined tab, not a filled pill: the category is identity, not status,
+   so it takes a drawn edge and leaves the marker fills to the things that
+   mean something. */
+.mem-cat {
+  display: inline-block;
+  padding: 1px 8px;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  border: 1px solid var(--rule-strong);
+  border-radius: 3px 6px 3px 6px / 6px 3px 6px 3px;
+  white-space: nowrap;
+}
+.mem-card.is-preference .mem-cat {
+  color: var(--sem-saved);
+  border-color: var(--sem-saved);
+}
+/* A date the room recorded, in the sans. --faint clears 4.5:1 on every ground
+   in both themes, and --fs-meta is the metadata floor rather than small text. */
+.mem-when {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--faint);
+  white-space: nowrap;
+}
+/* Layout only. The old rule faded these to opacity 0 until the pointer
+   arrived, which hid the only route to editing a memory from anyone who does
+   not hover — and hid the armed "Delete?" prompt again the moment the pointer
+   moved away. They are simply always drawn now; .chip-btn already carries the
+   contrast-checked resting ink, the hover, the destructive red and the 24px
+   floor, so nothing here re-states any of it. */
+.mem-actions {
+  grid-row: 1 / span 2;
+  grid-column: 3;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* The same card, mid-edit. The input takes the elastic column, because what
+   is being edited is the sentence, not a field on a form; the category and
+   the two confirm buttons sit beside it on the same line. */
+.mem-card.is-editing {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.mem-edit-input {
+  grid-column: 1;
+  min-width: 0;
+  width: 100%;
+}
+.mem-card.is-editing .memory-cat-select {
+  grid-column: 2;
+  max-width: 9rem;
+  font-size: var(--fs-micro);
+}
+.mem-card.is-editing .mem-actions {
+  grid-row: auto;
+  grid-column: 3;
+}
+
+/* ----- empty states ----- */
+
+.mem-empty {
+  display: grid;
+  gap: var(--sp-4);
+  justify-items: start;
+  margin: 0 0 var(--sp-6);
+}
+.mem-empty-copy {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin: 0;
+  max-width: 54ch;
+  color: var(--muted);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+.mem-empty-copy svg {
+  flex: none;
+  margin-top: 2px;
+  color: var(--faint);
+}
+/* Worked examples of what a memory looks like. Same three-signal rule as the
+   skills example: dashed pencil border, a tape label reading "Example", and
+   a caption that says they are not saved. Nothing inside is focusable. */
+.mem-example {
+  margin: 0;
+  width: 100%;
+  display: grid;
+  gap: var(--sp-2);
+}
+.mem-example-cap {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+}
+.mem-example-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--sp-2);
+}
+/* Two columns, not three: an example has no edit or delete control, and an
+   empty third track would still open a gap on the right of every card. */
+.mem-example-card {
+  grid-template-columns: 18px minmax(0, 1fr);
+  border-style: dashed;
+  border-color: var(--rule);
+  box-shadow: inset 3px 0 0 var(--rule);
+}
+.mem-example-card:hover {
+  border-color: var(--rule);
+}
+
+/* ----- the fold, then the scratch pad -----
+   A dashed pencil rule is the system's mark for a provisional boundary, and
+   it is doing real work here: above it is durable memory the assistant may
+   quote back at you; below it is a working file that never becomes memory.
+   The two are separated by FORM as well as by a line — cards above, a ruled
+   page below — so the difference survives being read in greyscale. */
+
+.mem-fold {
+  margin: var(--sp-8) 0 var(--sp-4);
+}
+.mem-scratch-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-3);
+}
+.mem-scratch-head h2 {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.mem-scratch-note {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  color: var(--faint);
+}

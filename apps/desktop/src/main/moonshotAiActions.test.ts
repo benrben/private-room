@@ -397,6 +397,21 @@ describe("aiAction", () => {
     expect((opened[1] as { id: string }).id).toBe(meta.id);
   });
 
+  it("keeps a successfully saved artifact when best-effort UI notifications throw", async () => {
+    const room = freshRoom();
+    const file = insertFile(room.db, "Src.md", "text/markdown", Buffer.from("x"), "source body", "user");
+    const deps = baseDeps({
+      rooms: fakeRooms(room),
+      send: () => { throw new Error("fabricated closed renderer"); },
+      post: fakePost(valueOutcome({ markdown: "# Saved despite renderer close" })),
+    });
+
+    await expect(aiAction(deps, "summarize", file.id, null, null, null, null)).resolves.toMatchObject({
+      name: "Summarize - Src.md",
+    });
+    expect(listFiles(room.db).some((entry) => entry.name === "Summarize - Src.md")).toBe(true);
+  });
+
   it("names the local-model step chip with the action title alone", async () => {
     const room = freshRoom();
     const file = insertFile(room.db, "Src.md", "text/markdown", Buffer.from("x"), "source body", "user");
@@ -823,6 +838,15 @@ describe("generateUiText", () => {
     };
     const result = await generateUiText(deps, "dek", "Write one sentence.", {}, 20);
     expect(result).toBeNull();
+  });
+
+  it.each([null, "plain text", 7])("treats a non-object sidecar value %j as no UI answer", async (value) => {
+    const deps: AiSidecarDeps = {
+      rooms: fakeRooms(null),
+      listModels: async () => ["qwen3.5:4b"],
+      post: fakePost(valueOutcome(value)),
+    };
+    await expect(generateUiText(deps, "dek", "Write one sentence.", {}, 20)).resolves.toBeNull();
   });
 
   it("degrades to null on any sidecar failure, never throwing", async () => {

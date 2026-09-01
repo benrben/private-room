@@ -83,6 +83,12 @@ describe("castFromTurns", () => {
     expect(cast).toHaveLength(2);
     expect(cast.every((h) => h.voice === "")).toBe(true);
   });
+
+  it("ignores a turn whose speaker is only whitespace", () => {
+    expect(castFromTurns([turn("   ", "stage direction"), turn("Ada", "hello")], ["v1"])).toEqual([
+      { name: "Ada", voice: "v1", rate: "", pitch: "" },
+    ]);
+  });
 });
 
 // ======================================================= normalize_turn_speakers
@@ -130,6 +136,36 @@ describe("getPodcast / savePodcast / setPodcastCast / setPodcastAudio", () => {
     expect(getPodcast(db, "no-such-file")).toBeNull();
   });
 
+  it("treats an unreadable or malformed stored cast as empty", () => {
+    const db = freshRoom();
+    const file = insertFile(db, "ep.html", "text/html", Buffer.from("<p>x</p>"), null, "generated");
+    savePodcast(db, file.id, "Episode 1", [turn("Ada", "Welcome.")], [host("Ada")]);
+
+    const replaceCast = (json: string): void => {
+      db.prepare("UPDATE podcasts SET cast_json = ? WHERE file_id = ?").run(json, file.id);
+    };
+    replaceCast("not json");
+    expect(getPodcast(db, file.id)?.cast).toEqual([]);
+    replaceCast("{}");
+    expect(getPodcast(db, file.id)?.cast).toEqual([]);
+    replaceCast('[{"name":"Ada","voice":9,"rate":false,"pitch":null}]');
+    expect(getPodcast(db, file.id)?.cast).toEqual([host("Ada")]);
+    replaceCast('[{"name":9}]');
+    expect(getPodcast(db, file.id)?.cast).toEqual([]);
+    replaceCast("[null]");
+    expect(getPodcast(db, file.id)?.cast).toEqual([]);
+
+    const replaceTurns = (json: string): void => {
+      db.prepare("UPDATE podcasts SET turns = ? WHERE file_id = ?").run(json, file.id);
+    };
+    replaceTurns("not json");
+    expect(getPodcast(db, file.id)?.turns).toEqual([]);
+    replaceTurns('[{"speaker":9,"line":"Welcome."}]');
+    expect(getPodcast(db, file.id)?.turns).toEqual([]);
+    replaceTurns("[null]");
+    expect(getPodcast(db, file.id)?.turns).toEqual([]);
+  });
+
   it("trashing the script for good takes its podcast row (ON DELETE CASCADE)", () => {
     // A destroyed script must not leave a row pointing at a file id that no
     // longer resolves.
@@ -166,6 +202,8 @@ describe("stripSpeakerLabel", () => {
     // Another host's name is left alone — a mislabelled turn, and guessing at
     // it would rewrite what the script says.
     expect(stripSpeakerLabel("Jordan: no", "Alex")).toBe("Jordan: no");
+    expect(stripSpeakerLabel(": body", "Alex")).toBe(": body");
+    expect(stripSpeakerLabel("Alex: body", "")).toBe("Alex: body");
     // A colon far into prose is prose, not a label.
     const long = "One thing I keep coming back to about all of this is: it works";
     expect(stripSpeakerLabel(long, "Alex")).toBe(long);

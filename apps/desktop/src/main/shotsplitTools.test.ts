@@ -13,7 +13,14 @@ import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { MAX_PARTS, partsFor, scriptChunks, sentences, splitScript } from "./shotsplitTools.js";
+import {
+  MAX_PARTS,
+  partsFor,
+  scriptChunks,
+  sentences,
+  splitScript,
+  splitWords,
+} from "./shotsplitTools.js";
 
 /** `text.split_whitespace().map(str::to_string).collect()` — the invariant
  * the whole module exists for. */
@@ -48,7 +55,10 @@ describe("splitScript", () => {
     for (const parts of [2, 3, 5, 8]) {
       const shots = splitScript(script, parts);
       expect(shots.length, `asked for ${parts}`).toBe(parts);
-      expect(words(shots.join(" ")), `text lost or invented at ${parts} parts`).toEqual(words(script));
+      expect(
+        words(shots.join(" ")),
+        `text lost or invented at ${parts} parts`,
+      ).toEqual(words(script));
     }
   });
 
@@ -61,15 +71,21 @@ describe("splitScript", () => {
     }
     const shots = splitScript(script, 20);
     expect(shots.length).toBe(20);
-    expect(shots.every((s) => s !== ""), "no empty shot").toBe(true);
+    expect(
+      shots.every((s) => s !== ""),
+      "no empty shot",
+    ).toBe(true);
     expect(words(shots.join(" "))).toEqual(words(script));
     // Evenly spread — not nineteen crumbs and one monster. Every shot is the
     // same 15 seconds on screen, so they should carry the same load.
     const beats = shots.map((s) => countOccurrences(s, "Beat number"));
-    expect(beats.reduce((a, b) => a + b, 0), "every beat placed once").toBe(40);
+    expect(
+      beats.reduce((a, b) => a + b, 0),
+      "every beat placed once",
+    ).toBe(40);
     expect(
       beats.every((n) => n >= 1 && n <= 3),
-      `one shot got far more than its share: ${JSON.stringify(beats)}`
+      `one shot got far more than its share: ${JSON.stringify(beats)}`,
     ).toBe(true);
   });
 
@@ -103,12 +119,16 @@ describe("splitScript", () => {
     const lengths = shots.map((s) => Array.from(s).length);
     // The long paragraph is broken ACROSS shots rather than left whole
     // against three near-empty ones — same seconds, same share of text.
-    expect(lengths[0]!, `the long paragraph was left as one shot: ${JSON.stringify(lengths)}`).toBeLessThan(
-      long.length / 2
-    );
+    expect(
+      lengths[0]!,
+      `the long paragraph was left as one shot: ${JSON.stringify(lengths)}`,
+    ).toBeLessThan(long.length / 2);
     const biggest = Math.max(...lengths);
     const smallest = Math.min(...lengths);
-    expect(biggest, `wildly uneven shots: ${JSON.stringify(lengths)}`).toBeLessThanOrEqual(smallest * 4);
+    expect(
+      biggest,
+      `wildly uneven shots: ${JSON.stringify(lengths)}`,
+    ).toBeLessThanOrEqual(smallest * 4);
     expect(words(shots.join(" "))).toEqual(words(script));
   });
 
@@ -129,6 +149,11 @@ describe("splitScript", () => {
     expect(pieces[1]!.trim().startsWith("Two?")).toBe(true);
     expect(pieces[2]!.trim().startsWith("Three…")).toBe(true);
     expect(pieces.join("")).toBe("One! Two? Three… Four.");
+  });
+
+  it("keeps direct one-piece word splits and sentence spacing exact", () => {
+    expect(splitWords("one \u{1F680} word", 0)).toEqual(["one \u{1F680} word"]);
+    expect(splitWords("one \u{1F680} word", 1)).toEqual(["one \u{1F680} word"]);
   });
 });
 
@@ -192,14 +217,18 @@ describe("scriptChunks", () => {
     const chunks = scriptChunks(EPISODE);
     expect(chunks).toBeDefined();
     expect(
-      chunks![0]!.action.startsWith("COLD OPEN — EXT. LUMINA — MARKET DISTRICT — DAY"),
-      `first beat lost its scene: ${JSON.stringify(chunks![0]!.action)}`
+      chunks![0]!.action.startsWith(
+        "COLD OPEN — EXT. LUMINA — MARKET DISTRICT — DAY",
+      ),
+      `first beat lost its scene: ${JSON.stringify(chunks![0]!.action)}`,
     ).toBe(true);
     expect(
       chunks![2]!.action.includes("EXT. LUMINA — MARKET DISTRICT — CONTINUOUS"),
-      `a heading between beats went to the wrong one: ${JSON.stringify(chunks![2]!.action)}`
+      `a heading between beats went to the wrong one: ${JSON.stringify(chunks![2]!.action)}`,
     ).toBe(true);
-    expect(chunks![3]!.action.includes("INT. NOA & LIOR'S APARTMENT — NIGHT")).toBe(true);
+    expect(
+      chunks![3]!.action.includes("INT. NOA & LIOR'S APARTMENT — NIGHT"),
+    ).toBe(true);
     // And the beat BEFORE a heading must not have swallowed it.
     expect(chunks![1]!.action.includes("ACT ONE")).toBe(false);
   });
@@ -207,7 +236,9 @@ describe("scriptChunks", () => {
   it("ordinary prose is not mistaken for a shot list", () => {
     // One stray clock in a sentence is not an author's shot list, and must
     // not switch off the length-based split.
-    expect(scriptChunks("We start at 9:00 and finish when we finish.")).toBeUndefined();
+    expect(
+      scriptChunks("We start at 9:00 and finish when we finish."),
+    ).toBeUndefined();
     expect(scriptChunks("No numbers here at all.")).toBeUndefined();
     // A duration written as a range in prose, once, is still not a list.
     expect(scriptChunks("It runs 00:00-05:00 in total.")).toBeUndefined();
@@ -222,50 +253,77 @@ describe("scriptChunks", () => {
       expect(chunks![0]!.seconds).toBe(15);
     }
   });
+
+  it("skips a malformed range, accepts spaces around a marker dash, and joins action lines", () => {
+    const script =
+      "**00:00 00:15** — prose, not a range.\n\n" +
+      "**00:00 – 00:15** — First action line.\nSecond action line.\n\n" +
+      "**00:15 – 00:30** — Final action.";
+    const chunks = scriptChunks(script);
+    expect(chunks).toHaveLength(2);
+    expect(chunks![0]).toMatchObject({
+      seconds: 15,
+      action: "First action line. Second action line",
+    });
+    expect(chunks![0]!.action).not.toContain("not a range");
+  });
 });
 
 describe("episode fixture (commands/shotsplit.rs's mod episode_tests)", () => {
   const fixturePath = path.join(
     path.dirname(fileURLToPath(import.meta.url)),
-    "../../../../src-tauri/tests/fixtures/episode-chunks.md"
+    "../../../../src-tauri/tests/fixtures/episode-chunks.md",
   );
   const haveRust = existsSync(fixturePath);
 
-  it.skipIf(!haveRust)("the reported episode yields its own twenty-one chunks", () => {
-    // The real file, read from disk, cut the way the app cuts it. A unit
-    // test on a hand-trimmed excerpt proves the parser; this proves the
-    // SCRIPT — headings, rules, a preamble, an end-matter line carrying its
-    // own "5:00", and beats that are not all the same length.
-    const script = readFileSync(fixturePath, "utf8");
-    const chunks = scriptChunks(script);
-    expect(chunks, "the markers are found").toBeDefined();
+  it.skipIf(!haveRust)(
+    "the reported episode yields its own twenty-one chunks",
+    () => {
+      // The real file, read from disk, cut the way the app cuts it. A unit
+      // test on a hand-trimmed excerpt proves the parser; this proves the
+      // SCRIPT — headings, rules, a preamble, an end-matter line carrying its
+      // own "5:00", and beats that are not all the same length.
+      const script = readFileSync(fixturePath, "utf8");
+      const chunks = scriptChunks(script);
+      expect(chunks, "the markers are found").toBeDefined();
 
-    // TWENTY-ONE, not twenty. The script's own heading says "20 chunks" and
-    // its body contains 21 timestamped beats — they total exactly 5:00, so
-    // the beats are right and the heading is off by one. What is WRITTEN
-    // wins: silently dropping a beat to match a heading would lose fifteen
-    // seconds of someone's episode.
-    expect(chunks!.length, "one shot per beat actually written").toBe(21);
+      // TWENTY-ONE, not twenty. The script's own heading says "20 chunks" and
+      // its body contains 21 timestamped beats — they total exactly 5:00, so
+      // the beats are right and the heading is off by one. What is WRITTEN
+      // wins: silently dropping a beat to match a heading would lose fifteen
+      // seconds of someone's episode.
+      expect(chunks!.length, "one shot per beat actually written").toBe(21);
 
-    const total = chunks!.reduce((sum, c) => sum + c.seconds, 0);
-    expect(total, "five minutes exactly").toBe(300);
+      const total = chunks!.reduce((sum, c) => sum + c.seconds, 0);
+      expect(total, "five minutes exactly").toBe(300);
 
-    // The three short beats keep their own length rather than being
-    // flattened to fifteen.
-    expect(chunks!.filter((c) => c.seconds === 10).length).toBe(3);
+      // The three short beats keep their own length rather than being
+      // flattened to fifteen.
+      expect(chunks!.filter((c) => c.seconds === 10).length).toBe(3);
 
-    // The closing "END OF EPISODE 1 — condensed to 5:00…" is a note to a
-    // reader, not something to draw, and must not ride on the last shot.
-    const last = chunks![chunks!.length - 1]!.action;
-    expect(last.includes("Reassign our star cadet"), JSON.stringify(last)).toBe(true);
-    expect(last.includes("END OF"), `end matter reached a prompt: ${JSON.stringify(last)}`).toBe(false);
-    expect(last.includes("300 seconds"), JSON.stringify(last)).toBe(false);
+      // The closing "END OF EPISODE 1 — condensed to 5:00…" is a note to a
+      // reader, not something to draw, and must not ride on the last shot.
+      const last = chunks![chunks!.length - 1]!.action;
+      expect(
+        last.includes("Reassign our star cadet"),
+        JSON.stringify(last),
+      ).toBe(true);
+      expect(
+        last.includes("END OF"),
+        `end matter reached a prompt: ${JSON.stringify(last)}`,
+      ).toBe(false);
+      expect(last.includes("300 seconds"), JSON.stringify(last)).toBe(false);
 
-    // Every beat carries its scene, and none carries a timestamp.
-    expect(chunks![0]!.action.includes("MARKET DISTRICT")).toBe(true);
-    expect(chunks!.every((c) => !c.action.includes("–") || !c.action.includes(":00–"))).toBe(true);
-    expect(chunks!.every((c) => c.action !== "")).toBe(true);
-  });
+      // Every beat carries its scene, and none carries a timestamp.
+      expect(chunks![0]!.action.includes("MARKET DISTRICT")).toBe(true);
+      expect(
+        chunks!.every(
+          (c) => !c.action.includes("–") || !c.action.includes(":00–"),
+        ),
+      ).toBe(true);
+      expect(chunks!.every((c) => c.action !== "")).toBe(true);
+    },
+  );
 });
 
 // ============================================================================
@@ -296,7 +354,9 @@ describe("splitScript / partsFor, non-integer part counts", () => {
   it("a negative or infinite part count clamps into 1..MAX_PARTS rather than misbehaving", () => {
     expect(splitScript("A. B. C.", -5)).toHaveLength(1);
     expect(splitScript("A. B. C.", Number.NEGATIVE_INFINITY)).toHaveLength(1);
-    expect(splitScript("A. B. C.", Number.POSITIVE_INFINITY)).toHaveLength(MAX_PARTS);
+    expect(splitScript("A. B. C.", Number.POSITIVE_INFINITY)).toHaveLength(
+      MAX_PARTS,
+    );
     expect(partsFor(-1, 15)).toBe(1);
     expect(partsFor(Number.POSITIVE_INFINITY, 15)).toBe(MAX_PARTS);
     expect(partsFor(300, -15)).toBe(80);
@@ -338,10 +398,15 @@ describe("Unicode fidelity, adversarial", () => {
           const isLow = code >= 0xdc00 && code <= 0xdfff;
           if (isHigh) {
             const next = shot.charCodeAt(i + 1);
-            expect(next >= 0xdc00 && next <= 0xdfff, `lone high surrogate in ${JSON.stringify(shot)}`).toBe(true);
+            expect(
+              next >= 0xdc00 && next <= 0xdfff,
+              `lone high surrogate in ${JSON.stringify(shot)}`,
+            ).toBe(true);
             i += 1;
           } else {
-            expect(isLow, `lone low surrogate in ${JSON.stringify(shot)}`).toBe(false);
+            expect(isLow, `lone low surrogate in ${JSON.stringify(shot)}`).toBe(
+              false,
+            );
           }
         }
       }
@@ -349,7 +414,8 @@ describe("Unicode fidelity, adversarial", () => {
   });
 
   it("an RTL/Hebrew script splits and round-trips like any other", () => {
-    const script = "הנמל ריק. מירה הולכת על הרציף. אור נדלק בחנות! דורן כבר שם.";
+    const script =
+      "הנמל ריק. מירה הולכת על הרציף. אור נדלק בחנות! דורן כבר שם.";
     const shots = splitScript(script, 4);
     expect(shots).toHaveLength(4);
     expect(words(shots.join(" "))).toEqual(words(script));
@@ -376,23 +442,33 @@ describe("Unicode fidelity, adversarial", () => {
 describe("scriptChunks, adversarial timestamps", () => {
   it("an out-of-range or malformed clock is not a marker", () => {
     // `99:99` — seconds >= 60 is refused by read_clock.
-    expect(scriptChunks("**00:00–99:99** — One.\n\n**99:99–00:30** — Two.")).toBeUndefined();
+    expect(
+      scriptChunks("**00:00–99:99** — One.\n\n**99:99–00:30** — Two."),
+    ).toBeUndefined();
     // A clock reached from mid-number is not a timestamp.
-    expect(scriptChunks("1234:56–1234:57 one\n\n1234:58–1234:59 two")).toBeUndefined();
+    expect(
+      scriptChunks("1234:56–1234:57 one\n\n1234:58–1234:59 two"),
+    ).toBeUndefined();
     // One digit of seconds is not a clock.
-    expect(scriptChunks("**0:0–0:1** — One.\n\n**0:1–0:2** — Two.")).toBeUndefined();
+    expect(
+      scriptChunks("**0:0–0:1** — One.\n\n**0:1–0:2** — Two."),
+    ).toBeUndefined();
     // A single marker is not a shot list, however well-formed.
     expect(scriptChunks("**00:00–00:15** — Only one beat.")).toBeUndefined();
   });
 
   it("an inverted or zero-length range clamps to a usable length rather than refusing the script", () => {
-    const chunks = scriptChunks("**00:30–00:00** — Backwards.\n\n**01:00–01:00** — Zero.");
+    const chunks = scriptChunks(
+      "**00:30–00:00** — Backwards.\n\n**01:00–01:00** — Zero.",
+    );
     expect(chunks).toBeDefined();
     expect(chunks!.map((c) => c.seconds)).toEqual([1, 1]);
   });
 
   it("a beat longer than a minute clamps to 60 — the catalogue's own ceiling", () => {
-    const chunks = scriptChunks("**00:00–05:00** — Long.\n\n**05:00–10:00** — Longer.");
+    const chunks = scriptChunks(
+      "**00:00–05:00** — Long.\n\n**05:00–10:00** — Longer.",
+    );
     expect(chunks!.map((c) => c.seconds)).toEqual([60, 60]);
   });
 

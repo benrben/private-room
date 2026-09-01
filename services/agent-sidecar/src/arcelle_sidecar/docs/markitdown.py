@@ -105,8 +105,31 @@ def _run_markitdown(bin_path: str, path: str, timeout: float) -> _RunResult:
     Killing the whole group is what makes "no orphan process survives the
     call" true rather than aspirational.
     """
+    child = _start_markitdown(bin_path, path)
+    if child is None:
+        return _RunResult("not_runnable")
+
+    chunks: list[bytes] = []
+    reader = threading.Thread(
+        target=_drain_markitdown_stdout,
+        args=(child, chunks),
+        daemon=True,
+    )
+    reader.start()
+
+    deadline = time.monotonic() + timeout
+    while True:
+        status = child.poll()
+        if status is not None:
+            return _completed_markitdown(status, chunks, reader)
+        if time.monotonic() >= deadline:
+            return _timed_out_markitdown(child, reader)
+        time.sleep(0.05)
+
+
+def _start_markitdown(bin_path: str, path: str) -> subprocess.Popen[bytes] | None:
     try:
-        child = subprocess.Popen(
+        return subprocess.Popen(
             [bin_path, path],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -114,36 +137,36 @@ def _run_markitdown(bin_path: str, path: str, timeout: float) -> _RunResult:
             start_new_session=True,
         )
     except OSError:
-        return _RunResult("not_runnable")
+        return None
 
-    chunks: list[bytes] = []
 
-    def _drain() -> None:
-        assert child.stdout is not None
-        while True:
-            chunk = child.stdout.read(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-
-    reader = threading.Thread(target=_drain)
-    reader.start()
-
-    deadline = time.monotonic() + timeout
+def _drain_markitdown_stdout(child: subprocess.Popen[bytes], chunks: list[bytes]) -> None:
+    assert child.stdout is not None
     while True:
-        status = child.poll()
-        if status is not None:
-            reader.join()
-            if status == 0:
-                buf = b"".join(chunks)
-                return _RunResult("text", buf.decode("utf-8", errors="replace"))
-            return _RunResult("failed")
-        if time.monotonic() >= deadline:
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass  # already gone -- a benign race with normal exit.
-            child.wait()
-            reader.join()
-            return _RunResult("timed_out")
-        time.sleep(0.05)
+        chunk = child.stdout.read(65536)
+        if not chunk:
+            return
+        chunks.append(chunk)
+
+
+def _completed_markitdown(status: int, chunks: list[bytes], reader: threading.Thread) -> _RunResult:
+    reader.join()
+    if status != 0:
+        return _RunResult("failed")
+    output = b"".join(chunks)
+    return _RunResult("text", output.decode("utf-8", errors="replace"))
+
+
+def _timed_out_markitdown(child: subprocess.Popen[bytes], reader: threading.Thread) -> _RunResult:
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # already gone -- a benign race with normal exit.
+    child.wait()
+    # A shell can put a background grandchild into another process group. It
+    # may retain stdout even after the direct child has died, so waiting for
+    # EOF here would silently turn a bounded timeout back into its full hang.
+    # Timeout outcomes intentionally discard output; a daemon reader may
+    # finish later without holding either this call or interpreter shutdown.
+    reader.join(timeout=0.1)
+    return _RunResult("timed_out")

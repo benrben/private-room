@@ -1,0 +1,347 @@
+
+/* The interface sans, deliberately, and NOT the hand.
+   This one selector carries the three most consequential sentences in the
+   product — "it's the only way back in if you forget your password", "this is
+   shown only once", and the note that changing a password invalidated the old
+   key. Every one is a one-time instruction whose misreading cannot be undone:
+   skim it, close the sheet, forget the password, and the room is gone. The
+   brief bars handwriting on instructions, and this is the last place to make
+   an exception for texture. */
+.recovery-sheet-note {
+  font-size: var(--fs-lead);
+  line-height: var(--lh-body);
+  color: var(--ink-2);
+  max-width: 46ch;
+  margin: 0 auto;
+}
+.recovery-sheet-actions {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* Print / Save-PDF: strip the app chrome and lay the sheet out as a clean,
+   single, black-on-white page with the code big and monospace. Literal #000 /
+   #fff here on purpose — this is ink on paper, not a themed screen, and a
+   token would resolve to whatever theme happened to be active. */
+@media print {
+  /* Hide everything, then re-reveal only the recovery sheet. */
+  body * {
+    visibility: hidden !important;
+  }
+  .recovery-sheet,
+  .recovery-sheet * {
+    visibility: visible !important;
+  }
+  .recovery-sheet {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    margin: 0;
+    padding: 48px 40px;
+    gap: 20px;
+    background: #fff;
+    border: none;
+    border-radius: 0;
+    color: #000;
+    box-shadow: none;
+  }
+  .recovery-sheet-title {
+    font-size: 20px;
+    color: #000;
+  }
+  .recovery-code {
+    font-size: 28px;
+    letter-spacing: 0.18em;
+    color: #000;
+    background: #fff;
+    border: 1.5px dashed #555;
+    padding: 22px 20px;
+  }
+  .recovery-sheet-note {
+    color: #333;
+    font-size: 13px;
+    max-width: 520px;
+    margin: 0 auto;
+  }
+  /* On-screen-only controls never print. */
+  .recovery-sheet-actions {
+    display: none !important;
+  }
+  /* Avoid a stray second page from an unrelated backdrop. */
+  .approve-backdrop,
+  .search-overlay {
+    display: none !important;
+  }
+  /* The recovery sheet can be printed from inside the Settings modal, whose
+     backdrop is `.settings-backdrop`. `display:none` on that ancestor would
+     kill the sheet subtree (a descendant's visibility can't override an
+     ancestor's display:none), so hide the backdrop ONLY when it does not hold
+     a recovery sheet. Browsers without :has() drop both rules and fall back to
+     the visibility trick above, which still prints the sheet cleanly. */
+  .settings-backdrop:not(:has(.recovery-sheet)) {
+    display: none !important;
+  }
+  .settings-backdrop:has(.recovery-sheet) {
+    display: block !important;
+    background: #fff !important;
+  }
+}
+
+/* ==========================================================================
+   5. THE TIME MACHINE (version timeline)
+   A ruled list with a pencil thread running down the dot column, the way a
+   timeline is drawn in a notebook rather than rendered as a widget.
+   ========================================================================== */
+
+.time-machine {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--sp-2);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+/* One version row: the timeline dot, the cause label, and a timestamp. The
+   dashed thread is a background on the ROW rather than a pseudo-element, so it
+   costs nothing per row and cannot collide with a child's ::before. It is
+   painted at the dot's own column (10px of padding plus the dot's 4px
+   half-width) and the dot, which is opaque, sits on it — the way a point is
+   marked on a line drawn down a page. */
+.tm-version {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  padding: var(--sp-2) 10px;
+  background-color: transparent;
+  background-image: repeating-linear-gradient(
+    to bottom,
+    var(--rule) 0 4px,
+    transparent 4px 8px
+  );
+  background-repeat: no-repeat;
+  background-size: 1px 100%;
+  background-position: 13px top;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-pen);
+}
+.tm-version:hover {
+  background-color: var(--hover);
+  border-color: transparent;
+}
+.tm-version-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+.tm-cause {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-meta);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* ART-1: who wrote this version, under the cause. Its own line rather than an
+   inline suffix — the cause is what happened, this is who did it, and on a row
+   that ellipsises the attribution must not be the half that gets cut. Rendered
+   only when the room recorded it, so its presence is itself the signal. */
+.tm-prov {
+  display: block;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The head of the chain: what made the state currently on screen. Sits above
+   the version list, ruled off with the tapered pencil stroke, so "Now" reads
+   as the present and not as the newest saved version (which it is not — a
+   version is a state that has been REPLACED). */
+.tm-now {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 10px;
+  margin-bottom: var(--sp-1);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+.tm-now-label {
+  flex-shrink: 0;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.tm-now .tm-prov {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-micro);
+  color: var(--text);
+}
+/* A timestamp is technical data: mono, tabular, so a column of them lines up
+   and a relative time does not jitter as it re-renders. */
+.tm-time {
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Confirm step before a restore replaces the current file bytes. Drawn as its
+   own red-outlined frame — this is the one control in the timeline that
+   overwrites work. */
+.tm-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: 10px;
+  background: color-mix(in srgb, var(--sem-urgent-fill) 8%, transparent);
+  border: 1px solid var(--sem-urgent);
+  border-radius: var(--radius-sm);
+}
+.tm-confirm-q {
+  font-size: var(--fs-micro);
+  line-height: var(--lh-body);
+  color: var(--text);
+}
+.tm-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}
+
+/* Idea 11: per-row Compare / Restore actions, revealed on hover so the row
+   stays calm at rest. Faded with `opacity`, deliberately NOT `visibility` or
+   `display` — either of those would take these buttons out of the tab order,
+   and then the :focus-within clause that makes them reachable from the
+   keyboard could never fire at all. */
+.tm-actions {
+  flex-shrink: 0;
+  display: inline-flex;
+  gap: var(--sp-1);
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-pen);
+}
+.tm-version:hover .tm-actions,
+.tm-version:focus-within .tm-actions {
+  opacity: 1;
+}
+.tm-action {
+  min-height: 24px;
+  font-size: var(--fs-micro);
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+}
+
+/* "Kept": this version sits OUTSIDE the rolling window, so it survives any
+   number of later saves. A badge rather than an icon — it is a promise about
+   what will not happen, and that has to be readable at rest. */
+.tm-kept {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px 999px 999px 999px / 12px 10px 12px 10px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--ink);
+  background: color-mix(in srgb, var(--sem-saved-fill) 30%, transparent);
+  vertical-align: baseline;
+}
+.tm-size {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+/* The rolling window, stated. Always visible under the list — the whole point
+   is that the limit stops being something you discover by losing a version. */
+.tm-retention {
+  margin-top: 6px;
+  padding: var(--sp-2) 10px 2px;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--ink-2);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 3%,
+    var(--line-soft) 95%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left top;
+}
+
+/* The version currently loaded reads as the live point. The marker spine is
+   the SHAPE that carries it, so the state survives being read in greyscale;
+   the wash and the strong ink only reinforce it. */
+.tm-version.current {
+  background-color: var(--selected);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.tm-version.current .tm-version-dot {
+  background: var(--accent);
+}
+.tm-version.current .tm-cause {
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+/* ==========================================================================
+   6. MOTION
+   Three arrivals, one spinner and one pulse. Under reduced motion the
+   arrivals land on their finished frame, the pulse stops, and the spinner
+   becomes a static ring — the button beside it already says "Running…", so
+   the liveness signal is a word rather than a rotation.
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .studio-prompt,
+  .memory-suggestion,
+  .import-suggestion {
+    animation: none;
+  }
+  .studio-prompt-stage {
+    animation: none;
+  }
+  /* A stopped spinner still has a solid top and three faint sides, which
+     reads as a broken control rather than a still one. Evening the ring out
+     turns it into a deliberate mark that simply does not turn. */
+  .btn-spinner {
+    animation: none;
+    border-color: color-mix(in srgb, currentColor 55%, transparent);
+  }
+  .ai-action-chip,
+  .tm-version,
+  .tm-actions {
+    transition: none;
+  }
+  .ai-action-chip:active:not(:disabled) {
+    transform: none;
+  }
+}

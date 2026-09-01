@@ -73,11 +73,14 @@
 // plain `vitest` process in this sandbox.
 
 import koffi from "koffi";
-import { createHash } from "node:crypto";
-import { createRequire } from "node:module";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import type { SafeStorage } from "electron";
+
+export {
+  safeStorageHas,
+  safeStorageRead,
+  safeStorageRemove,
+  safeStorageStore,
+  safeStorageWrapPath,
+} from "./keychainSafeStorage.js";
 
 /** Keychain service; the account is the room's file path. */
 export const SERVICE = "PrivateRoom";
@@ -141,7 +144,7 @@ const CF_STRING_ENCODING_UTF8 = 0x08000100;
 
 type NativeLib = ReturnType<typeof koffi.load>;
 
-interface Native {
+export interface Native {
   CFRelease: (cf: unknown) => void;
   CFStringCreateWithCString: (alloc: unknown, cStr: string, encoding: number) => unknown;
   CFDataCreate: (allocator: unknown, bytes: Uint8Array, length: number) => unknown;
@@ -273,6 +276,162 @@ function cfstr(n: Native, arena: Arena, s: string): unknown {
   return arena.own(n.CFStringCreateWithCString(null, s, CF_STRING_ENCODING_UTF8));
 }
 
+function requireMacOS(): void {
+  if (!IS_MACOS) throw new Error(NON_MACOS_MESSAGE);
+}
+
+function withArena<T>(n: Native, work: (arena: Arena) => T): T {
+  const arena = new Arena();
+  try {
+    return work(arena);
+  } finally {
+    arena.releaseAll(n);
+  }
+}
+
+function releaseResult(n: Native, result: unknown[]): void {
+  if (result[0]) n.CFRelease(result[0]);
+}
+
+function createBiometricAccessControl(n: Native, arena: Arena): unknown {
+  // Rust's create_with_protection() passes ptr::null_mut() for the error
+  // out-param and, on a null result, hardcodes errSecParam (-50) as the
+  // reported code rather than reading whatever SecAccessControlCreateWithFlags
+  // actually wrote — ported exactly, including the discarded error.
+  const errorOut: unknown[] = [null];
+  const access = n.SecAccessControlCreateWithFlags(
+    null,
+    n.kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+    BigInt(KSEC_ACCESS_CONTROL_BIOMETRY_CURRENT_SET),
+    errorOut,
+  );
+  if (!access) {
+    throw new Error(`Could not create biometric access control (${ERR_SEC_PARAM}).`);
+  }
+  return arena.own(access);
+}
+
+function storeBasePairs(
+  n: Native,
+  service: unknown,
+  account: unknown,
+  access: unknown,
+  label: unknown,
+): ReadonlyArray<readonly [unknown, unknown]> {
+  return [
+    [n.kSecClass, n.kSecClassGenericPassword],
+    [n.kSecAttrService, service],
+    [n.kSecAttrAccount, account],
+    [n.kSecAttrAccessControl, access],
+    [n.kSecAttrLabel, label],
+    [n.kSecUseDataProtectionKeychain, n.kCFBooleanTrue],
+  ];
+}
+
+function addOrUpdatePassword(
+  n: Native,
+  arena: Arena,
+  basePairs: ReadonlyArray<readonly [unknown, unknown]>,
+  passwordData: unknown,
+): void {
+  const addQuery = arena.own(buildDict(n, [...basePairs, [n.kSecValueData, passwordData] as const]));
+  const result: unknown[] = [null];
+  const status = n.SecItemAdd(addQuery, result);
+  releaseResult(n, result);
+
+  if (status === ERR_SEC_DUPLICATE_ITEM) {
+    // Mirrors security-framework's set_password_internal fallback: on a
+    // duplicate, update just the value data against the base query
+    // instead of failing. store() already deletes first, so this should
+    // be unreachable outside of a race — kept for fidelity and safety.
+    const matchQuery = arena.own(buildDict(n, basePairs));
+    const updateAttrs = arena.own(buildDict(n, [[n.kSecValueData, passwordData] as const]));
+    const updateStatus = n.SecItemUpdate(matchQuery, updateAttrs);
+    if (updateStatus !== 0) throw new Error(messageFor(updateStatus));
+    return;
+  }
+
+  if (status !== 0) throw new Error(messageFor(status));
+}
+
+function storeWithNative(n: Native, arena: Arena, roomPath: string, password: string, service: string): void {
+  const access = createBiometricAccessControl(n, arena);
+  const serviceRef = cfstr(n, arena, service);
+  const accountRef = cfstr(n, arena, roomPath);
+  const label = cfstr(n, arena, "Arcelle — Touch ID unlock");
+  const passwordBytes = Buffer.from(password, "utf8");
+  const passwordData = arena.own(n.CFDataCreate(null, passwordBytes, passwordBytes.length));
+  addOrUpdatePassword(n, arena, storeBasePairs(n, serviceRef, accountRef, access, label), passwordData);
+}
+
+function readDataRef(n: Native, arena: Arena, roomPath: string, service: string): unknown {
+  const serviceRef = cfstr(n, arena, service);
+  const accountRef = cfstr(n, arena, roomPath);
+  const query = arena.own(
+    buildDict(n, [
+      [n.kSecClass, n.kSecClassGenericPassword],
+      [n.kSecAttrService, serviceRef],
+      [n.kSecAttrAccount, accountRef],
+      [n.kSecReturnData, n.kCFBooleanTrue],
+      [n.kSecUseDataProtectionKeychain, n.kCFBooleanTrue],
+    ]),
+  );
+  const result: unknown[] = [null];
+  // This call is the one that triggers the real Touch ID / Face ID prompt
+  // (kSecReturnData forces LocalAuthentication to evaluate the item's access
+  // control before handing back the secret).
+  const status = n.SecItemCopyMatching(query, result);
+  if (status !== 0) throw new Error(messageFor(status));
+  if (!result[0]) throw new Error(messageFor(ERR_SEC_PARAM));
+  return result[0];
+}
+
+function decodeDataRef(n: Native, dataRef: unknown): string {
+  try {
+    // Defensive type check, mirroring get_password_and_release: we asked
+    // for kSecReturnData so this should always be CFData, but Rust checks
+    // rather than assumes.
+    if (n.CFGetTypeID(dataRef) !== n.CFDataGetTypeID()) {
+      throw new Error(messageFor(ERR_SEC_PARAM));
+    }
+    const length = n.CFDataGetLength(dataRef);
+    if (length === 0n) return "";
+    const bytePtr = n.CFDataGetBytePtr(dataRef);
+    const view = koffi.decode(bytePtr, koffi.array("uint8_t", Number(length))) as Uint8Array;
+    const bytes = Buffer.from(view);
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw new Error("Stored secret was not valid UTF-8.");
+    }
+  } finally {
+    n.CFRelease(dataRef);
+  }
+}
+
+function readWithNative(n: Native, arena: Arena, roomPath: string, service: string): string {
+  return decodeDataRef(n, readDataRef(n, arena, roomPath, service));
+}
+
+/**
+ * Creates isolated operations for deterministic FFI unit tests. It never
+ * calls `loadNative`, the platform keychain, or Electron; callers provide a
+ * complete fake `Native` implementation instead.
+ */
+export function createKeychainFfiForTests(native: Native): {
+  store(roomPath: string, password: string, service?: string): void;
+  read(roomPath: string, service?: string): string;
+} {
+  return {
+    store(roomPath, password, service = SERVICE) {
+      withArena(native, (arena) => storeWithNative(native, arena, roomPath, password, service));
+    },
+    read(roomPath, service = SERVICE) {
+      return withArena(native, (arena) => readWithNative(native, arena, roomPath, service));
+    },
+  };
+}
+
 /**
  * Does a biometric entry exist for this room? Queries attributes ONLY (no
  * `kSecReturnData`) and skips any auth UI, so it never triggers a prompt —
@@ -313,7 +472,7 @@ export function has(roomPath: string, serviceOverride?: string): boolean {
  * Any existing entry is replaced. Creating does not require a prompt.
  */
 export function store(roomPath: string, password: string, serviceOverride?: string): void {
-  if (!IS_MACOS) throw new Error(NON_MACOS_MESSAGE);
+  requireMacOS();
 
   // Replace cleanly: drop any prior item first so we never hit the
   // authenticated update path on a biometric item. Mirrors the Rust
@@ -325,61 +484,7 @@ export function store(roomPath: string, password: string, serviceOverride?: stri
   }
 
   const n = loadNative();
-  const arena = new Arena();
-  try {
-    // Rust's create_with_protection() passes ptr::null_mut() for the error
-    // out-param and, on a null result, hardcodes errSecParam (-50) as the
-    // reported code rather than reading whatever SecAccessControlCreateWithFlags
-    // actually wrote — ported exactly, including the discarded error.
-    const errorOut: unknown[] = [null];
-    const access = n.SecAccessControlCreateWithFlags(
-      null,
-      n.kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-      BigInt(KSEC_ACCESS_CONTROL_BIOMETRY_CURRENT_SET),
-      errorOut,
-    );
-    if (!access) {
-      throw new Error(`Could not create biometric access control (${ERR_SEC_PARAM}).`);
-    }
-    arena.own(access);
-
-    const svc = cfstr(n, arena, serviceOverride ?? SERVICE);
-    const acct = cfstr(n, arena, roomPath);
-    const label = cfstr(n, arena, "Arcelle — Touch ID unlock");
-    const pwBytes = Buffer.from(password, "utf8");
-    const pwData = arena.own(n.CFDataCreate(null, pwBytes, pwBytes.length));
-
-    const basePairs: ReadonlyArray<readonly [unknown, unknown]> = [
-      [n.kSecClass, n.kSecClassGenericPassword],
-      [n.kSecAttrService, svc],
-      [n.kSecAttrAccount, acct],
-      [n.kSecAttrAccessControl, access],
-      [n.kSecAttrLabel, label],
-      [n.kSecUseDataProtectionKeychain, n.kCFBooleanTrue],
-    ];
-
-    const addQuery = arena.own(buildDict(n, [...basePairs, [n.kSecValueData, pwData] as const]));
-    const result: unknown[] = [null];
-    const status = n.SecItemAdd(addQuery, result);
-    if (result[0]) n.CFRelease(result[0]);
-
-    if (status === ERR_SEC_DUPLICATE_ITEM) {
-      // Mirrors security-framework's set_password_internal fallback: on a
-      // duplicate, update just the value data against the base query
-      // instead of failing. store() already deletes first, so this should
-      // be unreachable outside of a race — kept for fidelity and safety.
-      const matchQuery = arena.own(buildDict(n, basePairs));
-      const updateAttrs = arena.own(buildDict(n, [[n.kSecValueData, pwData] as const]));
-      const updateStatus = n.SecItemUpdate(matchQuery, updateAttrs);
-      if (updateStatus !== 0) {
-        throw new Error(messageFor(updateStatus));
-      }
-    } else if (status !== 0) {
-      throw new Error(messageFor(status));
-    }
-  } finally {
-    arena.releaseAll(n);
-  }
+  withArena(n, (arena) => storeWithNative(n, arena, roomPath, password, serviceOverride ?? SERVICE));
 }
 
 /**
@@ -388,62 +493,29 @@ export function store(roomPath: string, password: string, serviceOverride?: stri
  * match surface as a clear error so the UI can fall back to typing.
  */
 export function read(roomPath: string, serviceOverride?: string): string {
-  if (!IS_MACOS) throw new Error(NON_MACOS_MESSAGE);
+  requireMacOS();
   const n = loadNative();
-  const arena = new Arena();
-  try {
-    const svc = cfstr(n, arena, serviceOverride ?? SERVICE);
-    const acct = cfstr(n, arena, roomPath);
-    const query = arena.own(
-      buildDict(n, [
-        [n.kSecClass, n.kSecClassGenericPassword],
-        [n.kSecAttrService, svc],
-        [n.kSecAttrAccount, acct],
-        [n.kSecReturnData, n.kCFBooleanTrue],
-        [n.kSecUseDataProtectionKeychain, n.kCFBooleanTrue],
-      ]),
-    );
-    const result: unknown[] = [null];
-    // This call is the one that triggers the real Touch ID / Face ID
-    // prompt (kSecReturnData forces LocalAuthentication to evaluate the
-    // item's access control before handing back the secret).
-    const status = n.SecItemCopyMatching(query, result);
-    if (status !== 0) {
-      throw new Error(messageFor(status));
-    }
-    const dataRef = result[0];
-    if (!dataRef) {
-      throw new Error(messageFor(ERR_SEC_PARAM));
-    }
-    try {
-      // Defensive type check, mirroring get_password_and_release: we asked
-      // for kSecReturnData so this should always be CFData, but Rust checks
-      // rather than assumes.
-      if (n.CFGetTypeID(dataRef) !== n.CFDataGetTypeID()) {
-        throw new Error(messageFor(ERR_SEC_PARAM));
-      }
-      const length = n.CFDataGetLength(dataRef);
-      if (length === 0n) return "";
-      const bytePtr = n.CFDataGetBytePtr(dataRef);
-      const view = koffi.decode(bytePtr, koffi.array("uint8_t", Number(length))) as Uint8Array;
-      const bytes = Buffer.from(view);
-      try {
-        return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-      } catch {
-        throw new Error("Stored secret was not valid UTF-8.");
-      }
-    } finally {
-      n.CFRelease(dataRef);
-    }
-  } finally {
-    arena.releaseAll(n);
-  }
+  return withArena(n, (arena) => readWithNative(n, arena, roomPath, serviceOverride ?? SERVICE));
 }
 
+interface DeleteEntryDeps {
+  isMacOS(): boolean;
+  loadNative(): Native;
+}
+
+const defaultDeleteEntryDeps: DeleteEntryDeps = {
+  isMacOS: () => IS_MACOS,
+  loadNative,
+};
+
 /** Delete the entry for `roomPath`. Missing is success (idempotent). */
-export function deleteEntry(roomPath: string, serviceOverride?: string): void {
-  if (!IS_MACOS) return; // matches the Rust source's non-macOS `Ok(())`
-  const n = loadNative();
+export function deleteEntry(
+  roomPath: string,
+  serviceOverride?: string,
+  deps: DeleteEntryDeps = defaultDeleteEntryDeps,
+): void {
+  if (!deps.isMacOS()) return; // matches the Rust source's non-macOS `Ok(())`
+  const n = deps.loadNative();
   const arena = new Arena();
   try {
     const svc = cfstr(n, arena, serviceOverride ?? SERVICE);
@@ -463,81 +535,4 @@ export function deleteEntry(roomPath: string, serviceOverride?: string): void {
   } finally {
     arena.releaseAll(n);
   }
-}
-
-// ------------------------------------------------------------------------
-// Safety-net fallback: Electron `safeStorage` (Part E of the migration plan)
-// ------------------------------------------------------------------------
-//
-// Keychain ACLs bind to the app's code signature. A re-signed Electron app
-// may not be able to read old Rust-app Keychain items, so this fallback
-// lets a user re-enroll once via `safeStorage` instead of losing Touch ID
-// unlock entirely. `safeStorage` requires a running, ready Electron app
-// (`app.isReady()`), so none of the functions below can be exercised from a
-// plain Node/vitest test — see the port report for why, and note that NO
-// test here calls them for real.
-//
-// `require("electron")` is resolved lazily, inside each function, via a
-// manually-created `createRequire` rather than a static top-level import:
-// under plain Node (as `vitest` runs this file), the "electron" package's
-// CJS entry point exports a plain path string, not the API object, and a
-// static `import { safeStorage } from "electron"` would fail to resolve a
-// named export at module-evaluation time and break every test in this
-// file — including the pure, FFI-free `messageFor` ones. Deferring the
-// require into the function body means it only ever runs inside a real
-// Electron main process, and never during `vitest run`. (See menu.ts's
-// `build()` in this same directory for the same problem solved with a
-// lazy `await import("electron")` — that function could afford to be
-// async; these can't, because `safeStorage.encryptString`/`decryptString`
-// are synchronous APIs the task's signatures deliberately mirror.)
-
-function requireSafeStorage(): SafeStorage {
-  const req = createRequire(import.meta.url);
-  const electronModule = req("electron") as { safeStorage?: SafeStorage };
-  if (!electronModule || !electronModule.safeStorage) {
-    throw new Error("safeStorage is only available inside a running Electron app.");
-  }
-  return electronModule.safeStorage;
-}
-
-/**
- * A deterministic file path under `userDataDir/"unlock"/` for this room's
- * wrapped secret. The room path is hashed (sha256, first 20 hex chars) so
- * it's filesystem-safe regardless of what characters the room's own path
- * contains.
- */
-export function safeStorageWrapPath(userDataDir: string, roomPath: string): string {
-  const hash = createHash("sha256").update(roomPath, "utf8").digest("hex").slice(0, 20);
-  return path.join(userDataDir, "unlock", `${hash}.bin`);
-}
-
-/** Encrypt `password` with `safeStorage` and write it to the wrap file for `roomPath`. */
-export function safeStorageStore(userDataDir: string, roomPath: string, password: string): void {
-  const safeStorage = requireSafeStorage();
-  const wrapPath = safeStorageWrapPath(userDataDir, roomPath);
-  fs.mkdirSync(path.dirname(wrapPath), { recursive: true });
-  const encrypted = safeStorage.encryptString(password);
-  fs.writeFileSync(wrapPath, encrypted);
-}
-
-/** Read back the password `safeStorageStore` wrote for `roomPath`. */
-export function safeStorageRead(userDataDir: string, roomPath: string): string {
-  const safeStorage = requireSafeStorage();
-  const wrapPath = safeStorageWrapPath(userDataDir, roomPath);
-  if (!fs.existsSync(wrapPath)) {
-    throw new Error(`No safeStorage entry for this room at ${wrapPath}.`);
-  }
-  const encrypted = fs.readFileSync(wrapPath);
-  return safeStorage.decryptString(encrypted);
-}
-
-/** Does a safeStorage wrap file exist for `roomPath`? */
-export function safeStorageHas(userDataDir: string, roomPath: string): boolean {
-  return fs.existsSync(safeStorageWrapPath(userDataDir, roomPath));
-}
-
-/** Remove the safeStorage wrap file for `roomPath`. Idempotent — missing is not an error. */
-export function safeStorageRemove(userDataDir: string, roomPath: string): void {
-  const wrapPath = safeStorageWrapPath(userDataDir, roomPath);
-  fs.rmSync(wrapPath, { force: true });
 }

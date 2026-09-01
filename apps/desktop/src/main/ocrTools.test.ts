@@ -10,6 +10,11 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+
+const sidecar = vi.hoisted(() => ({ sidecarJsonCancellable: vi.fn() }));
+
+vi.mock("./sidecarJsonCancellable.js", () => sidecar);
+
 import {
   isOcrCandidate,
   MAX_PAGE_EDGE,
@@ -19,6 +24,7 @@ import {
   PDF_RENDER_SCALE,
   pageRasterSize,
   recognize,
+  recognizeViaSidecar,
   unreadNotes,
   type OcrRecognizeFn,
 } from "./ocrTools.js";
@@ -169,6 +175,42 @@ describe("recognize", () => {
     const ocr: OcrRecognizeFn = () => Promise.reject(new Error("Vision request handler crashed"));
     await expect(recognize("image/png", "png", Buffer.from([1]), ocr)).rejects.toThrow(
       "Vision request handler crashed"
+    );
+  });
+});
+
+describe("recognizeViaSidecar", () => {
+  it("sends encoded OCR input through the fake cancellable sidecar seam", async () => {
+    sidecar.sidecarJsonCancellable.mockResolvedValue({ kind: "value", value: { text: "recognized" } });
+    const bytes = Buffer.from([0, 255, 3]);
+
+    await expect(recognizeViaSidecar("image/png", "png", bytes)).resolves.toBe("recognized");
+
+    expect(sidecar.sidecarJsonCancellable).toHaveBeenCalledWith(
+      "/ocr",
+      { mime: "image/png", ext: "png", data_b64: bytes.toString("base64") },
+      expect.anything(),
+      30 * 60 * 1000,
+    );
+  });
+
+  it("returns null when the fake sidecar response has no string text", async () => {
+    for (const value of [null, {}, { text: 42 }]) {
+      sidecar.sidecarJsonCancellable.mockResolvedValueOnce({ kind: "value", value });
+      await expect(recognizeViaSidecar("application/pdf", "pdf", Buffer.alloc(0))).resolves.toBeNull();
+    }
+  });
+
+  it("preserves stopped and sidecar error outcomes", async () => {
+    sidecar.sidecarJsonCancellable.mockResolvedValueOnce({ kind: "stopped" });
+    await expect(recognizeViaSidecar("image/jpeg", "jpg", Buffer.alloc(0))).rejects.toThrow("Stopped.");
+
+    sidecar.sidecarJsonCancellable.mockResolvedValueOnce({
+      kind: "error",
+      error: { error: "fake Vision bridge failed" },
+    });
+    await expect(recognizeViaSidecar("image/jpeg", "jpg", Buffer.alloc(0))).rejects.toThrow(
+      "fake Vision bridge failed",
     );
   });
 });

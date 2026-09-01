@@ -118,40 +118,64 @@ def _data_url(b64: str, mime: str) -> str:
     Validated here rather than trusted: a malformed payload should be named as
     ours before it becomes an opaque 400 from three services away.
     """
+    payload = _reference_payload(b64)
+    raw = _decoded_reference_payload(payload)
+    _validate_reference_size(raw)
+    kind = _picture_mime(mime)
+    return f"data:{kind};base64,{payload}"
+
+
+def _reference_payload(b64: str) -> str:
     payload = (b64 or "").strip()
     if not payload:
         raise VideoGenError("a reference picture was empty")
+    return payload
+
+
+def _decoded_reference_payload(payload: str) -> bytes:
     try:
-        raw = base64.b64decode(payload, validate=True)
+        return base64.b64decode(payload, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise VideoGenError("a reference picture could not be read") from exc
+
+
+def _validate_reference_size(raw: bytes) -> None:
     if len(raw) > MAX_REFERENCE_BYTES:
         raise VideoGenError(
             f"a reference picture is {len(raw) // (1024 * 1024)} MB, over this "
             f"room's {MAX_REFERENCE_BYTES // (1024 * 1024)} MB limit for one "
             "picture sent to a model"
         )
+
+
+def _picture_mime(mime: str) -> str:
     kind = (mime or "image/png").strip().lower()
     if not kind.startswith("image/"):
         raise VideoGenError(f"{kind} is not a picture, so it cannot be a frame")
-    return f"data:{kind};base64,{payload}"
+    return kind
 
 
 def frame_parts(frames: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     """Build the ``frame_images`` array: which picture is which end of the clip."""
     parts: list[dict[str, Any]] = []
     for frame in frames or []:
-        slot = str(frame.get("frame_type") or "first_frame").strip().lower()
-        if slot not in FRAME_TYPES:
-            raise VideoGenError(f"{slot} is not a frame this room knows how to send")
-        parts.append(
-            {
-                "type": "image_url",
-                "frame_type": slot,
-                "image_url": {"url": _data_url(str(frame.get("b64") or ""), str(frame.get("mime") or ""))},
-            }
-        )
+        parts.append(_frame_part(frame))
     return parts
+
+
+def _frame_part(frame: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "image_url",
+        "frame_type": _frame_slot(frame),
+        "image_url": {"url": _data_url(str(frame.get("b64") or ""), str(frame.get("mime") or ""))},
+    }
+
+
+def _frame_slot(frame: dict[str, Any]) -> str:
+    slot = str(frame.get("frame_type") or "first_frame").strip().lower()
+    if slot not in FRAME_TYPES:
+        raise VideoGenError(f"{slot} is not a frame this room knows how to send")
+    return slot
 
 
 def reference_parts(references: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -192,11 +216,10 @@ def guard(
     from . import privacy as privacy_mod
 
     policy = privacy_mod.policy_from_payload(privacy)
-    engaged = policy is not None and policy.active and privacy_mod.is_nonlocal_model(model)
-    if not engaged or policy is None:
+    if not _privacy_policy_is_engaged(policy, model, privacy_mod):
         return prompt, None
 
-    if picture_count and not acknowledged:
+    if _has_unacknowledged_pictures(picture_count, acknowledged):
         raise VideoGenError(
             "This room's privacy door does not let pictures leave the Mac, so "
             f"{model} cannot be shown the {picture_count} you attached. Send "
@@ -204,6 +227,14 @@ def guard(
         )
 
     return policy.redact_text(prompt), policy.report.as_payload()
+
+
+def _privacy_policy_is_engaged(policy: Any, model: str, privacy_mod: Any) -> bool:
+    return policy is not None and policy.active and privacy_mod.is_nonlocal_model(model)
+
+
+def _has_unacknowledged_pictures(picture_count: int, acknowledged: bool) -> bool:
+    return bool(picture_count and not acknowledged)
 
 
 async def submit(
@@ -227,12 +258,7 @@ async def submit(
     asked for — a submission with neither words nor a picture is refused before
     it is billed.
     """
-    text = (prompt or "").strip()
-    frame_list = frame_parts(frames)
-    reference_list = reference_parts(references)
-    if not text and not frame_list and not reference_list:
-        raise VideoGenError("nothing to film — say what happens, or attach a picture")
-
+    text, frame_list, reference_list = _submission_parts(prompt, frames, references)
     outbound, report = guard(
         text,
         model,
@@ -240,28 +266,96 @@ async def submit(
         picture_count=len(frame_list) + len(reference_list),
         acknowledged=bool(references_ack),
     )
+    payload = _submission_payload(
+        model,
+        provider.model,
+        outbound,
+        seconds,
+        resolution,
+        aspect_ratio,
+        frame_list,
+        reference_list,
+        generate_audio,
+    )
+    data = await _call(provider, "POST", "/videos", json=payload)
+    return _submission_result(data, report)
 
-    payload: dict[str, Any] = {"model": _model_slug(model, provider.model)}
-    if outbound:
-        payload["prompt"] = outbound
+
+def _submission_parts(
+    prompt: str,
+    frames: list[dict[str, Any]] | None,
+    references: list[dict[str, Any]] | None,
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    text = (prompt or "").strip()
+    frame_list = frame_parts(frames)
+    reference_list = reference_parts(references)
+    if not text and not frame_list and not reference_list:
+        raise VideoGenError("nothing to film — say what happens, or attach a picture")
+    return text, frame_list, reference_list
+
+
+def _submission_payload(
+    model: str,
+    configured_model: str,
+    prompt: str,
+    seconds: int | None,
+    resolution: str,
+    aspect_ratio: str,
+    frames: list[dict[str, Any]],
+    references: list[dict[str, Any]],
+    generate_audio: bool | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"model": _model_slug(model, configured_model)}
+    _add_submission_text(payload, prompt, resolution, aspect_ratio)
+    _add_submission_options(payload, seconds, generate_audio)
+    _add_submission_pictures(payload, frames, references)
+    return payload
+
+
+def _add_submission_text(
+    payload: dict[str, Any], prompt: str, resolution: str, aspect_ratio: str
+) -> None:
+    if prompt:
+        payload["prompt"] = prompt
+    _add_stripped_payload_value(payload, "resolution", resolution)
+    _add_stripped_payload_value(payload, "aspect_ratio", aspect_ratio)
+
+
+def _add_stripped_payload_value(payload: dict[str, Any], key: str, value: str) -> None:
+    stripped = value.strip()
+    if stripped:
+        payload[key] = stripped
+
+
+def _add_submission_options(
+    payload: dict[str, Any], seconds: int | None, generate_audio: bool | None
+) -> None:
     if seconds:
         payload["duration"] = int(seconds)
-    if resolution.strip():
-        payload["resolution"] = resolution.strip()
-    if aspect_ratio.strip():
-        payload["aspect_ratio"] = aspect_ratio.strip()
-    if frame_list:
-        payload["frame_images"] = frame_list
-    if reference_list:
-        payload["input_references"] = reference_list
     if generate_audio is not None:
         payload["generate_audio"] = bool(generate_audio)
 
-    data = await _call(provider, "POST", "/videos", json=payload)
+
+def _add_submission_pictures(
+    payload: dict[str, Any], frames: list[dict[str, Any]], references: list[dict[str, Any]]
+) -> None:
+    if frames:
+        payload["frame_images"] = frames
+    if references:
+        payload["input_references"] = references
+
+
+def _submission_id(data: dict[str, Any]) -> str:
     video_id = data.get("id") or data.get("job_id")
     if not isinstance(video_id, str) or not video_id.strip():
         raise VideoGenError("the provider accepted the job but named no id for it")
-    return {"video_id": video_id.strip(), "privacy": report}
+    return video_id.strip()
+
+
+def _submission_result(
+    data: dict[str, Any], report: dict[str, int] | None
+) -> dict[str, Any]:
+    return {"video_id": _submission_id(data), "privacy": report}
 
 
 async def status(*, model: str, video_id: str, provider: Any) -> dict[str, Any]:
@@ -274,42 +368,84 @@ async def status(*, model: str, video_id: str, provider: Any) -> dict[str, Any]:
     """
     _ = model  # present so the host's provider/privacy injection has a model to key on
     data = await _call(provider, "GET", f"/videos/{video_id}")
-    raw = str(data.get("status") or "").strip().lower()
-    error = data.get("error")
-    if isinstance(error, dict):
-        error = error.get("message")
-    progress = data.get("progress")
+    return _status_result(data)
+
+
+def _status_result(data: dict[str, Any]) -> dict[str, Any]:
+    raw = _status_value(data)
     return {
         "status": raw or "pending",
         "done": raw in DONE_STATUSES,
         "failed": raw in DEAD_STATUSES,
         "pending": raw not in DONE_STATUSES and raw not in DEAD_STATUSES,
-        "error": str(error).strip() if isinstance(error, str) and error.strip() else None,
-        "progress": int(progress) if isinstance(progress, (int, float)) else None,
+        "error": _optional_error_message(data.get("error")),
+        "progress": _optional_progress(data.get("progress")),
     }
+
+
+def _status_value(data: dict[str, Any]) -> str:
+    return str(data.get("status") or "").strip().lower()
+
+
+def _optional_error_message(error: Any) -> str | None:
+    if isinstance(error, dict):
+        error = error.get("message")
+    return _optional_text(error)
+
+
+def _optional_progress(progress: Any) -> int | None:
+    return int(progress) if isinstance(progress, (int, float)) else None
+
+
+def _optional_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
 
 
 async def fetch(*, model: str, video_id: str, provider: Any, index: int = 0) -> dict[str, Any]:
     """Download a finished clip as bytes the host can file."""
     _ = model
+    response = await _download_clip_response(provider, video_id, index)
+    _require_successful_clip_response(response)
+    raw = _clip_bytes(response)
+    mime, ext = _clip_format(response)
+    return {"artwork_b64": base64.b64encode(raw).decode("ascii"), "mime": mime, "ext": ext}
+
+
+async def _download_clip_response(provider: Any, video_id: str, index: int) -> httpx.Response:
     url = f"{provider.base_url.rstrip('/')}/videos/{video_id}/content?index={int(index)}"
     try:
         async with httpx.AsyncClient(timeout=FETCH_TIMEOUT_SECS, follow_redirects=True) as client:
-            response = await client.get(url, headers=_headers(provider.api_key))
+            return await client.get(url, headers=_headers(provider.api_key))
     except httpx.HTTPError as exc:
         raise VideoGenError(f"could not download the clip: {exc}") from exc
+
+
+def _require_successful_clip_response(response: httpx.Response) -> None:
     if not response.is_success:
         raise VideoGenError(_error_message(response))
 
+
+
+def _clip_bytes(response: httpx.Response) -> bytes:
     raw = response.content
     if not raw:
         raise VideoGenError("the provider returned an empty clip")
+    _require_clip_size(raw)
+    return raw
+
+
+def _require_clip_size(raw: bytes) -> None:
     if len(raw) > MAX_CLIP_BYTES:
         raise VideoGenError(
             f"the clip is {len(raw) // (1024 * 1024)} MB, over this room's "
             f"{MAX_CLIP_BYTES // (1024 * 1024)} MB limit for one generated file"
         )
 
+
+def _clip_format(response: httpx.Response) -> tuple[str, str]:
     mime = (response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
     ext = CLIP_MIMES.get(mime)
     if ext is None:
@@ -317,7 +453,7 @@ async def fetch(*, model: str, video_id: str, provider: Any, index: int = 0) -> 
         # clip they have already paid for. mp4 is what every model in the live
         # catalogue returns, so save it rather than refuse it.
         mime, ext = "video/mp4", "mp4"
-    return {"artwork_b64": base64.b64encode(raw).decode("ascii"), "mime": mime, "ext": ext}
+    return mime, ext
 
 
 async def _call(provider: Any, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
@@ -343,17 +479,25 @@ async def _call(provider: Any, method: str, path: str, **kwargs: Any) -> dict[st
 
 def _error_message(response: httpx.Response) -> str:
     """The provider's own words when it refuses, not just a status code."""
+    message = _provider_error_message(_json_body(response))
+    return message or _refusal_message(response)
+
+
+def _json_body(response: httpx.Response) -> Any:
     try:
-        body = response.json()
+        return response.json()
     except ValueError:
-        return f"the provider refused the request ({response.status_code})"
+        return None
+
+
+def _provider_error_message(body: Any) -> str | None:
     error = body.get("error") if isinstance(body, dict) else None
     if isinstance(error, dict):
-        message = error.get("message")
-        if isinstance(message, str) and message.strip():
-            return message.strip()
-    elif isinstance(error, str) and error.strip():
-        return error.strip()
+        error = error.get("message")
+    return _optional_text(error)
+
+
+def _refusal_message(response: httpx.Response) -> str:
     return f"the provider refused the request ({response.status_code})"
 
 

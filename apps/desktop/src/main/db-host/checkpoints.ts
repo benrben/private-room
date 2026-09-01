@@ -170,21 +170,23 @@ function manifestPath(dir: string): string {
   return `${dir}/manifest.json`;
 }
 
-function isCheckpointMeta(x: unknown): x is CheckpointMeta {
+function stringFields(record: Record<string, unknown>, fields: string[]): boolean {
+  return fields.every((field) => typeof record[field] === "string");
+}
+
+export function isCheckpointMeta(x: unknown): x is CheckpointMeta {
   if (typeof x !== "object" || x === null) {
     return false;
   }
   const o = x as Record<string, unknown>;
   return (
-    typeof o.id === "string" &&
-    typeof o.name === "string" &&
-    typeof o.createdAt === "string" &&
+    stringFields(o, ["id", "name", "createdAt"]) &&
     typeof o.sizeBytes === "number" &&
     typeof o.auto === "boolean"
   );
 }
 
-function isCheckpointManifest(x: unknown): x is CheckpointManifest {
+export function isCheckpointManifest(x: unknown): x is CheckpointManifest {
   if (typeof x !== "object" || x === null) {
     return false;
   }
@@ -241,6 +243,99 @@ export function writeManifest(dir: string, manifest: CheckpointManifest): void {
   }
 }
 
+function dedupeCheckpointEntries(entries: CheckpointMeta[]): CheckpointMeta[] {
+  const seen = new Set<string>();
+  return entries.filter((entry) => {
+    const duplicate = seen.has(entry.id);
+    seen.add(entry.id);
+    return !duplicate;
+  });
+}
+
+function entriesWithPayload(dir: string, entries: CheckpointMeta[]): CheckpointMeta[] {
+  return entries.filter((entry) => existsSync(checkpointFilePath(dir, entry.id)));
+}
+
+function checkpointSizeOrZero(filePath: string): number {
+  try {
+    return statSync(filePath).size;
+  } catch {
+    return 0;
+  }
+}
+
+function refreshEntrySize(dir: string, entry: CheckpointMeta): void {
+  try {
+    entry.sizeBytes = statSync(checkpointFilePath(dir, entry.id)).size;
+  } catch {
+    // The payload existed when filtering. Keeping the last-known size is safe
+    // if it disappears between that check and this one.
+  }
+}
+
+function refreshEntrySizes(dir: string, entries: CheckpointMeta[]): void {
+  for (const entry of entries) {
+    refreshEntrySize(dir, entry);
+  }
+}
+
+function directoryNames(dir: string): string[] {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
+function removeFileBestEffort(filePath: string): void {
+  try {
+    unlinkSync(filePath);
+  } catch {
+    // Best effort cleanup must not hide the operation's original result.
+  }
+}
+
+function recoveredCheckpoint(fullPath: string, id: string): CheckpointMeta {
+  return {
+    id,
+    name: "Recovered checkpoint",
+    createdAt: mtimeTimestamp(fullPath),
+    sizeBytes: checkpointSizeOrZero(fullPath),
+    auto: false,
+  };
+}
+
+function reconcileDirectoryEntry(dir: string, fileName: string, known: Set<string>): CheckpointMeta | undefined {
+  const fullPath = `${dir}/${fileName}`;
+  if (fileName.endsWith(".tmp")) {
+    removeFileBestEffort(fullPath);
+    return undefined;
+  }
+  if (!fileName.endsWith(".roomck")) {
+    return undefined;
+  }
+  const id = fileName.slice(0, -".roomck".length);
+  return known.has(id) ? undefined : recoveredCheckpoint(fullPath, id);
+}
+
+function recoverDirectoryEntries(dir: string, manifest: CheckpointManifest): void {
+  const known = new Set(manifest.entries.map((entry) => entry.id));
+  for (const fileName of directoryNames(dir)) {
+    const recovered = reconcileDirectoryEntry(dir, fileName, known);
+    if (recovered !== undefined) {
+      manifest.entries.push(recovered);
+    }
+  }
+}
+
+function writeManifestBestEffort(dir: string, manifest: CheckpointManifest): void {
+  try {
+    writeManifest(dir, manifest);
+  } catch {
+    // Recovery is still useful in memory when its durable manifest write fails.
+  }
+}
+
 /** The crash-recovery point in BOTH directions: dedupe entries by id (keep
  * first), drop manifest entries whose `.roomck` is gone, refresh the
  * survivors' sizes, delete stale `*.tmp` files (a crash mid-vacuum), and
@@ -251,70 +346,10 @@ export function writeManifest(dir: string, manifest: CheckpointManifest): void {
  * stop the CALLER from seeing the healed-in-memory manifest). */
 export function reconcile(dir: string): CheckpointManifest {
   const manifest = readManifest(dir);
-
-  // 0. Defensive dedupe by id (keep first) — a duplicate id must never leak
-  //    into rekey/prune loops that would then act on the same file twice.
-  const seen = new Set<string>();
-  manifest.entries = manifest.entries.filter((e) => {
-    if (seen.has(e.id)) {
-      return false;
-    }
-    seen.add(e.id);
-    return true;
-  });
-
-  // 1. Drop entries whose payload vanished; refresh the survivors' sizes.
-  manifest.entries = manifest.entries.filter((e) => existsSync(checkpointFilePath(dir, e.id)));
-  for (const e of manifest.entries) {
-    try {
-      e.sizeBytes = statSync(checkpointFilePath(dir, e.id)).size;
-    } catch {
-      // Existed a moment ago (the filter above just checked); a race here is
-      // vanishingly unlikely and leaving the last-known size is harmless.
-    }
-  }
-  const known = new Set(manifest.entries.map((e) => e.id));
-
-  // 2. Sweep the dir: delete stale temp files, adopt orphan payloads.
-  let names: string[] = [];
-  try {
-    names = readdirSync(dir);
-  } catch {
-    names = [];
-  }
-  for (const fname of names) {
-    const full = `${dir}/${fname}`;
-    if (fname.endsWith(".tmp")) {
-      try {
-        unlinkSync(full);
-      } catch {
-        // best effort
-      }
-    } else if (fname.endsWith(".roomck")) {
-      const id = fname.slice(0, -".roomck".length);
-      if (!known.has(id)) {
-        let size = 0;
-        try {
-          size = statSync(full).size;
-        } catch {
-          size = 0;
-        }
-        manifest.entries.push({
-          id,
-          name: "Recovered checkpoint",
-          createdAt: mtimeTimestamp(full),
-          sizeBytes: size,
-          auto: false,
-        });
-      }
-    }
-  }
-
-  try {
-    writeManifest(dir, manifest);
-  } catch {
-    // best effort, mirrors Rust's `let _ = write_manifest(dir, &manifest);`
-  }
+  manifest.entries = entriesWithPayload(dir, dedupeCheckpointEntries(manifest.entries));
+  refreshEntrySizes(dir, manifest.entries);
+  recoverDirectoryEntries(dir, manifest);
+  writeManifestBestEffort(dir, manifest);
   return manifest;
 }
 
@@ -329,34 +364,37 @@ export function checkpointCkPaths(roomPath: string): string[] {
   return reconcile(dir).entries.map((e) => checkpointFilePath(dir, e.id));
 }
 
+function autoCheckpointIdsToPrune(entries: CheckpointMeta[], keep: number): Set<string> {
+  const autos = entries
+    .filter((entry) => entry.auto)
+    .map((entry) => ({ id: entry.id, createdAt: entry.createdAt }));
+  autos.sort((left, right) => {
+    if (left.createdAt < right.createdAt) {
+      return 1;
+    }
+    return left.createdAt > right.createdAt ? -1 : 0;
+  });
+  return new Set(autos.slice(keep).map((entry) => entry.id));
+}
+
+function deleteCheckpointPayloads(dir: string, ids: Set<string>): void {
+  for (const id of ids) {
+    removeFileBestEffort(checkpointFilePath(dir, id));
+  }
+}
+
 /** Keep only the newest `keep` auto (pre-rollback) checkpoints; delete the
  * rest's payload files AND their manifest entries. Non-auto entries are
  * never touched. */
 export function pruneAutoCheckpoints(dir: string, keep: number): void {
   const manifest = reconcile(dir);
-  const autos = manifest.entries
-    .filter((e) => e.auto)
-    .map((e) => ({ id: e.id, createdAt: e.createdAt }));
-  // Newest first (descending by createdAt), matching Rust's
-  // `autos.sort_by(|a, b| b.1.cmp(&a.1))`.
-  autos.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
-  const doomed = new Set(autos.slice(keep).map((a) => a.id));
+  const doomed = autoCheckpointIdsToPrune(manifest.entries, keep);
   if (doomed.size === 0) {
     return;
   }
-  for (const id of doomed) {
-    try {
-      unlinkSync(checkpointFilePath(dir, id));
-    } catch {
-      // best effort
-    }
-  }
+  deleteCheckpointPayloads(dir, doomed);
   manifest.entries = manifest.entries.filter((e) => !doomed.has(e.id));
-  try {
-    writeManifest(dir, manifest);
-  } catch {
-    // best effort, mirrors Rust's `let _ = write_manifest(dir, &manifest);`
-  }
+  writeManifestBestEffort(dir, manifest);
 }
 
 // --------------------------------------------------------------- disk space
@@ -423,6 +461,50 @@ function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+function ensureCheckpointDirectory(dir: string): void {
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch (err) {
+    throw new Error(`Could not create the checkpoints folder: ${errMsg(err)}`);
+  }
+}
+
+function vacuumIntoCheckpoint(db: Database.Database, tmpPath: string): void {
+  removeFileBestEffort(tmpPath);
+  try {
+    const escaped = tmpPath.replace(/'/g, "''");
+    db.exec(`VACUUM INTO '${escaped}'`);
+  } catch (err) {
+    // A copy that died part-way must not remain for recovery to find later.
+    removeFileBestEffort(tmpPath);
+    throw err;
+  }
+}
+
+function publishCheckpoint(tmpPath: string, finalPath: string): void {
+  try {
+    renameSync(tmpPath, finalPath);
+  } catch (err) {
+    removeFileBestEffort(tmpPath);
+    throw new Error(`Could not save the checkpoint: ${errMsg(err)}`);
+  }
+}
+
+function checkpointName(name: string): string {
+  const trimmed = name.trim();
+  return trimmed.length > 0 ? trimmed : `Checkpoint — ${nowDate()}`;
+}
+
+function checkpointMeta(id: string, name: string, auto: boolean, finalPath: string): CheckpointMeta {
+  return {
+    id,
+    name: checkpointName(name),
+    createdAt: nowTimestamp(),
+    sizeBytes: checkpointSizeOrZero(finalPath),
+    auto,
+  };
+}
+
 /** Write a full SQLCipher copy of `db` into `dir` as a new checkpoint, append
  * its manifest entry, and return the metadata. Pure over a Database handle +
  * dir (no room-lifecycle state) so it is unit-testable against a real room
@@ -435,12 +517,7 @@ export function writeCheckpoint(
   name: string,
   auto: boolean
 ): CheckpointMeta {
-  try {
-    mkdirSync(dir, { recursive: true });
-  } catch (err) {
-    throw new Error(`Could not create the checkpoints folder: ${errMsg(err)}`);
-  }
-
+  ensureCheckpointDirectory(dir);
   // Self-heal the dir FIRST — before creating the new payload — so reconcile
   // can't mistake our fresh `.roomck` for an orphan and double-count it.
   const manifest = reconcile(dir);
@@ -449,56 +526,36 @@ export function writeCheckpoint(
   const id = randomUUID();
   const tmp = `${dir}/${id}.tmp`;
   const finalPath = checkpointFilePath(dir, id);
-  // VACUUM INTO refuses an existing destination — a fresh uuid never
-  // clashes, but clear any stale tmp defensively.
-  try {
-    unlinkSync(tmp);
-  } catch {
-    // expected: nothing there yet
-  }
-  try {
-    const escaped = tmp.replace(/'/g, "''");
-    db.exec(`VACUUM INTO '${escaped}'`);
-  } catch (err) {
-    // A copy that died part-way (out of space, unplugged drive) must not
-    // leave a multi-GB `.tmp` behind for reconcile to sweep much later.
-    try {
-      unlinkSync(tmp);
-    } catch {
-      // best effort
-    }
-    throw err;
-  }
-  try {
-    renameSync(tmp, finalPath);
-  } catch (err) {
-    try {
-      unlinkSync(tmp);
-    } catch {
-      // best effort
-    }
-    throw new Error(`Could not save the checkpoint: ${errMsg(err)}`);
-  }
-
-  let sizeBytes = 0;
-  try {
-    sizeBytes = statSync(finalPath).size;
-  } catch {
-    sizeBytes = 0;
-  }
-
-  const trimmed = name.trim();
-  const finalName = trimmed.length > 0 ? trimmed : `Checkpoint — ${nowDate()}`;
-  const meta: CheckpointMeta = {
-    id,
-    name: finalName,
-    createdAt: nowTimestamp(),
-    sizeBytes,
-    auto,
-  };
+  vacuumIntoCheckpoint(db, tmp);
+  publishCheckpoint(tmp, finalPath);
+  const meta = checkpointMeta(id, name, auto, finalPath);
   manifest.entries.push(meta);
   writeManifest(dir, manifest);
   return meta;
+}
+
+function removeRoomSidecars(roomPath: string): void {
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    removeFileBestEffort(`${roomPath}${suffix}`);
+  }
+}
+
+function stageRollbackCopy(checkpointPath: string, swapTmp: string): void {
+  try {
+    copyFileSync(checkpointPath, swapTmp);
+  } catch (err) {
+    removeFileBestEffort(swapTmp);
+    throw new Error(`Could not stage the rollback copy: ${errMsg(err)}`);
+  }
+}
+
+function publishRollbackCopy(swapTmp: string, roomPath: string): void {
+  try {
+    renameSync(swapTmp, roomPath);
+  } catch (err) {
+    removeFileBestEffort(swapTmp);
+    throw new Error(`Could not swap in the checkpoint: ${errMsg(err)}`);
+  }
 }
 
 /** Swap a checkpoint's `.roomck` in for the room file: delete stale WAL/SHM/
@@ -511,45 +568,13 @@ export function performSwap(roomPath: string, ckPath: string): void {
   // The staged copy sits beside the room until the rename, so the volume
   // briefly holds the room AND the checkpoint twice. Say so before starting
   // rather than dying half-way through with a raw copy error.
-  let ckSize = 0;
-  try {
-    ckSize = statSync(ckPath).size;
-  } catch {
-    ckSize = 0;
-  }
-  checkRoomFor(roomPath, ckSize, "to roll back");
-
-  for (const suffix of ["-wal", "-shm", "-journal"]) {
-    try {
-      unlinkSync(`${roomPath}${suffix}`);
-    } catch {
-      // best effort
-    }
-  }
-
+  checkRoomFor(roomPath, checkpointSizeOrZero(ckPath), "to roll back");
+  removeRoomSidecars(roomPath);
   const swapTmp = `${roomPath}.swap-${randomUUID()}`;
   // Clear the partial copy the same way the rename branch below does: a
   // failure part-way through (a volume that filled after the pre-check, an
   // ejected disk) otherwise leaves a room-sized file beside the room that
   // nothing in the app ever sweeps, and every retry adds another.
-  try {
-    copyFileSync(ckPath, swapTmp);
-  } catch (err) {
-    try {
-      unlinkSync(swapTmp);
-    } catch {
-      // best effort
-    }
-    throw new Error(`Could not stage the rollback copy: ${errMsg(err)}`);
-  }
-  try {
-    renameSync(swapTmp, roomPath);
-  } catch (err) {
-    try {
-      unlinkSync(swapTmp);
-    } catch {
-      // best effort
-    }
-    throw new Error(`Could not swap in the checkpoint: ${errMsg(err)}`);
-  }
+  stageRollbackCopy(ckPath, swapTmp);
+  publishRollbackCopy(swapTmp, roomPath);
 }

@@ -109,6 +109,11 @@
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { CancelFlag } from "./cancel.js";
+import {
+  DOWNLOAD_ENGINE_FETCH,
+  DOWNLOAD_ENGINE_MEDIA,
+  downloadTitle,
+} from "./jobDownloadTitle.js";
 import { checkPublicHttpUrl } from "./browser/guard.js";
 import { webAccessEnabled } from "./browser/webAccess.js";
 import { createJob, setJobStatus, type Job } from "./db-host/jobs.js";
@@ -142,44 +147,10 @@ import {
 } from "./ytdlp.js";
 import type { FileMeta } from "../shared/apiTypes.js";
 
-/** Plain fetch of one file (`web::download_to_temp`) — see this module's doc
- * for why that engine is an injected seam here. */
-export const DOWNLOAD_ENGINE_FETCH = "fetch";
-/** yt-dlp media download (`download_media_to_temp`) — the engine this batch
- * wires for real, end to end. */
-export const DOWNLOAD_ENGINE_MEDIA = "media";
+export { DOWNLOAD_ENGINE_FETCH, DOWNLOAD_ENGINE_MEDIA, downloadTitle } from "./jobDownloadTitle.js";
 
 /** `state.with_room(…)`'s own refusal when nothing is open, verbatim. */
 const NO_ROOM_OPEN = "No room is open.";
-
-// ============================================================================
-// download_title
-// ============================================================================
-
-/**
- * A short honest job title: the filename when the URL has one (FETCH engine
- * only — a media URL's last segment is rarely meaningful, e.g. YouTube's
- * `watch`), else the host, else the raw text when it doesn't even parse.
- *
- * Exported (Rust's `download_title` is module-private, reached by its sibling
- * `#[cfg(test)]` through `use super::*;`) purely so this port's test file can
- * pin the same cases.
- */
-export function downloadTitle(url: string, engine: string): string {
-  let short: string | null = null;
-  try {
-    const parsed = new URL(url);
-    // Rust: the last NON-EMPTY path segment, kept only for the fetch engine
-    // (`.filter(|s| engine == DOWNLOAD_ENGINE_FETCH && !s.is_empty())`), then
-    // `.or_else(|| u.host_str())`.
-    const lastSegment = parsed.pathname.split("/").filter((p) => p !== "").at(-1) ?? null;
-    const fromPath = engine === DOWNLOAD_ENGINE_FETCH ? lastSegment : null;
-    short = fromPath ?? (parsed.hostname !== "" ? parsed.hostname : null);
-  } catch {
-    short = null;
-  }
-  return `Download ${short ?? url}`;
-}
 
 // ============================================================================
 // The FETCH engine — an injected seam (see this module's doc)
@@ -261,6 +232,8 @@ export interface DownloadEngineDeps {
   tempDir?: string;
   cancelPollMs?: number;
   mediaDownloadBudgetMs?: number;
+  /** Injectable best-effort temp cleanup boundary; production uses fs/promises. */
+  removeWorkDir?: typeof fsp.rm;
 }
 
 /** What {@link startDownloadJobInner} and {@link downloadRowStarter} need: the
@@ -368,7 +341,7 @@ function runnerFor(deps: DownloadJobDeps): SpawnDownloadDeps {
  * same shape `jobQueue.ts`'s own (unexported) `planString` has, duplicated
  * rather than reaching into a sibling module's private helper or editing that
  * committed file to export one. */
-function planString(plan: unknown, key: string): string | null {
+export function planString(plan: unknown, key: string): string | null {
   if (typeof plan !== "object" || plan === null || Array.isArray(plan)) {
     return null;
   }
@@ -433,66 +406,101 @@ export function spawnDownload(
   cancel: CancelFlag
 ): Promise<void> {
   return spawnJobRunner(deps, jobId, roomPath, async () => {
-    const startingDb = pinnedDb(deps.rooms, roomPath);
-    if (startingDb !== null) {
-      setJobStatus(startingDb, jobId, "running", null);
-    }
-    emitProgress(deps.sink, jobId, "Downloading…", 0, 100);
-
-    // Ok(meta) = imported; Err(None) = paused (Stop); Err(Some(e)) = error.
-    let outcome:
-      | { readonly kind: "done"; readonly meta: FileMeta }
-      | { readonly kind: "paused" }
-      | { readonly kind: "error"; readonly error: string };
-    try {
-      const meta = await runDownload(deps, jobId, url, engine, cancel);
-      outcome = { kind: "done", meta };
-    } catch (err) {
-      outcome = cancel.load()
-        ? { kind: "paused" }
-        : { kind: "error", error: err instanceof Error ? err.message : String(err) };
-    }
-
-    const finishingDb = pinnedDb(deps.rooms, roomPath);
-    if (finishingDb !== null) {
-      const [status, error]: [string, string | null] =
-        outcome.kind === "done"
-          ? ["done", null]
-          : outcome.kind === "paused"
-            ? ["paused", null]
-            : ["error", outcome.error];
-      setJobStatus(finishingDb, jobId, status, error);
-    }
+    markDownloadRunning(deps, jobId, roomPath);
+    const outcome = await downloadOutcome(deps, jobId, url, engine, cancel);
+    finishDownload(deps, jobId, roomPath, outcome);
     deps.removeCancelFlag(jobId);
-
-    if (outcome.kind === "done") {
-      deps.sink.emit({
-        jobId,
-        label: `${outcome.meta.name} arrived in the room`,
-        done: 100,
-        total: 100,
-        finished: true,
-        fileId: outcome.meta.id,
-      });
-    } else if (outcome.kind === "paused") {
-      deps.sink.emit({ jobId, label: "Paused", done: 0, total: 100, paused: true });
-    } else {
-      deps.sink.emit({
-        jobId,
-        label: `Download failed — ${outcome.error}`,
-        done: 0,
-        total: 100,
-        failed: true,
-      });
-    }
+    emitDownloadOutcome(deps, jobId, outcome);
     await deps.onSettled(jobId);
   });
 }
 
-/** Best-effort work-dir sweep — Rust's `let _ = std::fs::remove_dir_all(…)`. */
-async function bestEffortRemoveDir(dir: string): Promise<void> {
+type DownloadOutcome =
+  | { readonly kind: "done"; readonly meta: FileMeta }
+  | { readonly kind: "paused" }
+  | { readonly kind: "error"; readonly error: string };
+
+function markDownloadRunning(deps: SpawnDownloadDeps, jobId: string, roomPath: string): void {
+  const db = pinnedDb(deps.rooms, roomPath);
+  if (db !== null) {
+    setJobStatus(db, jobId, "running", null);
+  }
+  emitProgress(deps.sink, jobId, "Downloading…", 0, 100);
+}
+
+async function downloadOutcome(
+  deps: SpawnDownloadDeps,
+  jobId: string,
+  url: string,
+  engine: string,
+  cancel: CancelFlag
+): Promise<DownloadOutcome> {
   try {
-    await fsp.rm(dir, { recursive: true, force: true });
+    return { kind: "done", meta: await runDownload(deps, jobId, url, engine, cancel) };
+  } catch (err) {
+    return cancel.load()
+      ? { kind: "paused" }
+      : { kind: "error", error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+function finishDownload(
+  deps: SpawnDownloadDeps,
+  jobId: string,
+  roomPath: string,
+  outcome: DownloadOutcome
+): void {
+  const db = pinnedDb(deps.rooms, roomPath);
+  if (db === null) {
+    return;
+  }
+  if (outcome.kind === "done") {
+    setJobStatus(db, jobId, "done", null);
+    return;
+  }
+  if (outcome.kind === "paused") {
+    setJobStatus(db, jobId, "paused", null);
+    return;
+  }
+  setJobStatus(db, jobId, "error", outcome.error);
+}
+
+function emitDownloadOutcome(
+  deps: SpawnDownloadDeps,
+  jobId: string,
+  outcome: DownloadOutcome
+): void {
+  if (outcome.kind === "done") {
+    deps.sink.emit({
+      jobId,
+      label: `${outcome.meta.name} arrived in the room`,
+      done: 100,
+      total: 100,
+      finished: true,
+      fileId: outcome.meta.id,
+    });
+    return;
+  }
+  if (outcome.kind === "paused") {
+    deps.sink.emit({ jobId, label: "Paused", done: 0, total: 100, paused: true });
+    return;
+  }
+  deps.sink.emit({
+    jobId,
+    label: `Download failed — ${outcome.error}`,
+    done: 0,
+    total: 100,
+    failed: true,
+  });
+}
+
+/** Best-effort work-dir sweep — Rust's `let _ = std::fs::remove_dir_all(…)`. */
+async function bestEffortRemoveDir(
+  dir: string,
+  remove: typeof fsp.rm = fsp.rm,
+): Promise<void> {
+  try {
+    await remove(dir, { recursive: true, force: true });
   } catch {
     // Best-effort by design: a temp dir that outlives its job is not a reason
     // to fail an import that already succeeded.
@@ -512,39 +520,57 @@ async function runDownload(
   cancel: CancelFlag
 ): Promise<FileMeta> {
   if (engine === DOWNLOAD_ENGINE_MEDIA) {
-    const downloadMedia = deps.downloadMedia ?? downloadMediaToTemp;
-    const progress: MediaProgress = (status, pct) => {
-      // Rust: `pct.unwrap_or(0.0).clamp(0.0, 100.0) as usize` — a cast that
-      // TRUNCATES, so 42.9% reads 42, never 43.
-      const done = Math.floor(Math.min(100, Math.max(0, pct ?? 0)));
-      emitProgress(deps.sink, jobId, status, done, 100);
-    };
-    // The background job has no picker in front of it — best quality.
-    const media = await downloadMedia(deps.dataDir, url, {
-      maxHeight: null,
-      cancel,
-      progress,
-      spawnFn: deps.spawnFn,
-      fetchFn: deps.fetchFn,
-      findFfmpegFn: deps.findFfmpegFn,
-      maxDownloadBytes: deps.maxDownloadBytes,
-      tempDir: deps.tempDir,
-      cancelPollMs: deps.cancelPollMs,
-      mediaDownloadBudgetMs: deps.mediaDownloadBudgetMs,
-    });
-    const name = path.basename(media.path) || "media";
-    emitProgress(deps.sink, jobId, "Sealing into the room…", 99, 100);
-    try {
-      return await deps.importDownload(media.path, name, url);
-    } finally {
-      // Unconditional, exactly as Rust sweeps the work dir on the line after
-      // `import_download` whether or not it returned an error.
-      await bestEffortRemoveDir(media.workDir);
-    }
+    return runMediaDownload(deps, jobId, url, cancel);
   }
 
   // DOWNLOAD_ENGINE_FETCH — and anything else a legacy or corrupted stored plan
   // might carry, since `start_download_row`'s own default is this same engine.
+  return runFetchDownload(deps, jobId, url, cancel);
+}
+
+async function runMediaDownload(
+  deps: SpawnDownloadDeps,
+  jobId: string,
+  url: string,
+  cancel: CancelFlag
+): Promise<FileMeta> {
+  const downloadMedia = deps.downloadMedia ?? downloadMediaToTemp;
+  const progress: MediaProgress = (status, pct) => {
+    // Rust: `pct.unwrap_or(0.0).clamp(0.0, 100.0) as usize` — a cast that
+    // TRUNCATES, so 42.9% reads 42, never 43.
+    const done = Math.floor(Math.min(100, Math.max(0, pct ?? 0)));
+    emitProgress(deps.sink, jobId, status, done, 100);
+  };
+  // The background job has no picker in front of it — best quality.
+  const media = await downloadMedia(deps.dataDir, url, {
+    maxHeight: null,
+    cancel,
+    progress,
+    spawnFn: deps.spawnFn,
+    fetchFn: deps.fetchFn,
+    findFfmpegFn: deps.findFfmpegFn,
+    maxDownloadBytes: deps.maxDownloadBytes,
+    tempDir: deps.tempDir,
+    cancelPollMs: deps.cancelPollMs,
+    mediaDownloadBudgetMs: deps.mediaDownloadBudgetMs,
+  });
+  const name = path.basename(media.path) || "media";
+  emitProgress(deps.sink, jobId, "Sealing into the room…", 99, 100);
+  try {
+    return await deps.importDownload(media.path, name, url);
+  } finally {
+    // Unconditional, exactly as Rust sweeps the work dir on the line after
+    // `import_download` whether or not it returned an error.
+    await bestEffortRemoveDir(media.workDir, deps.removeWorkDir);
+  }
+}
+
+async function runFetchDownload(
+  deps: SpawnDownloadDeps,
+  jobId: string,
+  url: string,
+  cancel: CancelFlag
+): Promise<FileMeta> {
   const downloadToTemp = deps.downloadToTemp ?? downloadToTempNotImplemented;
   const maxBytes = deps.maxDownloadBytes ?? MAX_DOWNLOAD_BYTES;
   const outcome = await downloadToTemp(url, maxBytes, cancel, (got, declared) => {

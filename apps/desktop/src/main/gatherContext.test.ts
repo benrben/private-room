@@ -18,7 +18,7 @@ import { addMemory } from "./db-host/memories.js";
 import { insertMessage, listMessages } from "./db-host/messages.js";
 import { createRoom } from "./db-host/open.js";
 import { setSetting } from "./db-host/settings.js";
-import { createSkill } from "./db-host/skills.js";
+import { createSkill, findSkill, upsertSkillResource } from "./db-host/skills.js";
 import {
   advisorToolsEnabled,
   advisorsEnabled,
@@ -167,6 +167,9 @@ describe("gatherContextAndSaveQuestion", () => {
     }
     expect(connectedMcpServers).not.toHaveBeenCalled();
     expect(prepareImage).not.toHaveBeenCalled();
+
+    const ordinary = gatherContextAndSaveQuestion(db, randomUUID(), "/ordinary keep it brief", [], null, null);
+    expect(ordinary.chatMessages.at(-1)?.content).toContain("Bundled resources:\n(no bundled resources)");
   });
 
   it("builds a system+user pair, saves the question, and titles the chat", () => {
@@ -323,6 +326,69 @@ describe("gatherContextAndSaveQuestion", () => {
     db.close();
   });
 
+  it("preserves a host-forced no-evidence policy through the room wrapper", async () => {
+    const db = freshRoom();
+    const ctx = await gatherContextAndSaveQuestionInRoom(
+      { db, path: "/tmp/Room" },
+      randomUUID(),
+      "answer without room evidence",
+      [],
+      null,
+      null,
+      { evidencePolicy: "no-tools-no-sources" },
+    );
+
+    expect(ctx.evidencePolicy).toBe("no-tools-no-sources");
+    expect(ctx.sources).toEqual([]);
+    db.close();
+  });
+
+  it("does not read workspace bytes for a non-image attachment", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "gather-workspace-text-"));
+    const root = path.join(tmpDir, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Room");
+    const workspace = new WorkspaceService(db, root);
+    const entry = await workspace.createFile("notes.txt", Readable.from([Buffer.from("room note")]), "upload");
+    db.prepare("UPDATE files SET mime_type = 'text/plain', extracted_text = 'room note' WHERE id = ?")
+      .run(entry.fileId);
+
+    const ctx = await gatherContextAndSaveQuestionInRoom(
+      { db, path: root, workspace },
+      randomUUID(),
+      "what does it say?",
+      [entry.fileId],
+      null,
+      null,
+    );
+
+    expect(ctx.chatMessages.at(-1)?.content).toContain("room note");
+    expect(ctx.chatMessages.at(-1)?.images).toBeUndefined();
+    db.close();
+  });
+
+  it("reports a workspace image whose backing file disappeared as unavailable", async () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "gather-workspace-missing-image-"));
+    const root = path.join(tmpDir, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Room");
+    const workspace = new WorkspaceService(db, root);
+    const entry = await workspace.createFile("gone.png", Readable.from([Buffer.from([1])]), "upload");
+    db.prepare("UPDATE files SET mime_type = 'image/png' WHERE id = ?").run(entry.fileId);
+    rmSync(path.join(root, "gone.png"));
+
+    const ctx = await gatherContextAndSaveQuestionInRoom(
+      { db, path: root, workspace },
+      randomUUID(),
+      "describe it",
+      [entry.fileId],
+      null,
+      null,
+    );
+
+    expect(ctx.chatMessages.at(-1)?.content).toContain("no image data stored");
+    expect(ctx.chatMessages.at(-1)?.images).toBeUndefined();
+    db.close();
+  });
+
   it("says so instead of silently dropping more than MAX_ATTACHED_IMAGES", () => {
     const db = freshRoom();
     const ids: string[] = [];
@@ -405,6 +471,9 @@ describe("gatherContextAndSaveQuestion", () => {
   it("advertises enabled, unowned skills and honors an explicit /skill request", () => {
     const db = freshRoom();
     createSkill(db, "lease-review", "Reviews a lease for red flags.", "Check the termination clause.", true, "user", "");
+    const selected = findSkill(db, "lease-review");
+    expect(selected).not.toBeNull();
+    upsertSkillResource(db, selected!.id, "references/checklist.md", "markdown", Buffer.from("Check deposits."));
     createSkill(db, "disabled-one", "Not ready yet.", "…", false, "user", "");
     // Scoped to a sub-agent — never advertised to the main assistant.
     createSkill(db, "video-cut", "Trims a video.", "Do the trim.", true, "user", "media.video");
@@ -419,6 +488,7 @@ describe("gatherContextAndSaveQuestion", () => {
     const explicitUser = explicit.chatMessages.at(-1)!.content;
     expect(explicitUser).toContain("Explicitly selected Agent Skill: /lease-review");
     expect(explicitUser).toContain("Check the termination clause.");
+    expect(explicitUser).toContain("references/checklist.md (markdown)");
     expect(explicitUser).toContain("Question: check the deposit clause");
   });
 
@@ -510,6 +580,19 @@ describe("gatherContextAndSaveQuestion", () => {
     expect(user).toContain("[file: Research/findings.md]");
     expect(user).not.toContain("[file: script.py]");
     expect(user).not.toContain("[file: report.pdf]");
+  });
+
+  it("resolves explicitly named files beyond the system prompt inventory cap", () => {
+    const db = freshRoom();
+    for (let index = 0; index <= 100; index += 1) {
+      insertFile(db, `a${String(index).padStart(3, "0")}.txt`, "text/plain", Buffer.from("other"), "other", "upload");
+    }
+    insertFile(db, "z-target.md", "text/markdown", Buffer.from("late file"), "late file", "upload");
+
+    const ctx = gatherContextAndSaveQuestion(db, randomUUID(), "Summarize z-target.md", [], null, null);
+
+    expect(ctx.sources).toContain("z-target.md");
+    expect(ctx.chatMessages.at(-1)?.content).toContain("[file: z-target.md]\nlate file");
   });
 
   it("preserves conversation history under the compaction budget, oldest to newest", () => {

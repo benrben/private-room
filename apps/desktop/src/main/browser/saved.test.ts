@@ -98,6 +98,11 @@ describe("articleDocument", () => {
     expect(doc).not.toContain("Updated");
   });
 
+  it("renders the page's declared excerpt in the document hero", () => {
+    const doc = articleDocument("Title", meta({ excerpt: "A concise <overview>." }), "<p>Body.</p>");
+    expect(doc).toContain('<p class="sub">A concise &lt;overview&gt;.</p>');
+  });
+
   it("invents no byline or date for a page that declared none", () => {
     const bare: PageMeta = { capturedAt: "2026-08-03T10:00:00Z" };
     const doc = articleDocument("Plain page", bare, "<p>Body.</p>");
@@ -180,6 +185,8 @@ describe("savedReply", () => {
     const selection = savedReply("selection", false, false, ["Sel.md"], {});
     expect(selection).toContain("the selected text");
     expect(selection).toContain('"Sel.md"');
+
+    expect(savedReply("page", false, false, [], {})).toContain("as the room.");
   });
 
   it("does not call a clipped capture whole", () => {

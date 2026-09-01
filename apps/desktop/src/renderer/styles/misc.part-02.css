@@ -1,0 +1,185 @@
+
+
+/* Dismiss is a 24px target, not a bordered box around a 12px glyph. Written as
+   `.toast .toast-close` so it beats the single-class rule in settings.css by
+   specificity rather than by load order — the two files could be reordered and
+   this would still hold. */
+.toast .toast-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  min-height: 24px;
+  padding: var(--sp-1);
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  opacity: 1;
+  line-height: 0;
+}
+.toast .toast-close:hover {
+  color: var(--text-strong);
+  background: var(--hover);
+  border-color: transparent;
+}
+
+/* ==========================================================================
+   5. TRAINING-WHEEL CHROME (ADD-22: badges, lanes, undo, nudges)
+   ========================================================================== */
+
+/* Settings: model capability badges. Outlined capsules, not filled ones — a
+   capability is identity, not status, so it takes a drawn edge and leaves the
+   marker fills to the things that mean something. */
+.model-badges {
+  display: inline-flex;
+  gap: 5px;
+  margin-left: var(--sp-2);
+}
+.model-badge {
+  font-size: var(--fs-micro);
+  line-height: 1.5;
+  padding: 1px var(--sp-2);
+  border-radius: 999px 999px 999px 999px / 12px 10px 12px 10px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  background: transparent;
+  white-space: nowrap;
+}
+.model-warn {
+  margin-top: var(--sp-2);
+}
+
+/* A chip whose SELECTED state has to carry a tick as well as a wash — the
+   reasoning-effort chips and the model-capability filters in
+   EngineModelPicker. Their resting styles live in workspace.css, which this
+   file deliberately does not redefine; all that is needed here is the box that
+   holds the glyph beside the word, because colour on its own is never allowed
+   to be the signal that something is chosen. */
+.pick-on {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+.pick-on svg {
+  flex: none;
+}
+
+/* Chat: the deterministic router's chosen lane, shown before the step chips.
+   Blue is "active / informational" product-wide. */
+.lane-chip {
+  font-size: var(--fs-micro);
+  color: var(--sem-linked);
+  background: color-mix(in srgb, var(--sem-linked-fill) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--sem-linked) 45%, transparent);
+  border-radius: 999px 999px 999px 999px / 14px 12px 14px 12px;
+  padding: 2px 9px;
+}
+
+/* A tool step that didn't succeed reads as failed instead of neutral. Red is
+   an outline plus the word the chip already carries — never a fill. */
+.step-chip.failed {
+  color: var(--sem-urgent);
+  border-color: var(--sem-urgent);
+  background: color-mix(in srgb, var(--sem-urgent-fill) 10%, transparent);
+}
+
+/* Annotation chip: "≈ closest match" qualifier when the quote was approximate.
+   Set in the hand rather than italicised sans — it is a margin note about a
+   quotation, which is exactly what Kalam is reserved for. */
+.annot-approx {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  color: var(--ink-2);
+}
+
+/* Undo affordance on an assistant message that changed a file. */
+.undo-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+/* Nudge to attach an image the question names but hasn't attached. Pink is the
+   editorial/AI-attribution marker, and this is the room noticing something on
+   the user's behalf. */
+.attach-nudge {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: var(--sp-2);
+  padding: 6px 10px;
+  font-size: var(--fs-micro);
+  color: var(--text);
+  background: var(--accent-ghost);
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, transparent);
+  border-radius: var(--radius-sm);
+}
+.attach-nudge .subtle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  white-space: nowrap;
+}
+
+/* Empty-chat command discovery row: the one place in the product where an
+   empty state is the WHOLE screen, so it is an invitation — a handwritten
+   prompt and the commands themselves, ready to press. */
+.cmd-hints {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: var(--sp-3);
+}
+.cmd-hints-label {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  color: var(--ink-2);
+}
+.cmd-hint-chip {
+  min-height: 24px;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px 999px 999px 999px / 14px 12px 14px 12px;
+  padding: 3px 10px;
+  cursor: pointer;
+  transition:
+    color var(--dur-fast) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen),
+    transform var(--dur-fast) var(--ease-pen);
+}
+.cmd-hint-chip:hover {
+  color: var(--text-strong);
+  border-color: var(--sketch);
+}
+/* Pressed against the paper, like every other control in the system. */
+.cmd-hint-chip:active {
+  transform: translateY(1px);
+}
+
+/* ==========================================================================
+   6. MOTION
+   Two arrivals and a set of colour crossfades. Reduced motion lands every one
+   of them on its finished frame — nothing here animates INTO a resting state
+   the element does not otherwise have.
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .ctx-menu,
+  .approve-card {
+    animation: none;
+  }
+  .ctx-item,
+  .settings-nav-item,
+  .cmd-hint-chip {
+    transition: none;
+  }
+  .cmd-hint-chip:active {
+    transform: none;
+  }
+}

@@ -54,6 +54,15 @@ from typing import Any
 import numpy as np
 
 from arcelle_sidecar.diar.embed import VoicePrint
+from arcelle_sidecar.rec.meta_similarity import (
+    text_overlap as text_overlap,
+    time_overlap as time_overlap,
+)
+from arcelle_sidecar.rec.meta_transcript import (
+    format_stamp as format_stamp,
+    segment_visible_text as segment_visible_text,
+    transcript_text as transcript_text,
+)
 
 # --------------------------------------------------------------- constants
 
@@ -428,6 +437,43 @@ class RecMeta:
         apart."""
         return self.speaker_names.get(label, label)
 
+    def _speaker_identity_fields(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        if self.speaker_names:
+            fields["speakerNames"] = {
+                label: self.speaker_names[label] for label in sorted(self.speaker_names)
+            }
+        if self.recognized:
+            fields["recognized"] = sorted(self.recognized)
+        return fields
+
+    def _chapter_fields(self) -> dict[str, Any]:
+        if self.chapters:
+            return {"chapters": [chapter.to_dict() for chapter in self.chapters]}
+        return {}
+
+    def _highlight_fields(self) -> dict[str, Any]:
+        if self.highlights:
+            return {"highlights": [highlight.to_dict() for highlight in self.highlights]}
+        return {}
+
+    def _note_fields(self) -> dict[str, Any]:
+        if self.notes:
+            return {"notes": [note.to_dict() for note in self.notes]}
+        return {}
+
+    def _annotation_fields(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        fields.update(self._chapter_fields())
+        fields.update(self._highlight_fields())
+        fields.update(self._note_fields())
+        return fields
+
+    def _read_stamp_field(self) -> dict[str, Any]:
+        if self.read_of is None:
+            return {}
+        return {"readOf": self.read_of.to_dict()}
+
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "durationCs": self.duration_cs,
@@ -435,18 +481,9 @@ class RecMeta:
             "cuts": [c.to_dict() for c in self.cuts],
             "maxSpeakers": self.max_speakers,
         }
-        if self.speaker_names:
-            d["speakerNames"] = {k: self.speaker_names[k] for k in sorted(self.speaker_names)}
-        if self.recognized:
-            d["recognized"] = sorted(self.recognized)
-        if self.chapters:
-            d["chapters"] = [c.to_dict() for c in self.chapters]
-        if self.highlights:
-            d["highlights"] = [h.to_dict() for h in self.highlights]
-        if self.notes:
-            d["notes"] = [n.to_dict() for n in self.notes]
-        if self.read_of is not None:
-            d["readOf"] = self.read_of.to_dict()
+        d.update(self._speaker_identity_fields())
+        d.update(self._annotation_fields())
+        d.update(self._read_stamp_field())
         return d
 
     @staticmethod
@@ -457,18 +494,33 @@ class RecMeta:
         # Every other field carries `#[serde(default, ...)]` and is read
         # leniently below.
         raw_read_of = d.get("readOf")
+        duration_cs, segments, cuts = _required_meta_fields(d)
         return RecMeta(
-            duration_cs=d["durationCs"],
-            segments=[RecSegment.from_dict(s) for s in d["segments"]],
-            cuts=[RecCut.from_dict(c) for c in d["cuts"]],
-            max_speakers=d.get("maxSpeakers", 0),
-            speaker_names=dict(d.get("speakerNames", {})),
-            recognized=set(d.get("recognized", [])),
-            chapters=[RecChapter.from_dict(c) for c in d.get("chapters", [])],
-            highlights=[RecHighlight.from_dict(h) for h in d.get("highlights", [])],
-            notes=[RecNote.from_dict(n) for n in d.get("notes", [])],
-            read_of=ReadStamp.from_dict(raw_read_of) if raw_read_of is not None else None,
+            duration_cs=duration_cs,
+            segments=segments,
+            cuts=cuts,
+            **_optional_meta_fields(d, raw_read_of),
         )
+
+
+def _required_meta_fields(d: dict[str, Any]) -> tuple[int, list[RecSegment], list[RecCut]]:
+    return (
+        d["durationCs"],
+        [RecSegment.from_dict(segment) for segment in d["segments"]],
+        [RecCut.from_dict(cut) for cut in d["cuts"]],
+    )
+
+
+def _optional_meta_fields(d: dict[str, Any], raw_read_of: Any) -> dict[str, Any]:
+    return {
+        "max_speakers": d.get("maxSpeakers", 0),
+        "speaker_names": dict(d.get("speakerNames", {})),
+        "recognized": set(d.get("recognized", [])),
+        "chapters": [RecChapter.from_dict(chapter) for chapter in d.get("chapters", [])],
+        "highlights": [RecHighlight.from_dict(highlight) for highlight in d.get("highlights", [])],
+        "notes": [RecNote.from_dict(note) for note in d.get("notes", [])],
+        "read_of": ReadStamp.from_dict(raw_read_of) if raw_read_of is not None else None,
+    }
 
 
 # ------------------------------------------------------------- pure helpers
@@ -487,23 +539,6 @@ def samples_of_cs(cs: int) -> int:
     return (max(cs, 0) * SAMPLE_RATE) // 100
 
 
-def format_stamp(cs: int) -> str:
-    """``[m:ss]`` or ``[h:mm:ss]`` -- minutes/seconds zero-padded to 2 digits
-    when hours are shown; with no hours, seconds is still zero-padded but
-    minutes is NOT (matches the Rust ``format!`` exactly: ``"{m}"``, not
-    ``"{m:02}"``, in the no-hours branch)."""
-    # Rust: `(cs / 100).max(0)` -- Rust's `/` truncates toward zero, Python's
-    # `//` floors toward -inf. They can only disagree when cs is negative, in
-    # which case both quotients are <= 0 and the following `max(..., 0)`
-    # clamps either to the same 0 -- so plain `//` is safe here.
-    s = max(cs // 100, 0)
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    if h > 0:
-        return f"[{h}:{m:02d}:{sec:02d}]"
-    return f"[{m}:{sec:02d}]"
-
-
 def relabel_interval(elapsed_ms: int) -> int:
     """How many phrases to wait before the next whole-recording re-cluster,
     given how long the last one took (``ceil(elapsed_ms /
@@ -514,125 +549,6 @@ def relabel_interval(elapsed_ms: int) -> int:
     # (elapsed_ms is always >= 0 here) and agrees with div_ceil(0, b) == 0.
     interval = -(-elapsed_ms // RELABEL_TIME_BUDGET_MS)
     return max(RELABEL_EVERY_SEGMENTS, min(RELABEL_MAX_SEGMENTS, interval))
-
-
-def _words_of(text: str) -> set[str]:
-    """Words, lowercased, punctuation dropped -- split on any
-    non-alphanumeric character (Unicode-aware, matching Rust's
-    ``!c.is_alphanumeric()``), empty tokens dropped. Whisper punctuates the
-    same sound differently on a clean lane and on its echo."""
-    words: set[str] = set()
-    current: list[str] = []
-    for ch in text.lower():
-        if ch.isalnum():
-            current.append(ch)
-        elif current:
-            words.add("".join(current))
-            current = []
-    if current:
-        words.add("".join(current))
-    return words
-
-
-def text_overlap(a: str, b: str) -> float:
-    """How much of the shorter phrase's vocabulary the longer one repeats.
-    Uses the smaller set as the denominator (not the union) so a phrase
-    heard whole on one lane and clipped on the other still matches."""
-    wa, wb = _words_of(a), _words_of(b)
-    smaller = min(len(wa), len(wb))
-    if smaller == 0:
-        return 0.0
-    return len(wa & wb) / smaller
-
-
-def time_overlap(a: tuple[int, int], b: tuple[int, int]) -> float:
-    """Shared time as a fraction of the shorter span (centiseconds)."""
-    shared = max(0, min(a[1], b[1]) - max(a[0], b[0]))
-    shorter = max(1, min(a[1] - a[0], b[1] - b[0]))
-    return shared / shorter
-
-
-_NOTE_LABELS: dict[NoteKind, str] = {
-    NoteKind.DECISION: "Decision",
-    NoteKind.ACTION: "Action",
-    NoteKind.QUESTION: "Open question",
-    NoteKind.POINT: "Point",
-}
-
-
-def _note_line(n: RecNote) -> str:
-    """One note as the transcript states it. Labelled by kind so a reader --
-    human or model -- can tell a decision from an open question without
-    guessing, and so "action items" is a searchable phrase."""
-    label = _NOTE_LABELS[n.kind]
-    if n.kind == NoteKind.ACTION and n.who:
-        return f"{label} ({n.who}): {n.text}"
-    return f"{label}: {n.text}"
-
-
-def segment_visible_text(seg: RecSegment) -> str:
-    """A segment's text with deleted words removed. Falls back to the raw
-    text (stripped) when a segment has no word list (partial-only or legacy
-    rows)."""
-    if not seg.words:
-        return seg.text.strip()
-    kept = [w.w.strip() for w in seg.words if not w.del_]
-    kept = [w for w in kept if w]
-    return " ".join(kept)
-
-
-def transcript_text(meta: RecMeta) -> str:
-    """The searchable/actionable transcript stored as the file's extracted
-    text -- the same "[m:ss] ..." contract the audio viewer, RAG index, and
-    every AI action already consume. Deleted words are simply absent.
-
-    Ported exactly against the Rust source's actual control flow: a
-    segment's ``segment_visible_text`` is computed and checked FIRST -- an
-    empty segment is skipped immediately, before any pending chapter/note is
-    flushed against its ``t0``. A chapter/note anchored at-or-before an
-    empty segment therefore is NOT flushed by that segment; it waits for the
-    next non-empty one (or the final flush after the loop) to be emitted.
-    ``meta.chapters``/``meta.notes`` are assumed already in ``t0`` order --
-    this walks them with two index pointers rather than sorting, matching
-    the Rust source's own assumption (``.iter().peekable()`` over the stored
-    order).
-
-    Highlights are marked, NOT repeated. A highlight is a pointer at words
-    already on the line below it; copying them would put every marked
-    sentence into the search index and into every AI prompt twice.
-    """
-    out: list[str] = ["(live recording)\n"]
-    chapters = meta.chapters
-    notes = meta.notes
-    ci = 0
-    ni = 0
-    nc = len(chapters)
-    nn = len(notes)
-    for seg in meta.segments:
-        text = segment_visible_text(seg)
-        if not text:
-            continue
-        while ci < nc and chapters[ci].t0 <= seg.t0:
-            c = chapters[ci]
-            out.append(f"\n## {format_stamp(c.t0)} {c.title}\n")
-            ci += 1
-        while ni < nn and notes[ni].t0 <= seg.t0:
-            n = notes[ni]
-            out.append(f"{format_stamp(n.t0)} {_note_line(n)}\n")
-            ni += 1
-        marked = any(h.t0 < seg.t1 and seg.t0 < max(h.t1, h.t0 + 1) for h in meta.highlights)
-        # The user's name for the speaker, when they set one (GH #5) -- this
-        # text is what search and the AI read, so it has to match the
-        # screen.
-        who = meta.display_speaker(seg.speaker)
-        mark = "* " if marked else ""
-        out.append(f"{mark}{format_stamp(seg.t0)} {who}: {text}\n")
-    # Anything anchored past the last phrase still belongs in the text.
-    for c in chapters[ci:]:
-        out.append(f"\n## {format_stamp(c.t0)} {c.title}\n")
-    for n in notes[ni:]:
-        out.append(f"{format_stamp(n.t0)} {_note_line(n)}\n")
-    return "".join(out)
 
 
 def add_cut(cuts: list[RecCut], new: RecCut) -> list[RecCut]:

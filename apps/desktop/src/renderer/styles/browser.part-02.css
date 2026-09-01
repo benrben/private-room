@@ -1,0 +1,493 @@
+
+
+/* ----- take over / hand back -----
+   A toggle, so ON is circled rather than filled: a marker wash, the pen on
+   the edge and the second stroke outside it. The label already says which
+   state it is in. */
+.browser-takeover {
+  position: relative;
+  flex: none;
+  height: 28px;
+  padding: 0 var(--sp-3);
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-xs);
+  font: inherit;
+  font-family: var(--sans);
+  font-size: var(--fs-meta);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    border-color var(--dur-fast) var(--ease-pen),
+    background-color var(--dur-fast) var(--ease-pen),
+    transform var(--dur-fast) var(--ease-pen);
+}
+
+.browser-takeover:hover:not(:disabled) {
+  border-color: var(--sketch);
+  background-color: var(--hover);
+}
+
+.browser-takeover:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+/* Restated for hover as well: the plain hover rule above is more specific
+   than `.on`, so without this the button that says "you have the wheel" lost
+   its pen the moment the pointer touched it. */
+.browser-takeover.on,
+.browser-takeover.on:hover:not(:disabled) {
+  color: var(--text-strong);
+  background-color: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.browser-takeover.on::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.browser-takeover:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* ----- the reading-view skip control -----
+   Visually hidden until focused, and it lives in the CHROME, not in the body:
+   anything positioned inside `.browser-body` is drawn UNDER the native page,
+   so a focus ring down there would be invisible exactly when it is enabled. */
+.browser-skip {
+  position: absolute;
+  left: 8px;
+  top: 6px;
+  z-index: 2;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+/* It floats over the strip when it appears, so — and only so — it takes an
+   opaque surface. */
+.browser-skip:focus-visible {
+  width: auto;
+  height: auto;
+  clip-path: none;
+  padding: 6px var(--sp-3);
+  color: var(--text);
+  background: var(--raised);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 6px 18px var(--shadow-lift);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ==========================================================================
+   3. STRIPS — banners, the save slip
+   Every one of these is a ROW in normal flow. None of them may become a
+   floating surface (see the file header).
+   ========================================================================== */
+
+/* A slip of paper laid across the top of the page: a marker stroke down its
+   leading edge, a wash of the same hue behind it, and always a word. The
+   default meaning is "informational" — the notice, the takeover state, the
+   way back to a results page. */
+.browser-banner {
+  --mk: var(--sem-linked-fill);
+  --mk-ink: var(--sem-linked);
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 12px;
+  color: var(--text);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  border-bottom: 1px solid var(--line);
+  box-shadow: inset 3px 0 0 var(--mk-ink);
+  /* Opaque under the wash, for the same reason the chrome above it is: these
+     rows sit directly against an arbitrary web page, and a translucent slip
+     over a white one loses both its wash and its words. */
+  background-color: var(--panel);
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--mk) 18%, transparent) 0%,
+    color-mix(in srgb, var(--mk) 9%, transparent) 62%,
+    color-mix(in srgb, var(--mk) 14%, transparent) 100%
+  );
+}
+
+/* Failed, refused, or stopped answering. */
+.browser-banner.error {
+  --mk: var(--sem-urgent-fill);
+  --mk-ink: var(--sem-urgent);
+}
+
+/* BROWSE-2: the Save strip — a second chrome ROW, never a dropdown, because
+   the native page floats above every DOM element. Pink is "saved" across the
+   whole product, so the strip that files things into the room carries it. */
+.browser-save-row {
+  --mk: var(--sem-saved-fill);
+  --mk-ink: var(--sem-saved);
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* The buttons inside a coloured strip take the strip's own ink for their
+   edge: --rule-strong is 3.0:1 on bare paper and the wash takes it under the
+   3:1 a control boundary owes. The LABEL stays --text, so they never read as
+   coloured text. Their hover swash follows too, because --mk is inherited —
+   a button on the Save strip wipes pink, one on an error strip wipes red. */
+.browser-banner .browser-btn:hover:not(:disabled) {
+  border-color: var(--mk-ink);
+}
+
+/* An explanation, so it is sans and it is not shrunk below the metadata
+   floor. */
+.browser-save-hint {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+}
+
+/* The "back to results" row: normal flow, like the Save strip, because the
+   native page is back on screen by then and nothing may float over it. */
+.browser-results-row {
+  justify-content: flex-start;
+}
+
+.browser-results-row b {
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+/* ==========================================================================
+   4. BODY AND STAGE
+   ========================================================================== */
+
+.browser-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+
+/* EMPTY BY DESIGN. The native page is parked exactly over this rect; anything
+   rendered inside would be hidden beneath it. */
+.browser-stage {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* The hole must not reserve half the pane for a webview that is parked at 1x1.
+   Whenever a React surface has taken the pane — the start screen or the results
+   list — the stage yields to it, exactly as it does for the reading view. */
+.browser-body:has(> .browser-start) .browser-stage,
+.browser-body:has(> .bsearch) .browser-stage {
+  flex: 0 0 0;
+  min-width: 0;
+}
+
+/* ==========================================================================
+   5. THE START PAGE — a ruled sheet
+   Shown only while no page is loaded, so it is never underneath the webview:
+   BrowserView parks the native view at 1x1 whenever `blank` is true.
+
+   A ruled page, not a centred icon: a pencil margin down the left, horizontal
+   rules at a fixed 28px pitch, and every text block set on that rhythm so the
+   writing actually sits on the lines. The rules are a background gradient on
+   the sheet itself — no elements, nothing for a screen reader to walk past,
+   and nothing that can move.
+   ========================================================================== */
+
+/* A FLEX ITEM, not an `inset: 0` overlay.
+   It was absolute so it could fill the pane while the native page sits parked
+   at 1x1 behind it. But `.browser-body` also holds the journal and the reading
+   view as flex SIBLINGS, and both are transparent by design — so an overlay
+   spanning the whole body was drawn straight through them: the record and the
+   start screen's prose rendered on top of each other, each unreadable (seen in
+   a rendered screenshot, 2026-08-15; no layout test could catch it, because
+   every box was exactly where it had been asked to go).
+
+   As a flex item it simply takes the room the panels leave. */
+.browser-start {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: auto;
+  padding: var(--sp-6) var(--sp-6) var(--sp-8);
+  color: var(--text);
+}
+
+.bstart-sheet {
+  /* The pitch. Every line-height and vertical margin below is this or a
+     multiple of it, which is what keeps the text on the rules. */
+  --bstart-rule: 28px;
+  /* 560, not the widest the pane allows: the sheet has to leave a gutter for
+     the marginal note below, and the copy inside it is capped at 48ch
+     anyway. */
+  width: min(100%, 560px);
+  margin: 0 auto;
+  padding: var(--bstart-rule) 0 calc(var(--bstart-rule) * 2) var(--sp-6);
+  /* The margin rule, drawn a little heavier than the writing lines. */
+  border-left: 1.5px solid var(--rule);
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0 calc(var(--bstart-rule) - 1px),
+    var(--line-soft) calc(var(--bstart-rule) - 1px) var(--bstart-rule)
+  );
+}
+
+/* Two rules tall, so the title occupies a full band pair and everything after
+   it stays on the rhythm. Sans: this is the page's title, and the hand is
+   reserved for asides. */
+.bstart-title {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: var(--fs-section);
+  font-family: var(--display);
+  font-weight: 600;
+  line-height: calc(var(--bstart-rule) * 2);
+  letter-spacing: -0.01em;
+}
+
+/* An explanation of what this browser does — never the hand, and never set
+   small: --fs-lead is the rung the type scale reserves for instruction copy. */
+.bstart-copy {
+  margin: 0;
+  max-width: 48ch;
+  color: var(--muted);
+  font-size: var(--fs-lead);
+  line-height: var(--bstart-rule);
+}
+
+/* The marginal direction: a handwritten aside with the pen arrow sweeping up
+   and to the right, at the address box a row above it.
+
+   Decoration — aria-hidden in the markup, inert here, fixed content, and
+   drawn OUTSIDE the sheet. display:none is the DEFAULT and the query is the
+   exception, never the other way round: in a narrow pane there is no gutter
+   to draw it in and it would land on top of the writing. The query has no
+   name, so it resolves against the nearest ancestor container, which is
+   `.pane` in shell.css — the width of the centre pane is exactly the question
+   being asked. At 820px the gutter is 130px and this is 108, so it clears the
+   sheet with room to spare. */
+.bstart-aside {
+  display: none;
+}
+
+.bstart-aside-note {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  color: var(--faint);
+}
+
+/* Sized down from .nb-arrow-curve's own 48x40 so the note and the mark
+   together still fit the gutter. */
+.bstart-aside-arrow {
+  width: 36px;
+  height: 30px;
+  color: var(--ink-muted);
+}
+
+@container (min-width: 820px) {
+  .bstart-aside {
+    position: absolute;
+    top: 10px;
+    left: 8px;
+    width: 108px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: flex-end;
+    gap: 2px;
+    pointer-events: none;
+  }
+}
+
+/* ==========================================================================
+   6. THE JOURNAL — what the agent did, as an annotated journal
+   A side PANEL, not an overlay: it shrinks the stage so the native page moves
+   out of its way, because nothing can be drawn on top of that page.
+
+   The record is the point. Mono for the facts that have to be checkable — the
+   URL and the instant — and the hand for the description of what was done,
+   which is the annotation beside them. Every row's kind is a taped label that
+   says the kind in a WORD, with the marker only reinforcing it.
+   ========================================================================== */
+
+.browser-journal {
+  flex: 0 1 320px;
+  min-width: 232px;
+  padding: var(--sp-3) 14px 28px;
+  border-left: 1px solid var(--line);
+  background: transparent;
+  overflow-y: auto;
+}
+
+.browser-journal header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding-bottom: var(--sp-2);
+  /* The same drawn section rule Room Home uses, as a background so it costs
+     no element. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 2%,
+    var(--line-soft) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+
+.browser-journal h2 {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+/* The armed "Erase this record?" question, in the header slot Clear vacated. */
+/* THE CONFIRMATION GETS ITS OWN ROW.
+   It sat in the header's second flex cell — about 130px in a 320px panel —
+   which wrapped "Erase 9 entries and 42 cached items (searches, page text and
+   previews)?" into five lines beside a heading that had itself wrapped to
+   three. That sentence exists to be READ before something irreversible
+   happens, so it takes the full width and the two answers sit under it.
+   `flex-basis: 100%` makes the header wrap it onto its own line rather than
+   needing a second element around it. */
+.browser-journal-confirm {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  flex: 1 0 100%;
+  gap: 6px;
+  margin-top: var(--sp-2);
+  color: var(--text);
+  font-size: var(--fs-micro);
+  line-height: var(--lh-body);
+}
+
+.browser-journal-confirm > span:first-child {
+  flex: 1 1 100%;
+}
+
+/* The heading must not wrap to three lines to make room for a button. */
+.browser-journal header {
+  flex-wrap: wrap;
+}
+
+/* An explanation of what the journal IS — sans, at the metadata rung. */
+.browser-journal-note {
+  margin: var(--sp-3) 0 var(--sp-4);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+
+/* An empty state is a direction, which is one of the few places the hand is
+   allowed to speak. */
+.browser-journal-empty {
+  margin: var(--sp-3) 0 var(--sp-4);
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  color: var(--ink-2);
+}
+
+/* ----- the record, as SITTINGS -----
+   The panel used to be one flat list of the newest 300 rows across every
+   browsing sitting the room had ever had, unfiltered and ungrouped (audit P1).
+   Three additions carry the fix: a row of facet toggles, a heading and one-line
+   summary per sitting, and a ×N on runs that were collapsed. */
+
+.browser-journal-facets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: var(--sp-4);
+}
+
+.browser-journal-facets .browser-btn {
+  min-height: 24px;
+  padding: 0 8px;
+  font-size: var(--fs-micro, var(--fs-meta));
+}
+
+.browser-journal-session + .browser-journal-session {
+  margin-top: var(--sp-5);
+}
+
+.browser-journal-session > h3 {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin: 0 0 2px;
+  font-family: var(--sans);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+/* A timestamp is data you check character by character — mono, like the URLs
+   in the rows below it. */
+.browser-journal-when {
+  font-family: var(--mono);
+  font-size: var(--fs-micro, var(--fs-meta));
+  font-weight: 400;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.browser-journal-summary {
+  margin: 0 0 var(--sp-3);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+
+.browser-journal-more {
+  margin-top: var(--sp-4);
+}
+
+/* How many identical rows this one line stands for. MONO, like the timestamps
+   and the URLs: it is a counted fact the reader may need to check, and the hand
+   is reserved for words a person actually wrote (paper.css §3). */
+.browser-journal .jn {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+/* The dashed pencil thread that ties the entries together (.nb-connect on the
+   list), with a node hung off it per row. */
+.browser-journal-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 22px;
+  --nb-connect-at: 7px;
+}
+
+.browser-journal-list > li {
+  position: relative;
+  display: grid;
+  gap: 3px;
+  padding: var(--sp-2) 0 var(--sp-3);
+}

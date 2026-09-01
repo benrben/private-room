@@ -27,7 +27,7 @@ import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createRoom, openRoom } from "./open.js";
 import { insertFile, deleteFile } from "./files.js";
 import { reclaimableBytes, rekey, rekeyCopy, vacuum, vacuumInto, verifyPassword } from "./rekey.js";
@@ -113,6 +113,31 @@ describe("verifyPassword", () => {
       "The current password is not correct."
     );
     expect(() => verifyPassword(FIXTURE_REKEYED, "new password 2!!")).not.toThrow();
+  });
+});
+
+describe("throwaway connection cleanup", () => {
+  it("does not turn a close failure into a failed password verification or copy rekey", () => {
+    withFreshTmpDir(() => {
+      const roomPath = tempRoomPath();
+      const db = createRoom(roomPath, "the-password", "Room");
+      db.close();
+      const copyPath = path.join(tmpDir, "copy.roomai");
+      copyFileSync(roomPath, copyPath);
+      const realClose = Database.prototype.close;
+      const close = vi.spyOn(Database.prototype, "close").mockImplementation(function () {
+        realClose.call(this);
+        throw new Error("fabricated close failure after close");
+      });
+      try {
+        expect(() => verifyPassword(roomPath, "the-password")).not.toThrow();
+        expect(() => rekeyCopy(copyPath, "the-password", "new-password")).not.toThrow();
+      } finally {
+        close.mockRestore();
+      }
+      const reopened = openRoom(copyPath, "new-password");
+      reopened.close();
+    });
   });
 });
 

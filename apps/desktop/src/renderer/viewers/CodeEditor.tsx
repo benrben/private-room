@@ -121,6 +121,58 @@ interface Props {
   onDirtyChange?: (dirty: boolean) => void;
 }
 
+function editorBanner(banner: ReactNode | undefined, readOnly: boolean | undefined): ReactNode {
+  return banner && !readOnly && <div className="editor-banner">{banner}</div>;
+}
+
+function editorToolbar({
+  language,
+  dirty,
+  onSave,
+  readOnly,
+  saveLabel,
+  save,
+}: {
+  language: string;
+  dirty: boolean;
+  onSave: Props["onSave"];
+  readOnly: boolean | undefined;
+  saveLabel: string | undefined;
+  save: () => void;
+}): ReactNode {
+  return onSave && !readOnly && (
+    <div className="editor-bar">
+      {/* What this buffer IS, at the head of its own bar. The bar used to
+          open with a dirty flag and nothing else, so a code file's header
+          said only whether it had been typed in. Blue is the product's
+          informational marker and the word carries the fact — this is a
+          label, not a status.
+
+          The auto margin is inline because .editor-bar (viewer-formats.css,
+          another owner's file) justifies its children to the end, and there
+          is no margin utility in the shared primitives to say this with. */}
+      <span className="nb-cat nb-mark-blue" style={{ marginRight: "auto" }}>
+        {language}
+      </span>
+      {/* Unsaved work is a state to notice, which is what the yellow marker
+          means product-wide — and it arrives as a strip of tape, so the
+          change is a SHAPE as well as a hue. The saved state deliberately
+          gets no mark at all: a permanent green badge saying nothing is
+          wrong is noise, and the resting state of a buffer should be calm.
+          The wording is unchanged; `editor-dirty` is dropped in the dirty
+          case only because its `.on` colour would fight the tape's ink. */}
+      <span className={dirty ? "nb-tape nb-sem-pending" : "editor-dirty"}>
+        {dirty ? "● unsaved changes" : "all changes saved"}
+      </span>
+      {/* Saving is the one action in this bar, so it is drawn as a real
+          outlined control rather than as a third flat link. */}
+      <button className="nb-btn btn-ic" onClick={save}>
+        <SaveIcon size={14} /> {saveLabel ?? "Save"} ⌘S
+      </button>
+    </div>
+  );
+}
+
 export default function CodeEditor({
   value,
   language,
@@ -284,38 +336,15 @@ export default function CodeEditor({
 
   return (
     <div className="code-editor">
-      {banner && !readOnly && <div className="editor-banner">{banner}</div>}
-      {onSave && !readOnly && (
-        <div className="editor-bar">
-          {/* What this buffer IS, at the head of its own bar. The bar used to
-              open with a dirty flag and nothing else, so a code file's header
-              said only whether it had been typed in. Blue is the product's
-              informational marker and the word carries the fact — this is a
-              label, not a status.
-
-              The auto margin is inline because .editor-bar (viewer-formats.css,
-              another owner's file) justifies its children to the end, and there
-              is no margin utility in the shared primitives to say this with. */}
-          <span className="nb-cat nb-mark-blue" style={{ marginRight: "auto" }}>
-            {language}
-          </span>
-          {/* Unsaved work is a state to notice, which is what the yellow marker
-              means product-wide — and it arrives as a strip of tape, so the
-              change is a SHAPE as well as a hue. The saved state deliberately
-              gets no mark at all: a permanent green badge saying nothing is
-              wrong is noise, and the resting state of a buffer should be calm.
-              The wording is unchanged; `editor-dirty` is dropped in the dirty
-              case only because its `.on` colour would fight the tape's ink. */}
-          <span className={dirty ? "nb-tape nb-sem-pending" : "editor-dirty"}>
-            {dirty ? "● unsaved changes" : "all changes saved"}
-          </span>
-          {/* Saving is the one action in this bar, so it is drawn as a real
-              outlined control rather than as a third flat link. */}
-          <button className="nb-btn btn-ic" onClick={() => void saveNow()}>
-            <SaveIcon size={14} /> {saveLabel ?? "Save"} ⌘S
-          </button>
-        </div>
-      )}
+      {editorBanner(banner, readOnly)}
+      {editorToolbar({
+        language,
+        dirty,
+        onSave,
+        readOnly,
+        saveLabel,
+        save: () => void saveNow(),
+      })}
       <div className="editor-host" ref={hostRef} />
     </div>
   );

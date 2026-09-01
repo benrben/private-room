@@ -146,6 +146,10 @@ describe("fidelity to Rust's character and length semantics", () => {
     expect(faultIn(hebrewJammed)).toBe("no_word_breaks");
     expect(faultIn(asciiJammed)).toBe("no_word_breaks");
     expect(choose(hebrewJammed, asciiJammed)).toBe(hebrewJammed);
+    // The other tiebreak direction remains available for an ordinary longer
+    // OCR reading; `choose` must not always preserve extraction once both
+    // readings are faulty.
+    expect(choose("x".repeat(250), "y".repeat(300))).toBe("y".repeat(300));
   });
 
   it("word breaks are any Unicode whitespace, not the ASCII space", () => {

@@ -328,20 +328,43 @@ export function upsertSchedule(
     (r) => r[0] as string
   );
   if (existingId !== null) {
-    executeOne(
-      db,
-      "UPDATE schedules SET kind = ?, param = ?, enabled = ?, catch_up = ?, " +
-        "next_run_at = ? WHERE id = ?",
-      [kind, param, enabled ? 1 : 0, catchUp ? 1 : 0, nextRunAt, existingId]
-    );
+    updateSchedule(db, existingId, kind, param, enabled, catchUp, nextRunAt);
     return;
   }
-  const id = randomUUID();
+  insertSchedule(db, workflowId, kind, param, enabled, catchUp, nextRunAt);
+}
+
+function updateSchedule(
+  db: Database.Database,
+  id: string,
+  kind: string,
+  param: string,
+  enabled: boolean,
+  catchUp: boolean,
+  nextRunAt: string | null
+): void {
+  executeOne(
+    db,
+    "UPDATE schedules SET kind = ?, param = ?, enabled = ?, catch_up = ?, " +
+      "next_run_at = ? WHERE id = ?",
+    [kind, param, enabled ? 1 : 0, catchUp ? 1 : 0, nextRunAt, id]
+  );
+}
+
+function insertSchedule(
+  db: Database.Database,
+  workflowId: string,
+  kind: string,
+  param: string,
+  enabled: boolean,
+  catchUp: boolean,
+  nextRunAt: string | null
+): void {
   executeOne(
     db,
     "INSERT INTO schedules(id, workflow_id, kind, param, enabled, catch_up, next_run_at) " +
       "VALUES(?, ?, ?, ?, ?, ?, ?)",
-    [id, workflowId, kind, param, enabled ? 1 : 0, catchUp ? 1 : 0, nextRunAt]
+    [randomUUID(), workflowId, kind, param, enabled ? 1 : 0, catchUp ? 1 : 0, nextRunAt]
   );
 }
 

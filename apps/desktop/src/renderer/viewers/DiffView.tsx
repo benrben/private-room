@@ -12,19 +12,35 @@ import { languageForFile } from "./monacoSetup";
  * "Plain view" that swaps to `dir="auto"` panes for right-to-left documents.
  * Counts strong RTL letters against all letters; ~30% is enough because a
  * mostly-Hebrew doc still has Latin numbers/punctuation. */
-export function isRtlDominant(text: string): boolean {
+function inRange(codePoint: number, first: number, last: number): boolean {
+  return codePoint >= first && codePoint <= last;
+}
+
+function isRtlLetter(codePoint: number): boolean {
+  return inRange(codePoint, 0x0590, 0x05ff) || inRange(codePoint, 0x0600, 0x06ff);
+}
+
+function isCountedLetter(character: string, rtl: boolean): boolean {
+  return rtl || /[A-Za-zÀ-ɏ]/.test(character);
+}
+
+function rtlLetterCounts(text: string): [rtl: number, letters: number] {
   let rtl = 0;
   let letters = 0;
   for (const ch of text) {
     const c = ch.codePointAt(0)!;
-    const isRtl =
-      (c >= 0x0590 && c <= 0x05ff) || (c >= 0x0600 && c <= 0x06ff);
+    const isRtl = isRtlLetter(c);
     // Rough "is a letter": RTL blocks above, or ASCII/Latin letters.
-    if (isRtl || /[A-Za-zÀ-ɏ]/.test(ch)) {
+    if (isCountedLetter(ch, isRtl)) {
       letters++;
       if (isRtl) rtl++;
     }
   }
+  return [rtl, letters];
+}
+
+export function isRtlDominant(text: string): boolean {
+  const [rtl, letters] = rtlLetterCounts(text);
   return letters > 0 && rtl / letters >= 0.3;
 }
 

@@ -345,4 +345,97 @@ describe("organize", () => {
     expect(listTrashedFiles(db).map((t) => t.name).sort()).toEqual(["one.md", "two.md"]);
     expect(() => findFileLike(db, "scan.pdf")).not.toThrow();
   });
+
+  it("keeps folder creation, file work, and folder removal in their planned phases", () => {
+    const db = room();
+    const old = createFolder(db, "Old");
+    const id = add(db, "draft.txt", "body");
+    moveFileToFolder(db, id, old.id);
+
+    const report = organize(
+      db,
+      [{ name: "draft.txt", folder: "Archive", newName: "final" }],
+      ["", "top", "Old", "Archive"],
+      ["", "Missing", "Old"],
+      false,
+    );
+
+    expect(report).toMatchObject({
+      foldersMade: ['"Archive"'],
+      moved: ['"draft.txt" → "Archive"'],
+      renamed: ['"draft.txt" → "final.txt"'],
+      foldersRemoved: ['"Old"'],
+      failed: [{ name: "Missing", error: "no folder by that name" }],
+    });
+    expect(getFileMeta(db, id).folderId).toBe(listFolders(db).find((folder) => folder.name === "Archive")!.id);
+    expect(() => findFileLike(db, "final.txt")).not.toThrow();
+  });
+
+  it("records per-operation database failures without hiding the rest of a plan", () => {
+    const db = room();
+    const moveId = add(db, "move.txt", "body");
+    const renameId = add(db, "rename.txt", "body");
+    createFolder(db, "Blocked removal");
+    db.exec(`
+      CREATE TRIGGER fail_organize_folder_create BEFORE INSERT ON folders
+      WHEN NEW.name = 'Blocked create'
+      BEGIN SELECT RAISE(ABORT, 'folder blocked'); END;
+      CREATE TRIGGER fail_organize_move BEFORE UPDATE OF folder_id ON files
+      WHEN NEW.id = '${moveId}'
+      BEGIN SELECT RAISE(ABORT, 'move blocked'); END;
+      CREATE TRIGGER fail_organize_rename BEFORE UPDATE OF name ON files
+      WHEN NEW.id = '${renameId}'
+      BEGIN SELECT RAISE(ABORT, 'rename blocked'); END;
+      CREATE TRIGGER fail_organize_folder_remove BEFORE DELETE ON folders
+      WHEN OLD.name = 'Blocked removal'
+      BEGIN SELECT RAISE(ABORT, 'remove blocked'); END;
+    `);
+
+    const report = organize(
+      db,
+      [
+        { name: "move.txt", folder: "" },
+        { name: "rename.txt", newName: "renamed" },
+      ],
+      ["Blocked create"],
+      ["Blocked removal"],
+      false,
+    );
+
+    expect(report.failed).toEqual([
+      { name: "Blocked create", error: "folder blocked" },
+      { name: "move.txt", error: "move blocked" },
+      { name: "rename.txt", error: "rename blocked" },
+      { name: "Blocked removal", error: "remove blocked" },
+    ]);
+  });
+
+  it("keeps failure receipts and no-op receipts precise", () => {
+    expect(organizeSentence({ moved: [], renamed: [], foldersMade: [], foldersRemoved: [], failed: [], capped: 0 }, false))
+      .toBe("Nothing was changed.");
+    expect(organizeSentence({
+      moved: [], renamed: [], foldersMade: [], foldersRemoved: ['"Old"'], failed: [{ name: "x", error: "blocked" }], capped: 0,
+    }, false, " — files stayed put"))
+      .toBe('removed folder(s) "Old" — files stayed put. 1 could not be done: "x" (blocked).');
+  });
+
+  it("previews folder removal without deleting the folder", () => {
+    const db = room();
+    createFolder(db, "Keep in preview");
+    const report = organize(db, [], [], ["Keep in preview"], true);
+    expect(report.foldersRemoved).toEqual(['"Keep in preview"']);
+    expect(listFolders(db).map((folder) => folder.name)).toContain("Keep in preview");
+  });
+
+  it("reports a trash write failure by file name", () => {
+    const db = room();
+    const id = add(db, "blocked-trash.txt", "body");
+    db.exec(`
+      CREATE TRIGGER fail_organize_trash BEFORE UPDATE OF trashed_at ON files
+      WHEN NEW.id = '${id}'
+      BEGIN SELECT RAISE(ABORT, 'trash blocked'); END;
+    `);
+    const [report] = trashNamed(db, ["blocked-trash.txt"]);
+    expect(report).toMatchObject({ ok: [], failed: [{ name: "blocked-trash.txt", error: "trash blocked" }] });
+  });
 });

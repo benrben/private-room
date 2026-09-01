@@ -89,7 +89,7 @@ export interface RoomSource {
  * already spells it. */
 const NO_ROOM_OPEN = "No room is open.";
 
-function openDb(room: RoomSource): Database.Database {
+export function openDb(room: RoomSource): Database.Database {
   const open = room.currentRoom();
   if (open === null) {
     throw new Error(NO_ROOM_OPEN);

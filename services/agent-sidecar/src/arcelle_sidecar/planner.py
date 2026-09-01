@@ -63,8 +63,8 @@ utterance"), and the reason a mis-planned step still cannot invent a filename.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
+from typing import TypeAlias
 
 from .agents import (
     AGENT_TOOL_DOMAINS,
@@ -80,6 +80,8 @@ from .agents import (
     worker_reachable,
 )
 from .manager import rank_worker, resolve_worker
+from .planner_clauses import _clauses
+from .planner_intent import is_static_visual_intent, is_visual_video_intent
 from .prompts import no_plan_note, plan_note
 
 #: The score a clause must reach before a domain may CLAIM it.
@@ -102,96 +104,6 @@ MIN_CLAIM_SCORE = 2
 #: both are worse than saying "I could not plan this one", which is a state this
 #: module already has a truthful answer for.
 MAX_PLAN_STEPS = 6
-
-
-_VIDEO_FILE_RE = re.compile(r"(?i)\.(?:mp4|mov|m4v|webm)\b")
-_VIDEO_MEDIUM_RE = re.compile(r"(?i)\b(?:video|footage|clip|recording)\b")
-_FRAME_RE = re.compile(r"(?i)\bframe\b")
-_TRANSCRIPT_RE = re.compile(r"(?i)\btranscri(?:be|bed|bing|pt|ption)\b")
-_TIMESTAMP_RE = re.compile(r"(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?!\d)")
-_VISUAL_WORDS_RE = re.compile(
-    r"(?i)(?:\bwhat\b.{0,48}\b(?:see|visible|shown)\b|"
-    r"\b(?:show|describe|inspect|look at|watch)\b.{0,48}"
-    r"\b(?:frame|scene|screen|video|footage|clip|recording)\b|"
-    r"\b(?:on screen|which slide is (?:up|visible|shown))\b)"
-)
-
-_STATIC_VISUAL_ANCHOR_RE = re.compile(
-    r"(?i)(?:\.(?:png|jpe?g|gif|webp|avif|heic|heif|tiff?|svg|sketch)\b|"
-    r"\b(?:image|photo|picture|screenshot|sketch|drawing|diagram|chart|canvas)\b)"
-)
-_STATIC_VISUAL_WORDS_RE = re.compile(
-    r"(?i)(?:\bwhat\b.{0,56}\b(?:see|visible|shown|written|depicted|pictured)\b|"
-    r"\b(?:describe|inspect|look at)\b.{0,80}(?:"
-    r"\.(?:png|jpe?g|gif|webp|avif|heic|heif|tiff?|svg|sketch)\b|"
-    r"\b(?:image|photo|picture|screenshot|sketch|drawing|diagram|chart|canvas)\b)|"
-    r"\bwhat does\b.{0,56}\b(?:look like|say|show)\b|"
-    r"\b(?:colour|color|layout|arrangement)\b.{0,40}"
-    r"\b(?:image|photo|picture|screenshot|sketch|drawing|diagram|chart|canvas)\b)"
-)
-
-
-def is_visual_video_intent(question: str) -> bool:
-    """Whether ``question`` unambiguously asks for video pixels.
-
-    This is deliberately narrower than the Video specialist's sibling-routing
-    vocabulary.  A bare ``video`` can mean transcription, file management or a
-    question about codecs; deterministically opening pixels is justified only
-    when visual language is paired with a video/file anchor, or when a frame is
-    paired with a timestamp.  The original words remain the delegation's slots.
-    """
-    q = " ".join(question.split())
-    frame = bool(_FRAME_RE.search(q))
-    timestamp = bool(_TIMESTAMP_RE.search(q))
-    medium = bool(_VIDEO_FILE_RE.search(q) or _VIDEO_MEDIUM_RE.search(q))
-    visual = bool(_VISUAL_WORDS_RE.search(q))
-    if _TRANSCRIPT_RE.search(q) and not frame:
-        return False
-    return (frame and timestamp) or (timestamp and visual) or (medium and visual)
-
-
-def is_static_visual_intent(question: str) -> bool:
-    """Whether the request needs pixels from a still image or sketch."""
-    q = " ".join(question.split())
-    if is_visual_video_intent(q):
-        return False
-    return bool(
-        _STATIC_VISUAL_ANCHOR_RE.search(q) and _STATIC_VISUAL_WORDS_RE.search(q)
-    )
-
-#: Separators a USER typed. Deliberately conservative: no bare "and" (it joins
-#: two halves of one errand far more often than two errands — "find the rent and
-#: the notice period"), and a capturing group so the delimiter itself survives
-#: the split and can be read for sequencing below.
-#:
-#: Over-splitting is the failure mode to fear here, because every extra fragment
-#: is a candidate extra specialist — i.e. the very "twelve specialists" symptom
-#: this module exists to remove. Under-splitting costs one specialist a
-#: two-part instruction, which is a thing workers handle every day.
-_SPLIT_RE = re.compile(
-    r"("
-    r"\n+"
-    r"|;"
-    r"|,?\s+and\s+then\s+"
-    r"|,?\s+then\s+"
-    r"|,?\s+after\s+that,?\s+"
-    r"|,?\s+afterwards,?\s+"
-    r"|,?\s+and\s+also\s+"
-    r"|,?\s+also,?\s+"
-    r"|\s+ואז\s+"
-    r"|\s+אחר\s+כך\s+"
-    r"|\s+לאחר\s+מכן\s+"
-    r"|\s+וגם\s+"
-    r")",
-    re.IGNORECASE,
-)
-
-#: Which of those separators mean "and USE what the last step found". A newline
-#: or a semicolon does not; "then" does. This is the only source of a step's
-#: ``depends_on``, so a plan never serialises work the user wrote as parallel.
-_SEQ_RE = re.compile(
-    r"then|after\s+that|afterwards|ואז|אחר\s+כך|לאחר\s+מכן", re.IGNORECASE
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,39 +171,27 @@ class Plan:
     def note(self) -> str:
         """The system-prompt paragraph handed to the hub ("" = nothing to add)."""
         if self.reason == "planned":
-            return plan_note(
-                [
-                    (s.label, s.area, s.instruction, s.needs_previous)
-                    for s in self.steps
-                ],
-                tools=[DOMAIN_KEYS[s.domain] for s in self.steps],
-                batch_tool=BATCH_TOOL_NAME,
-                unavailable=self.unavailable,
-                unplanned=self.unplanned,
-                default_tool=self.default_tool,
-            )
+            return _plan_note_for(self)
         if self.reason == "abstained" and self.default_tool:
             return no_plan_note(self.default_tool)
         return ""
 
 
-def _clauses(question: str) -> list[tuple[str, bool]]:
-    """The request as ``(clause, needs_previous)`` in the order it was written.
-
-    Falls back to the whole question as one clause when nothing splits — which
-    is the common case and the safe one.
-    """
-    parts = _SPLIT_RE.split(question.strip())
-    out: list[tuple[str, bool]] = []
-    seq = False
-    for i, part in enumerate(parts):
-        if i % 2:  # a delimiter: it describes the clause that FOLLOWS it
-            seq = bool(_SEQ_RE.search(part))
-            continue
-        text = part.strip().strip(",.;:- \t")
-        if text:
-            out.append((text, seq and bool(out)))
-    return out or [(question.strip(), False)]
+def _plan_note_for(plan: Plan) -> str:
+    """Build the planned-turn note from its already-resolved steps."""
+    steps = [
+        (step.label, step.area, step.instruction, step.needs_previous)
+        for step in plan.steps
+    ]
+    tools = [DOMAIN_KEYS[step.domain] for step in plan.steps]
+    return plan_note(
+        steps,
+        tools=tools,
+        batch_tool=BATCH_TOOL_NAME,
+        unavailable=plan.unavailable,
+        unplanned=plan.unplanned,
+        default_tool=plan.default_tool,
+    )
 
 
 #: ``(domain key, the member whose vocabulary routes TO that domain)``.
@@ -318,6 +218,94 @@ _DOMAIN_VOCABULARY: tuple[tuple[str, AgentSpec], ...] = tuple(
 )
 
 
+DomainRank: TypeAlias = tuple[str, AgentSpec, tuple[int, bool, int]]
+Clause: TypeAlias = tuple[str, bool]
+Pick: TypeAlias = tuple[str, str]
+GroupedClauses: TypeAlias = tuple[str, list[str], bool]
+ClassifiedClause: TypeAlias = tuple[Clause, Pick]
+
+
+def _agent_domain(agent: AgentSpec) -> str:
+    """Return an agent's domain, retaining File as the registry fallback."""
+    return normalize_domain_key(agent.id) or "file"
+
+
+def _video_pick(
+    clause: str,
+    *,
+    web_enabled: bool,
+    served_names: set[str],
+) -> tuple[str, str] | None:
+    """Return the dedicated video decision, when the clause asks for pixels."""
+    if not is_visual_video_intent(clause):
+        return None
+    video = get_agent("media.video")
+    if worker_reachable(
+        video,
+        web_enabled=web_enabled,
+        served_names=served_names,
+    ):
+        return ("domain", _agent_domain(video))
+    return ("unavailable", video.label)
+
+
+def _static_image_pick(
+    clause: str,
+    *,
+    web_enabled: bool,
+    served_names: set[str],
+) -> tuple[str, str] | None:
+    """Return the dedicated still-image decision, when the clause needs pixels."""
+    if not is_static_visual_intent(clause):
+        return None
+    file_agent = get_agent("files.read")
+    if "view_file_image" in served_names and worker_reachable(
+        file_agent,
+        web_enabled=web_enabled,
+        served_names=served_names,
+    ):
+        return ("domain", _agent_domain(file_agent))
+    return ("unavailable", file_agent.label)
+
+
+def _ranked_domain(clause: str) -> DomainRank | None:
+    """Return the highest-scoring default domain in stable registry order."""
+    best: DomainRank | None = None
+    for key, spec in _DOMAIN_VOCABULARY:
+        rank = rank_worker(clause.lower(), spec)
+        if best is None or rank > best[2]:
+            best = (key, spec, rank)
+    return best
+
+
+def _is_claimable(pick: DomainRank | None) -> bool:
+    """Whether the highest-scoring domain meets the abstention threshold."""
+    return pick is not None and pick[2][0] >= MIN_CLAIM_SCORE
+
+
+def _web_is_disabled(spec: AgentSpec, *, web_enabled: bool) -> bool:
+    """Whether this candidate is intentionally silent while the web is off."""
+    return spec.id in WEB_DEPENDENT_AGENT_IDS and not web_enabled
+
+
+def _ranked_pick(
+    clause: str,
+    *,
+    web_enabled: bool,
+    live: list[str],
+) -> tuple[str, str]:
+    """Classify a non-visual clause using the derived domain vocabulary."""
+    pick = _ranked_domain(clause)
+    if not _is_claimable(pick):
+        return ("none", "")
+    key, spec, _ = pick
+    if _web_is_disabled(spec, web_enabled=web_enabled):
+        return ("none", "")
+    if key not in live:
+        return ("unavailable", spec.label)
+    return ("domain", key)
+
+
 def _pick(
     clause: str,
     *,
@@ -340,54 +328,193 @@ def _pick(
     # A visual-video request is a high-confidence NON-DEFAULT member of the
     # broad File domain.  The generic planner intentionally scores only domain
     # defaults because sibling vocabularies such as Browser's ``open`` are too
-    # broad cross-domain.  Keeping this one receipt-critical exception explicit
-    # prevents ``frame 6:00 in @video.mp4`` from becoming an abstained plan and
-    # leaving Main free to answer from an attached transcript.
-    if is_visual_video_intent(clause):
-        video = get_agent("media.video")
-        if worker_reachable(
-            video,
-            web_enabled=web_enabled,
-            served_names=served_names,
-        ):
-            return ("domain", normalize_domain_key(video.id) or "file")
-        return ("unavailable", video.label)
+    # broad cross-domain.  Keeping this receipt-critical exception explicit
+    # prevents ``frame 6:00 in @video.mp4`` from becoming an abstained plan.
+    if visual_pick := _video_pick(
+        clause,
+        web_enabled=web_enabled,
+        served_names=served_names,
+    ):
+        return visual_pick
 
     # `files.read` is core-capable, so ordinary reachability would still call
     # it available after a blind provider or Cloud Privacy removed its pixels.
-    if is_static_visual_intent(clause):
-        file_agent = get_agent("files.read")
-        if "view_file_image" in served_names and worker_reachable(
-            file_agent,
-            web_enabled=web_enabled,
-            served_names=served_names,
-        ):
-            return ("domain", normalize_domain_key(file_agent.id) or "file")
-        return ("unavailable", file_agent.label)
+    if visual_pick := _static_image_pick(
+        clause,
+        web_enabled=web_enabled,
+        served_names=served_names,
+    ):
+        return visual_pick
 
-    q = clause.lower()
-    best: tuple[str, AgentSpec] | None = None
-    best_rank = (0, False, 0)
-    for key, spec in _DOMAIN_VOCABULARY:
-        rank = rank_worker(q, spec)
-        if rank > best_rank:
-            best, best_rank = (key, spec), rank
-    if best is None or best_rank[0] < MIN_CLAIM_SCORE:
-        return ("none", "")
-    key, spec = best
-    if spec.id in WEB_DEPENDENT_AGENT_IDS and not web_enabled:
-        # The internet is off, which is a SETTING the user controls — and
-        # :data:`.prompts.WEB_OFF_NOTE` is already the app's one carefully
-        # worded answer to it, ending on where the switch is. Reporting it here
-        # as well would put a second answer in the same system message, and
-        # this one's wording ("this room has no specialist for that") is the
-        # exact permanence claim that note exists to stop: live QA 2026-07-30
-        # had the model tell a user their app had no browser at all and send
-        # them looking for a feature they already own.
-        return ("none", "")
-    if key not in live:
-        return ("unavailable", spec.label)
-    return ("domain", key)
+    return _ranked_pick(clause, web_enabled=web_enabled, live=live)
+
+
+def _default_tool(live: list[str]) -> str:
+    """Return the reachable default-domain tool, if the registry has one."""
+    default_key = normalize_domain_key(DEFAULT_AGENT_ID) or ""
+    return DOMAIN_KEYS[default_key] if default_key in live else ""
+
+
+def _classified_clauses(
+    clauses: list[Clause],
+    *,
+    web_enabled: bool,
+    live: list[str],
+    served_names: set[str],
+) -> list[ClassifiedClause]:
+    """Classify every user clause without changing its order or text."""
+    return [
+        (
+            clause,
+            _pick(
+                clause[0],
+                web_enabled=web_enabled,
+                live=live,
+                served_names=served_names,
+            ),
+        )
+        for clause in clauses
+    ]
+
+
+def _has_recognized_pick(classified: list[ClassifiedClause]) -> bool:
+    """Whether at least one clause named a specialist or unavailable capability."""
+    return any(kind != "none" for _, (kind, _) in classified)
+
+
+def _domain_key_or_record_remainder(
+    *,
+    kind: str,
+    value: str,
+    text: str,
+    unavailable: list[tuple[str, str]],
+    unplanned: list[str],
+) -> str | None:
+    """Keep unavailable and unclaimed clauses out of specialist grouping."""
+    if kind == "unavailable":
+        unavailable.append((value, text))
+        return None
+    if kind != "domain":
+        unplanned.append(text)
+        return None
+    return value
+
+
+def _append_grouped_clause(
+    grouped: list[GroupedClauses], *, key: str, text: str, needs_previous: bool
+) -> None:
+    """Merge adjacent clauses only when they name the same specialist domain."""
+    if grouped and grouped[-1][0] == key:
+        grouped[-1][1].append(text)
+        return
+    grouped.append((key, [text], needs_previous and bool(grouped)))
+
+
+def _group_classified_clauses(
+    classified: list[ClassifiedClause], *, live: list[str]
+) -> tuple[list[GroupedClauses], list[tuple[str, str]], list[str]]:
+    """Group reachable domain clauses while preserving visible remainders."""
+    unavailable: list[tuple[str, str]] = []
+    unplanned: list[str] = []
+    grouped: list[GroupedClauses] = []
+    for ((text, needs_previous), (kind, value)) in classified:
+        key = _domain_key_or_record_remainder(
+            kind=kind,
+            value=value,
+            text=text,
+            unavailable=unavailable,
+            unplanned=unplanned,
+        )
+        if key is None:
+            continue
+        if key not in live:
+            unplanned.append(text)
+            continue
+        _append_grouped_clause(
+            grouped,
+            key=key,
+            text=text,
+            needs_previous=needs_previous,
+        )
+    return grouped, unavailable, unplanned
+
+
+def _step_worker(
+    *,
+    key: str,
+    instruction: str,
+    served_names: set[str],
+    web_enabled: bool,
+) -> str:
+    """Resolve the concrete worker behind a previously selected domain."""
+    if is_static_visual_intent(instruction):
+        return "files.read"
+    return resolve_worker(
+        DOMAIN_KEYS[key],
+        instruction,
+        served_names=served_names,
+        web_enabled=web_enabled,
+    )
+
+
+def _plan_step(
+    grouped: GroupedClauses, *, served_names: set[str], web_enabled: bool
+) -> PlanStep:
+    """Build one displayed plan step from an adjacent-domain clause group."""
+    key, texts, needs_previous = grouped
+    instruction = "; ".join(texts)
+    worker = _step_worker(
+        key=key,
+        instruction=instruction,
+        served_names=served_names,
+        web_enabled=web_enabled,
+    )
+    return PlanStep(
+        domain=key,
+        worker=worker,
+        label=get_agent(worker).label,
+        area=DOMAIN_BLURBS[key],
+        instruction=instruction,
+        needs_previous=needs_previous,
+    )
+
+
+def _plan_steps(
+    grouped: list[GroupedClauses], *, served_names: set[str], web_enabled: bool
+) -> list[PlanStep]:
+    """Resolve each grouped domain into the worker the dispatcher will use."""
+    return [
+        _plan_step(
+            group,
+            served_names=served_names,
+            web_enabled=web_enabled,
+        )
+        for group in grouped
+    ]
+
+
+def _abstained_plan(default_tool: str) -> Plan:
+    """Return the hub-owned fallback when no compact plan can be stated."""
+    return Plan(steps=(), unavailable=(), reason="abstained", default_tool=default_tool)
+
+
+def _completed_plan(
+    *,
+    steps: list[PlanStep],
+    unavailable: list[tuple[str, str]],
+    unplanned: list[str],
+    default_tool: str,
+) -> Plan:
+    """Return a stated plan unless the request named no usable capability."""
+    if not steps and not unavailable:
+        return _abstained_plan(default_tool)
+    return Plan(
+        steps=tuple(steps),
+        unavailable=tuple(unavailable),
+        reason="planned",
+        unplanned=tuple(unplanned),
+        default_tool=default_tool,
+    )
 
 
 def build_plan(
@@ -415,105 +542,37 @@ def build_plan(
         # nothing; a plan note here would be a second story about the same turn.
         return Plan(steps=(), unavailable=(), reason="no-specialists")
 
-    default_key = normalize_domain_key(DEFAULT_AGENT_ID) or ""
-    default_tool = DOMAIN_KEYS[default_key] if default_key in live else ""
-
-    clauses = _clauses(question)
-    picks = [
-        _pick(
-            text,
-            web_enabled=web_enabled,
-            live=live,
-            served_names=served_names,
-        )
-        for text, _ in clauses
-    ]
-    if not any(kind != "none" for kind, _ in picks):
+    default_tool = _default_tool(live)
+    classified = _classified_clauses(
+        _clauses(question),
+        web_enabled=web_enabled,
+        live=live,
+        served_names=served_names,
+    )
+    if not _has_recognized_pick(classified):
         # Nothing in the words named a specialist. The vocabulary genuinely
         # cannot see "compare my rent to the market" as file+web, and forcing a
         # single specialist on it would lose half the request — so this is the
         # one case the hub still decides, and it is told so.
-        return Plan(
-            steps=(), unavailable=(), reason="abstained", default_tool=default_tool
-        )
+        return _abstained_plan(default_tool)
 
-    unavailable: list[tuple[str, str]] = []
-    unplanned: list[str] = []
-    # [domain key, [the user's clauses], needs_previous]
-    grouped: list[tuple[str, list[str], bool]] = []
-    for (text, seq), (kind, value) in zip(clauses, picks):
-        if kind == "unavailable":
-            unavailable.append((value, text))
-            continue
-        if kind != "domain":
-            # UNCLAIMED — and that is not the same fact as "this belongs to the
-            # default specialist". Sending it there anyway, then STATING it in a
-            # paragraph that ends "do not drop one it does", is a substituted
-            # specialist asserted as fact: "search the web for rents; thanks!"
-            # planned a File agent sub-loop for "thanks!", and with the web off
-            # "search the web for rents; email dana" planned the WEB half as a
-            # File agent step — the exact re-routing this module's own docstring
-            # forbids. The clause is not dropped either (that loses part of the
-            # request): it goes back to the hub by name, which is what abstaining
-            # already means one level up.
-            unplanned.append(text)
-            continue
-        key = value
-        if key not in live:
-            # Defensive: `_pick` already refused an unreachable domain, so this
-            # is unreachable in practice. Kept rather than asserted, because the
-            # honest answer to "I cannot place this" is the remainder note.
-            unplanned.append(text)
-            continue
-        if grouped and grouped[-1][0] == key:
-            # Two clauses in a row for the same specialist are ONE step. Asking
-            # the same agent twice in a round is the "twelve specialists" shape
-            # in miniature, and it costs a whole extra sub-loop.
-            grouped[-1][1].append(text)
-            continue
-        grouped.append((key, [text], seq and bool(grouped)))
+    grouped, unavailable, unplanned = _group_classified_clauses(
+        classified,
+        live=live,
+    )
 
     if len(grouped) > MAX_PLAN_STEPS:
-        return Plan(
-            steps=(), unavailable=(), reason="abstained", default_tool=default_tool
-        )
+        return _abstained_plan(default_tool)
 
-    steps: list[PlanStep] = []
-    for key, texts, seq in grouped:
-        instruction = "; ".join(texts)
-        # The CONCRETE worker comes from the dispatcher itself, so the label in
-        # the plan is the label that will actually light up. Re-deriving it here
-        # would be a second answer to a question `resolve_worker` already owns.
-        worker = (
-            "files.read"
-            if is_static_visual_intent(instruction)
-            else resolve_worker(
-                DOMAIN_KEYS[key],
-                instruction,
-                served_names=served_names,
-                web_enabled=web_enabled,
-            )
-        )
-        steps.append(
-            PlanStep(
-                domain=key,
-                worker=worker,
-                label=get_agent(worker).label,
-                area=DOMAIN_BLURBS[key],
-                instruction=instruction,
-                needs_previous=seq,
-            )
-        )
-
-    if not steps and not unavailable:
-        return Plan(
-            steps=(), unavailable=(), reason="abstained", default_tool=default_tool
-        )
-    return Plan(
-        steps=tuple(steps),
-        unavailable=tuple(unavailable),
-        reason="planned",
-        unplanned=tuple(unplanned),
+    steps = _plan_steps(
+        grouped,
+        served_names=served_names,
+        web_enabled=web_enabled,
+    )
+    return _completed_plan(
+        steps=steps,
+        unavailable=unavailable,
+        unplanned=unplanned,
         default_tool=default_tool,
     )
 

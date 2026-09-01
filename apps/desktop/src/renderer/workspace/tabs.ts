@@ -270,30 +270,50 @@ export function useTabs(roomName: string): TabsApi {
  * the Room Map or Memory. Treating that as "no record" and falling back to
  * `tabs[0]` reopened the room on the OLDEST surviving file tab — a file the
  * reader might not have touched in weeks. */
-function parseTabs(raw: string): { tabs: Tab[]; activeId: string | undefined } {
-  const empty = { tabs: [] as Tab[], activeId: undefined };
-  if (!raw) return empty;
+type ParsedTabs = { tabs: Tab[]; activeId: string | undefined };
+
+function parseTabs(raw: string): ParsedTabs {
+  if (!raw) return emptyParsedTabs();
+  return decodeTabs(raw) ?? emptyParsedTabs();
+}
+
+function emptyParsedTabs(): ParsedTabs {
+  return { tabs: [], activeId: undefined };
+}
+
+function decodeTabs(raw: string): ParsedTabs | null {
   try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null) return empty;
-    const { tabs, activeId } = parsed as { tabs?: unknown; activeId?: unknown };
-    if (!Array.isArray(tabs)) return empty;
-    return {
-      tabs: tabs.filter(isTab).filter(isDurable),
-      activeId: typeof activeId === "string" ? activeId : undefined,
-    };
+    return parsedTabs(JSON.parse(raw));
   } catch {
-    return empty;
+    return null;
   }
 }
 
+function parsedTabs(value: unknown): ParsedTabs | null {
+  if (!isRecord(value)) return null;
+  const { tabs, activeId } = value;
+  if (!Array.isArray(tabs)) return null;
+  return {
+    tabs: tabs.filter(isTab).filter(isDurable),
+    activeId: typeof activeId === "string" ? activeId : undefined,
+  };
+}
+
 function isTab(value: unknown): value is Tab {
-  if (typeof value !== "object" || value === null) return false;
-  const t = value as Record<string, unknown>;
+  if (!isRecord(value) || !hasTabStrings(value)) return false;
   return (
-    typeof t.id === "string" &&
-    typeof t.ref === "string" &&
-    typeof t.title === "string" &&
-    (t.kind === "file" || t.kind === "area")
+    isTabKind(value.kind)
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function hasTabStrings(value: Record<string, unknown>): boolean {
+  return typeof value.id === "string" && typeof value.ref === "string" && typeof value.title === "string";
+}
+
+function isTabKind(value: unknown): value is TabKind {
+  return value === "file" || value === "area";
 }

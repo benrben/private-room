@@ -35,8 +35,10 @@
  *     binary accepts the string this module builds and honors the real
  *     `--ffmpeg-location` this module passes.
  *
- * Skips (rather than fails) when yt-dlp isn't installed, so a machine without
- * it still gets an honest green rather than a red that means nothing.
+ * Skips (rather than fails) when yt-dlp is not runnable, so a machine without
+ * a working binary still gets an honest green rather than a red that means
+ * nothing. `which` alone is insufficient on macOS: it can find a Python shim
+ * whose interpreter was removed or cannot be executed.
  */
 
 import { execFileSync, spawn as nodeSpawn } from "node:child_process";
@@ -58,10 +60,12 @@ import {
   type SpawnFn,
 } from "./ytdlp.js";
 
-function which(bin: string): string | null {
+function runnableBinary(bin: string): string | null {
   try {
-    const out = execFileSync("which", [bin], { encoding: "utf8" }).trim();
-    return out.length > 0 ? out : null;
+    const candidate = execFileSync("which", [bin], { encoding: "utf8" }).trim();
+    if (candidate === "") return null;
+    execFileSync(candidate, ["--version"], { stdio: "ignore" });
+    return candidate;
   } catch {
     return null;
   }
@@ -69,8 +73,8 @@ function which(bin: string): string | null {
 
 /** Checked, not assumed — and reported, so a skip reads as an environment
  * fact rather than a silent gap. */
-const REAL_YTDLP = which("yt-dlp");
-const REAL_FFMPEG = which("ffmpeg");
+const REAL_YTDLP = runnableBinary("yt-dlp");
+const REAL_FFMPEG = runnableBinary("ffmpeg");
 
 const realSpawnFn: SpawnFn = (command, args) =>
   nodeSpawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -352,8 +356,8 @@ describe("wire-suite honesty", () => {
     // Not an assertion about the environment — either binary may legitimately
     // be missing; this exists so the run's output says which.
     console.log(
-      `[ytdlp.wire.test.ts] yt-dlp: ${REAL_YTDLP ?? "NOT FOUND (real-subprocess suite skipped)"}; ` +
-        `ffmpeg: ${REAL_FFMPEG ?? "NOT FOUND (ffmpeg assertion skipped)"}`
+      `[ytdlp.wire.test.ts] yt-dlp: ${REAL_YTDLP ?? "NOT RUNNABLE (real-subprocess suite skipped)"}; ` +
+        `ffmpeg: ${REAL_FFMPEG ?? "NOT RUNNABLE (ffmpeg assertion skipped)"}`
     );
     expect(REAL_YTDLP === null || typeof REAL_YTDLP === "string").toBe(true);
   });

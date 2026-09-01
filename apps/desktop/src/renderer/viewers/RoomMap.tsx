@@ -1,167 +1,248 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-// CONTRACT-NOTE: G3 will add a `GraphIcon` (constellation) to ../icons. Until
-// then this import is the only thing tying RoomMap to that file; if it lands
-// under a different name, swap it here.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GraphIcon } from "../icons";
 import "./roomMap.css";
-import type { SimNode, SimEdge, Tip, LabelBox, RoomGraph, RoomMapProps } from "./roomMap/types";
-import {
-  EMPTY_TEXT,
-  LABEL_MIN_R_PX,
-  LABEL_FONT,
-  LABEL_CHAR_W,
-  LABEL_PAD,
-  LABEL_H,
-  LABEL_MARK_W,
-  LABEL_MAX,
-  NAME_MAX,
-} from "./roomMap/constants";
+import type { LabelBox, RoomGraph, RoomMapProps, SimEdge, SimNode, Tip, View } from "./roomMap/types";
+import { EMPTY_TEXT, LABEL_CHAR_W, LABEL_FONT, LABEL_H, LABEL_MARK_W, LABEL_MAX, LABEL_MIN_R_PX, LABEL_PAD, NAME_MAX } from "./roomMap/constants";
 import { nodeRadius } from "./roomMap/layout";
-import { EDGE_KINDS, EDGE_STYLE, styleFor, edgeRank, type EdgeFilter } from "./roomMap/edges";
+import { EDGE_KINDS, EDGE_STYLE, edgeRank, styleFor, type EdgeFilter } from "./roomMap/edges";
 import { useRoomGraph } from "./roomMap/useRoomGraph";
 import { usePanZoom } from "./roomMap/usePanZoom";
 import Edge from "./roomMap/Edge";
-import NodeStar from "./roomMap/NodeStar";
 import Label from "./roomMap/Label";
+import NodeStar from "./roomMap/NodeStar";
 import Tooltip from "./roomMap/Tooltip";
 
-// Re-export the graph types so external imports from this path keep resolving.
-export type { GraphNode, GraphEdge, RoomGraph, RoomMapProps } from "./roomMap/types";
+export type { GraphEdge, GraphNode, RoomGraph, RoomMapProps } from "./roomMap/types";
 
-/* ------------------------------------------------------------------ *
- * Room map — the constellation view.
- *
- * Reads room_graph() (mean-embedding similarity between files) and lays the
- * files out as violet stars on the ink canvas, drawing a faint line between
- * files the model found related. Hovering a line explains *why* they're
- * linked (the edge's `shared` reasons); clicking a star opens that file.
- *
- * This is a FULL-CANVAS view: the root fills 100%/100% of whatever container
- * hosts it (A2 renders it in the center pane). We measure the stage with a
- * ResizeObserver and lay the graph out to the actual pixel size, then support
- *   • wheel / trackpad zoom toward the cursor,
- *   • click-drag pan on empty canvas,
- *   • persistent labels (selected node + neighbours + the larger stars, more
- *     of them as you zoom in) so you don't have to hover to read the room,
- *   • a "reset view" affordance to re-fit if pan/zoom gets lost.
- *
- * No layout library is bundled (checked package.json — no d3-force), so the
- * spring layout below is a small hand-rolled Fruchterman-Reingold: cheap,
- * deterministic (no Math.random), and capped so a few hundred nodes still
- * settle smoothly.
- *
- * The stateful machinery lives in two hooks under ./roomMap:
- *   • useRoomGraph — the room_graph() fetch, the measure/re-fit observer, the
- *     settle loop, and the derived graph data (capped edges, degree, …).
- *   • usePanZoom   — the view transform + wheel/zoom/pan/reset handlers.
- * This shell owns the shared refs, threads the hooks together (pan-zoom's
- * setView re-frames the graph; the graph's setFocus resets selection), and
- * renders.
- * ------------------------------------------------------------------ */
+const TIP_MAX_W = 260;
+const TIP_PAD_X = 20;
+const TIP_PAD_Y = 14;
+const TIP_LINE_H = 19;
+const TIP_LINE_GAP = 2;
+const TIP_OFFSET = 14;
 
-/** Keep a label card of length `len` inside a `span`-wide canvas, with a hair
- *  of paper at the edge. Falls back to the near edge when the card is wider
- *  than the canvas, so a long name still starts where it can be read. */
-function onCanvas(at: number, len: number, span: number): number {
-  const EDGE = 4;
-  return Math.max(EDGE, Math.min(at, span - len - EDGE));
+interface LabelCandidate {
+  n: SimNode;
+  sx: number;
+  sy: number;
+  rScreen: number;
+  prio: number;
+  deg: number;
 }
 
-/* ----- tooltip box estimate -----
- *
- * The stage clips its overflow, so a tip opened near the right or bottom edge
- * was cut off mid-word. The card isn't in the DOM when its position is chosen,
- * so its box is ESTIMATED from the text with the same per-character advance the
- * labels estimate with (LABEL_CHAR_W, at the same 12px size), bounded by
- * .rm-tip's own max-width. Over-estimating flips the card a few pixels early;
- * under-estimating costs the reader the end of the sentence, which is the whole
- * content of a `similar` link's evidence — so every rounding here goes UP. */
-const TIP_MAX_W = 260; // .rm-tip max-width
-const TIP_PAD_X = 20; // .nb-tip left+right padding and border
-const TIP_PAD_Y = 14; // .nb-tip top+bottom padding and border
-const TIP_LINE_H = 19; // --fs-micro (12) × --lh-body (1.55) = 18.6, rounded up
-const TIP_LINE_GAP = 2; // .rm-tip-line margin-top
-const TIP_OFFSET = 14; // clearance from the cursor
+interface Box { x: number; y: number; w: number; h: number }
+interface ListGroup { kind: string; label: string; names: string[] }
+interface ListRow { id: string; name: string; folder: string; openable: boolean; groups: ListGroup[]; total: number }
+type GraphState = ReturnType<typeof useRoomGraph>;
+type PanZoom = ReturnType<typeof usePanZoom>;
+
+interface MapModel extends GraphState, PanZoom {
+  focus: string | null;
+  hasStage: boolean;
+  hidden: string[];
+  hovered: string | null;
+  labels: LabelBox[];
+  layout: { nodes: SimNode[]; edges: SimEdge[] } | null;
+  listRows: ListRow[];
+  listView: boolean;
+  minWeight: number;
+  onOpenFile?: (id: string) => void;
+  rebuilt: boolean;
+  refit: () => void;
+  selectedNeighbors: Set<string> | null;
+  setHidden: React.Dispatch<React.SetStateAction<string[]>>;
+  setFocus: React.Dispatch<React.SetStateAction<string | null>>;
+  setHovered: React.Dispatch<React.SetStateAction<string | null>>;
+  setListView: React.Dispatch<React.SetStateAction<boolean>>;
+  setMinWeight: React.Dispatch<React.SetStateAction<number>>;
+  setShowLegend: React.Dispatch<React.SetStateAction<boolean>>;
+  setTip: React.Dispatch<React.SetStateAction<Tip | null>>;
+  showEmpty: boolean;
+  showLegend: boolean;
+  showTip: (event: React.MouseEvent, title: string, lines: string[]) => void;
+  stageRef: React.RefObject<HTMLDivElement | null>;
+  tip: Tip | null;
+}
+
+function onCanvas(at: number, length: number, span: number): number {
+  const edge = 4;
+  return Math.max(edge, Math.min(at, span - length - edge));
+}
+
+function textWidth(text: string): number { return text.length * LABEL_CHAR_W; }
+
+function countTipRows(textW: number): (total: number, text: string) => number {
+  return (total, text) => total + Math.max(1, Math.ceil(textWidth(text) / textW));
+}
 
 function tipBox(title: string, lines: string[]): { w: number; h: number } {
-  const runW = (s: string) => s.length * LABEL_CHAR_W;
-  const widest = Math.max(1, runW(title), ...lines.map(runW));
+  const widest = Math.max(1, textWidth(title), ...lines.map(textWidth));
   const textW = Math.min(TIP_MAX_W, widest);
-  const rows = [title, ...lines].reduce((n, s) => n + Math.max(1, Math.ceil(runW(s) / textW)), 0);
-  return {
-    w: textW + TIP_PAD_X,
-    h: TIP_PAD_Y + rows * TIP_LINE_H + lines.length * TIP_LINE_GAP,
-  };
+  const rows = [title, ...lines].reduce(countTipRows(textW), 0);
+  return { w: textW + TIP_PAD_X, h: TIP_PAD_Y + rows * TIP_LINE_H + lines.length * TIP_LINE_GAP };
 }
 
-export default function RoomMap({ onOpenFile }: RoomMapProps) {
-  const [tip, setTip] = useState<Tip | null>(null);
-  const [hovered, setHovered] = useState<string | null>(null);
-  // A canvas of stars is unreachable without a mouse; the same connections are
-  // also offered as a plain, tabbable list.
-  const [listView, setListView] = useState(false);
-  // Sticky selection: survives mouse-leave so its label + neighbour labels
-  // persist without needing hover. Cleared by clicking empty canvas / reset.
-  const [focus, setFocus] = useState<string | null>(null);
-  // Density control. A typed graph without a filter is still a hairball, so the
-  // reader can switch a kind off and raise the strength bar. Nothing starts
-  // hidden: in a room with no web saves and no full passes the fact types are
-  // all empty, and defaulting the one inferred kind OFF would open the map as a
-  // field of unconnected dots — which reads as broken, not as honest.
-  const [hidden, setHidden] = useState<string[]>([]);
-  const [minWeight, setMinWeight] = useState(0);
-  const filter = useMemo<EdgeFilter>(() => ({ hidden, minWeight }), [hidden, minWeight]);
-  // Open by default: six kinds of line are only readable with a key on screen,
-  // and the key IS the control.
-  const [showLegend, setShowLegend] = useState(true);
+function mousePosition(event: React.MouseEvent, rect: DOMRect | undefined): { x: number; y: number } {
+  if (!rect) return { x: event.clientX, y: event.clientY };
+  return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+}
 
-  const stageRef = useRef<HTMLDivElement>(null);
-  const sizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
-  // True once the user pans/zooms, so the settle loop and resize handler stop
-  // stealing the view back to the auto-fit. Cleared by "reset view" only — a
-  // new graph deliberately leaves it set, because a file write elsewhere in the
-  // room is not a reason to take the reader's frame away.
-  const userAdjustedRef = useRef(false);
-  // Live layout — mutated in place by the animation loop; render reads it.
-  const layoutRef = useRef<{ nodes: SimNode[]; edges: SimEdge[] } | null>(null);
+function tipCoordinate(point: number, boxLength: number, limit: number | undefined): number {
+  const offset = point + TIP_OFFSET;
+  if (limit === undefined || offset + boxLength <= limit) return offset;
+  return Math.max(4, point - TIP_OFFSET - boxLength);
+}
 
-  // Pan / zoom in screen space. Owns `view` + drag refs; deselects on
-  // empty-canvas click and clears the tooltip on drag start.
-  const { view, setView, svgRef, onWheel, zoomBy, resetView, onBgDown, onBgMove, onBgUp } =
-    usePanZoom({ sizeRef, userAdjustedRef, layoutRef, setFocus, setTip });
+function tipPosition(event: React.MouseEvent, title: string, lines: string[], stage: HTMLDivElement | null): Tip {
+  const rect = stage?.getBoundingClientRect();
+  const point = mousePosition(event, rect);
+  const box = tipBox(title, lines);
+  return { left: tipCoordinate(point.x, box.w, rect?.width), top: tipCoordinate(point.y, box.h, rect?.height), title, lines };
+}
 
-  // The graph fetch + layout. Threads pan-zoom's setView (re-frame on
-  // measure/settle) and selection's setFocus (reset on a fresh graph).
-  const {
-    graph,
-    status,
-    error,
-    reload,
-    size,
-    cappedEdges,
-    visibleEdges,
-    edgeCounts,
-    fileNodeCount,
-    atFileLimit,
-    degree,
-    adjacency,
-    topNode,
-    nonce,
-  } = useRoomGraph({ filter, stageRef, sizeRef, userAdjustedRef, layoutRef, setView, setFocus });
+function useTooltip(stageRef: React.RefObject<HTMLDivElement | null>, setTip: React.Dispatch<React.SetStateAction<Tip | null>>) {
+  return useCallback((event: React.MouseEvent, title: string, lines: string[]) => setTip(tipPosition(event, title, lines, stageRef.current)), [setTip, stageRef]);
+}
 
-  // Two different questions, kept apart. What the reader CHOSE is `focus`, and
-  // only that is circled — a ring that fell back to the hub meant the map had
-  // no state in which nothing was selected, so clicking empty canvas returned
-  // the ring to a node nobody picked instead of removing it. The hub is still
-  // the default the LABELS orient around, so the room reads on open.
-  const labelFocusId = focus ?? topNode;
-  const labelNeighbors = labelFocusId ? adjacency.get(labelFocusId) ?? null : null;
-  const selectedNeighbors = focus ? adjacency.get(focus) ?? null : null;
+function labelPriority(node: SimNode, focusId: string | null, neighbors: Set<string> | null, radius: number): number {
+  if (node.id === focusId) return 3;
+  if (neighbors?.has(node.id)) return 2;
+  return radius >= LABEL_MIN_R_PX ? 1 : 0;
+}
 
-  // A room-file change re-seeds every node onto a fresh circle, and a reader
-  // who has panned or zoomed keeps their frame across that — so the viewport
-  // they are staring at now holds different stars. Say so, and offer the way
-  // back, rather than letting the map silently rearrange itself.
+function nodeIsVisible(x: number, y: number, radius: number, size: { w: number; h: number }): boolean {
+  return x + radius >= 0 && x - radius <= size.w && y + radius >= 0 && y - radius <= size.h;
+}
+
+function toLabelCandidate(node: SimNode, view: View, size: { w: number; h: number }, degree: Map<string, number>, focusId: string | null, neighbors: Set<string> | null): LabelCandidate | null {
+  const sx = node.x * view.k + view.x;
+  const sy = node.y * view.k + view.y;
+  const deg = degree.get(node.id) ?? 0;
+  const rScreen = nodeRadius(deg) * view.k;
+  if (!nodeIsVisible(sx, sy, rScreen, size)) return null;
+  const prio = labelPriority(node, focusId, neighbors, rScreen);
+  return prio ? { n: node, sx, sy, rScreen, prio, deg } : null;
+}
+
+function compareCandidates(a: LabelCandidate, b: LabelCandidate): number {
+  if (a.prio !== b.prio) return b.prio - a.prio;
+  if (a.deg !== b.deg) return b.deg - a.deg;
+  return compareIds(a.n.id, b.n.id);
+}
+
+function compareIds(left: string, right: string): number {
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+function labelName(name: string): string { return name.length <= NAME_MAX ? name : `${name.slice(0, NAME_MAX - 1)}…`; }
+function labelWidth(candidate: LabelCandidate): number { return labelName(candidate.n.name).length * LABEL_CHAR_W + LABEL_PAD * 2 + (candidate.n.kind === "memory" ? LABEL_MARK_W : 0); }
+
+function labelSpots(candidate: LabelCandidate, width: number): { x: number; y: number }[] {
+  const off = Math.max(candidate.rScreen, 3) + 6;
+  return [
+    { x: candidate.sx + off, y: candidate.sy - LABEL_H / 2 },
+    { x: candidate.sx - off - width, y: candidate.sy - LABEL_H / 2 },
+    { x: candidate.sx + off * 0.5, y: candidate.sy + off },
+    { x: candidate.sx - off * 0.5 - width, y: candidate.sy + off },
+    { x: candidate.sx + off * 0.5, y: candidate.sy - off - LABEL_H },
+    { x: candidate.sx - off * 0.5 - width, y: candidate.sy - off - LABEL_H },
+  ];
+}
+
+function clampedBoxes(candidate: LabelCandidate, width: number, size: { w: number; h: number }): Box[] {
+  return labelSpots(candidate, width).map((spot) => ({ x: onCanvas(spot.x, width, size.w), y: onCanvas(spot.y, LABEL_H, size.h), w: width, h: LABEL_H }));
+}
+
+function boxesOverlap(a: Box, b: Box): boolean { return a.x <= b.x + b.w && a.x + a.w >= b.x && a.y <= b.y + b.h && a.y + a.h >= b.y; }
+
+function firstFreeBox(boxes: Box[], placed: Box[]): Box | null {
+  for (const box of boxes) if (placed.every((other) => !boxesOverlap(box, other))) return box;
+  return null;
+}
+
+function fallbackBox(box: Box | null, priority: number, boxes: Box[]): Box | null {
+  if (box || priority < 2) return box;
+  return boxes[0] ?? null;
+}
+
+function makeLabel(candidate: LabelCandidate, placed: Box[], size: { w: number; h: number }): LabelBox | null {
+  const width = labelWidth(candidate);
+  const boxes = clampedBoxes(candidate, width, size);
+  const box = fallbackBox(firstFreeBox(boxes, placed), candidate.prio, boxes);
+  if (!box) return null;
+  const markWidth = candidate.n.kind === "memory" ? LABEL_MARK_W : 0;
+  return { id: candidate.n.id, name: labelName(candidate.n.name), textX: box.x + LABEL_PAD + markWidth, textY: box.y + LABEL_H / 2 + LABEL_FONT * 0.35, boxX: box.x, boxY: box.y, boxW: width, boxH: LABEL_H, prio: candidate.prio, kind: candidate.n.kind };
+}
+
+function labelCandidates(layout: { nodes: SimNode[]; edges: SimEdge[] }, view: View, size: { w: number; h: number }, degree: Map<string, number>, focusId: string | null, neighbors: Set<string> | null): LabelCandidate[] {
+  const candidates: LabelCandidate[] = [];
+  for (const node of layout.nodes) {
+    const candidate = toLabelCandidate(node, view, size, degree, focusId, neighbors);
+    if (candidate) candidates.push(candidate);
+  }
+  return candidates.sort(compareCandidates);
+}
+
+function canBuildLabels(layout: { nodes: SimNode[]; edges: SimEdge[] } | null, size: { w: number; h: number }): layout is { nodes: SimNode[]; edges: SimEdge[] } {
+  return layout !== null && size.w > 0 && size.h > 0;
+}
+
+function appendLabel(labels: LabelBox[], placed: Box[], candidate: LabelCandidate, size: { w: number; h: number }): boolean {
+  if (labels.length >= LABEL_MAX) return false;
+  const label = makeLabel(candidate, placed, size);
+  if (!label) return true;
+  placed.push({ x: label.boxX, y: label.boxY, w: label.boxW, h: label.boxH });
+  labels.push(label);
+  return true;
+}
+
+function buildLabels(layout: { nodes: SimNode[]; edges: SimEdge[] } | null, view: View, size: { w: number; h: number }, degree: Map<string, number>, focusId: string | null, neighbors: Set<string> | null): LabelBox[] {
+  if (!canBuildLabels(layout, size)) return [];
+  const placed: Box[] = [];
+  const labels: LabelBox[] = [];
+  for (const candidate of labelCandidates(layout, view, size, degree, focusId, neighbors)) {
+    if (!appendLabel(labels, placed, candidate, size)) break;
+  }
+  return labels;
+}
+
+function printedNodeName(nodes: Map<string, RoomGraph["nodes"][number]>, id: string): string {
+  const node = nodes.get(id);
+  if (!node) return id;
+  return node.kind === "memory" ? `Memory: ${node.name}` : node.name;
+}
+
+function addListNote(perNode: Map<string, Map<string, string[]>>, nodes: Map<string, RoomGraph["nodes"][number]>, from: string, to: string, kind: string) {
+  const kinds = perNode.get(from) ?? new Map<string, string[]>();
+  perNode.set(from, kinds);
+  const names = kinds.get(kind) ?? [];
+  kinds.set(kind, names);
+  names.push(printedNodeName(nodes, to));
+}
+
+function makeListGroups(kinds: Map<string, string[]>): ListGroup[] {
+  return [...kinds.entries()].sort((left, right) => edgeRank(left[0]) - edgeRank(right[0])).map(([kind, names]) => ({ kind, label: styleFor(kind).label, names: [...names].sort((a, b) => a.localeCompare(b)) }));
+}
+
+function makeListRow(node: RoomGraph["nodes"][number], perNode: Map<string, Map<string, string[]>>): ListRow {
+  const groups = makeListGroups(perNode.get(node.id) ?? new Map<string, string[]>());
+  return { id: node.id, name: node.name, folder: node.kind === "memory" ? "Memory" : node.folder || "Top level", openable: node.kind === "file", groups, total: groups.reduce((total, group) => total + group.names.length, 0) };
+}
+
+function compareListRows(a: ListRow, b: ListRow): number { return a.total !== b.total ? b.total - a.total : a.name.localeCompare(b.name); }
+
+function buildListRows(graph: RoomGraph | null, visibleEdges: GraphState["visibleEdges"]): ListRow[] {
+  const nodes = new Map((graph?.nodes ?? []).map((node) => [node.id, node]));
+  const perNode = new Map<string, Map<string, string[]>>();
+  for (const edge of visibleEdges) {
+    addListNote(perNode, nodes, edge.a, edge.b, edge.kind);
+    addListNote(perNode, nodes, edge.b, edge.a, edge.kind);
+  }
+  return (graph?.nodes ?? []).map((node) => makeListRow(node, perNode)).sort(compareListRows);
+}
+
+function useRebuilt(graph: RoomGraph | null, userAdjustedRef: React.MutableRefObject<boolean>, resetView: () => void) {
   const [rebuilt, setRebuilt] = useState(false);
   const seenGraphRef = useRef<RoomGraph | null>(null);
   useEffect(() => {
@@ -169,548 +250,151 @@ export default function RoomMap({ onOpenFile }: RoomMapProps) {
     const previous = seenGraphRef.current;
     seenGraphRef.current = graph;
     if (previous && userAdjustedRef.current) setRebuilt(true);
-  }, [graph]);
-  const refit = () => {
-    setRebuilt(false);
-    resetView();
-  };
+  }, [graph, userAdjustedRef]);
+  const refit = useCallback(() => { setRebuilt(false); resetView(); }, [resetView]);
+  return { rebuilt, refit };
+}
 
-  function showTip(e: React.MouseEvent, title: string, lines: string[]) {
-    const rect = stageRef.current?.getBoundingClientRect();
-    const x = e.clientX - (rect?.left ?? 0);
-    const y = e.clientY - (rect?.top ?? 0);
-    const box = tipBox(title, lines);
-    // Flip to the other side of the cursor rather than run off the stage — the
-    // same discipline `onCanvas` applies to the labels. Without a measured
-    // stage there is nothing to flip against, so the tip keeps its offset.
-    let left = x + TIP_OFFSET;
-    if (rect && left + box.w > rect.width) left = Math.max(4, x - TIP_OFFSET - box.w);
-    let top = y + TIP_OFFSET;
-    if (rect && top + box.h > rect.height) top = Math.max(4, y - TIP_OFFSET - box.h);
-    setTip({ left, top, title, lines });
-  }
+function useMapFilter(hidden: string[], minWeight: number): EdgeFilter {
+  return useMemo(() => ({ hidden, minWeight }), [hidden, minWeight]);
+}
 
-  // ---------------- derived render data ----------------
-  const layout = layoutRef.current;
-  // "Nothing to map" is about the GRAPH, not the file count: one file with
-  // linked memories is a real constellation, and hiding it behind the empty
-  // sentence also took the legend, the list toggle and the controls with it.
-  // A room with no files at all, or a single lone node, still gets the words.
-  const showEmpty = graph != null && (fileNodeCount === 0 || graph.nodes.length < 2);
-  const hasStage = size.w > 0 && size.h > 0;
+function neighborState(focus: string | null, topNode: string | null, adjacency: Map<string, Set<string>>) {
+  const labelFocusId = focus ?? topNode;
+  const labelNeighbors = labelFocusId ? adjacency.get(labelFocusId) ?? null : null;
+  const selectedNeighbors = focus ? adjacency.get(focus) ?? null : null;
+  return { labelFocusId, labelNeighbors, selectedNeighbors };
+}
 
-  // Persistent, de-cluttered labels (computed in screen space each frame).
-  const labels = useMemo<LabelBox[]>(() => {
-    if (!layout || !hasStage) return [];
-    interface Cand {
-      n: SimNode;
-      sx: number;
-      sy: number;
-      rScreen: number;
-      prio: number;
-      deg: number;
-    }
-    const cands: Cand[] = [];
-    for (const n of layout.nodes) {
-      const sx = n.x * view.k + view.x;
-      const sy = n.y * view.k + view.y;
-      const deg = degree.get(n.id) ?? 0;
-      const rScreen = nodeRadius(deg) * view.k;
-      // Cull on the STAR's own geometry. A fixed 60/30px margin kept a card for
-      // a node up to 60px past the edge, and the card was then clamped fully
-      // into view — a label pinned to the boundary naming a star that is not on
-      // screen. If no part of the disc is on the stage, there is nothing here
-      // to name.
-      if (
-        sx + rScreen < 0 ||
-        sx - rScreen > size.w ||
-        sy + rScreen < 0 ||
-        sy - rScreen > size.h
-      ) {
-        continue;
-      }
-      let prio = 0;
-      if (n.id === labelFocusId) prio = 3;
-      else if (labelNeighbors?.has(n.id)) prio = 2;
-      else if (rScreen >= LABEL_MIN_R_PX) prio = 1; // more of these appear as you zoom in
-      if (prio === 0) continue;
-      cands.push({ n, sx, sy, rScreen, prio, deg });
-    }
-    // Ties are broken on the node id, never on array order and never on
-    // anything derived from time: two names that would print on top of each
-    // other have to lose to each other the SAME way on every frame, or the
-    // loser flickers in and out while the layout settles. `id` is the only key
-    // here that is unique and stable, and a plain code-unit comparison keeps
-    // the order independent of the reader's locale.
-    cands.sort(
-      (a, b) =>
-        b.prio - a.prio ||
-        b.deg - a.deg ||
-        (a.n.id < b.n.id ? -1 : a.n.id > b.n.id ? 1 : 0),
-    );
+function mapHasStage(size: { w: number; h: number }): boolean { return size.w > 0 && size.h > 0; }
 
-    const placed: { x: number; y: number; w: number; h: number }[] = [];
-    const out: LabelBox[] = [];
-    for (const c of cands) {
-      if (out.length >= LABEL_MAX) break;
-      const name = c.n.name.length > NAME_MAX ? c.n.name.slice(0, NAME_MAX - 1) + "…" : c.n.name;
-      // A memory's card carries a ring mark before its name, so it is wider by
-      // exactly that much — see Label.tsx.
-      const markW = c.n.kind === "memory" ? LABEL_MARK_W : 0;
-      const tw = name.length * LABEL_CHAR_W + LABEL_PAD * 2 + markW;
-      const off = Math.max(c.rScreen, 3) + 6;
-      // Six placements tried in a FIXED order — beside the node first, then
-      // below it, then above it, right before left each time. A fixed ladder is
-      // what makes the de-clutter reproducible: there is no jitter and no
-      // search, so the same graph at the same zoom always parks the same card
-      // in the same place.
-      const spots: { x: number; y: number }[] = [
-        { x: c.sx + off, y: c.sy - LABEL_H / 2 },
-        { x: c.sx - off - tw, y: c.sy - LABEL_H / 2 },
-        { x: c.sx + off * 0.5, y: c.sy + off },
-        { x: c.sx - off * 0.5 - tw, y: c.sy + off },
-        { x: c.sx + off * 0.5, y: c.sy - off - LABEL_H },
-        { x: c.sx - off * 0.5 - tw, y: c.sy - off - LABEL_H },
-      ];
-      // Clamp BEFORE the overlap test, or a card shoved back on-canvas could
-      // land on one already drawn.
-      const boxes = spots.map((s) => ({
-        x: onCanvas(s.x, tw, size.w),
-        y: onCanvas(s.y, LABEL_H, size.h),
-        w: tw,
-        h: LABEL_H,
-      }));
-      const free = boxes.find(
-        (cand) =>
-          !placed.some(
-            (p) =>
-              !(
-                cand.x > p.x + p.w ||
-                cand.x + cand.w < p.x ||
-                cand.y > p.y + p.h ||
-                cand.y + cand.h < p.y
-              ),
-          ),
-      );
-      // Nowhere clear: the selection and its neighbours are the reason the
-      // reader is looking, so they print anyway, beside the node. A crowded
-      // zoom-label just waits until there is room for it.
-      const box = free ?? (c.prio >= 2 ? boxes[0] : null);
-      if (!box) continue;
-      placed.push(box);
-      out.push({
-        id: c.n.id,
-        name,
-        textX: box.x + LABEL_PAD + markW,
-        textY: box.y + LABEL_H / 2 + LABEL_FONT * 0.35,
-        boxX: box.x,
-        boxY: box.y,
-        boxW: tw,
-        boxH: LABEL_H,
-        prio: c.prio,
-        kind: c.n.kind,
-      });
-    }
-    return out;
-    // `nonce` forces a recompute each settle frame (layout mutates via ref).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, size, hasStage, labelFocusId, labelNeighbors, degree, nonce]);
+function mapIsEmpty(graph: RoomGraph | null, fileNodeCount: number): boolean {
+  if (graph === null) return false;
+  if (fileNodeCount === 0) return true;
+  return graph.nodes.length < 2;
+}
 
-  // The same graph as plain text, links GROUPED BY KIND — now that a line can
-  // mean six different things, a list that only said "linked to X" would be
-  // strictly less informative than the canvas it stands in for. The canvas is
-  // mouse-only by nature, so this is the keyboard / screen-reader route to the
-  // exact same information — which is why it covers MEMORY nodes too. It used
-  // to list files only, so a memory drawn on the canvas appeared in the list
-  // either not at all or as a bare name inside some file's group, with nothing
-  // saying it was a memory.
-  const listRows = useMemo(() => {
-    const byId = new Map((graph?.nodes ?? []).map((n) => [n.id, n]));
-    // A memory carries its kind into every place its name is printed, the same
-    // way the canvas gives it its own shape and NodeStar its own aria-label.
-    const printed = (id: string) => {
-      const node = byId.get(id);
-      if (!node) return id;
-      return node.kind === "memory" ? `Memory: ${node.name}` : node.name;
-    };
-    const perNode = new Map<string, Map<string, string[]>>();
-    const note = (from: string, to: string, kind: string) => {
-      const kinds = perNode.get(from) ?? new Map<string, string[]>();
-      perNode.set(from, kinds);
-      const names = kinds.get(kind) ?? [];
-      kinds.set(kind, names);
-      names.push(printed(to));
-    };
-    for (const e of visibleEdges) {
-      note(e.a, e.b, e.kind);
-      note(e.b, e.a, e.kind);
-    }
-    return (graph?.nodes ?? [])
-      .map((n) => {
-        const kinds = perNode.get(n.id) ?? new Map<string, string[]>();
-        const groups = [...kinds.entries()]
-          .sort((x, y) => edgeRank(x[0]) - edgeRank(y[0]))
-          .map(([kind, names]) => ({
-            kind,
-            label: styleFor(kind).label,
-            names: [...names].sort((a, b) => a.localeCompare(b)),
-          }));
-        return {
-          id: n.id,
-          name: n.name,
-          // The "where this lives" slot: a folder for a file, and for a memory
-          // the one thing there is to say about where it lives — it is a
-          // memory, not a document, and it cannot be opened.
-          folder: n.kind === "memory" ? "Memory" : n.folder || "Top level",
-          openable: n.kind === "file",
-          groups,
-          total: groups.reduce((sum, g) => sum + g.names.length, 0),
-        };
-      })
-      .sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
-  }, [graph, visibleEdges]);
-
-  return (
-    <div className="room-map" style={{ position: "relative", width: "100%", height: "100%" }}>
-      <div className="room-map-toolbar">
-        <GraphIcon size={16} />
-        <span className="room-map-title">Room map</span>
-        {graph && !showEmpty && (
-          <span
-            className="room-map-count"
-            title={
-              // Being AT the ceiling doesn't prove anything was left out — a
-              // room of exactly this many files is mapped in full — so say what
-              // is true either way rather than accusing the room of hiding
-              // files it may not have.
-              atFileLimit
-                ? `This map covers the ${fileNodeCount} newest files in the room; if there are more than that, the older ones aren't on it.`
-                : undefined
-            }
-          >
-            · {atFileLimit ? "newest " : ""}
-            {fileNodeCount} file{fileNodeCount === 1 ? "" : "s"} · {visibleEdges.length} link
-            {visibleEdges.length === 1 ? "" : "s"}
-            {/* Say what is being withheld. A count that silently shrank when a
-                kind was switched off would read as links disappearing. */}
-            {cappedEdges.length > visibleEdges.length &&
-              ` (${cappedEdges.length - visibleEdges.length} hidden)`}
-          </span>
-        )}
-        {graph && !showEmpty && (
-          <button
-            type="button"
-            className={`nb-chip nb-chip-btn rm-toolchip rm-listtoggle${
-              showLegend ? " is-on" : ""
-            }`}
-            aria-pressed={showLegend}
-            title="Choose which kinds of link the map shows"
-            onClick={() => setShowLegend((v) => !v)}
-          >
-            Links
-          </button>
-        )}
-        {/* The map was re-laid-out under a frame the reader chose. Said out
-            loud, with the way back, instead of leaving them to work out why the
-            stars under their viewport changed. */}
-        {rebuilt && !showEmpty && !listView && (
-          <button
-            type="button"
-            className="nb-chip nb-chip-btn rm-toolchip"
-            title="The room changed, so the map was laid out again — the stars have moved. Fit it back to the screen."
-            onClick={refit}
-          >
-            Map rebuilt — reset view
-          </button>
-        )}
-        {graph && !showEmpty && (
-          <button
-            type="button"
-            className={`nb-chip nb-chip-btn rm-toolchip rm-toolbtn${
-              listView ? " is-on" : ""
-            }`}
-            aria-pressed={listView}
-            title="Show the same files and connections as a plain, keyboard-reachable list"
-            onClick={() => setListView((v) => !v)}
-          >
-            {listView ? "Map" : "List"}
-          </button>
-        )}
-      </div>
-
-      {/* Density control. Not `.room-map-legend` — that class carries
-          `pointer-events: none`, so its toggles would be unclickable. */}
-      {graph && !showEmpty && showLegend && (
-        <div className="rm-legend" role="group" aria-label="Link kinds">
-          {EDGE_KINDS.map((kind) => {
-            const style = EDGE_STYLE[kind];
-            const count = edgeCounts[kind] ?? 0;
-            const on = !hidden.includes(kind);
-            return (
-              <button
-                key={kind}
-                type="button"
-                className={`nb-chip nb-chip-btn rm-legend-chip${on ? " is-on" : ""}`}
-                aria-pressed={on}
-                disabled={count === 0}
-                title={
-                  count === 0
-                    ? `Nothing in this room is linked this way — ${style.lead.toLowerCase()}`
-                    : style.lead
-                }
-                onClick={() =>
-                  setHidden((cur) =>
-                    cur.includes(kind) ? cur.filter((k) => k !== kind) : [...cur, kind],
-                  )
-                }
-              >
-                {/* The swatch is a SAMPLE OF THE ACTUAL LINE, at the same
-                    dash pattern and the same relative weight the map draws —
-                    which is what lets the chip stand in for its kind even for
-                    a reader who cannot separate the two graphite kinds by hue.
-                    Drawn a little longer than a hairline so a 5-3 dash and a
-                    1-3.5 dot are visibly different things, and inset from both
-                    ends so the round caps on the heaviest kind are not clipped
-                    by the swatch's own box. */}
-                <svg className="rm-legend-swatch" width="26" height="10" aria-hidden="true">
-                  {/* `stroke` via `style`, not the presentation attribute: the
-                      value is a var() custom property, and a presentation
-                      attribute is the weakest thing in the cascade — the same
-                      trap that made every edge on the map render as one violet
-                      hairline. An inline declaration cannot be outranked. */}
-                  <line
-                    x1="2.5"
-                    y1="5"
-                    x2="23.5"
-                    y2="5"
-                    style={{ stroke: style.color, strokeWidth: 1.5 * style.widthMul }}
-                    strokeDasharray={style.dash ?? undefined}
-                    strokeLinecap="round"
-                  />
-                </svg>
-                {style.label}
-                <span className="rm-legend-count">{count}</span>
-              </button>
-            );
-          })}
-          {/* The visible, reversible control behind "the weak links are quiet".
-              Nothing on this map is hidden without a way back, and this is the
-              way back for the faintest end of the ink ramp. */}
-          <label className="rm-legend-strength">
-            <span className="rm-legend-strength-label">Strength</span>
-            <input
-              type="range"
-              min={0}
-              max={0.9}
-              step={0.1}
-              value={minWeight}
-              onChange={(e) => setMinWeight(Number(e.target.value))}
-              title="Hide the weakest links"
-            />
-            <span className="rm-legend-count">{Math.round(minWeight * 100)}%</span>
-          </label>
-        </div>
-      )}
-
-      <div className="room-map-stage" ref={stageRef}>
-        {status && <div className="viewer-status">{status}</div>}
-        {/* A raw exception where the status line goes leaves the reader stuck;
-            say what happened in plain words and offer the retry. */}
-        {error && (
-          <div className="room-map-error" role="alert">
-            <p>
-              The room map couldn’t be built. Nothing in the room was changed —
-              this is only the map.
-            </p>
-            <p className="room-map-error-detail">{error}</p>
-            <button type="button" className="nb-btn rm-retry" onClick={reload}>
-              Try again
-            </button>
-          </div>
-        )}
-
-        {error ? null : showEmpty ? (
-          // An empty-state direction, which is one of the few places the hand
-          // is allowed — see the reserve list in paper.css.
-          <div className="room-map-empty rm-empty">{EMPTY_TEXT}</div>
-        ) : listView ? (
-          <div className="room-map-list">
-            <ul className="nb-list rm-list">
-              {listRows.map((row) => (
-                <li key={row.id}>
-                  <button
-                    type="button"
-                    className="rm-list-name"
-                    onClick={() => row.openable && onOpenFile?.(row.id)}
-                    disabled={!row.openable || !onOpenFile}
-                  >
-                    {row.name}
-                  </button>
-                  <span className="rm-list-folder">{row.folder}</span>
-                  <div className="rm-list-links">
-                    {row.groups.length === 0 ? (
-                      "No connections found"
-                    ) : (
-                      <ul className="rm-list-kinds">
-                        {row.groups.map((g) => (
-                          <li key={g.kind}>
-                            <span className="rm-list-kind">{g.label}:</span>{" "}
-                            {g.names.join(", ")}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                </li>
-              ))}
-            </ul>
-          </div>
-        ) : (
-          hasStage && (
-            <svg
-              ref={svgRef}
-              className="room-map-svg"
-              width={size.w}
-              height={size.h}
-              viewBox={`0 0 ${size.w} ${size.h}`}
-              onWheel={onWheel}
-            >
-              {/* Arrowheads for the directed kinds. `userSpaceOnUse` means the
-                  marker is measured in the zoomed group's world units, so the
-                  size has to be divided by the scale or the heads balloon as
-                  you zoom out. */}
-              <defs>
-                {EDGE_KINDS.filter((k) => EDGE_STYLE[k].directed).map((k) => (
-                  <marker
-                    key={k}
-                    id={`rm-arrow-${k}`}
-                    viewBox="0 0 10 10"
-                    refX="9"
-                    refY="5"
-                    markerWidth={7 / view.k}
-                    markerHeight={7 / view.k}
-                    markerUnits="userSpaceOnUse"
-                    orient="auto"
-                  >
-                    <path d="M0,1 L10,5 L0,9 z" style={{ fill: EDGE_STYLE[k].color }} />
-                  </marker>
-                ))}
-              </defs>
-
-              {/* Backdrop: the only surface that pans / deselects. */}
-              <rect
-                x={0}
-                y={0}
-                width={size.w}
-                height={size.h}
-                fill="transparent"
-                onPointerDown={onBgDown}
-                onPointerMove={onBgMove}
-                onPointerUp={onBgUp}
-                onPointerCancel={onBgUp}
-              />
-
-              <g transform={`translate(${view.x} ${view.y}) scale(${view.k})`}>
-                {/* edges first, under the stars */}
-                {layout &&
-                  layout.edges.map((se, i) =>
-                    // A filtered-out link is not drawn AND does not pull on the
-                    // layout (runTick skips it) — but it stays in the array, so
-                    // switching a kind back on is a repaint, not a re-seed.
-                    se.hidden ? null : (
-                      <Edge
-                        key={`e${i}`}
-                        se={se}
-                        a={layout.nodes[se.ai]}
-                        b={layout.nodes[se.bi]}
-                        view={view}
-                        hovered={hovered}
-                        focusId={focus}
-                        degree={degree}
-                        showTip={showTip}
-                        setTip={setTip}
-                      />
-                    ),
-                  )}
-
-                {/* nodes on top */}
-                {layout &&
-                  layout.nodes.map((n) => (
-                    <NodeStar
-                      key={n.id}
-                      n={n}
-                      degree={degree}
-                      hovered={hovered}
-                      focusId={focus}
-                      focusNeighbors={selectedNeighbors}
-                      view={view}
-                      onOpenFile={onOpenFile}
-                      setHovered={setHovered}
-                      setFocus={setFocus}
-                      showTip={showTip}
-                      setTip={setTip}
-                    />
-                  ))}
-              </g>
-
-              {/* Persistent labels — drawn in screen space so they stay a
-                  constant, readable size at any zoom, over an ink-safe pill. */}
-              <g className="room-map-labels" pointerEvents="none">
-                {labels.map((l) => (
-                  <Label key={`l${l.id}`} l={l} />
-                ))}
-              </g>
-            </svg>
-          )
-        )}
-
-        {/* Reset / zoom affordances — pan+zoom can wander, so offer a re-fit. */}
-        {!showEmpty && !listView && !error && hasStage && (
-          <div className="rm-controls">
-            <button
-              type="button"
-              className="nb-btn nb-btn-icon rm-btn"
-              title="Zoom in"
-              aria-label="Zoom in"
-              onClick={() => zoomBy(1.25)}
-            >
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                <path d="M8 3.5v9M3.5 8h9" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-              </svg>
-            </button>
-            <button
-              type="button"
-              className="nb-btn nb-btn-icon rm-btn"
-              title="Zoom out"
-              aria-label="Zoom out"
-              onClick={() => zoomBy(1 / 1.25)}
-            >
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                <path d="M3.5 8h9" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-              </svg>
-            </button>
-            <button
-              type="button"
-              className="nb-btn nb-btn-icon rm-btn rm-btn-reset"
-              title="Reset view (fit to screen)"
-              aria-label="Reset view"
-              onClick={refit}
-            >
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                <path
-                  d="M2.5 5.5v-3h3M13.5 5.5v-3h-3M2.5 10.5v3h3M13.5 10.5v3h-3"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
-            </button>
-          </div>
-        )}
-
-        {tip && <Tooltip tip={tip} />}
-      </div>
-    </div>
+function useMapLabels(layout: React.MutableRefObject<{ nodes: SimNode[]; edges: SimEdge[] } | null>, panZoom: PanZoom, graphState: GraphState, focusId: string | null, neighbors: Set<string> | null): LabelBox[] {
+  return useMemo(
+    () => buildLabels(layout.current, panZoom.view, graphState.size, graphState.degree, focusId, neighbors),
+    [panZoom.view, graphState.size, graphState.degree, focusId, neighbors, graphState.nonce],
   );
 }
+
+function useListRows(graph: RoomGraph | null, visibleEdges: GraphState["visibleEdges"]): ListRow[] {
+  return useMemo(() => buildListRows(graph, visibleEdges), [graph, visibleEdges]);
+}
+
+function useRoomMapModel(onOpenFile: RoomMapProps["onOpenFile"]): MapModel {
+  const [tip, setTip] = useState<Tip | null>(null);
+  const [hovered, setHovered] = useState<string | null>(null);
+  const [listView, setListView] = useState(false);
+  const [focus, setFocus] = useState<string | null>(null);
+  const [hidden, setHidden] = useState<string[]>([]);
+  const [minWeight, setMinWeight] = useState(0);
+  const [showLegend, setShowLegend] = useState(true);
+  const filter = useMapFilter(hidden, minWeight);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const sizeRef = useRef({ w: 0, h: 0 });
+  const userAdjustedRef = useRef(false);
+  const layoutRef = useRef<{ nodes: SimNode[]; edges: SimEdge[] } | null>(null);
+  const panZoom = usePanZoom({ sizeRef, userAdjustedRef, layoutRef, setFocus, setTip });
+  const graphState = useRoomGraph({ filter, stageRef, sizeRef, userAdjustedRef, layoutRef, setView: panZoom.setView, setFocus });
+  const neighbors = neighborState(focus, graphState.topNode, graphState.adjacency);
+  const { rebuilt, refit } = useRebuilt(graphState.graph, userAdjustedRef, panZoom.resetView);
+  const labels = useMapLabels(layoutRef, panZoom, graphState, neighbors.labelFocusId, neighbors.labelNeighbors);
+  const listRows = useListRows(graphState.graph, graphState.visibleEdges);
+  const showTip = useTooltip(stageRef, setTip);
+  const showEmpty = mapIsEmpty(graphState.graph, graphState.fileNodeCount);
+  return { ...graphState, ...panZoom, focus, hasStage: mapHasStage(graphState.size), hidden, hovered, labels, layout: layoutRef.current, listRows, listView, minWeight, onOpenFile, rebuilt, refit, selectedNeighbors: neighbors.selectedNeighbors, setFocus, setHidden, setHovered, setListView, setMinWeight, setShowLegend, setTip, showEmpty, showLegend, showTip, stageRef, tip };
+}
+
+function countTitle(model: MapModel): string | undefined {
+  if (!model.atFileLimit) return undefined;
+  return `This map covers the ${model.fileNodeCount} newest files in the room; if there are more than that, the older ones aren't on it.`;
+}
+
+function pluralSuffix(count: number): string { return count === 1 ? "" : "s"; }
+function newestPrefix(atLimit: boolean): string { return atLimit ? "newest " : ""; }
+
+function hiddenEdgeText(model: MapModel): string | null {
+  const hidden = model.cappedEdges.length - model.visibleEdges.length;
+  return hidden > 0 ? ` (${hidden} hidden)` : null;
+}
+
+function RoomMapCount({ model }: { model: MapModel }) {
+  if (!model.graph || model.showEmpty) return null;
+  return <span className="room-map-count" title={countTitle(model)}>· {newestPrefix(model.atFileLimit)}{model.fileNodeCount} file{pluralSuffix(model.fileNodeCount)} · {model.visibleEdges.length} link{pluralSuffix(model.visibleEdges.length)}{hiddenEdgeText(model)}</span>;
+}
+
+function toggleClass(base: string, on: boolean): string { return on ? `${base} is-on` : base; }
+function mapCanShowControls(model: MapModel): boolean { return model.graph !== null && !model.showEmpty; }
+
+function LegendToggle({ model }: { model: MapModel }) {
+  return <button type="button" className={toggleClass("nb-chip nb-chip-btn rm-toolchip rm-listtoggle", model.showLegend)} aria-pressed={model.showLegend} title="Choose which kinds of link the map shows" onClick={() => model.setShowLegend((value) => !value)}>Links</button>;
+}
+
+function RebuiltNotice({ model }: { model: MapModel }) {
+  if (!model.rebuilt || model.listView) return null;
+  return <button type="button" className="nb-chip nb-chip-btn rm-toolchip" title="The room changed, so the map was laid out again — the stars have moved. Fit it back to the screen." onClick={model.refit}>Map rebuilt — reset view</button>;
+}
+
+function ListToggle({ model }: { model: MapModel }) {
+  const text = model.listView ? "Map" : "List";
+  return <button type="button" className={toggleClass("nb-chip nb-chip-btn rm-toolchip rm-toolbtn", model.listView)} aria-pressed={model.listView} title="Show the same files and connections as a plain, keyboard-reachable list" onClick={() => model.setListView((value) => !value)}>{text}</button>;
+}
+
+function RoomMapToolbarButtons({ model }: { model: MapModel }) {
+  if (!mapCanShowControls(model)) return null;
+  return <><LegendToggle model={model} /><RebuiltNotice model={model} /><ListToggle model={model} /></>;
+}
+
+function RoomMapToolbar({ model }: { model: MapModel }) { return <div className="room-map-toolbar"><GraphIcon size={16} /><span className="room-map-title">Room map</span><RoomMapCount model={model} /><RoomMapToolbarButtons model={model} /></div>; }
+
+function LegendChip({ kind, model }: { kind: string; model: MapModel }) {
+  const style = styleFor(kind);
+  const count = model.edgeCounts[kind] ?? 0;
+  const on = !model.hidden.includes(kind);
+  const title = count === 0 ? `Nothing in this room is linked this way — ${style.lead.toLowerCase()}` : style.lead;
+  return <button type="button" className={`nb-chip nb-chip-btn rm-legend-chip${on ? " is-on" : ""}`} aria-pressed={on} disabled={count === 0} title={title} onClick={() => model.setHidden((current) => current.includes(kind) ? current.filter((value) => value !== kind) : [...current, kind])}><svg className="rm-legend-swatch" width="26" height="10" aria-hidden="true"><line x1="2.5" y1="5" x2="23.5" y2="5" style={{ stroke: style.color, strokeWidth: 1.5 * style.widthMul }} strokeDasharray={style.dash ?? undefined} strokeLinecap="round" /></svg>{style.label}<span className="rm-legend-count">{count}</span></button>;
+}
+
+function RoomMapLegend({ model }: { model: MapModel }) {
+  if (!model.graph || model.showEmpty || !model.showLegend) return null;
+  return <div className="rm-legend" role="group" aria-label="Link kinds">{EDGE_KINDS.map((kind) => <LegendChip key={kind} kind={kind} model={model} />)}<label className="rm-legend-strength"><span className="rm-legend-strength-label">Strength</span><input type="range" min={0} max={0.9} step={0.1} value={model.minWeight} onChange={(event) => model.setMinWeight(Number(event.target.value))} title="Hide the weakest links" /><span className="rm-legend-count">{Math.round(model.minWeight * 100)}%</span></label></div>;
+}
+
+function RoomMapError({ error, reload }: { error: string; reload: () => void }) { return <div className="room-map-error" role="alert"><p>The room map couldn’t be built. Nothing in the room was changed — this is only the map.</p><p className="room-map-error-detail">{error}</p><button type="button" className="nb-btn rm-retry" onClick={reload}>Try again</button></div>; }
+function MapFeedback({ model }: { model: MapModel }) { return <>{model.status && <div className="viewer-status">{model.status}</div>}{model.error && <RoomMapError error={model.error} reload={model.reload} />}</>; }
+
+function RoomMapListRow({ row, onOpenFile }: { row: ListRow; onOpenFile?: (id: string) => void }) { return <li><button type="button" className="rm-list-name" onClick={() => row.openable && onOpenFile?.(row.id)} disabled={!row.openable || !onOpenFile}>{row.name}</button><span className="rm-list-folder">{row.folder}</span><div className="rm-list-links">{row.groups.length === 0 ? "No connections found" : <ul className="rm-list-kinds">{row.groups.map((group) => <li key={group.kind}><span className="rm-list-kind">{group.label}:</span> {group.names.join(", ")}</li>)}</ul>}</div></li>; }
+function RoomMapList({ model }: { model: MapModel }) { return <div className="room-map-list"><ul className="nb-list rm-list">{model.listRows.map((row) => <RoomMapListRow key={row.id} row={row} onOpenFile={model.onOpenFile} />)}</ul></div>; }
+
+function ArrowMarkers({ view }: { view: View }) { return <defs>{EDGE_KINDS.filter((kind) => EDGE_STYLE[kind].directed).map((kind) => <marker key={kind} id={`rm-arrow-${kind}`} viewBox="0 0 10 10" refX="9" refY="5" markerWidth={7 / view.k} markerHeight={7 / view.k} markerUnits="userSpaceOnUse" orient="auto"><path d="M0,1 L10,5 L0,9 z" style={{ fill: EDGE_STYLE[kind].color }} /></marker>)}</defs>; }
+function MapEdges({ model }: { model: MapModel }) { if (!model.layout) return null; return <>{model.layout.edges.map((edge, index) => edge.hidden ? null : <Edge key={`e${index}`} se={edge} a={model.layout!.nodes[edge.ai]} b={model.layout!.nodes[edge.bi]} view={model.view} hovered={model.hovered} focusId={model.focus} degree={model.degree} showTip={model.showTip} setTip={model.setTip} />)}</>; }
+function MapNodes({ model }: { model: MapModel }) { if (!model.layout) return null; return <>{model.layout.nodes.map((node) => <NodeStar key={node.id} n={node} degree={model.degree} hovered={model.hovered} focusId={model.focus} focusNeighbors={model.selectedNeighbors} view={model.view} onOpenFile={model.onOpenFile} setHovered={model.setHovered} setFocus={model.setFocus} showTip={model.showTip} setTip={model.setTip} />)}</>; }
+
+function RoomMapCanvas({ model }: { model: MapModel }) {
+  if (!model.hasStage) return null;
+  return <svg ref={model.svgRef} className="room-map-svg" width={model.size.w} height={model.size.h} viewBox={`0 0 ${model.size.w} ${model.size.h}`} onWheel={model.onWheel}><ArrowMarkers view={model.view} /><rect x={0} y={0} width={model.size.w} height={model.size.h} fill="transparent" onPointerDown={model.onBgDown} onPointerMove={model.onBgMove} onPointerUp={model.onBgUp} onPointerCancel={model.onBgUp} /><g transform={`translate(${model.view.x} ${model.view.y}) scale(${model.view.k})`}><MapEdges model={model} /><MapNodes model={model} /></g><g className="room-map-labels" pointerEvents="none">{model.labels.map((label) => <Label key={`l${label.id}`} l={label} />)}</g></svg>;
+}
+
+function MapDisplay({ model }: { model: MapModel }) {
+  if (model.error) return null;
+  if (model.showEmpty) return <div className="room-map-empty rm-empty">{EMPTY_TEXT}</div>;
+  if (model.listView) return <RoomMapList model={model} />;
+  return <RoomMapCanvas model={model} />;
+}
+
+function ZoomIcon({ path }: { path: string }) { return <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d={path} stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" /></svg>; }
+function ResetIcon() { return <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.5 5.5v-3h3M13.5 5.5v-3h-3M2.5 10.5v3h3M13.5 10.5v3h-3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg>; }
+
+function RoomMapControls({ model }: { model: MapModel }) {
+  if (model.showEmpty || model.listView || model.error || !model.hasStage) return null;
+  return <div className="rm-controls"><button type="button" className="nb-btn nb-btn-icon rm-btn" title="Zoom in" aria-label="Zoom in" onClick={() => model.zoomBy(1.25)}><ZoomIcon path="M8 3.5v9M3.5 8h9" /></button><button type="button" className="nb-btn nb-btn-icon rm-btn" title="Zoom out" aria-label="Zoom out" onClick={() => model.zoomBy(1 / 1.25)}><ZoomIcon path="M3.5 8h9" /></button><button type="button" className="nb-btn nb-btn-icon rm-btn rm-btn-reset" title="Reset view (fit to screen)" aria-label="Reset view" onClick={model.refit}><ResetIcon /></button></div>;
+}
+
+function RoomMapStage({ model }: { model: MapModel }) { return <div className="room-map-stage" ref={model.stageRef}><MapFeedback model={model} /><MapDisplay model={model} /><RoomMapControls model={model} />{model.tip && <Tooltip tip={model.tip} />}</div>; }
+function RoomMapContent({ model }: { model: MapModel }) { return <div className="room-map" style={{ position: "relative", width: "100%", height: "100%" }}><RoomMapToolbar model={model} /><RoomMapLegend model={model} /><RoomMapStage model={model} /></div>; }
+
+export default function RoomMap({ onOpenFile }: RoomMapProps) { return <RoomMapContent model={useRoomMapModel(onOpenFile)} />; }

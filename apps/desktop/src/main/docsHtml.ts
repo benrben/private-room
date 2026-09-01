@@ -538,22 +538,10 @@ export function titleFromName(name: string): string {
   return i > 0 ? name.slice(0, i) : name;
 }
 
-/** A polished document header: an uppercase accent eyebrow, a large title, an
- * optional muted subline, and an accent rule. `subHtml` is inserted as-is, so
- * callers pass already-escaped content. Ported verbatim from `docs_html.rs`'s
- * `doc_hero`. Not exported \u2014 `htmlTitledDoc` is the only caller this batch
- * needs (the eyebrow/subline-carrying callers, the Studio summary and
- * `#minutes`, are `commands/summarize.rs`/`minutes.rs`, out of this batch's
- * scope). */
-function docHero(eyebrow: string, title: string, subHtml: string): string {
+/** The title-only document header used by {@link htmlTitledDoc}. */
+function docHero(title: string): string {
   let h = '<header class="hero">\n';
-  if (eyebrow !== "") {
-    h += `<div class="eyebrow">${htmlEscape(eyebrow)}</div>\n`;
-  }
   h += `<h1>${htmlEscape(title)}</h1>\n`;
-  if (subHtml.trim() !== "") {
-    h += `<p class="sub">${subHtml}</p>\n`;
-  }
   h += '<div class="rule"></div>\n</header>\n';
   return h;
 }
@@ -566,5 +554,5 @@ export function htmlTitledDoc(name: string, title: string, body: string): string
   if (isFullHtmlDoc(body)) {
     return htmlDocument(name, body);
   }
-  return htmlDocument(name, docHero("", title, "") + body);
+  return htmlDocument(name, docHero(title) + body);
 }

@@ -44,6 +44,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import type { IncomingHttpHeaders } from "node:http";
 import path from "node:path";
 import { checkPublicHttpUrl } from "./browser/guard.js";
+import { asStr, at, field, idx, jsonRecord } from "./mcpRegistryJson.js";
 import { bodyCappedTo, guardedGet } from "./webFetch.js";
 import type { CatalogEntry, InstallSpec } from "../shared/apiTypes.js";
 
@@ -112,50 +113,6 @@ export async function sendWithRetries(
   throw new Error(last);
 }
 
-// ------------------------------------------------------------- JSON reading
-//
-// A registry record is untrusted third-party JSON. These helpers only ever read
-// a fixed, literal key chosen by OUR code (never a name taken from the payload),
-// so there is no dynamic-key access here — but reads still go through
-// `hasOwnProperty` rather than a plain `obj[key]`, both to match
-// `serde_json::Value` indexing (a real key's value, never an inherited
-// `Object.prototype` member like `toString`) and as this migration's practice
-// for anything built from model/room/registry-controlled JSON.
-
-function idx(v: unknown, key: string | number): unknown {
-  if (typeof key === "number") {
-    return Array.isArray(v) && key >= 0 && key < v.length ? v[key] : null;
-  }
-  if (v !== null && typeof v === "object" && !Array.isArray(v) && Object.prototype.hasOwnProperty.call(v, key)) {
-    return (v as Record<string, unknown>)[key];
-  }
-  return null;
-}
-
-/** Chained {@link idx}, e.g. `at(s, "repository", "url")` for Rust's
- * `s["repository"]["url"]`. */
-function at(v: unknown, ...keys: Array<string | number>): unknown {
-  let cur = v;
-  for (const k of keys) cur = idx(cur, k);
-  return cur;
-}
-
-function asStr(v: unknown): string | null {
-  return typeof v === "string" ? v : null;
-}
-
-/** The value at the first present key — the registry mixes camelCase (current
- * schema) and snake_case (older docs), so we accept both everywhere. A key whose
- * value is JSON null reads the same as an absent key, matching
- * `serde_json::Value` indexing. Ported from `field`. */
-function field(v: unknown, keys: readonly string[]): unknown {
-  for (const k of keys) {
-    const f = idx(v, k);
-    if (f !== null) return f;
-  }
-  return null;
-}
-
 // ------------------------------------------------------------ normalization
 
 /** ASCII-only lowercasing — Rust's `to_ascii_lowercase`/`eq_ignore_ascii_case`
@@ -183,12 +140,14 @@ export function splitNamespace(id: string): [publisher: string, name: string] {
  * Ported from `publisher_from_ns`. */
 function publisherFromNs(ns: string): string {
   const segs = ns.split(".").filter((s) => s !== "");
-  if (segs.length >= 3 && segs[0] === "io" && (segs[1] === "github" || segs[1] === "gitlab")) {
-    return segs[2] as string;
-  }
-  if (segs.length === 0) return "";
-  if (segs.length === 1) return segs[0] as string;
-  return segs[1] as string;
+  const hostedPublisher = hostedNamespacePublisher(segs);
+  return hostedPublisher ?? segs[1] ?? segs[0] ?? "";
+}
+
+function hostedNamespacePublisher(segs: readonly string[]): string | null {
+  const [tld, host, owner] = segs;
+  const isHosted = tld === "io" && (host === "github" || host === "gitlab");
+  return isHosted && owner !== undefined ? owner : null;
 }
 
 const GENERIC_NAMES = new Set(["mcp", "server", "mcp-server", "mcpserver", "mcp_server", "main", "app", "index"]);
@@ -237,31 +196,22 @@ function namedKeys(v: unknown): string[] {
  * the current schema (`identifier`/`registryType`/`runtimeHint`) and older
  * snake_case (`name`/`registry_name`/`runtime_hint`). Ported from
  * `derive_stdio`. */
+function stdioRunner(runtimeHint: string, registryType: string): string {
+  if (runtimeHint !== "") return runtimeHint;
+  if (registryType === "pypi") return "uvx";
+  return registryType === "oci" || registryType === "docker" ? "docker" : "npx";
+}
+
 function deriveStdio(p: unknown): InstallSpec | null {
   const pkg = asStr(field(p, ["identifier", "name"]));
   if (pkg === null) return null;
   const registry = asStr(field(p, ["registryType", "registry_name"])) ?? "";
   const hint = asStr(field(p, ["runtimeHint", "runtime_hint"])) ?? "";
-  let command: string;
-  let args: string[];
-  if (hint !== "") {
-    command = hint;
-    args = runnerArgs(hint, pkg);
-  } else if (registry === "pypi") {
-    command = "uvx";
-    args = [pkg];
-  } else if (registry === "oci" || registry === "docker") {
-    command = "docker";
-    args = ["run", "-i", "--rm", pkg];
-  } else {
-    // npm and unknown default to npx.
-    command = "npx";
-    args = ["-y", pkg];
-  }
+  const command = stdioRunner(hint, registry);
   return {
     kind: "stdio",
     command,
-    args,
+    args: runnerArgs(command, pkg),
     envKeys: namedKeys(field(p, ["environmentVariables", "environment_variables"])),
   };
 }
@@ -318,47 +268,65 @@ function deriveInstalls(s: unknown): [InstallSpec, InstallSpec | null] | null {
   return null;
 }
 
-function normalizeOne(entry: unknown): CatalogEntry | null {
+function serverValue(entry: unknown): unknown {
   // The current registry wraps each item: `{ "server": {...}, "_meta": {...} }`.
   // Older docs put the fields at the top level, so fall back to the item.
   // `hasOwnProperty`-checked rather than "is it usable": Rust's
   // `.get("server").is_some()` is true for an explicit `"server": null` too, and
   // that record must come out empty rather than quietly reading the envelope's
   // own fields instead.
-  const hasServerKey =
-    entry !== null &&
-    typeof entry === "object" &&
-    !Array.isArray(entry) &&
-    Object.prototype.hasOwnProperty.call(entry, "server");
-  const s = hasServerKey ? idx(entry, "server") : entry;
+  const record = jsonRecord(entry);
+  return record !== null && Object.prototype.hasOwnProperty.call(record, "server")
+    ? idx(record, "server")
+    : entry;
+}
 
-  const id = asStr(idx(s, "name"));
-  if (id === null) return null;
-  const [publisher, name] = splitNamespace(id);
-  const title = asStr(idx(s, "title"))?.trim() ?? "";
-  // The raw icon URL; `inlineIcons` later replaces it with a data: URI (or
-  // clears it) since the CSP won't load a remote image.
-  const icon = asStr(at(s, "icons", 0, "src"));
-  const description = asStr(idx(s, "description")) ?? "";
-  const repository = asStr(at(s, "repository", "url"));
+type InstallDetails = Pick<CatalogEntry, "install" | "altInstall" | "remote" | "transport">;
+
+function installDetails(s: unknown): InstallDetails | null {
   const installs = deriveInstalls(s);
   if (installs === null) return null;
   const [install, altInstall] = installs;
   const remote = install.kind === "http";
+  return { install, altInstall, remote, transport: remote ? remoteTransport(s) : "stdio" };
+}
+
+function entryTitle(s: unknown): string | null {
+  const title = asStr(idx(s, "title"))?.trim() ?? "";
+  return title === "" ? null : title;
+}
+
+function catalogEntry(
+  s: unknown,
+  id: string,
+  publisher: string,
+  name: string,
+  details: InstallDetails,
+): CatalogEntry {
+  const repository = asStr(at(s, "repository", "url"));
   return {
     id,
     name,
-    title: title === "" ? null : title,
-    icon,
-    description,
+    title: entryTitle(s),
+    // The raw icon URL; `inlineIcons` later replaces it with a data: URI (or
+    // clears it) since the CSP won't load a remote image.
+    icon: asStr(at(s, "icons", 0, "src")),
+    description: asStr(idx(s, "description")) ?? "",
     publisher,
     verified: namespaceOwnsRepo(publisher, repository),
-    remote,
-    transport: remote ? remoteTransport(s) : "stdio",
     repository,
-    install,
-    altInstall,
+    ...details,
   };
+}
+
+function normalizeOne(entry: unknown): CatalogEntry | null {
+  const s = serverValue(entry);
+
+  const id = asStr(idx(s, "name"));
+  if (id === null) return null;
+  const [publisher, name] = splitNamespace(id);
+  const details = installDetails(s);
+  return details === null ? null : catalogEntry(s, id, publisher, name, details);
 }
 
 /** Normalize a whole `{"servers": [...]}` registry payload. Tolerant: a record
@@ -547,6 +515,39 @@ export interface McpRegistrySearchDeps {
   fetchIconFn?: (url: string) => Promise<string | null>;
 }
 
+function registrySearchUrl(query: string | undefined, limit: number | undefined): string {
+  // Rust's `limit` is a `usize`, so a negative number cannot reach its `.min(200)`
+  // at all; the floor is what stands in for that here.
+  const n = Math.max(0, Math.min(limit ?? 80, 200));
+  const params = new URLSearchParams({ limit: String(n) });
+  const trimmed = query?.trim();
+  if (trimmed) params.set("search", trimmed);
+  return `${REGISTRY_URL}?${params.toString()}`;
+}
+
+async function registryResponse(
+  url: string,
+  fetchFn: RegistryFetchFn | undefined,
+): Promise<RegistryHttpResponse> {
+  try {
+    return await sendWithRetries(url, { headers: { Accept: "application/json" } }, fetchFn);
+  } catch (e) {
+    throw new Error(
+      `The connector registry did not respond after two attempts (${errMessage(e)}). ` +
+        "The official registry may be busy; check your internet connection or try again shortly."
+    );
+  }
+}
+
+async function registryPayload(response: RegistryHttpResponse): Promise<unknown> {
+  if (!response.ok) throw new Error(`Registry returned HTTP ${response.status}.`);
+  try {
+    return await response.json();
+  } catch (e) {
+    throw new Error(`Registry sent a reply we couldn't read: ${errMessage(e)}`);
+  }
+}
+
 /**
  * Search the live registry and return normalized listings. Throws (surfaced to
  * the UI) when browsing is off — the frontend then shows the opt-in gate.
@@ -565,33 +566,8 @@ export async function mcpRegistrySearch(
   if (!mcpRegistryOptinStatus(userDataDir)) {
     throw new Error("Browsing the connector registry reaches the internet. Turn it on to search.");
   }
-  // Rust's `limit` is a `usize`, so a negative number cannot reach its `.min(200)`
-  // at all; the floor is what stands in for that here.
-  const n = Math.max(0, Math.min(limit ?? 80, 200));
-  const params = new URLSearchParams({ limit: String(n) });
-  const trimmed = query?.trim();
-  if (trimmed !== undefined && trimmed !== "") params.set("search", trimmed);
-
-  let resp: RegistryHttpResponse;
-  try {
-    resp = await sendWithRetries(
-      `${REGISTRY_URL}?${params.toString()}`,
-      { headers: { Accept: "application/json" } },
-      deps.fetchFn
-    );
-  } catch (e) {
-    throw new Error(
-      `The connector registry did not respond after two attempts (${errMessage(e)}). ` +
-        "The official registry may be busy; check your internet connection or try again shortly."
-    );
-  }
-  if (!resp.ok) throw new Error(`Registry returned HTTP ${resp.status}.`);
-  let payload: unknown;
-  try {
-    payload = await resp.json();
-  } catch (e) {
-    throw new Error(`Registry sent a reply we couldn't read: ${errMessage(e)}`);
-  }
+  const response = await registryResponse(registrySearchUrl(query, limit), deps.fetchFn);
+  const payload = await registryPayload(response);
   const entries = normalizeServers(payload);
   // Icons go out on their own path: the registry's own address is ours and may
   // redirect freely, but these URLs are attacker-chosen and every hop of theirs

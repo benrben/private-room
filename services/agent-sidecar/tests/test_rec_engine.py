@@ -57,6 +57,7 @@ from arcelle_sidecar.rec.engine import (
     MsgEditMeta,
     MsgPause,
     MsgResume,
+    MsgSetLiveTranslate,
     MsgSetLiveStt,
     MsgStop,
     MsgSysTapResult,
@@ -73,8 +74,10 @@ from arcelle_sidecar.rec.engine import (
 )
 from arcelle_sidecar.rec.lanes import Active, LaneLang, Source
 from arcelle_sidecar.rec.meta import (
+    FLUSH_EVERY_SEGMENTS,
     LANE_RESYNC_GAP,
     MAX_SESSION_SAMPLES,
+    RETRANSCRIBE_DECODE_PCT,
     RETRANSCRIBE_STOPPED,
     SAMPLE_RATE,
     NoteKind,
@@ -694,6 +697,55 @@ async def test_a_dropped_echo_retracts_the_language_vote_it_cast_on_the_mic_lane
     )
 
 
+async def test_a_mic_echo_clears_its_ghost_without_removing_the_system_row() -> None:
+    """The system row wins even when hand-built decode results arrive mic-last."""
+    ports = FakePorts()
+    engine = make_engine(ports)
+    text = "we should move the whole launch to Friday afternoon instead"
+
+    await engine.handle(MsgDecodeDone(final_out(
+        source=Source.SYS, start=0, n_samples=SAMPLE_RATE * 4, text=text
+    )))
+    await engine.handle(MsgDecodeDone(final_out(
+        source=Source.MIC, start=0, n_samples=SAMPLE_RATE * 4, text=text
+    )))
+
+    assert [segment.source for segment in engine.meta.segments] == ["sys"]
+    assert ports.payloads("rec-partial")[-1]["text"] == ""
+    assert not ports.payloads("rec-segment-drop")
+
+
+async def test_final_integration_keeps_order_caches_windows_translates_and_checkpoints() -> None:
+    """One finalized row preserves each independent post-integration duty."""
+    ports = FakePorts()
+    engine = make_engine(ports, live_translate="he")
+    engine.meta.segments.append(
+        RecSegment(
+            id="later",
+            source="sys",
+            speaker="Speaker 1",
+            t0=400,
+            t1=500,
+            text="a later row that is not an echo",
+            words=[],
+            lang="en",
+        )
+    )
+    engine.relabel_countdown = 1
+    engine.segments_since_flush = FLUSH_EVERY_SEGMENTS - 1
+    out = final_out(source=Source.SYS, start=0, n_samples=SAMPLE_RATE, text="an earlier row")
+    out.wins = [(0, 1, diar_embed.VoicePrint())]
+
+    await engine.handle(MsgDecodeDone(out))
+
+    first = engine.meta.segments[0]
+    assert [segment.t0 for segment in engine.meta.segments] == [0, 400]
+    assert engine.win_cache[first.id] == out.wins
+    assert [(segment.id, lang) for segment, lang in engine.translate_tx.waiting] == [(first.id, "he")]
+    assert ports.saves(Save.CHECKPOINT)
+    assert engine.segments_since_flush == 0
+
+
 # =============================================================================
 # ---- mic-degraded-echo-during-crosstalk guard (mean_p < 0.35) -------------
 # =============================================================================
@@ -1008,6 +1060,43 @@ async def test_a_failed_tap_is_reported_on_the_sys_source_and_the_health_is_dura
     assert engine.sys_lane().value == "off"
 
 
+async def test_handle_routes_live_translation_resume_and_stopping_decode() -> None:
+    """The message dispatcher must retain each message arm's state changes."""
+    ports = FakePorts()
+    engine = make_engine(ports, system_audio=True)
+
+    await engine.handle(MsgSetLiveTranslate(lang="he"))
+    assert engine.live_translate == "he"
+
+    await engine.handle(MsgResume())
+    assert engine.status == "recording"
+    assert engine.mic.resync is True and engine.sys.resync is True
+    assert ports.sys_tap_requests == 1
+
+    await engine.handle(MsgSysTapResult(ok=True))
+    assert engine.sys_tap_up is True
+
+    engine.stopping = True
+    engine.decode_busy = True
+    await engine.handle(
+        MsgDecodeDone(
+            DecodeOut(
+                kind=JobKind.PARTIAL,
+                source=Source.MIC,
+                start=0,
+                n_samples=0,
+                segs=[],
+                detected=None,
+                emb=None,
+                wins=[],
+                err=None,
+            )
+        )
+    )
+    assert engine.decode_busy is False
+    assert ports.payloads("rec-save-progress")[-1]["stage"] == "transcribing"
+
+
 # =============================================================================
 # ---- the 3-hour MAX_SESSION_SAMPLES ceiling -------------------------------
 # =============================================================================
@@ -1028,6 +1117,45 @@ async def test_max_session_samples_ceiling_forces_a_clean_self_stop() -> None:
     await engine.finish()
     assert engine.status == "saved"
     assert engine.outcome is not None and engine.outcome.ok and engine.outcome.meta is not None
+
+
+async def test_ingest_recovers_mic_resyncs_a_late_lane_and_queues_a_closed_phrase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One new mic batch repairs the watchdog and anchors its lane at the head."""
+    ports = FakePorts()
+    engine = make_engine(ports)
+    engine.mic_flagged = True
+    engine.mixed = np.zeros(LANE_RESYNC_GAP, dtype=np.float32)
+    engine.mic.ingested = 0
+    engine.mic.resync = True
+    queued: list[tuple[Source, int, list[float]]] = []
+
+    monkeypatch.setattr(engine.mic, "push", lambda _pcm: [(17, [0.2, 0.3])])
+    monkeypatch.setattr(
+        engine,
+        "queue_final",
+        lambda source, start, audio: queued.append((source, start, audio)),
+    )
+    monkeypatch.setattr(engine, "dispatch_next", lambda: None)
+
+    await engine.ingest(Source.MIC, SAMPLE_RATE, np.array([0.1, 0.2], dtype=np.float32))
+
+    assert engine.mic_flagged is False and engine.mic_ever_pushed is True
+    assert ports.payloads("rec-source")[-1]["status"] == "on"
+    assert engine.mic.ingested == LANE_RESYNC_GAP + 2
+    assert queued == [(Source.MIC, 17, [0.2, 0.3])]
+
+
+async def test_ingest_checkpoint_backoff_skips_an_automatic_retry() -> None:
+    ports = FakePorts()
+    engine = make_engine(ports)
+    engine.mixed = np.zeros(SAMPLE_RATE * 60, dtype=np.float32)
+    engine.flush_failed_at = time.monotonic()
+
+    await engine._checkpoint_audio_if_due()
+
+    assert not ports.persists
 
 
 async def test_a_stop_that_races_a_self_stop_is_still_answered() -> None:
@@ -1468,6 +1596,90 @@ def test_retranscribe_stop_aborts_mid_pass(fox_pcm: np.ndarray) -> None:
     assert calls["n"] > 3
 
 
+def test_retranscribe_preserves_each_offline_pass_outcome_without_model_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The offline loop keeps a real final, drops an empty one, carries cuts,
+    and distinguishes a decoder failure without needing model fixtures."""
+    import arcelle_sidecar.rec.engine as engine_mod
+
+    class FakeLane:
+        def __init__(self, _source: int) -> None:
+            self.pushed = False
+
+        def push(self, samples: np.ndarray) -> list[tuple[int, list[float]]]:
+            assert not self.pushed
+            self.pushed = True
+            return [(0, samples.tolist())]
+
+        @staticmethod
+        def flush_active() -> None:
+            return None
+
+    class FakeBook:
+        @staticmethod
+        def assign(_voice: object) -> str:
+            return "Speaker 1"
+
+    voice = diar_embed.VoicePrint(vec=np.array([1.0], np.float32), voiced_frames=1)
+    phrases = iter(
+        [
+            engine_mod.PhraseOut(
+                segs=[SegOut(text="hello", words=[("hello", 0, 2)], lang="en")],
+                detected=("en", 0.9),
+            ),
+            engine_mod.PhraseOut(segs=[SegOut(text=" ", lang="en")]),
+        ]
+    )
+
+    monkeypatch.setattr(engine_mod, "Lane", FakeLane)
+    monkeypatch.setattr(engine_mod, "_new_speaker_book", lambda _cap: FakeBook())
+    monkeypatch.setattr(engine_mod, "embed", lambda *_args: voice)
+    monkeypatch.setattr(engine_mod, "transcribe_segments", lambda *_args: next(phrases))
+    monkeypatch.setattr(engine_mod, "window_prints", lambda *_args: [(0, 2, voice)])
+
+    monkeypatch.setattr(engine_mod, "split_by_voice", lambda *_args: False)
+    samples = np.full(SAMPLE_RATE, 0.2, np.float32)
+    prior = RecMeta(
+        cuts=[RecCut(t0=5, t1=6), RecCut(t0=0, t1=1)],
+        speaker_names={"Speaker 1": "Typed", "Speaker 2": "Guessed"},
+        recognized={"Guessed"},
+    )
+    progress: list[tuple[int, int]] = []
+
+    rebuilt = retranscribe(
+        NO_MODEL, samples, prior, [], None, lambda done, total: progress.append((done, total)), lambda: False
+    )
+    empty = retranscribe(NO_MODEL, samples, RecMeta(), [], None, lambda *_args: None, lambda: False)
+
+    assert [segment.text for segment in rebuilt.segments] == ["hello"]
+    assert rebuilt.segments[0].words[0].del_ is True
+    assert rebuilt.speaker_names == {"Speaker 1": "Typed"}
+    assert progress == [(RETRANSCRIBE_DECODE_PCT, 100), (100, 100)]
+    assert empty.segments == []
+    assert engine_mod._retranscription_windows(samples, rebuilt.segments[0], "") == [(0, 2, voice)]
+    assert engine_mod._retranscription_windows(samples, RecSegment(
+        id="outside", source="sys", speaker="Speaker 1", t0=2, t1=1, text="", words=[]
+    ), "") == []
+
+    class FlushLane:
+        @staticmethod
+        def flush_active() -> tuple[int, list[float]]:
+            return (SAMPLE_RATE, [0.2])
+
+    queued = engine_mod._new_retranscription(np.zeros(0, np.float32), RecMeta(), None)
+    queued.lane = FlushLane()  # type: ignore[assignment]
+    engine_mod._feed_retranscription_lane(queued)
+    assert list(queued.ready) == [(SAMPLE_RATE, [0.2])]
+
+    def broken_decode(*_args: object) -> engine_mod.PhraseOut:
+        raise ValueError("broken model")
+
+    monkeypatch.setattr(engine_mod, "transcribe_segments", broken_decode)
+    with pytest.raises(RuntimeError, match=r"^Transcribing at \[0:00\] failed: broken model$"):
+        retranscribe(NO_MODEL, samples, RecMeta(), [], None, lambda *_args: None, lambda: False)
+
+
 # =============================================================================
 # ---- live translation ------------------------------------------------------
 # =============================================================================
@@ -1898,6 +2110,41 @@ async def test_a_stop_that_arrives_after_the_run_loop_returned_reads_the_verdict
     dead.send(MsgStop(done=after))
     with pytest.raises(RuntimeError, match=SAVE_FAILED):
         await asyncio.wait_for(after, timeout=2)
+
+
+async def test_run_starts_system_capture_and_honors_a_handle_stop(monkeypatch) -> None:
+    """The loop preserves both optional startup work and its stop return seam."""
+    ports = FakePorts()
+    engine = make_engine(ports, system_audio=True)
+    started: list[bool] = []
+    handled: list[object] = []
+
+    async def start_sys_tap() -> None:
+        started.append(True)
+
+    async def stop_after_one_message(msg: object) -> bool:
+        handled.append(msg)
+        return True
+
+    monkeypatch.setattr(engine, "start_sys_tap", start_sys_tap)
+    monkeypatch.setattr(engine, "handle", stop_after_one_message)
+    engine.send(MsgPause())
+
+    assert await asyncio.wait_for(engine.run(), timeout=2) is None
+    assert started == [True]
+    assert len(handled) == 1 and isinstance(handled[0], MsgPause)
+    assert engine._ended is True
+
+
+async def test_run_ticks_while_idle_before_processing_stop() -> None:
+    """An empty inbox still runs the timeout branch before a later Stop arrives."""
+    engine = make_engine(FakePorts())
+    task = asyncio.create_task(engine.run())
+    await asyncio.sleep(0.12)
+    engine.send(MsgStop())
+
+    outcome = await asyncio.wait_for(task, timeout=2)
+    assert outcome is not None and outcome.ok is True
 
 
 async def test_an_edit_meta_left_in_the_inbox_is_told_the_engine_is_gone() -> None:

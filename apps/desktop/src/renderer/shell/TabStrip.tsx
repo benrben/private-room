@@ -62,6 +62,64 @@ function TabTitleText({
   return <>{generated ?? fallback}</>;
 }
 
+function handleTabKeyDown(
+  event: React.KeyboardEvent<HTMLDivElement>,
+  index: number,
+  tab: Tab,
+  tabs: TabsApi,
+  arrowTo: (from: number, delta: number) => void,
+  focusTab: (index: number) => void,
+): void {
+  if (activateTabForKey(event, tab.id, tabs)) return;
+  if (moveTabForArrowKey(event, index, arrowTo)) return;
+  moveTabToEdgeForKey(event, tabs, focusTab);
+}
+
+function activateTabForKey(
+  event: React.KeyboardEvent<HTMLDivElement>,
+  tabId: string,
+  tabs: Pick<TabsApi, "activate">,
+): boolean {
+  if (event.key !== "Enter" && event.key !== " ") return false;
+  event.preventDefault();
+  tabs.activate(tabId);
+  return true;
+}
+
+function moveTabForArrowKey(
+  event: React.KeyboardEvent<HTMLDivElement>,
+  index: number,
+  arrowTo: (from: number, delta: number) => void,
+): boolean {
+  const delta = arrowDelta(event.key);
+  if (delta === null) return false;
+  event.preventDefault();
+  arrowTo(index, delta);
+  return true;
+}
+
+function arrowDelta(key: string): number | null {
+  return ({ ArrowRight: 1, ArrowLeft: -1 }[key] ?? null);
+}
+
+function moveTabToEdgeForKey(
+  event: React.KeyboardEvent<HTMLDivElement>,
+  tabs: TabsApi,
+  focusTab: (index: number) => void,
+): void {
+  const index = tabEdgeIndex(event.key, tabs.tabs.length);
+  if (index === null) return;
+  event.preventDefault();
+  focusTab(index);
+  tabs.activate(tabs.tabs[index].id);
+}
+
+function tabEdgeIndex(key: string, tabCount: number): number | null {
+  if (key === "Home") return 0;
+  if (key === "End") return tabCount - 1;
+  return null;
+}
+
 /** HOME'S OPEN ROOM DOCUMENTS, and nothing else.
  *
  * Not the app's navigation: places live in the activity rail, which is always
@@ -221,24 +279,7 @@ export default function TabStrip({
                 if (from >= 0 && from !== index) tabs.move(from, index);
               }}
               onClick={() => tabs.activate(tab.id)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  tabs.activate(tab.id);
-                  return;
-                }
-                if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
-                  e.preventDefault();
-                  arrowTo(index, e.key === "ArrowRight" ? 1 : -1);
-                  return;
-                }
-                if (e.key === "Home" || e.key === "End") {
-                  e.preventDefault();
-                  const to = e.key === "Home" ? 0 : tabs.tabs.length - 1;
-                  focusTab(to);
-                  tabs.activate(tabs.tabs[to].id);
-                }
-              }}
+              onKeyDown={(event) => handleTabKeyDown(event, index, tab, tabs, arrowTo, focusTab)}
               onAuxClick={(e) => {
                 // Middle-click closes, as everywhere else with tabs.
                 if (e.button === 1) {

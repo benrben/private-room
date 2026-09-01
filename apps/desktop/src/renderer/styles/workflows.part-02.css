@@ -1,0 +1,499 @@
+
+/* Only the ink is set here: base.css's own button:hover already lifts the
+   border to the pen and washes the ground, and restating either at lower
+   specificity would just be a dead declaration. */
+.wf-icon-btn:hover {
+  color: var(--text);
+}
+/* A menu floats, so it is opaque — the one place the system allows a fill,
+   because it has to occlude what is underneath it.
+
+   Must sit ABOVE the full-screen .menu-backdrop (z-index 45), like .pop-menu
+   (46). At 40 the backdrop covered the grid and swallowed the click's
+   mousedown — the picker closed before an icon could be selected. */
+.wf-icon-grid {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 46;
+  margin-top: 5px;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--sp-1);
+  padding: 6px;
+  background: var(--raised);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  box-shadow:
+    0 12px 30px var(--shadow),
+    0 2px 6px var(--shadow-lift);
+}
+.wf-icon-choice {
+  width: 34px;
+  height: 34px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+}
+.wf-icon-choice:hover {
+  color: var(--text);
+}
+/* Selection is the pen: the accent ring plus a second offset stroke, so the
+   chosen icon looks gone-round-twice rather than merely tinted. aria-checked
+   carries the same fact to assistive technology. */
+.wf-icon-choice.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-ghost);
+}
+
+/* ==========================================================================
+   6. THE DETAIL HEADER
+   .viewer-head itself belongs to shell.css, which loads AFTER this file, so
+   anything that has to beat one of its rules is scoped under .wf-page to win
+   on specificity rather than on order.
+   ========================================================================== */
+
+.wf-detail-actions {
+  position: relative;
+}
+/* The workflow's name is edited in place: no box until you touch it, then the
+   pen's own focus stroke. */
+.wf-page .wf-title-input {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--sans);
+  font-size: var(--fs-card);
+  font-weight: 600;
+  color: var(--text-strong);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: var(--sp-1) var(--sp-2);
+}
+.wf-page .wf-title-input:hover {
+  border-color: var(--line);
+}
+.wf-page .wf-title-input:focus {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--raised) 62%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 42%, transparent);
+}
+
+/* ----- validation errors -----
+   A marker stroke down the page rather than a filled alert box. The word "Fix
+   these before activating" carries the meaning; the text stays --text rather
+   than red, because a paragraph of red-on-red is the least readable way to
+   deliver instructions. */
+.wf-errors {
+  --mk: var(--sem-urgent-fill);
+  --mk-ink: var(--sem-urgent);
+  margin-bottom: var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  color: var(--text);
+  box-shadow: inset 3px 0 0 var(--mk-ink);
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--mk) 20%, transparent) 0%,
+    color-mix(in srgb, var(--mk) 10%, transparent) 62%,
+    color-mix(in srgb, var(--mk) 15%, transparent) 100%
+  );
+}
+.wf-errors ul {
+  margin: var(--sp-1) 0 0;
+  padding-left: 1.2rem;
+}
+.wf-errors li + li {
+  margin-top: 2px;
+}
+/* A validation error that maps to a step — click to select it. The dotted
+   underline says "this is pressable" without turning the sentence into a
+   button, and it is a real <button> underneath. */
+.wf-error-link {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+/* Two classes deep so base.css's `button:hover` cannot paint an accent wash
+   behind what is, visually, a sentence. */
+.wf-errors .wf-error-link:hover {
+  background-color: transparent;
+  text-decoration: underline;
+}
+
+/* ==========================================================================
+   7. THE PIPELINE — connected notebook blocks
+   Steps are blocks drawn on the sheet and the connectors are pen strokes
+   between them, with the barbed head the ink-glyph arrow uses. Geometry comes
+   from PipelineCanvas.tsx's own layout pass; nothing here measures anything.
+   ========================================================================== */
+
+.pipeline-wrap {
+  position: relative;
+  overflow: auto;
+  min-height: 260px;
+  border: var(--stroke-w) solid var(--sketch);
+  border-radius: var(--radius-lg);
+  /* Transparent: the sheet's dotted rule runs straight through the canvas.
+     The old rule painted a SECOND grid here — green dots at the same 22px
+     pitch as the page's own, permanently a few pixels out of phase with it. */
+  background: transparent;
+}
+.pipeline-canvas {
+  position: relative;
+}
+.pipeline-edges {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+/* The connector itself. Round caps and a weight just under the pen's, so it
+   reads as a line drawn between two blocks rather than as a UI wire. */
+.pipeline-edges .pipeline-edge {
+  fill: none;
+  stroke: var(--rule-strong);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+/* An edge whose source step has FINISHED. Green means complete product-wide,
+   and the pen (accent) is reserved for selection — an accent edge here read
+   as "this connector is selected". */
+.pipeline-edges .pipeline-edge.live {
+  stroke: var(--sem-done);
+}
+/* The arrowhead, stroked rather than filled so it matches the line it ends. */
+.pipeline-arrow {
+  fill: none;
+  stroke: var(--rule-strong);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.pipeline-arrow.live {
+  stroke: var(--sem-done);
+}
+/* The outcome label on a branch edge. The halo is the SHEET's colour, since
+   that is what is actually behind the text now that the canvas is a frame
+   rather than a filled panel. */
+.pipeline-edge-branch {
+  fill: var(--muted);
+  font-family: var(--sans);
+  /* Was 10px, under the floor the type scale sets as the smallest size allowed
+     anywhere — and this is the only place the drawing says which way a
+     condition went. */
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  paint-order: stroke;
+  stroke: var(--page);
+  stroke-width: 3px;
+}
+
+.pipeline-node {
+  position: absolute;
+  /* Mirrors NODE_W in PipelineCanvas.tsx; the height comes in as an inline
+     style from NODE_H there. */
+  width: 150px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 9px;
+  text-align: left;
+  color: var(--text);
+  /* Filled in the SHEET's own colour: a block still reads as sitting on the
+     paper, but a connector routed past it passes BEHIND it instead of through
+     it. Same reasoning as the node on Room Home's timeline. */
+  background: var(--page);
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-radius: var(--radius-sm);
+  /* The block's height is fixed by the layout pass, so this is the guarantee
+     that no combination of long label and live status can ever spill over the
+     row beneath it. The three line-heights below are budgeted against NODE_H:
+     82 − 12 padding − 3 border = 67, and 14.4 + 35.8 + 14.4 + gaps = 66.6.
+     Changing either without the other is what put a step name on top of its
+     neighbour before. An element's own outline is not clipped by its own
+     overflow, so the focus ring still draws in full. */
+  overflow: hidden;
+  cursor: pointer;
+  transition:
+    border-color var(--dur-fast) var(--ease-pen),
+    box-shadow var(--dur-fast) var(--ease-pen);
+}
+.pipeline-node:hover {
+  border-color: var(--sketch);
+}
+.pipeline-node:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.pipeline-node-kind {
+  flex: none;
+  font-size: var(--fs-micro);
+  line-height: 1.2;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--faint);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+/* Two lines, then clipped. The block's height is fixed by the layout pass, so
+   a long step name has to stop somewhere — the FULL name is still in the
+   node's aria-label, so nothing is hidden from anyone who needs it. */
+.pipeline-node-label {
+  font-size: var(--fs-body);
+  font-weight: 600;
+  line-height: 1.28;
+  color: var(--text-strong);
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+/* Live status, in the marker ink each state sets below. It is a WORD, so the
+   colour is never carrying the signal on its own. */
+.pipeline-node-status {
+  flex: none;
+  font-size: var(--fs-micro);
+  line-height: 1.2;
+  color: var(--mk-ink, var(--muted));
+}
+
+/* Status sets the block's marker and its border together. Every state also
+   differs in SHAPE — a dashed edge for skipped, a second stroke for running —
+   so none of them is told apart by hue alone. */
+.pipeline-node.done {
+  --mk-ink: var(--sem-done);
+  border-color: var(--sem-done);
+}
+.pipeline-node.error {
+  --mk-ink: var(--sem-urgent);
+  border-color: var(--sem-urgent);
+}
+/* Dashed, which is the system's mark for something provisional, and MUTED
+   text rather than the old opacity: 0.5, which dimmed the step name straight
+   through the contrast floor. */
+.pipeline-node.skipped {
+  border-style: dashed;
+  border-color: var(--rule-strong);
+}
+.pipeline-node.skipped .pipeline-node-label {
+  color: var(--muted);
+}
+/* The pen went round twice. Static by design — the old rule pulsed forever,
+   and nothing in this system is allowed to move continuously. */
+.pipeline-node.running {
+  --mk-ink: var(--sem-linked);
+  border-color: var(--sem-linked);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--sem-linked) 30%, transparent);
+}
+
+/* Selection is drawn LAST on purpose: box-shadow is one property, so a status
+   ring and a selection ring cannot coexist, and the one the user just created
+   by clicking is the one that has to answer. The status word stays in the
+   block either way — colour was never carrying it alone. */
+.pipeline-node.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/* The "add a step" affordances hanging off a block's edge. 24px is the floor
+   for anything clickable; PipelineCanvas.tsx centres them from the same
+   number. Filled in the sheet's colour so the connector passes behind. */
+.pipeline-add {
+  position: absolute;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  font-size: var(--fs-meta);
+  line-height: 1;
+  color: var(--accent);
+  background: var(--page);
+  border: 1px dashed var(--rule-strong);
+  border-radius: 50%;
+}
+.pipeline-add:hover {
+  border-style: solid;
+  border-color: var(--accent);
+  background-color: var(--accent-ghost);
+}
+/* The parallel-branch (fan-out) affordance, sitting below a block's tail "+". */
+.pipeline-branch {
+  color: var(--accent-2);
+  font-size: var(--fs-meta);
+}
+
+/* ==========================================================================
+   8. THE STEP INSPECTOR AND BINDING EDITOR
+   ========================================================================== */
+
+.node-param-sheet {
+  margin-top: var(--sp-4);
+  padding: var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  background: transparent;
+  border: var(--stroke-w) solid color-mix(in srgb, var(--sketch) 72%, transparent);
+  border-radius: var(--radius);
+}
+.node-param-sheet label,
+.node-param-sheet .field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  color: var(--text);
+}
+/* A radiogroup/group heading, used instead of a <label> — a label may only
+   name one control, and these head a whole set of buttons. */
+.node-param-sheet .field-head {
+  font-size: var(--fs-meta);
+  font-weight: 600;
+}
+/* The parenthetical after a field name: the same words, not emphasised. It
+   was an inline opacity: 0.6, which is a contrast hazard rather than a colour
+   — --muted is solved against every ground this can land on. */
+.wf-field-hint {
+  font-weight: 400;
+  color: var(--muted);
+}
+/* Fields inherit their surface, border and drawn focus stroke from base.css;
+   all they need here is to fill the column. The old rule restated the
+   background and pinned color-scheme: dark, which meant a native select's
+   popup and caret stayed dark after the app switched to the ivory theme —
+   tokens.css already sets color-scheme per theme on :root. */
+.node-param-sheet textarea,
+.node-param-sheet input[type="text"],
+.node-param-sheet select {
+  width: 100%;
+  font: inherit;
+  font-family: var(--sans);
+  font-weight: 400;
+}
+.node-param-sheet textarea {
+  min-height: 92px;
+  line-height: var(--lh-body);
+  resize: vertical;
+}
+.node-param-sheet .caption {
+  font-weight: 400;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+.wf-delete-step {
+  align-self: flex-start;
+  margin-top: var(--sp-1);
+}
+/* base.css paints an accent ghost behind any hovered button; under the red
+   swash .nb-btn-danger wipes in, the two turn to mud. The swash is the mark
+   here, so this one keeps its own ground. */
+.node-param-sheet .wf-delete-step:hover:not(:disabled) {
+  background-color: transparent;
+}
+
+/* The file-kind toggles. .nb-chip-btn brings the 24px target, the focus ring
+   and the circled "on" treatment; aria-pressed puts the state where colour
+   cannot reach. */
+.wf-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-2);
+  font-weight: 400;
+}
+
+/* ----- segmented control -----
+   The active segment takes the system's universal active signal — the marker
+   underline — instead of a saturated fill. The old rule also clipped the
+   group with overflow: hidden, which cut the focus ring off every segment
+   inside it. */
+.wf-seg {
+  display: inline-flex;
+  align-self: flex-start;
+  /* 2px of inset so a segment's own corner never reaches — and so never pokes
+     out of — the group's rounded one, which is what the old overflow: hidden
+     was really solving, at the cost of every segment's focus ring. */
+  padding: 2px;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-sm);
+  font-weight: 400;
+}
+.wf-seg button {
+  min-height: 26px;
+  padding: 4px 11px;
+  font: inherit;
+  font-size: var(--fs-meta);
+  color: var(--text-dim);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-xs);
+  box-shadow: none;
+}
+.wf-seg button + button {
+  box-shadow: inset 1px 0 0 var(--line);
+}
+.wf-seg button:hover {
+  color: var(--text);
+  background-color: var(--hover);
+}
+.wf-seg button.active {
+  color: var(--text-strong);
+  background-color: var(--accent-ghost);
+  box-shadow: inset 0 -3px 0 var(--accent-fill);
+}
+/* An active segment that also owes a left divider. box-shadow is ONE property,
+   so the two strokes have to be written together or the later rule silently
+   deletes the earlier one. */
+.wf-seg button + button.active {
+  box-shadow:
+    inset 1px 0 0 var(--line),
+    inset 0 -3px 0 var(--accent-fill);
+}
+
+/* ----- condition / route branch editor ----- */
+.wf-branches {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  /* Dashed: a set of outcomes that is not wired up yet is provisional. */
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-sm);
+}
+.wf-branch-label {
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.wf-branch-row {
+  display: flex;
+  gap: var(--sp-1);
+  align-items: center;
+}
+.wf-branch-row select {
+  flex: 1;
+  min-width: 0;
+}

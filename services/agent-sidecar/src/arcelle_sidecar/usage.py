@@ -51,25 +51,38 @@ def categorize_messages(messages: list[Message], tools_chars: int) -> dict[str, 
     """
     totals: dict[str, int] = {c: 0 for c in CATEGORIES}
     totals["tools"] += max(tools_chars, 0)
-    for m in messages:
-        role = m.get("role")
-        n = msg_len(m)
-        if role == "system":
-            totals["system"] += n
-        elif role == "tool":
-            name = m.get("tool_name") or ""
-            if name in SKILL_TOOL_NAMES:
-                totals["skills"] += n
-            elif name in FILE_TOOL_NAMES:
-                totals["files"] += n
-            else:
-                totals["tools"] += n
-        elif role == "user" and m.get("images"):
-            totals["files"] += n
-        else:
-            # user/assistant text — the running conversation.
-            totals["history"] += n
+    for message in messages:
+        _add_message_cost(totals, message, message.get("role"), msg_len(message))
     return totals
+
+
+def _add_message_cost(
+    totals: dict[str, int], message: Message, role: object, cost: int
+) -> None:
+    """Charge one already-measured message to its fixed usage bucket."""
+    totals[_message_category(role, message)] += cost
+
+
+def _message_category(role: object, message: Message) -> str:
+    """Classify system and tool turns before ordinary conversation turns."""
+    if role == "system":
+        return "system"
+    if role == "tool":
+        return _tool_result_category(message)
+    return _ordinary_message_category(role, message)
+
+
+def _tool_result_category(message: Message) -> str:
+    """Classify a tool result by the kind of prompt material it returns."""
+    name = message.get("tool_name") or ""
+    if name in SKILL_TOOL_NAMES:
+        return "skills"
+    return "files" if name in FILE_TOOL_NAMES else "tools"
+
+
+def _ordinary_message_category(role: object, message: Message) -> str:
+    """Charge user attachments as files; all other ordinary turns as history."""
+    return "files" if role == "user" and message.get("images") else "history"
 
 
 def build_usage_event(
@@ -88,31 +101,49 @@ def build_usage_event(
     estimate is the whole bar, and a flat 3 against the 5.89 the app measured
     for English prose told the user they had spent roughly double.
     """
-    per_token = bytes_per_token()
-    est_breakdown = {
-        c: int(max(breakdown_chars.get(c, 0), 0) / per_token) for c in CATEGORIES
-    }
-    est_total = sum(est_breakdown.values())
-    real_total = usage.input_tokens if usage.is_real else None
-
-    if real_total is not None and est_total > 0:
-        breakdown = {
-            c: {"tokens": round(v * real_total / est_total), "estimated": True}
-            for c, v in est_breakdown.items()
-        }
-        total_tokens = real_total
-        estimated = False
-    else:
-        breakdown = {c: {"tokens": v, "estimated": True} for c, v in est_breakdown.items()}
-        total_tokens = real_total if real_total is not None else est_total
-        estimated = real_total is None
-
-    event: dict[str, Any] = {
+    estimated_breakdown = _estimated_breakdown(breakdown_chars, bytes_per_token())
+    total_tokens, estimated, breakdown = _usage_numbers(usage, estimated_breakdown)
+    event = {
         "total_tokens": total_tokens,
         "max_context": usage.max_context,
         "estimated": estimated,
         "breakdown": breakdown,
     }
+    return _with_round(event, round_)
+
+
+def _estimated_breakdown(breakdown_chars: dict[str, int], per_token: float) -> dict[str, int]:
+    return {category: int(max(breakdown_chars.get(category, 0), 0) / per_token) for category in CATEGORIES}
+
+
+def _usage_numbers(
+    usage: RoundUsage, estimated_breakdown: dict[str, int]
+) -> tuple[int, bool, dict[str, dict[str, int | bool]]]:
+    estimated_total = sum(estimated_breakdown.values())
+    real_total = usage.input_tokens if usage.is_real else None
+    if real_total is not None and estimated_total > 0:
+        return real_total, False, _scaled_breakdown(estimated_breakdown, real_total, estimated_total)
+    total_tokens = real_total if real_total is not None else estimated_total
+    return total_tokens, real_total is None, _estimated_category_breakdown(estimated_breakdown)
+
+
+def _scaled_breakdown(
+    estimated_breakdown: dict[str, int], real_total: int, estimated_total: int
+) -> dict[str, dict[str, int | bool]]:
+    return {
+        category: {"tokens": round(value * real_total / estimated_total), "estimated": True}
+        for category, value in estimated_breakdown.items()
+    }
+
+
+def _estimated_category_breakdown(estimated_breakdown: dict[str, int]) -> dict[str, dict[str, int | bool]]:
+    return {
+        category: {"tokens": value, "estimated": True}
+        for category, value in estimated_breakdown.items()
+    }
+
+
+def _with_round(event: dict[str, Any], round_: int | None) -> dict[str, Any]:
     if round_ is not None:
         event["round"] = round_
     return event

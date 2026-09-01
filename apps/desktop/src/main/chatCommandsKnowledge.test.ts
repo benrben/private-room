@@ -99,8 +99,16 @@ afterEach(() => {
 
 class TestRoomSource implements RoomSource {
   private room: RoomHandle | null = null;
-  open(db: Database.Database, roomPath: string, workspace?: WorkspaceService): void {
-    this.room = { db, path: roomPath, ...(workspace === undefined ? {} : { workspace }) };
+  open(
+    db: Database.Database,
+    roomPath: string,
+    workspace?: WorkspaceService,
+  ): void {
+    this.room = {
+      db,
+      path: roomPath,
+      ...(workspace === undefined ? {} : { workspace }),
+    };
   }
   close(): void {
     this.room = null;
@@ -144,7 +152,7 @@ function collectingEmit(): { emit: EmitFn; events: Array<[string, unknown]> } {
 
 async function withFakeSidecar<T>(
   handler: (body: unknown, req: http.IncomingMessage) => unknown,
-  fn: () => Promise<T>
+  fn: () => Promise<T>,
 ): Promise<T> {
   const server = http.createServer((req, res) => {
     let raw = "";
@@ -186,7 +194,11 @@ describe("cmdWindows", () => {
     expect(windows.length).toBeGreaterThan(1);
     expect(windows[windows.length - 1]).toContain("FINAL LINE");
     const joined = windows.join("");
-    for (const probe of ["line number 0", "line number 1999", "line number 3999"]) {
+    for (const probe of [
+      "line number 0",
+      "line number 1999",
+      "line number 3999",
+    ]) {
       expect(joined).toContain(probe);
     }
   });
@@ -194,15 +206,26 @@ describe("cmdWindows", () => {
   it("windows_stay_within_one_pass", () => {
     const text = "sentence. ".repeat(20_000);
     for (const w of cmdWindows(text)) {
-      expect(Buffer.byteLength(w, "utf8")).toBeLessThanOrEqual(CMD_WINDOW_CHARS + 400);
+      expect(Buffer.byteLength(w, "utf8")).toBeLessThanOrEqual(
+        CMD_WINDOW_CHARS + 400,
+      );
     }
+  });
+});
+
+describe("command boundary failures", () => {
+  it("requires an open room once a command reaches room access", async () => {
+    const rooms = new TestRoomSource();
+    await expect(cmdRemember(baseCtx(rooms, { args: "remember this" }))).rejects.toThrow("No room is open.");
   });
 });
 
 describe("quietStepText", () => {
   it("a_quiet_step_never_carries_the_models_reasoning", () => {
     expect(
-      quietStepText("<think>The user wants French. Careful with the idiom.</think>\nBonjour le monde.")
+      quietStepText(
+        "<think>The user wants French. Careful with the idiom.</think>\nBonjour le monde.",
+      ),
     ).toBe("Bonjour le monde.");
     expect(quietStepText("<think>still thinking about it")).toBe("");
     expect(quietStepText("  Plain answer.  ")).toBe("Plain answer.");
@@ -220,17 +243,24 @@ describe("tabularFieldRows", () => {
       "Widget A,Gadgets,120,19.99,2398.80\n" +
       "Widget B,Gadgets,80,29.99,2399.20\n";
     const rows = tabularFieldRows("sales.csv", csv, s(["Product", "revenue"]));
-    expect(rows).toEqual([s(["Widget A", "2398.80"]), s(["Widget B", "2399.20"])]);
+    expect(rows).toEqual([
+      s(["Widget A", "2398.80"]),
+      s(["Widget B", "2399.20"]),
+    ]);
   });
 
   it("tabular_field_rows_bails_when_a_field_is_not_a_column", () => {
     const csv = "product,revenue\nWidget A,2398.80\n";
-    expect(tabularFieldRows("sales.csv", csv, s(["product", "total profit"]))).toBeNull();
+    expect(
+      tabularFieldRows("sales.csv", csv, s(["product", "total profit"])),
+    ).toBeNull();
   });
 
   it("tabular_field_rows_only_for_tabular_extensions", () => {
     const csv = "product,revenue\nWidget A,2398.80\n";
-    expect(tabularFieldRows("notes.md", csv, s(["product", "revenue"]))).toBeNull();
+    expect(
+      tabularFieldRows("notes.md", csv, s(["product", "revenue"])),
+    ).toBeNull();
   });
 
   it("tabular_field_rows_handles_tsv_and_quoted_commas", () => {
@@ -246,7 +276,9 @@ describe("stripTrailingPreposition", () => {
     expect(stripTrailingPreposition("revenue in ")).toBe("revenue");
     expect(stripTrailingPreposition("share of")).toBe("share");
     expect(stripTrailingPreposition("gross margin")).toBe("gross margin");
-    expect(stripTrailingPreposition("country of origin")).toBe("country of origin");
+    expect(stripTrailingPreposition("country of origin")).toBe(
+      "country of origin",
+    );
     expect(stripTrailingPreposition("burden of proof")).toBe("burden of proof");
     expect(stripTrailingPreposition("from")).toBe("");
   });
@@ -283,11 +315,15 @@ describe("findBody", () => {
   it("find_prints_a_bounded_list_and_admits_what_it_left_out", () => {
     const body = findBody("deposit", chunks(200));
     expect(body.startsWith("Matches for **deposit** (200):")).toBe(true);
-    expect(body.split("\n").filter((l) => l.startsWith("- **")).length).toBe(MAX_FIND_MATCHES);
+    expect(body.split("\n").filter((l) => l.startsWith("- **")).length).toBe(
+      MAX_FIND_MATCHES,
+    );
     expect(body).toContain(`…and ${200 - MAX_FIND_MATCHES} more`);
 
     const small = findBody("deposit", chunks(3));
-    expect(small.split("\n").filter((l) => l.startsWith("- **")).length).toBe(3);
+    expect(small.split("\n").filter((l) => l.startsWith("- **")).length).toBe(
+      3,
+    );
     expect(small).not.toContain("more");
 
     const exact = findBody("deposit", chunks(MAX_FIND_MATCHES));
@@ -304,7 +340,7 @@ type FakeGenerate = (
   messages: readonly SidecarChatMessage[],
   temperature: number | null,
   keepAlive: string,
-  opts?: GenerateOpts
+  opts?: GenerateOpts,
 ) => Promise<string>;
 
 describe("askQuiet", () => {
@@ -319,7 +355,9 @@ describe("askQuiet", () => {
     const rooms = new TestRoomSource();
     const fake: FakeGenerate = () => new Promise(() => {}); // never resolves
     const ctx = baseCtx(rooms, { generate: fake as never, stepTimeoutMs: 20 });
-    await expect(askQuiet(ctx, "sys", "user", 0.0)).rejects.toThrow(/took too long to respond/);
+    await expect(askQuiet(ctx, "sys", "user", 0.0)).rejects.toThrow(
+      /took too long to respond/,
+    );
   });
 
   it("propagates a genuine engine failure rather than swallowing it", async () => {
@@ -328,7 +366,9 @@ describe("askQuiet", () => {
       throw new Error("MODEL_MISSING:qwen3.5:4b");
     };
     const ctx = baseCtx(rooms, { generate: fake as never });
-    await expect(askQuiet(ctx, "sys", "user", 0.0)).rejects.toThrow("MODEL_MISSING:qwen3.5:4b");
+    await expect(askQuiet(ctx, "sys", "user", 0.0)).rejects.toThrow(
+      "MODEL_MISSING:qwen3.5:4b",
+    );
   });
 });
 
@@ -360,7 +400,9 @@ describe("digest", () => {
     const big = "word ".repeat(5000); // well over CMD_WINDOW_CHARS (16000) bytes
     const out = await digest(ctx, big, "Reading the source");
     expect(calls).toBeGreaterThan(1); // more than one window was read
-    expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(CMD_WINDOW_CHARS);
+    expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(
+      CMD_WINDOW_CHARS,
+    );
   });
 
   it("a window whose model call fails is counted as unread, not silently dropped", async () => {
@@ -404,6 +446,60 @@ describe("digest", () => {
     // one fold round that then stops.
     expect(calls).toBeLessThan(6);
   });
+
+  it("keeps accumulated fabricated notes when every fold window fails", async () => {
+    const rooms = new TestRoomSource();
+    let foldCalls = 0;
+    const fake: FakeGenerate = async (_model, messages) => {
+      const user = messages[1]?.content ?? "";
+      if (user.startsWith("Part of the source:")) return "n".repeat(CMD_WINDOW_CHARS);
+      foldCalls += 1;
+      throw new Error("fabricated fold failure");
+    };
+    const ctx = baseCtx(rooms, { generate: fake as never });
+
+    const out = await digest(ctx, "source ".repeat(3_000), "Reading");
+
+    expect(Buffer.byteLength(out, "utf8")).toBeGreaterThan(CMD_WINDOW_CHARS);
+    expect(foldCalls).toBeGreaterThan(0);
+    expect(ctx.unread.count).toBeGreaterThan(0);
+  });
+
+  it("stops folding immediately when the fabricated cancel flag is raised", async () => {
+    const rooms = new TestRoomSource();
+    let cancelled = false;
+    const fake: FakeGenerate = async () => {
+      cancelled = true;
+      return "n".repeat(CMD_WINDOW_CHARS + 1);
+    };
+    const ctx = baseCtx(rooms, {
+      cancel: { load: () => cancelled } as never,
+      generate: fake as never,
+    });
+
+    const out = await digest(ctx, "source ".repeat(3_000), "Reading");
+
+    expect(out).toHaveLength(CMD_WINDOW_CHARS + 1);
+    expect(ctx.unread.count).toBe(0);
+  });
+
+  it("re-folds fabricated oversized notes until the joined notes fit one command window", async () => {
+    const rooms = new TestRoomSource();
+    let foldCalls = 0;
+    const fake: FakeGenerate = async (_model, messages) => {
+      const user = messages[1]?.content ?? "";
+      if (user.startsWith("Part of the source:")) return "n".repeat(CMD_WINDOW_CHARS);
+      foldCalls += 1;
+      return "folded fabricated note";
+    };
+    const ctx = baseCtx(rooms, { generate: fake as never });
+
+    const out = await digest(ctx, "source ".repeat(3_000), "Reading");
+
+    expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(CMD_WINDOW_CHARS);
+    expect(out).toContain("folded fabricated note");
+    expect(foldCalls).toBeGreaterThan(0);
+  });
 });
 
 // ============================================================================
@@ -413,7 +509,9 @@ describe("digest", () => {
 describe("cmdRemember", () => {
   it("Usage error on empty args", async () => {
     const { rooms } = freshRoom();
-    await expect(cmdRemember(baseCtx(rooms, { args: "  " }))).rejects.toThrow("Usage: #remember");
+    await expect(cmdRemember(baseCtx(rooms, { args: "  " }))).rejects.toThrow(
+      "Usage: #remember",
+    );
   });
 
   it("saves a new fact verbatim, with no length cap (unlike the UI/tool path)", async () => {
@@ -431,7 +529,9 @@ describe("cmdRemember", () => {
   it("an exact duplicate is reported, not saved a second time", async () => {
     const { rooms, db } = freshRoom();
     addMemory(db, "The lease renews every March.", null);
-    const result = await cmdRemember(baseCtx(rooms, { args: "The lease renews every March." }));
+    const result = await cmdRemember(
+      baseCtx(rooms, { args: "The lease renews every March." }),
+    );
     expect(result.content).toBe("That's already in this room's memory.");
     expect(listMemories(db)).toHaveLength(1);
   });
@@ -444,15 +544,28 @@ describe("cmdRemember", () => {
 describe("cmdFind", () => {
   it("Usage error on empty args", async () => {
     const { rooms } = freshRoom();
-    await expect(cmdFind(baseCtx(rooms, { args: " " }))).rejects.toThrow("Usage: #find");
+    await expect(cmdFind(baseCtx(rooms, { args: " " }))).rejects.toThrow(
+      "Usage: #find",
+    );
   });
 
   it("reports no matches for a term nothing in the room contains", async () => {
     const { rooms, db } = freshRoom();
     vi.mocked(ensureUp).mockRejectedValue(new Error("no sidecar in this test"));
-    insertFile(db, "lease.txt", "text/plain", Buffer.from("the tenant pays rent"), "the tenant pays rent", "upload");
-    const result = await cmdFind(baseCtx(rooms, { args: "zzz-nonexistent-term" }));
-    expect(result.content).toBe("No matches found for **zzz-nonexistent-term**.");
+    insertFile(
+      db,
+      "lease.txt",
+      "text/plain",
+      Buffer.from("the tenant pays rent"),
+      "the tenant pays rent",
+      "upload",
+    );
+    const result = await cmdFind(
+      baseCtx(rooms, { args: "zzz-nonexistent-term" }),
+    );
+    expect(result.content).toBe(
+      "No matches found for **zzz-nonexistent-term**.",
+    );
     expect(result.sources).toEqual([]);
   });
 
@@ -465,7 +578,7 @@ describe("cmdFind", () => {
       "text/plain",
       Buffer.from("the deposit clause says the deposit is refundable"),
       "the deposit clause says the deposit is refundable",
-      "upload"
+      "upload",
     );
     const result = await cmdFind(baseCtx(rooms, { args: "deposit" }));
     expect(result.content).toContain("Matches for **deposit**");
@@ -482,7 +595,11 @@ describe("cmdAddFile", () => {
   it("commits command artifacts to normal workspace files", async () => {
     tmpDir = mkdtempSync(path.join(os.tmpdir(), "chat-knowledge-workspace-"));
     const root = path.join(tmpDir, "Room");
-    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Room");
+    const { db } = createWorkspaceRoom(
+      root,
+      "correct horse battery staple",
+      "Room",
+    );
     openDb = db;
     const workspace = new WorkspaceService(db, root);
     const rooms = new TestRoomSource();
@@ -495,17 +612,22 @@ describe("cmdAddFile", () => {
       },
     );
 
-    expect(readFileSync(path.join(root, "Workspace note.html"), "utf8"))
-      .toContain("Workspace knowledge.");
-    const row = db.prepare(
-      "SELECT storage_kind, original_bytes FROM files WHERE name = 'Workspace note.html'",
-    ).get() as { storage_kind: string; original_bytes: Buffer | null };
+    expect(
+      readFileSync(path.join(root, "Workspace note.html"), "utf8"),
+    ).toContain("Workspace knowledge.");
+    const row = db
+      .prepare(
+        "SELECT storage_kind, original_bytes FROM files WHERE name = 'Workspace note.html'",
+      )
+      .get() as { storage_kind: string; original_bytes: Buffer | null };
     expect(row).toEqual({ storage_kind: "workspace", original_bytes: null });
   });
 
   it("Usage error on empty args", async () => {
     const { rooms } = freshRoom();
-    await expect(cmdAddFile(baseCtx(rooms, { args: "  " }))).rejects.toThrow("Usage: #add-file");
+    await expect(cmdAddFile(baseCtx(rooms, { args: "  " }))).rejects.toThrow(
+      "Usage: #add-file",
+    );
   });
 
   it("single file: defaults to an HTML name derived from the topic, and opens it", async () => {
@@ -518,10 +640,14 @@ describe("cmdAddFile", () => {
         return { text: "<p>Revenue is up.</p>" };
       },
       async () => {
-        const result = await cmdAddFile(baseCtx(rooms, { args: "Q3 revenue plan", emit }));
-        expect(result.content).toContain("Created **Q3 revenue plan.html** and opened it.");
+        const result = await cmdAddFile(
+          baseCtx(rooms, { args: "Q3 revenue plan", emit }),
+        );
+        expect(result.content).toContain(
+          "Created **Q3 revenue plan.html** and opened it.",
+        );
         expect(result.sources).toEqual(["Q3 revenue plan.html"]);
-      }
+      },
     );
     const names = db
       .prepare("SELECT name FROM files WHERE trashed_at IS NULL")
@@ -536,9 +662,27 @@ describe("cmdAddFile", () => {
     await withFakeSidecar(
       () => ({ text: "<p>body</p>" }),
       async () => {
-        const result = await cmdAddFile(baseCtx(rooms, { args: "notes.md: the kickoff meeting" }));
+        const result = await cmdAddFile(
+          baseCtx(rooms, { args: "notes.md: the kickoff meeting" }),
+        );
         expect(result.sources).toEqual(["notes.md"]);
-      }
+      },
+    );
+  });
+
+  it("single file: regenerating the same name reports that the previous version is in History", async () => {
+    const { rooms } = freshRoom();
+    await withFakeSidecar(
+      () => ({ text: "<p>Updated body.</p>" }),
+      async () => {
+        await cmdAddFile(baseCtx(rooms, { args: "project plan: first draft" }));
+        const rewritten = await cmdAddFile(
+          baseCtx(rooms, { args: "project plan: revised draft" }),
+        );
+        expect(rewritten.content).toBe(
+          "Rewrote **project plan.html** and opened it — the previous version is in History.",
+        );
+      },
     );
   });
 
@@ -547,10 +691,22 @@ describe("cmdAddFile", () => {
     await withFakeSidecar(
       () => ({ text: "   " }),
       async () => {
+        await expect(
+          cmdAddFile(baseCtx(rooms, { args: "Empty topic" })),
+        ).rejects.toThrow("The model returned nothing");
+      },
+    );
+  });
+
+  it("single file: a non-object generation reply is treated as empty", async () => {
+    const { rooms } = freshRoom();
+    await withFakeSidecar(
+      () => ["malformed", "reply"],
+      async () => {
         await expect(cmdAddFile(baseCtx(rooms, { args: "Empty topic" }))).rejects.toThrow(
-          "The model returned nothing"
+          "The model returned nothing",
         );
-      }
+      },
     );
   });
 
@@ -560,13 +716,15 @@ describe("cmdAddFile", () => {
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ code: "MODEL_MISSING", error: "not pulled" }));
     });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
     const port = (server.address() as { port: number }).port;
     vi.mocked(ensureUp).mockResolvedValue(`http://127.0.0.1:${port}`);
     try {
-      await expect(cmdAddFile(baseCtx(rooms, { args: "Some topic" }))).rejects.toThrow(
-        "MODEL_MISSING:qwen3.5:4b"
-      );
+      await expect(
+        cmdAddFile(baseCtx(rooms, { args: "Some topic" })),
+      ).rejects.toThrow("MODEL_MISSING:qwen3.5:4b");
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
@@ -584,12 +742,16 @@ describe("cmdAddFile", () => {
         return { text: `<p>Report for ${item}</p>` };
       },
       async () => {
-        const result = await cmdAddFile(baseCtx(rooms, { args: "#add-file for each: stocks in the chat" }));
+        const result = await cmdAddFile(
+          baseCtx(rooms, { args: "#add-file for each: stocks in the chat" }),
+        );
         expect(result.content).toContain("Created 2 file(s)");
         expect(result.sources).toEqual(["AAPL.html", "MSFT.html"]);
-      }
+      },
     );
-    const rows = db.prepare("SELECT name FROM files WHERE trashed_at IS NULL").all() as Array<{ name: string }>;
+    const rows = db
+      .prepare("SELECT name FROM files WHERE trashed_at IS NULL")
+      .all() as Array<{ name: string }>;
     expect(rows.map((r) => r.name).sort()).toEqual(["AAPL.html", "MSFT.html"]);
   });
 
@@ -605,9 +767,60 @@ describe("cmdAddFile", () => {
         return { text: item === "Alpha" ? "" : "<p>Beta's report</p>" };
       },
       async () => {
-        const result = await cmdAddFile(baseCtx(rooms, { args: "for each thing" }));
+        const result = await cmdAddFile(
+          baseCtx(rooms, { args: "for each thing" }),
+        );
         expect(result.sources).toEqual(["Beta.html"]);
-      }
+      },
+    );
+  });
+
+  it("for each: a cancelled write is not reported as a created file", async () => {
+    const { rooms, db } = freshRoom();
+    const cancel = new CancelFlag();
+    let loads = 0;
+    vi.spyOn(cancel, "load").mockImplementation(() => {
+      loads += 1;
+      return loads >= 3;
+    });
+    await withFakeSidecar(
+      (body) => {
+        if ((body as { mode: string }).mode === "list")
+          return { items: ["Alpha"] };
+        return { text: "<p>Alpha report</p>" };
+      },
+      async () => {
+        await expect(
+          cmdAddFile(baseCtx(rooms, { args: "for each thing", cancel })),
+        ).rejects.toThrow("Couldn't create any files");
+      },
+    );
+    const rows = db
+      .prepare("SELECT name FROM files WHERE trashed_at IS NULL")
+      .all();
+    expect(rows).toEqual([]);
+  });
+
+  it("for each: caps the persisted list and says how many named items were left out", async () => {
+    const { rooms } = freshRoom();
+    const items = Array.from(
+      { length: MAX_FAN_OUT_FILES + 1 },
+      (_, index) => `Item ${index + 1}`,
+    );
+    await withFakeSidecar(
+      (body) => {
+        if ((body as { mode: string }).mode === "list") return { items };
+        return { text: "<p>Generated report</p>" };
+      },
+      async () => {
+        const result = await cmdAddFile(
+          baseCtx(rooms, { args: "for each item" }),
+        );
+        expect(result.sources).toHaveLength(MAX_FAN_OUT_FILES);
+        expect(result.content).toContain(
+          "Stopped at 25 files — 1 more were named.",
+        );
+      },
     );
   });
 
@@ -616,11 +829,25 @@ describe("cmdAddFile", () => {
     await withFakeSidecar(
       () => ({ items: [] }),
       async () => {
-        await expect(cmdAddFile(baseCtx(rooms, { args: "for each thing" }))).rejects.toThrow(
-          "Couldn't find a list to iterate over"
-        );
-      }
+        await expect(
+          cmdAddFile(baseCtx(rooms, { args: "for each thing" })),
+        ).rejects.toThrow("Couldn't find a list to iterate over");
+      },
     );
+  });
+
+  it("for each: malformed list reply shapes are treated as no list", async () => {
+    const { rooms } = freshRoom();
+    for (const reply of [["not", "an", "object"], { items: "not-an-array" }]) {
+      await withFakeSidecar(
+        () => reply,
+        async () => {
+          await expect(cmdAddFile(baseCtx(rooms, { args: "for each thing" }))).rejects.toThrow(
+            "Couldn't find a list to iterate over",
+          );
+        },
+      );
+    }
   });
 });
 
@@ -631,61 +858,128 @@ describe("cmdAddFile", () => {
 describe("cmdHighlight", () => {
   it("refuses without an @file", async () => {
     const { rooms } = freshRoom();
-    await expect(cmdHighlight(baseCtx(rooms, { args: "the total" }))).rejects.toThrow("Add a file with @");
+    await expect(
+      cmdHighlight(baseCtx(rooms, { args: "the total" })),
+    ).rejects.toThrow("Add a file with @");
   });
 
   it("refuses when nothing to highlight was said", async () => {
     const { rooms, db } = freshRoom();
-    const file = insertFile(db, "invoice.pdf", "application/pdf", Buffer.from("x"), "the total is $500", "upload");
-    await expect(cmdHighlight(baseCtx(rooms, { args: "   ", refs: [file.id] }))).rejects.toThrow(
-      "Say what to highlight"
+    const file = insertFile(
+      db,
+      "invoice.pdf",
+      "application/pdf",
+      Buffer.from("x"),
+      "the total is $500",
+      "upload",
     );
+    await expect(
+      cmdHighlight(baseCtx(rooms, { args: "   ", refs: [file.id] })),
+    ).rejects.toThrow("Say what to highlight");
   });
 
   it("the trailing 'in'/'on' the UI leaves behind is stripped, REPEATEDLY, as a whole word", async () => {
     const { rooms, db } = freshRoom();
     const text = "Invoice #4021. The total due is $532.10.";
-    const file = insertFile(db, "invoice.pdf", "application/pdf", Buffer.from(text), text, "upload");
+    const file = insertFile(
+      db,
+      "invoice.pdf",
+      "application/pdf",
+      Buffer.from(text),
+      text,
+      "upload",
+    );
     const fake: FakeGenerate = async (_m, messages) => {
       // Whatever the model was asked confirms "in in" collapsed to "the total".
       expect(messages[1]?.content).toContain("Request: the total\n");
       return '"The total due is $532.10"';
     };
     const result = await cmdHighlight(
-      baseCtx(rooms, { args: "the total in in", refs: [file.id], generate: fake as never })
+      baseCtx(rooms, {
+        args: "the total in in",
+        refs: [file.id],
+        generate: fake as never,
+      }),
     );
     expect(result.content).toContain("Highlighted");
   });
 
   it("refuses when the file has no readable text", async () => {
     const { rooms, db } = freshRoom();
-    const file = insertFile(db, "scan.pdf", "application/pdf", Buffer.from("x"), null, "upload");
+    const file = insertFile(
+      db,
+      "scan.pdf",
+      "application/pdf",
+      Buffer.from("x"),
+      null,
+      "upload",
+    );
     await expect(
-      cmdHighlight(baseCtx(rooms, { args: "the total", refs: [file.id] }))
+      cmdHighlight(baseCtx(rooms, { args: "the total", refs: [file.id] })),
     ).rejects.toThrow("no readable text to highlight");
   });
 
   it("finds and annotates an exact quote the model returns", async () => {
     const { rooms, db } = freshRoom();
     const text = "Invoice #4021. The total due is $532.10, payable on receipt.";
-    const file = insertFile(db, "invoice.pdf", "application/pdf", Buffer.from(text), text, "upload");
+    const file = insertFile(
+      db,
+      "invoice.pdf",
+      "application/pdf",
+      Buffer.from(text),
+      text,
+      "upload",
+    );
     const { emit, events } = collectingEmit();
     const fake: FakeGenerate = async () => '"The total due is $532.10"';
     const result = await cmdHighlight(
-      baseCtx(rooms, { args: "the total", refs: [file.id], generate: fake as never, emit })
+      baseCtx(rooms, {
+        args: "the total",
+        refs: [file.id],
+        generate: fake as never,
+        emit,
+      }),
     );
-    expect(result.content).toContain('Highlighted "The total due is $532.10" in **invoice.pdf**.');
+    expect(result.content).toContain(
+      'Highlighted "The total due is $532.10" in **invoice.pdf**.',
+    );
     expect(result.effects.annotation).not.toBeNull();
     expect(events.some(([e]) => e === "agent-annotate")).toBe(true);
+  });
+
+  it("still reports a grounded highlight when the renderer emit fails", async () => {
+    const { rooms, db } = freshRoom();
+    const text = "Invoice total is $532.10.";
+    const file = insertFile(db, "invoice.pdf", "application/pdf", Buffer.from(text), text, "upload");
+    const ctx = baseCtx(rooms, {
+      args: "the total",
+      refs: [file.id],
+      generate: (async () => "Invoice total is $532.10.") as never,
+      emit: () => { throw new Error("fabricated renderer disconnect"); },
+    });
+    await expect(cmdHighlight(ctx)).resolves.toMatchObject({ content: expect.stringContaining("Highlighted") });
   });
 
   it("a passage the file never contains is refused, not fabricated", async () => {
     const { rooms, db } = freshRoom();
     const text = "Invoice #4021. The total due is $532.10.";
-    const file = insertFile(db, "invoice.pdf", "application/pdf", Buffer.from(text), text, "upload");
+    const file = insertFile(
+      db,
+      "invoice.pdf",
+      "application/pdf",
+      Buffer.from(text),
+      text,
+      "upload",
+    );
     const fake: FakeGenerate = async () => ""; // the model finds nothing
     await expect(
-      cmdHighlight(baseCtx(rooms, { args: "the signature", refs: [file.id], generate: fake as never }))
+      cmdHighlight(
+        baseCtx(rooms, {
+          args: "the signature",
+          refs: [file.id],
+          generate: fake as never,
+        }),
+      ),
     ).rejects.toThrow("Couldn't find an exact passage");
   });
 });
@@ -697,26 +991,46 @@ describe("cmdHighlight", () => {
 describe("cmdExtract", () => {
   it("refuses without any @files", async () => {
     const { rooms } = freshRoom();
-    await expect(cmdExtract(baseCtx(rooms, { args: "revenue, CEO" }))).rejects.toThrow("Add files with @");
+    await expect(
+      cmdExtract(baseCtx(rooms, { args: "revenue, CEO" })),
+    ).rejects.toThrow("Add files with @");
   });
 
   it("refuses without any fields", async () => {
     const { rooms, db } = freshRoom();
-    const file = insertFile(db, "a.pdf", "application/pdf", Buffer.from("x"), "x", "upload");
-    await expect(cmdExtract(baseCtx(rooms, { args: "  ", refs: [file.id] }))).rejects.toThrow(
-      "Say which fields to extract"
+    const file = insertFile(
+      db,
+      "a.pdf",
+      "application/pdf",
+      Buffer.from("x"),
+      "x",
+      "upload",
     );
+    await expect(
+      cmdExtract(baseCtx(rooms, { args: "  ", refs: [file.id] })),
+    ).rejects.toThrow("Say which fields to extract");
   });
 
   it("reads a matching CSV directly, with no model call at all", async () => {
     const { rooms, db } = freshRoom();
     const csv = "product,revenue\nWidget A,2398.80\nWidget B,2399.20\n";
-    const file = insertFile(db, "sales.csv", "text/csv", Buffer.from(csv), csv, "upload");
+    const file = insertFile(
+      db,
+      "sales.csv",
+      "text/csv",
+      Buffer.from(csv),
+      csv,
+      "upload",
+    );
     vi.mocked(ensureUp).mockRejectedValue(new Error("must not be called"));
-    const result = await cmdExtract(baseCtx(rooms, { args: "product, revenue", refs: [file.id] }));
+    const result = await cmdExtract(
+      baseCtx(rooms, { args: "product, revenue", refs: [file.id] }),
+    );
     expect(result.content).toContain("Extracted 2 field(s) from 1 file(s)");
     expect(result.sources).toEqual(["extract.csv"]);
-    const meta = db.prepare("SELECT extracted_text FROM files WHERE name = 'extract.csv'").get() as {
+    const meta = db
+      .prepare("SELECT extracted_text FROM files WHERE name = 'extract.csv'")
+      .get() as {
       extracted_text: string;
     };
     expect(meta.extracted_text).toContain("Widget A,2398.80");
@@ -726,7 +1040,14 @@ describe("cmdExtract", () => {
   it("falls back to the model for a non-tabular file, defaulting a truly missing field to (not found)", async () => {
     const { rooms, db } = freshRoom();
     const text = "Acme Corp reported revenue of $12M this quarter.";
-    const file = insertFile(db, "report.txt", "text/plain", Buffer.from(text), text, "upload");
+    const file = insertFile(
+      db,
+      "report.txt",
+      "text/plain",
+      Buffer.from(text),
+      text,
+      "upload",
+    );
     await withFakeSidecar(
       (body) => {
         const fields = (body as { fields: string[] }).fields;
@@ -738,16 +1059,60 @@ describe("cmdExtract", () => {
       },
       async () => {
         const result = await cmdExtract(
-          baseCtx(rooms, { args: "revenue, CEO", refs: [file.id] })
+          baseCtx(rooms, { args: "revenue, CEO", refs: [file.id] }),
         );
         expect(result.content).toContain("Extracted 2 field(s) from 1 file(s)");
-      }
+      },
     );
-    const meta = db.prepare("SELECT extracted_text FROM files WHERE name = 'extract.csv'").get() as {
+    const meta = db
+      .prepare("SELECT extracted_text FROM files WHERE name = 'extract.csv'")
+      .get() as {
       extracted_text: string;
     };
     expect(meta.extracted_text).toContain("$12M");
     expect(meta.extracted_text).toContain("(not found)");
+  });
+
+  it("reads every long-source window and treats a non-object values reply as not found", async () => {
+    const { rooms, db } = freshRoom();
+    const text = "A long fabricated report sentence. ".repeat(1_200);
+    const file = insertFile(db, "report.txt", "text/plain", Buffer.from(text), text, "upload");
+    const steps: unknown[] = [];
+    await withFakeSidecar(
+      () => ["malformed", "values"],
+      async () => {
+        const result = await cmdExtract(baseCtx(rooms, {
+          args: "revenue",
+          refs: [file.id],
+          send: ((_event: string, payload: unknown) => steps.push(payload)) as EventSender,
+        }));
+        expect(result.content).toContain("Extracted 1 field(s)");
+      },
+    );
+    expect(steps.some((payload) => JSON.stringify(payload).includes("part 2/"))).toBe(true);
+    const csv = db.prepare("SELECT extracted_text FROM files WHERE name = 'extract.csv'").get() as { extracted_text: string };
+    expect(csv.extracted_text).toContain("(not found)");
+  });
+
+  it("marks a failed extraction window unread and still saves explicit not-found cells", async () => {
+    const { rooms, db } = freshRoom();
+    const file = insertFile(db, "report.txt", "text/plain", Buffer.from("some report"), "some report", "upload");
+    const server = http.createServer((_req, res) => {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ code: "TEMPORARY", error: "fabricated outage" }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    vi.mocked(ensureUp).mockResolvedValue(`http://127.0.0.1:${port}`);
+    const unread = { count: 0 };
+    try {
+      await expect(cmdExtract(baseCtx(rooms, { args: "revenue", refs: [file.id], unread }))).resolves.toMatchObject({
+        content: expect.stringContaining("Extracted 1 field(s)"),
+      });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    expect(unread.count).toBe(1);
   });
 });
 
@@ -759,20 +1124,26 @@ describe("cmdExtract", () => {
 describe("adversarial", () => {
   it("every command refuses empty/whitespace arguments with its own usage line, touching nothing", async () => {
     const { rooms, db } = freshRoom();
-    vi.mocked(ensureUp).mockRejectedValue(new Error("no sidecar must be reached"));
+    vi.mocked(ensureUp).mockRejectedValue(
+      new Error("no sidecar must be reached"),
+    );
     for (const args of ["", "   ", "\n\t "]) {
-      await expect(cmdRemember(baseCtx(rooms, { args }))).rejects.toThrow("Usage: #remember <fact>");
-      await expect(cmdFind(baseCtx(rooms, { args }))).rejects.toThrow("Usage: #find <keywords>");
+      await expect(cmdRemember(baseCtx(rooms, { args }))).rejects.toThrow(
+        "Usage: #remember <fact>",
+      );
+      await expect(cmdFind(baseCtx(rooms, { args }))).rejects.toThrow(
+        "Usage: #find <keywords>",
+      );
       await expect(cmdAddFile(baseCtx(rooms, { args }))).rejects.toThrow(
-        "Usage: #add-file <name>: <topic>   (or)   #add-file for each <thing>"
+        "Usage: #add-file <name>: <topic>   (or)   #add-file for each <thing>",
       );
       // #highlight and #extract check their @refs FIRST, so with none pinned
       // that is the error they must give — not the empty-args one.
       await expect(cmdHighlight(baseCtx(rooms, { args }))).rejects.toThrow(
-        "Add a file with @ — e.g. #highlight the total in @invoice.pdf"
+        "Add a file with @ — e.g. #highlight the total in @invoice.pdf",
       );
       await expect(cmdExtract(baseCtx(rooms, { args }))).rejects.toThrow(
-        "Add files with @ — e.g. #extract revenue, CEO from @a.pdf @b.pdf"
+        "Add files with @ — e.g. #extract revenue, CEO from @a.pdf @b.pdf",
       );
     }
     expect(listMemories(db)).toHaveLength(0);
@@ -780,42 +1151,66 @@ describe("adversarial", () => {
 
   it("#extract whose fields are nothing but the trailing preposition refuses before any model call", async () => {
     const { rooms, db } = freshRoom();
-    const id = insertFile(db, "a.pdf", "application/pdf", Buffer.from("x"), "x", "test").id;
-    vi.mocked(ensureUp).mockRejectedValue(new Error("no sidecar must be reached"));
+    const id = insertFile(
+      db,
+      "a.pdf",
+      "application/pdf",
+      Buffer.from("x"),
+      "x",
+      "test",
+    ).id;
+    vi.mocked(ensureUp).mockRejectedValue(
+      new Error("no sidecar must be reached"),
+    );
     // `strip_trailing_preposition` eats the whole word, leaving nothing.
     for (const args of ["from", "  in  ", "of", ",", " , , "]) {
-      await expect(cmdExtract(baseCtx(rooms, { refs: [id], args }))).rejects.toThrow(
-        "Say which fields to extract — e.g. #extract revenue, CEO from @a @b"
+      await expect(
+        cmdExtract(baseCtx(rooms, { refs: [id], args })),
+      ).rejects.toThrow(
+        "Say which fields to extract — e.g. #extract revenue, CEO from @a @b",
       );
     }
   });
 
   it("#extract never leaks a residual source filename into the last field header", () => {
-    expect(extractFieldNames("Project codename, expected quantity total from findings.md"))
-      .toEqual(["Project codename", "expected quantity total"]);
-    expect(extractFieldNames("cost of goods, country of origin"))
-      .toEqual(["cost of goods", "country of origin"]);
-    expect(extractFieldNames("revenue from subscriptions, annual growth"))
-      .toEqual(["revenue from subscriptions", "annual growth"]);
+    expect(
+      extractFieldNames(
+        "Project codename, expected quantity total from findings.md",
+      ),
+    ).toEqual(["Project codename", "expected quantity total"]);
+    expect(extractFieldNames("cost of goods, country of origin")).toEqual([
+      "cost of goods",
+      "country of origin",
+    ]);
+    expect(
+      extractFieldNames("revenue from subscriptions, annual growth"),
+    ).toEqual(["revenue from subscriptions", "annual growth"]);
   });
 
   it("#highlight whose target strips to nothing refuses, and one that does not is stripped as a WHOLE word", async () => {
     const { rooms, db } = freshRoom();
-    const id = insertFile(db, "c.txt", "text/plain", Buffer.from("body"), "body", "test").id;
+    const id = insertFile(
+      db,
+      "c.txt",
+      "text/plain",
+      Buffer.from("body"),
+      "body",
+      "test",
+    ).id;
     vi.mocked(ensureUp).mockRejectedValue(new Error("no sidecar in this test"));
     for (const args of ["", "   "]) {
-      await expect(cmdHighlight(baseCtx(rooms, { refs: [id], args }))).rejects.toThrow(
-        "Say what to highlight"
-      );
+      await expect(
+        cmdHighlight(baseCtx(rooms, { refs: [id], args })),
+      ).rejects.toThrow("Say what to highlight");
     }
     // But `" in "` is NOT one of those: it trims to "in", and Rust's
     // `trim_end_matches(" in")` needs the leading SPACE, so nothing more is
     // stripped and the target really is the word "in". "in on in" is the same
     // rule applied twice: one trailing " in", then one trailing " on", leaving
     // "in" — the command proceeds rather than refusing.
-    await expect(cmdHighlight(baseCtx(rooms, { refs: [id], args: " in " }))).rejects.toThrow(
-      'Couldn\'t find an exact passage for "in" in c.txt.'
-    );
+    await expect(
+      cmdHighlight(baseCtx(rooms, { refs: [id], args: " in " })),
+    ).rejects.toThrow('Couldn\'t find an exact passage for "in" in c.txt.');
     let asked: string | null = null;
     await expect(
       cmdHighlight(
@@ -826,16 +1221,19 @@ describe("adversarial", () => {
             asked = messages[messages.length - 1]?.content ?? "";
             return "";
           },
-        })
-      )
+        }),
+      ),
     ).rejects.toThrow('Couldn\'t find an exact passage for "in" in c.txt.');
     expect(asked).toBe("Request: in\n\nDocument:\nbody");
   });
 
   it("a fact that is another command's trigger syntax is stored verbatim, never re-dispatched", async () => {
     const { rooms, db } = freshRoom();
-    const hostile = "#add-file for each: @a.pdf, @b.pdf — and #checkpoint after";
-    const result = await cmdRemember(baseCtx(rooms, { args: `  ${hostile}  ` }));
+    const hostile =
+      "#add-file for each: @a.pdf, @b.pdf — and #checkpoint after";
+    const result = await cmdRemember(
+      baseCtx(rooms, { args: `  ${hostile}  ` }),
+    );
     expect(result.content).toBe(`Saved to memory:\n\n> ${hostile}`);
     expect(listMemories(db).map((m) => m.content)).toEqual([hostile]);
     // The fan-out branch is keyed off `#add-file`'s OWN args, not a memory's
@@ -855,10 +1253,10 @@ describe("adversarial", () => {
       },
       async () => {
         const result = await cmdAddFile(
-          baseCtx(rooms, { args: "Plan: rollout: phase #2 — see @old.md" })
+          baseCtx(rooms, { args: "Plan: rollout: phase #2 — see @old.md" }),
         );
         expect(result.content).toBe("Created **Plan.html** and opened it.");
-      }
+      },
     );
     expect(seen).toHaveLength(1);
     expect(seen[0]!.mode).toBe("single");
@@ -876,7 +1274,7 @@ describe("adversarial", () => {
       },
       async () => {
         await cmdAddFile(baseCtx(rooms, { args: `${nine}: the actual topic` }));
-      }
+      },
     );
     // Rust: `n.split_whitespace().count() <= 8` fails, so `(None, a)` — the
     // topic is the WHOLE argument, colon included.
@@ -895,10 +1293,10 @@ describe("adversarial", () => {
       async () => {
         // "FOR EACH" with nothing after it still takes the fan-out branch —
         // Rust lowercases before `find`, and the subject is simply empty.
-        await expect(cmdAddFile(baseCtx(rooms, { args: "FOR EACH" }))).rejects.toThrow(
-          "Couldn't find a list to iterate over in this chat."
-        );
-      }
+        await expect(
+          cmdAddFile(baseCtx(rooms, { args: "FOR EACH" })),
+        ).rejects.toThrow("Couldn't find a list to iterate over in this chat.");
+      },
     );
     expect(modes).toEqual(["list"]);
   });

@@ -55,7 +55,7 @@ import { registerWebRequestFunnel, type WebRequestFunnelDeps } from "./webReques
 import { attachDownloadGating, type DownloadGatingDeps } from "./downloadGating.js";
 import { attachNavigationGating, type NavigationDeps } from "./navigation.js";
 import { attachPopupHandling } from "./popup.js";
-import { PAGE_SCRIPT_PATH } from "./pageScript.js";
+import { PAGE_SCRIPT_PATHS } from "./pageScript.js";
 import { saneBounds, type Bounds } from "./tabs.js";
 import type { Protection } from "./protection.js";
 import type { EvalHost } from "./evalBridge.js";
@@ -121,7 +121,9 @@ export function createLivePage(id: string, deps: CreatePageDeps): LivePage {
   const electron = electronMain();
   // Never `persist:`-prefixed, never reused — see this module's header.
   const webSession = electron.session.fromPartition(`arcelle-browse-${randomUUID()}`);
-  webSession.registerPreloadScript({ filePath: PAGE_SCRIPT_PATH, type: "frame" });
+  for (const filePath of PAGE_SCRIPT_PATHS) {
+    webSession.registerPreloadScript({ filePath, type: "frame" });
+  }
 
   // The verdict is RETURNED rather than journalled here: the caller opens the
   // browsing sitting when it records the page, and a line written before that

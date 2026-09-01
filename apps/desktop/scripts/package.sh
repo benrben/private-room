@@ -32,6 +32,11 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 NATIVE_MODULE="better-sqlite3-multiple-ciphers"
+# electron-rebuild resolves the workspace copy below `apps/desktop/node_modules`.
+# Rebuild that same resolved package on the way back to Node: a root-level copy
+# can be a distinct pnpm store entry and leaves the module Vitest actually loads
+# on Electron's ABI.
+NATIVE_MODULE_DIR="$(node -p "require('path').dirname(require.resolve('${NATIVE_MODULE}/package.json'))")"
 
 echo "▶ Preflight: typecheck + full suite (must stay green under Node's own ABI before packaging touches it)"
 if ! npm run typecheck; then
@@ -56,11 +61,11 @@ fi
 rebuild_back() {
   local exit_code=$?
   echo "▶ Rebuilding ${NATIVE_MODULE} back to Node's ABI (unconditional — runs whether packaging just succeeded or failed)"
-  if ! npm run build-release --prefix "../../node_modules/${NATIVE_MODULE}"; then
+  if ! npm run build-release --prefix "$NATIVE_MODULE_DIR"; then
     echo "✗✗ FAILED to rebuild ${NATIVE_MODULE} back to Node's ABI." >&2
     echo "   The workspace's native module is now Electron-ABI-only and ~200 vitest" >&2
     echo "   files that touch the DB will fail until this is fixed by hand:" >&2
-    echo "     npm run build-release --prefix ../../node_modules/${NATIVE_MODULE}" >&2
+    echo "     npm run build-release --prefix $NATIVE_MODULE_DIR" >&2
     exit 1
   fi
   echo "▶ Verifying ${NATIVE_MODULE} loads under Node's own ABI (a real require + a real :memory: open, not just an exit code)"

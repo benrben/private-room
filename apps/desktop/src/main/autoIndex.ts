@@ -97,7 +97,40 @@ import { type Job, deleteJob, unfinishedJobs } from "./db-host/jobs.js";
 import { recordingsMissingRead } from "./db-host/recordings.js";
 import { getSetting } from "./db-host/settings.js";
 import { listModels as listModelsReal } from "./engineRouting.js";
-import type { RoomSource } from "./jobs.js";
+import type { RoomHandle, RoomSource } from "./jobs.js";
+import {
+  START_DEEP_SUMMARY_NOT_IMPLEMENTED,
+  START_REC_READ_NOT_IMPLEMENTED,
+  SUMMARY_FILLER_NOT_IMPLEMENTED,
+  spawnSummaryFillerNotImplemented,
+  startDeepSummaryAutoNotImplemented,
+  startRecReadNotImplemented,
+  type SpawnSummaryFiller,
+  type StartDeepSummaryAuto,
+  type StartRecRead,
+} from "./autoIndexActions.js";
+import {
+  QUIET_FILLER_MAX,
+  autoIndexDecision,
+  type AutoIndexDecision,
+} from "./autoIndexPolicy.js";
+
+export {
+  QUIET_FILLER_MAX,
+  START_DEEP_SUMMARY_NOT_IMPLEMENTED,
+  START_REC_READ_NOT_IMPLEMENTED,
+  SUMMARY_FILLER_NOT_IMPLEMENTED,
+  autoIndexDecision,
+  spawnSummaryFillerNotImplemented,
+  startDeepSummaryAutoNotImplemented,
+  startRecReadNotImplemented,
+};
+export type {
+  AutoIndexDecision,
+  SpawnSummaryFiller,
+  StartDeepSummaryAuto,
+  StartRecRead,
+};
 
 // ============================================================================
 // Constants — verbatim from auto_index.rs
@@ -111,137 +144,13 @@ export const AUTO_INDEX_DEBOUNCE_SECS = 30;
 const AUTO_INDEX_RETRY_SECS = 60;
 /** …at most this many times (a fresh import re-arms from zero). */
 const AUTO_INDEX_MAX_RETRIES = 10;
-/** Drops of at most this many missing files stay silent (quiet filler, no
- * job-card noise); anything larger becomes a visible job. */
-export const QUIET_FILLER_MAX = 5;
-
 // ============================================================================
 // The pure policy — auto_index_decision
 // ============================================================================
 
-/**
- * What the scheduler should do once the debounce elapses — the TS spelling of
- * Rust's `AutoIndexDecision` (`Skip`/`QuietFiller`/`StartJob`/`Retry`), in the
- * camelCase tag convention this codebase's other ported unions already use
- * (`mcpConfig.ts`'s `needsApproval`, `editMatchFuzzy.ts`'s `notFound`).
- */
-export type AutoIndexDecision = "skip" | "quietFiller" | "startJob" | "retry";
-
-/**
- * `settingOn`: the `auto_index` room setting (absent = on, `"0"` = off).
- * `missing`: `filesMissingSummary` count (sentinel'd files excluded).
- * `jobRunning` / `asking`: live cancel-registry probes.
- * `modelsAvailable`: whether Ollama reported any installed model.
- *
- * Pure — this is where the whole policy lives, so it is unit-tested
- * exhaustively with the Rust suite's own table.
- */
-export function autoIndexDecision(
-  settingOn: boolean,
-  missing: number,
-  jobRunning: boolean,
-  asking: boolean,
-  modelsAvailable: boolean
-): AutoIndexDecision {
-  if (!settingOn) {
-    // Off means off. This returned QuietFiller — introduced as "byte-for-byte
-    // today's behavior" so adding the toggle changed nothing — with the result
-    // that the switch labelled "Describe new files automatically with the
-    // local AI" went on describing new files automatically with the local AI.
-    // A setting that does not do what it says is worse than no setting, and
-    // this one also spends the room's single model lane behind the back of
-    // someone who asked for it not to be.
-    return "skip";
-  }
-  if (asking || jobRunning) {
-    return "retry";
-  }
-  if (!modelsAvailable || missing === 0) {
-    return "skip";
-  }
-  return missing <= QUIET_FILLER_MAX ? "quietFiller" : "startJob";
-}
-
 // ============================================================================
 // The three unported actions — injectable seams, "stub, don't fake"
 // ============================================================================
-
-/**
- * `start_deep_summary_inner(window, state, auto = true)` — build the
- * missing-file plan, resolve the engine/model, create the durable job row and
- * spawn the per-file summarizer runner. Resolves to the new job id; rejects on
- * a genuine refusal (queue at capacity, nothing left to index, a mid-rollback
- * room). This module is the `auto = true` call site, its only one, so the flag
- * is baked in rather than passed.
- */
-export type StartDeepSummaryAuto = (roomPath: string) => Promise<string>;
-
-/** The labeled reason the stubbed deep-summary starter fails with. Exported so
- * a caller or a test can recognize it without hand-copying the string —
- * `jobs.ts`'s `PODCAST_RENDER_NOT_IMPLEMENTED` convention. */
-export const START_DEEP_SUMMARY_NOT_IMPLEMENTED =
-  "NOT_IMPLEMENTED: start_deep_summary_inner (the deep-summary plan builder, " +
-  "engine resolution and per-file summarizer runner, in " +
-  "src-tauri/src/commands/jobs.rs) has no Electron port yet — this batch " +
-  "ports only the auto-index scheduler that decides when to call it.";
-
-/** The stub to wire into {@link AutoIndexDeps} until a real
- * {@link StartDeepSummaryAuto} exists (the field is required — nothing falls
- * back to this on its own): a clearly-labeled failure, never a
- * fabricated success. Rust's own `let _ = start_deep_summary_inner(...).await;`
- * already discards the result, so a rejection here reaches exactly the path a
- * real refusal would. */
-export const startDeepSummaryAutoNotImplemented: StartDeepSummaryAuto = () =>
-  Promise.reject(new Error(START_DEEP_SUMMARY_NOT_IMPLEMENTED));
-
-/**
- * `start_rec_read(window, state, roomPath, fileId)` — build the read plan for
- * one recording (partition its transcript, resolve the pass engine) and spawn
- * the reading-pass runner. Resolves to the new job id; rejects when reading
- * would be dishonest rather than merely unhelpful (no transcript yet, already
- * being read) or the queue refuses.
- */
-export type StartRecRead = (roomPath: string, fileId: string) => Promise<string>;
-
-/** The labeled reason the stubbed recording-read starter fails with. */
-export const START_REC_READ_NOT_IMPLEMENTED =
-  "NOT_IMPLEMENTED: start_rec_read (the reading-pass plan builder and runner, " +
-  "in src-tauri/src/commands/jobs/rec_read.rs) has no Electron port yet — " +
-  "this batch ports only the scheduler that decides a recording is due for one.";
-
-/** The stub to wire into {@link AutoIndexDeps} until a real
- * {@link StartRecRead} exists (the field is required — nothing falls back to
- * this on its own). A rejection is read EXACTLY like a real
- * refusal: the tick falls through to the ordinary summary decision, precisely
- * as Rust's `if start_rec_read(...).await.is_ok() { return; }` does with any
- * `Err`. */
-export const startRecReadNotImplemented: StartRecRead = () =>
-  Promise.reject(new Error(START_REC_READ_NOT_IMPLEMENTED));
-
-/** `spawn_summary_filler(app, roomPath, delaySecs)` — the legacy,
- * single-flight, non-durable opportunistic filler. Fire-and-forget in Rust too
- * (it returns nothing, and "all failures are silent" is its own doc), so this
- * seam is `void` as well. `delaySecs` is load-bearing and always 0 from here:
- * this waiter has ALREADY debounced, so the filler's own head start would
- * otherwise stack on top. */
-export type SpawnSummaryFiller = (roomPath: string, delaySecs: number) => void;
-
-/** The labeled reason the stubbed quiet filler reports. */
-export const SUMMARY_FILLER_NOT_IMPLEMENTED =
-  "NOT_IMPLEMENTED: spawn_summary_filler (the legacy opportunistic one-liner " +
-  "filler, in src-tauri/src/commands/stt_cmds.rs) has no Electron port yet — " +
-  "this tick would have started it for a small drop.";
-
-/** The stub to wire into {@link AutoIndexDeps} until a real
- * {@link SpawnSummaryFiller} exists (the field is required — nothing falls back
- * to this on its own). Logs rather than throwing: the Rust
- * call it stands in for is `void`, and a scheduler tick must not fail because
- * the filler beneath it is unbuilt. It does not stay SILENT either — a silent
- * no-op is indistinguishable from a production wiring that forgot to pass the
- * real filler in. */
-export const spawnSummaryFillerNotImplemented: SpawnSummaryFiller = () => {
-  console.error(SUMMARY_FILLER_NOT_IMPLEMENTED);
-};
 
 // ============================================================================
 // The debounced dispatch — schedule_auto_index
@@ -326,6 +235,34 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+function currentRoomAtPath(rooms: RoomSource, roomPath: string): RoomHandle | null {
+  const room = rooms.current();
+  if (room === null || room.path !== roomPath) {
+    return null;
+  }
+  return room;
+}
+
+function unfinishedJobsOrNone(room: RoomHandle): Job[] {
+  try {
+    return unfinishedJobs(room.db);
+  } catch {
+    return [];
+  }
+}
+
+function isAutoDeepSummaryJob(job: Job): boolean {
+  return job.kind === "deep_summary" && isRecord(job.plan) && job.plan["auto"] === true;
+}
+
+function deleteJobBestEffort(room: RoomHandle, jobId: string): void {
+  try {
+    deleteJob(room.db, jobId);
+  } catch {
+    // best-effort, mirrors Rust's `let _ = db::delete_job(...)`.
+  }
+}
+
 /**
  * Job-lifecycle amendment (ported from the `StartJob` arm's own comment): any
  * unfinished auto deep-summary job (parked 'paused' by quiesce after a quit
@@ -340,23 +277,13 @@ function isRecord(v: unknown): v is Record<string, unknown> {
  * not take the rest of the tick down with it.
  */
 function retireUnfinishedAutoDeepSummaryJobs(rooms: RoomSource, roomPath: string): void {
-  const room = rooms.current();
-  if (room === null || room.path !== roomPath) {
+  const room = currentRoomAtPath(rooms, roomPath);
+  if (room === null) {
     return;
   }
-  let jobs: Job[];
-  try {
-    jobs = unfinishedJobs(room.db);
-  } catch {
-    return; // mirrors the `?` inside Rust's swallowed `let _ = with_room(...)`
-  }
-  for (const j of jobs) {
-    if (j.kind === "deep_summary" && isRecord(j.plan) && j.plan["auto"] === true) {
-      try {
-        deleteJob(room.db, j.id);
-      } catch {
-        // best-effort, mirrors Rust's `let _ = db::delete_job(...)`.
-      }
+  for (const job of unfinishedJobsOrNone(room)) {
+    if (isAutoDeepSummaryJob(job)) {
+      deleteJobBestEffort(room, job.id);
     }
   }
 }
@@ -409,6 +336,111 @@ function nextUnreadRecording(rooms: RoomSource, roomPath: string): string | unde
   }
 }
 
+type AutoIndexPassContext = Pick<AutoIndexDeps, "rooms" | "cancelState" | "startDeepSummaryAuto" | "startRecRead" | "spawnSummaryFiller"> & {
+  readonly generationIsCurrent: () => boolean;
+  readonly roomPath: string;
+};
+
+interface AutoIndexReadiness {
+  readonly settingOn: boolean;
+  readonly missing: number;
+  readonly modelsAvailable: boolean;
+  readonly jobRunning: boolean;
+  readonly asking: boolean;
+}
+
+function staleAutoIndexOutcome(): AutoIndexOutcome {
+  return { kind: "stale" };
+}
+
+async function modelsAreAvailable(listModels: () => Promise<string[]>): Promise<boolean> {
+  return (await listModels()).length > 0;
+}
+
+function configuredModelLister(deps: Pick<AutoIndexDeps, "listModels">): () => Promise<string[]> {
+  return deps.listModels ?? listModelsReal;
+}
+
+function canReadUnreadRecording(readiness: AutoIndexReadiness): boolean {
+  return (
+    readiness.settingOn &&
+    readiness.modelsAvailable &&
+    !readiness.jobRunning &&
+    !readiness.asking
+  );
+}
+
+async function startUnreadRecording(
+  deps: Pick<AutoIndexDeps, "startRecRead">,
+  roomPath: string,
+  fileId: string
+): Promise<boolean> {
+  try {
+    await deps.startRecRead(roomPath, fileId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function unreadRecordingOutcome(
+  context: AutoIndexPassContext,
+  readiness: AutoIndexReadiness
+): Promise<AutoIndexOutcome | null> {
+  if (!canReadUnreadRecording(readiness)) {
+    return null;
+  }
+  const fileId = nextUnreadRecording(context.rooms, context.roomPath);
+  if (fileId === undefined) {
+    return null;
+  }
+  if (await startUnreadRecording(context, context.roomPath, fileId)) {
+    return { kind: "recRead", fileId };
+  }
+  return context.generationIsCurrent() ? null : staleAutoIndexOutcome();
+}
+
+async function startAutoIndexJob(context: AutoIndexPassContext): Promise<AutoIndexOutcome> {
+  retireUnfinishedAutoDeepSummaryJobs(context.rooms, context.roomPath);
+  if (context.rooms.current() === null) {
+    return staleAutoIndexOutcome(); // folded main_window check — see module doc
+  }
+  let jobId: string | null = null;
+  try {
+    jobId = await context.startDeepSummaryAuto(context.roomPath);
+  } catch {
+    jobId = null; // matches Rust's `let _ = start_deep_summary_inner(...)`
+  }
+  return { kind: "startJob", jobId };
+}
+
+async function autoIndexDecisionOutcome(
+  context: AutoIndexPassContext,
+  readiness: AutoIndexReadiness
+): Promise<AutoIndexOutcome> {
+  switch (
+    autoIndexDecision(
+      readiness.settingOn,
+      readiness.missing,
+      readiness.jobRunning,
+      readiness.asking,
+      readiness.modelsAvailable
+    )
+  ) {
+    case "skip":
+      return { kind: "skip" };
+    case "quietFiller":
+      // Delay 0: this waiter already debounced (addendum fix — the filler's
+      // own 45 s head start would otherwise stack on top).
+      context.spawnSummaryFiller(context.roomPath, 0);
+      return { kind: "quietFiller" };
+    case "retry":
+      return { kind: "retry" };
+    case "startJob":
+      return startAutoIndexJob(context);
+  }
+}
+
 /**
  * One pass of the debounced check: read the room's live state, try the
  * recording-read priority arm, then fall back to {@link autoIndexDecision} and
@@ -427,27 +459,31 @@ export async function runAutoIndexPass(
   generation: number,
   roomPath: string
 ): Promise<AutoIndexOutcome> {
-  const mine = (): boolean => state.generation === generation;
-  const listModels = deps.listModels ?? listModelsReal;
+  const context: AutoIndexPassContext = {
+    ...deps,
+    generationIsCurrent: () => state.generation === generation,
+    roomPath,
+  };
+  const listModels = configuredModelLister(deps);
 
   // A later ingest re-armed the debounce — that waiter owns the run.
-  if (!mine()) {
-    return { kind: "stale" };
+  if (!context.generationIsCurrent()) {
+    return staleAutoIndexOutcome();
   }
 
   const room = readRoomState(deps.rooms, roomPath);
   if (room === null) {
-    return { kind: "stale" };
+    return staleAutoIndexOutcome();
   }
-  const { settingOn, missing } = room;
-
-  const asking = deps.cancelState.cancels.size > 0;
-  const jobRunning = deps.cancelState.jobCancels.size > 0;
-
-  const modelsAvailable = (await listModels()).length > 0;
+  const readiness: AutoIndexReadiness = {
+    ...room,
+    asking: deps.cancelState.cancels.size > 0,
+    jobRunning: deps.cancelState.jobCancels.size > 0,
+    modelsAvailable: await modelsAreAvailable(listModels),
+  };
   // The model probe awaited — a newer waiter may own the run now.
-  if (!mine()) {
-    return { kind: "stale" };
+  if (!context.generationIsCurrent()) {
+    return staleAutoIndexOutcome();
   }
 
   // The room reads recordings it has never read, on the same tick as the
@@ -458,58 +494,11 @@ export async function runAutoIndexPass(
   // controls, so leaving it out meant the box could be off while the same tick
   // still spent the room's one model lane. Half a switch is the same defect as
   // no switch, only harder to notice.
-  if (settingOn && modelsAvailable && !jobRunning && !asking) {
-    const fileId = nextUnreadRecording(deps.rooms, roomPath);
-    if (fileId !== undefined) {
-      // Only a read that actually STARTED has spent this tick's model lane and
-      // earned the early exit. One that could not start — room at job
-      // capacity, this recording already queued, no transcript yet — spends
-      // nothing, and returning on it starved the summary sweep below for as
-      // long as the recording stayed unread: every import after it went
-      // undescribed, on this tick and on every later one.
-      let started = false;
-      try {
-        await deps.startRecRead(roomPath, fileId);
-        started = true;
-      } catch {
-        started = false;
-      }
-      if (started) {
-        return { kind: "recRead", fileId };
-      }
-      // That attempt awaited (it resolves the pass engine before it can refuse
-      // for a full queue), so the same rule as the model probe applies to the
-      // sweep it now falls through to.
-      if (!mine()) {
-        return { kind: "stale" };
-      }
-    }
+  const recordingOutcome = await unreadRecordingOutcome(context, readiness);
+  if (recordingOutcome !== null) {
+    return recordingOutcome;
   }
-
-  switch (autoIndexDecision(settingOn, missing, jobRunning, asking, modelsAvailable)) {
-    case "skip":
-      return { kind: "skip" };
-    case "quietFiller":
-      // Delay 0: this waiter already debounced (addendum fix — the filler's
-      // own 45 s head start would otherwise stack on top).
-      deps.spawnSummaryFiller(roomPath, 0);
-      return { kind: "quietFiller" };
-    case "retry":
-      return { kind: "retry" };
-    case "startJob": {
-      retireUnfinishedAutoDeepSummaryJobs(deps.rooms, roomPath);
-      if (deps.rooms.current() === null) {
-        return { kind: "stale" }; // folded main_window check — see module doc
-      }
-      let jobId: string | null = null;
-      try {
-        jobId = await deps.startDeepSummaryAuto(roomPath);
-      } catch {
-        jobId = null; // matches Rust's `let _ = start_deep_summary_inner(...)`
-      }
-      return { kind: "startJob", jobId };
-    }
-  }
+  return autoIndexDecisionOutcome(context, readiness);
 }
 
 /**

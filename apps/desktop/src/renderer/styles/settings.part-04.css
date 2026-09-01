@@ -1,0 +1,418 @@
+
+
+/* ==========================================================================
+   14. OTHER SURFACES THAT LIVE IN THIS FILE
+   Not Settings, but historically defined here and consumed elsewhere:
+   Toasts.tsx, the connector dot in Sidebar.tsx, the composer's connector
+   badge, the raw mcpServers box in ConnectorsView.
+
+   Their ANATOMY is untouched — same elements, same layout, same left-edge
+   colour code — because the components that render them belong to other
+   surfaces. What changed is that they now resolve through tokens instead of
+   through literal rgba shadows, legacy --ok/--warn/--danger aliases and
+   off-scale sizes (a toast was 12.5px), so they flip with the theme and land
+   on the same type scale as everything else.
+   ========================================================================== */
+
+.mcp-config {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  line-height: 1.55;
+  tab-size: 2;
+  resize: vertical;
+}
+
+.mcp-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin-top: var(--sp-3);
+}
+
+.mcp-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: var(--fs-body);
+}
+
+.mcp-row .settings-hint {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* A status dot always rides with the connector's name and its state word in
+   the markup — it is a reinforcement, never the signal. */
+.mcp-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  align-self: center;
+  background: var(--faint);
+}
+
+.mcp-dot.connected {
+  background: var(--sem-done);
+}
+
+.mcp-dot.connecting {
+  background: var(--sem-pending);
+}
+
+.mcp-dot.failed {
+  background: var(--sem-urgent);
+}
+
+.mcp-badge {
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  margin-bottom: var(--sp-2);
+}
+
+/* SEC-6 — always-visible cloud-engine warning by the composer. */
+.cloud-badge {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  font-size: var(--fs-meta);
+  color: var(--text);
+  background: color-mix(in srgb, var(--sem-pending-fill) 14%, transparent);
+  box-shadow: inset 3px 0 0 var(--sem-pending);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-1) var(--sp-3);
+  margin-bottom: var(--sp-2);
+}
+
+.cloud-badge button {
+  color: var(--accent);
+  font-size: var(--fs-meta);
+  white-space: nowrap;
+}
+
+/* SEC-6 — mark the model dropdown while a cloud engine is selected. */
+.topbar-right select.cloud-engine {
+  color: var(--sem-pending);
+  border-color: var(--sem-pending);
+}
+
+/* ----- toasts -----
+   They float, so they are opaque (paper.css section 9). The kind is carried
+   by the message text; the edge only reinforces it. */
+.toast-stack {
+  position: absolute;
+  right: 16px;
+  bottom: calc(100% + 10px);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  width: min(420px, calc(100vw - 32px));
+  max-width: 100%;
+  z-index: 30;
+  pointer-events: none;
+}
+
+.toast {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius);
+  background: var(--raised);
+  border: 1px solid var(--rule-strong);
+  border-left: 3px solid var(--muted);
+  box-shadow:
+    0 12px 30px var(--shadow),
+    0 2px 6px var(--shadow-lift);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  color: var(--text);
+  pointer-events: auto;
+  animation: toast-in var(--dur-fast) var(--ease-pen);
+}
+
+.toast.success {
+  border-left-color: var(--sem-done);
+}
+
+.toast.error {
+  border-left-color: var(--sem-urgent);
+}
+
+.toast.info {
+  border-left-color: var(--sem-linked);
+}
+
+.toast-text {
+  grid-column: 2;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.toast-close {
+  grid-column: 3;
+  grid-row: 1;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.toast-close:hover {
+  color: var(--text);
+}
+
+/* A short rise and fade, no scale, no bounce — the same arrival every other
+   floating surface in the system gets. */
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+/* ==========================================================================
+   15. MOTION ESCAPES
+   Every transition and animation added above has one. Nothing animates INTO
+   its resting state from a value the element does not otherwise have, so
+   switching them off lands on the finished frame.
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-sheet .settings-nav-item,
+  .pull-bar-fill {
+    transition: none;
+  }
+  .toast {
+    animation: none;
+  }
+}
+
+/* ==========================================================================
+   16. CUSTOMIZE SIDEBAR
+   Rendered twice from one component (shell/CustomizeSidebar.tsx): as a sheet
+   over the workspace, and inline inside Settings → Interface. These rules are
+   deliberately layout-only and inherit their surface from whichever of those
+   two frames they land in, so the inline copy does not draw a second card
+   inside the settings card it is already sitting in.
+   ========================================================================== */
+
+.cz-modal {
+  max-width: 620px;
+}
+.cz-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+}
+.cz-group-label {
+  margin: 0 0 2px;
+  font-size: var(--fs-micro);
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.cz-group-hint {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-meta);
+  color: var(--muted);
+}
+.cz-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.cz-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-1);
+  border-bottom: 1px solid var(--line-soft);
+}
+.cz-row:last-child {
+  border-bottom: 0;
+}
+.cz-glyph {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+.cz-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.cz-name {
+  font-size: var(--fs-body);
+  color: var(--text);
+}
+.cz-blurb {
+  font-size: var(--fs-micro);
+  color: var(--faint);
+  line-height: 1.35;
+}
+.cz-move {
+  display: inline-flex;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+.cz-arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+}
+.cz-arrow:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--hover);
+  border-color: var(--rule);
+}
+/* Disabled rather than hidden: a row that loses its up-arrow at the top of a
+   list makes every row below it shift by 24px as you move things, which reads
+   as the list jumping around under your hand. */
+.cz-arrow:disabled {
+  opacity: 0.32;
+  cursor: default;
+}
+/* The switch. `role="switch"`, so it announces on/off rather than
+   checked/unchecked — this pins a tool to the sidebar, it does not select it
+   for some later action. */
+.cz-switch {
+  position: relative;
+  flex: 0 0 auto;
+  width: 40px;
+  height: 22px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1.5px solid var(--rule-strong);
+  background: transparent;
+  transition:
+    background var(--dur-fast) var(--ease-pen),
+    border-color var(--dur-fast) var(--ease-pen);
+}
+.cz-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--rule-strong);
+  transition:
+    transform var(--dur-fast) var(--ease-pen),
+    background var(--dur-fast) var(--ease-pen);
+}
+.cz-switch[aria-checked="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.cz-switch[aria-checked="true"]::after {
+  transform: translateX(17px);
+  background: var(--page);
+}
+.cz-empty {
+  margin: 0;
+  padding: var(--sp-3) var(--sp-1);
+  font-size: var(--fs-meta);
+  color: var(--faint);
+}
+/* Why there is no Library row. Someone who remembers it in that column comes
+   looking here first, and silence reads as "removed" rather than "moved". */
+.cz-note {
+  margin: 0;
+  padding: var(--sp-3);
+  font-size: var(--fs-meta);
+  line-height: 1.5;
+  color: var(--muted);
+  border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--accent-fill);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+.cz-note kbd {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.cz-reset {
+  align-self: flex-start;
+  font-size: var(--fs-meta);
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  padding: 6px 12px;
+}
+.cz-reset:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cz-switch,
+  .cz-switch::after {
+    transition: none;
+  }
+}
+
+/* ----- Settings → Interface: the three layout presets ----- */
+.iface-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+}
+.iface-preset {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  min-width: 150px;
+  padding: var(--sp-2) var(--sp-3);
+  text-align: left;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+}
+.iface-preset:hover:not(:disabled) {
+  background: var(--hover);
+  border-color: var(--rule-strong);
+}
+.iface-preset:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.iface-preset-name {
+  font-size: var(--fs-body);
+  font-weight: 600;
+}
+.iface-preset-hint {
+  font-size: var(--fs-micro);
+  color: var(--faint);
+}
+/* Inside Settings the sidebar list is already within a settings card, so it
+   drops the sheet's outer rhythm and sits as one more labelled block. */
+#set-interface .cz-body {
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-4);
+}
+#set-interface .cz-reset {
+  align-self: flex-start;
+}

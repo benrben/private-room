@@ -34,35 +34,39 @@ type Step = {
   nodeKind: string | null;
 };
 
-function parseStep(raw: string): Step {
+function parsedObject(raw: string): Record<string, unknown> | null {
   try {
-    const wf = JSON.parse(raw);
-    if (wf && typeof wf === "object") {
-      return {
-        result: typeof wf.result === "string" ? wf.result : raw,
-        skipped: wf.skipped === true,
-        branch: typeof wf.branch === "string" ? wf.branch : null,
-        nodeLabel: typeof wf.node_label === "string" ? wf.node_label : null,
-        nodeKind: typeof wf.node_kind === "string" ? wf.node_kind : null,
-      };
-    }
+    const value = JSON.parse(raw);
+    return value && typeof value === "object" ? value as Record<string, unknown> : null;
   } catch {
-    /* not a WfArtifact wrapper — show the raw string as-is */
+    return null;
   }
-  return { result: raw, skipped: false, branch: null, nodeLabel: null, nodeKind: null };
+}
+
+function stringField(value: Record<string, unknown>, name: string): string | null {
+  return typeof value[name] === "string" ? value[name] : null;
+}
+
+function parseStep(raw: string): Step {
+  const wf = parsedObject(raw);
+  if (!wf) return { result: raw, skipped: false, branch: null, nodeLabel: null, nodeKind: null };
+  return {
+    result: stringField(wf, "result") ?? raw,
+    skipped: wf.skipped === true,
+    branch: stringField(wf, "branch"),
+    nodeLabel: stringField(wf, "node_label"),
+    nodeKind: stringField(wf, "node_kind"),
+  };
+}
+
+function isScriptReport(value: Record<string, unknown>): boolean {
+  return typeof value.exitCode === "number" && ("stdoutTail" in value || "stderrTail" in value);
 }
 
 /** A script node's result is itself a ScriptRunReport JSON (import mode). */
 function asScriptReport(result: string): ScriptReport | null {
-  try {
-    const r = JSON.parse(result);
-    if (r && typeof r === "object" && typeof r.exitCode === "number" && ("stdoutTail" in r || "stderrTail" in r)) {
-      return r as ScriptReport;
-    }
-  } catch {
-    /* not JSON — a plain-text artifact */
-  }
-  return null;
+  const report = parsedObject(result);
+  return report && isScriptReport(report) ? report as ScriptReport : null;
 }
 
 /** The copyable text for a step (the script streams for a report, else result). */
@@ -114,31 +118,38 @@ async function fetchRunSteps(jobId: string, hint: number): Promise<(string | nul
 
 function StepBody({ step }: { step: Step }) {
   const report = asScriptReport(step.result);
-  if (report) {
-    const imported = (report.imported ?? []).map((f) => f.name).filter(Boolean);
-    return (
-      <div className="script-report">
-        <span className={`wf-badge ${report.exitCode === 0 ? "dot-ok" : "dot-err"}`}>exit {report.exitCode}</span>
-        {report.stdoutTail?.trim() ? (
-          <div className="script-stream">
-            <strong>stdout</strong>
-            <pre>{report.stdoutTail}</pre>
-          </div>
-        ) : null}
-        {report.stderrTail?.trim() ? (
-          <div className="script-stream err">
-            <strong>stderr</strong>
-            <pre>{report.stderrTail}</pre>
-          </div>
-        ) : null}
-        {imported.length > 0 && (
-          <div className="caption">
-            Imported {imported.length} file(s): {imported.join(", ")}
-          </div>
-        )}
-      </div>
-    );
-  }
+  if (report) return <ScriptReportBody report={report} />;
+  return <PlainStepBody step={step} />;
+}
+
+function ScriptReportBody({ report }: { report: ScriptReport }) {
+  const imported = (report.imported ?? []).flatMap((file) => file.name ? [file.name] : []);
+  return (
+    <div className="script-report">
+      <span className={`wf-badge ${report.exitCode === 0 ? "dot-ok" : "dot-err"}`}>exit {report.exitCode}</span>
+      <ScriptStream label="stdout" text={report.stdoutTail} />
+      <ScriptStream label="stderr" text={report.stderrTail} error />
+      <ImportedFiles names={imported} />
+    </div>
+  );
+}
+
+function ScriptStream({ label, text, error = false }: { label: string; text: string | undefined; error?: boolean }) {
+  if (!text?.trim()) return null;
+  return (
+    <div className={`script-stream${error ? " err" : ""}`}>
+      <strong>{label}</strong>
+      <pre>{text}</pre>
+    </div>
+  );
+}
+
+function ImportedFiles({ names }: { names: string[] }) {
+  if (names.length === 0) return null;
+  return <div className="caption">Imported {names.length} file(s): {names.join(", ")}</div>;
+}
+
+function PlainStepBody({ step }: { step: Step }) {
   if (step.skipped && !step.result.trim()) {
     return <div className="caption">Step skipped (an upstream branch was not taken).</div>;
   }
@@ -151,12 +162,6 @@ function StepBody({ step }: { step: Step }) {
 function StepRow({ index, raw, fallback }: { index: number; raw: string; fallback?: WorkflowNode }) {
   const [copied, setCopied] = useState(false);
   const step = parseStep(raw);
-  const fbLabel = fallback?.label ? String(fallback.label) : null;
-  const fbKind = fallback?.kind ?? null;
-  const kindRaw = step.nodeKind ?? fbKind;
-  const kind = kindRaw ? kindRaw.replace(/_/g, " ") : null;
-  const title = step.nodeLabel || fbLabel || `Step ${index + 1}`;
-  const statusLabel = step.skipped ? "skipped" : "done";
 
   async function copy() {
     try {
@@ -170,22 +175,60 @@ function StepRow({ index, raw, fallback }: { index: number; raw: string; fallbac
 
   return (
     <div className="run-step">
-      <div className="run-step-head">
-        <strong>{title}</strong>
-        {kind && <span className="run-step-kind">{kind}</span>}
-        {step.branch && <span className="wf-badge">branch: {step.branch}</span>}
-        <span className={`wf-badge ${step.skipped ? "" : "dot-ok"}`}>{statusLabel}</span>
-        <span className="run-step-spacer" />
-        {step.result.trim() && (
-          <button className="subtle run-step-copy btn-ic" onClick={() => void copy()} title="Copy this step's output">
-            {copied ? (<><CircleCheckIcon size={12} /> Copied</>) : "Copy"}
-          </button>
-        )}
-      </div>
+      <StepHeader index={index} step={step} fallback={fallback} copied={copied} onCopy={copy} />
       <div className="run-step-body">
         <StepBody step={step} />
       </div>
     </div>
+  );
+}
+
+function StepHeader({
+  index,
+  step,
+  fallback,
+  copied,
+  onCopy,
+}: {
+  index: number;
+  step: Step;
+  fallback?: WorkflowNode;
+  copied: boolean;
+  onCopy: () => Promise<void>;
+}) {
+  return (
+    <div className="run-step-head">
+      <strong>{stepTitle(step, fallback, index)}</strong>
+      <StepKind kind={step.nodeKind ?? fallback?.kind ?? null} />
+      <StepBranch branch={step.branch} />
+      <span className={`wf-badge ${step.skipped ? "" : "dot-ok"}`}>{step.skipped ? "skipped" : "done"}</span>
+      <span className="run-step-spacer" />
+      <CopyStepButton result={step.result} copied={copied} onCopy={onCopy} />
+    </div>
+  );
+}
+
+function stepTitle(step: Step, fallback: WorkflowNode | undefined, index: number): string {
+  const fallbackLabel = fallback?.label ? String(fallback.label) : null;
+  return step.nodeLabel ?? fallbackLabel ?? `Step ${index + 1}`;
+}
+
+function StepKind({ kind }: { kind: string | null }) {
+  if (!kind) return null;
+  return <span className="run-step-kind">{kind.replace(/_/g, " ")}</span>;
+}
+
+function StepBranch({ branch }: { branch: string | null }) {
+  if (!branch) return null;
+  return <span className="wf-badge">branch: {branch}</span>;
+}
+
+function CopyStepButton({ result, copied, onCopy }: { result: string; copied: boolean; onCopy: () => Promise<void> }) {
+  if (!result.trim()) return null;
+  return (
+    <button className="subtle run-step-copy btn-ic" onClick={() => void onCopy()} title="Copy this step's output">
+      {copied ? <><CircleCheckIcon size={12} /> Copied</> : "Copy"}
+    </button>
   );
 }
 
@@ -215,73 +258,143 @@ export function RunHistory({ runs, nodeCount, nodes }: Props) {
     return <div className="caption run-history-empty">No runs yet.</div>;
   }
 
-  // Collapse a LEADING streak of identical failures (newest-first) into one
-  // representative row + a count, so a script that failed 5× the same way reads
-  // as a single incident here too — not five identical rows.
-  const firstErr = runs[0]?.error ?? "";
+  const collapsed = leadingFailureCount(runs);
+  const shown = runsAfterCollapse(runs, collapsed);
+  return (
+    <div className="run-history nb-connect">
+      <RunRows
+        runs={shown}
+        collapsed={collapsed}
+        nodes={nodes}
+        openRun={openRun}
+        artifacts={artifacts}
+        onToggle={toggle}
+      />
+    </div>
+  );
+}
+
+/** Collapse a LEADING streak of identical failures (newest-first) into one
+ * representative row + a count, so a script that failed 5× the same way reads
+ * as a single incident here too — not five identical rows. */
+function leadingFailureCount(runs: WorkflowRun[]): number {
+  const firstErr = runError(runs[0]);
   let lead = 0;
   for (const r of runs) {
     // "error" is the ONLY failure status a run row is ever written with
     // (running | queued | paused | done | error — see db/workflows.rs). The old
     // `|| r.status === "failed"` half could never be true; the same dead check
     // was already removed from its Rust twin in commands/scripts.rs.
-    if (r.status !== "error" || (r.error ?? "") !== firstErr) break;
+    if (!hasErrorFromRunStart(r, firstErr)) break;
     lead++;
   }
-  const collapsed = lead >= 2 ? lead : 0;
-  const shown = collapsed ? [runs[0], ...runs.slice(lead)] : runs;
+  return lead >= 2 ? lead : 0;
+}
 
+function runError(run: WorkflowRun | undefined): string {
+  return run?.error ?? "";
+}
+
+function hasErrorFromRunStart(run: WorkflowRun, firstError: string): boolean {
+  return run.status === "error" && runError(run) === firstError;
+}
+
+function runsAfterCollapse(runs: WorkflowRun[], collapsed: number): WorkflowRun[] {
+  if (collapsed === 0) return runs;
+  return [runs[0], ...runs.slice(collapsed)];
+}
+
+function RunRows({
+  runs,
+  collapsed,
+  nodes,
+  openRun,
+  artifacts,
+  onToggle,
+}: {
+  runs: WorkflowRun[];
+  collapsed: number;
+  nodes: WorkflowNode[] | undefined;
+  openRun: string | null;
+  artifacts: Record<string, (string | null)[]>;
+  onToggle: (run: WorkflowRun) => Promise<void>;
+}) {
   return (
-    // A ruled timeline: one dashed pencil thread down the gutter (.nb-connect,
-    // which spans the container's own box and so needs nothing measured), a
-    // drawn node per run, and mono timestamps that line up column-wise because
-    // reading a run history means comparing times.
-    <div className="run-history nb-connect">
-      {shown.map((r, idx) => {
-        const expanded = openRun === r.id;
-        // `undefined` = the artifacts are still being fetched. Treating that as
-        // an empty list flashed "No step artifacts recorded" over every run the
-        // moment it was opened.
-        const steps = artifacts[r.id];
-        return (
-          <div key={r.id} className="run-row">
-            <button
-              type="button"
-              className="run-row-head"
-              aria-expanded={expanded}
-              onClick={() => void toggle(r)}
-            >
-              <span className={`wf-badge ${runDotClass(r.status)}`}>{r.status}</span>
-              <span className="run-row-trigger">{r.trigger}</span>
-              <span className="run-row-when">{fmt(r.startedAt)}</span>
-              {/* Was an inline #b33 — the one hardcoded colour on this surface,
-                  which meant the failure text was the same red on ivory as on
-                  charcoal and answered to neither theme. */}
-              {r.error && <span className="run-row-err">{r.error}</span>}
-              <span aria-hidden className="run-row-caret">{expanded ? "▾" : "▸"}</span>
-            </button>
-            {idx === 0 && collapsed > 0 && (
-              <div className="run-step caption">
-                + {collapsed - 1} earlier run{collapsed - 1 === 1 ? "" : "s"} failed
-                the same way
-              </div>
-            )}
-            {expanded && (
-              <div>
-                {steps === undefined ? (
-                  <div className="run-step caption">Loading this run's steps…</div>
-                ) : steps.every((a) => a == null) ? (
-                  <div className="run-step caption">No step artifacts recorded.</div>
-                ) : (
-                  steps.map((a, i) =>
-                    a == null ? null : <StepRow key={i} index={i} raw={a} fallback={nodes?.[i]} />,
-                  )
-                )}
-              </div>
-            )}
-          </div>
-        );
-      })}
+    <>
+      {runs.map((run, index) => (
+        <RunRow
+          key={run.id}
+          run={run}
+          collapsed={index === 0 ? collapsed : 0}
+          nodes={nodes}
+          expanded={openRun === run.id}
+          steps={artifacts[run.id]}
+          onToggle={onToggle}
+        />
+      ))}
+    </>
+  );
+}
+
+function RunRow({
+  run,
+  collapsed,
+  nodes,
+  expanded,
+  steps,
+  onToggle,
+}: {
+  run: WorkflowRun;
+  collapsed: number;
+  nodes: WorkflowNode[] | undefined;
+  expanded: boolean;
+  steps: (string | null)[] | undefined;
+  onToggle: (run: WorkflowRun) => Promise<void>;
+}) {
+  return (
+    <div className="run-row">
+      <RunRowHead run={run} expanded={expanded} onToggle={onToggle} />
+      <CollapsedFailureCount count={collapsed} />
+      <RunStepArtifacts expanded={expanded} steps={steps} nodes={nodes} />
     </div>
   );
+}
+
+function RunRowHead({ run, expanded, onToggle }: { run: WorkflowRun; expanded: boolean; onToggle: (run: WorkflowRun) => Promise<void> }) {
+  return (
+    <button type="button" className="run-row-head" aria-expanded={expanded} onClick={() => void onToggle(run)}>
+      <span className={`wf-badge ${runDotClass(run.status)}`}>{run.status}</span>
+      <span className="run-row-trigger">{run.trigger}</span>
+      <span className="run-row-when">{fmt(run.startedAt)}</span>
+      {run.error && <span className="run-row-err">{run.error}</span>}
+      <span aria-hidden className="run-row-caret">{expanded ? "▾" : "▸"}</span>
+    </button>
+  );
+}
+
+function CollapsedFailureCount({ count }: { count: number }) {
+  if (count === 0) return null;
+  const earlier = count - 1;
+  const suffix = earlier === 1 ? "" : "s";
+  return <div className="run-step caption">+ {earlier} earlier run{suffix} failed the same way</div>;
+}
+
+function RunStepArtifacts({
+  expanded,
+  steps,
+  nodes,
+}: {
+  expanded: boolean;
+  steps: (string | null)[] | undefined;
+  nodes: WorkflowNode[] | undefined;
+}) {
+  if (!expanded) return null;
+  if (steps === undefined) return <div className="run-step caption">Loading this run's steps…</div>;
+  if (steps.every((step) => step == null)) return <div className="run-step caption">No step artifacts recorded.</div>;
+  return <div>{steps.map((step, index) => artifactRow(step, index, nodes))}</div>;
+}
+
+function artifactRow(step: string | null, index: number, nodes: WorkflowNode[] | undefined) {
+  if (step == null) return null;
+  return <StepRow key={index} index={index} raw={step} fallback={nodes?.[index]} />;
 }

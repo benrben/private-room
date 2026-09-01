@@ -1,340 +1,198 @@
-"""The SUMMARIZE feature's logic (MIGRATION Phase 2).
-
-Ported from ``commands/summarize.rs`` — the two-step map-reduce that builds a
-room's "Room summary.html". Rust's job shrinks to gathering the DB text and
-storing the returned result; ALL prompts + orchestration live here:
-
-* ``/summarize_file`` (the MAP step, ADD-17/ADD-27) — describe ONE file in one
-  factual sentence. For a file that doesn't fit one window the MODEL drives the
-  reading: it gets a ``read_text(offset, limit, find)`` tool and up to
-  ``MAX_READS`` extra windows over the file's OWN text before a final,
-  schema-constrained call produces the sentence. The paging is pure compute over
-  the text Rust posted, so the whole loop moves here with no DB round-trips.
-* ``/combine_summary`` (the REDUCE step, ADD-17/ADD-22) — the "What this room is
-  for" paragraph + three suggested questions, from the per-file one-liners Rust
-  gathered. Two single-purpose calls (free-text prose for the purpose, a plain
-  string array for the questions) — exactly the split summarize.rs uses because a
-  4B model can't fill a nested JSON shape it never sees.
-
-Rust keeps the deterministic HTML assembly + file write (escaping, glyphs, the
-canonical "Room summary.html" name, version history) — that is presentation, not
-LLM. This module returns only the model-produced pieces: the one-liner, the
-purpose paragraph, and the questions.
-
-Privacy (SPEC §6): the model is the loopback Ollama server; tracing is stripped at
-package import. Nothing here logs the user's file text.
-
-Error contract: reuses :class:`.llm.LlmError` (OLLAMA_DOWN / MODEL_MISSING /
-ENGINE_ERROR) so the routes surface the same ``{error, code}`` bodies the rest of
-the gateway does, letting Rust rebuild the sentinels summarize.rs branches on.
-"""
+"""Map/reduce summary orchestration and its public facade."""
 
 from __future__ import annotations
 
-import json
-import re
-from dataclasses import dataclass
-from typing import Any, Protocol
+from dataclasses import dataclass, field
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
-
-from . import config
 from .budget import json_chars, msg_len, window_budget_bytes
-# docs_html.rs ``parse_string_list``, one implementation for the whole sidecar.
-# The copy that used to live here silently stopped at 12 items and measured its
-# 80-character line limit in CHARACTERS, so a Hebrew reply was cut at a different
-# point than in ``#add-file`` and a fix to either copy never reached the other.
 from .chat_docs import parse_string_list
 from .llm import LlmError, _classify
 from .messages import Message, ToolCall, canonical_json
 from .model_limits import max_num_ctx, native_context_length, pick_num_ctx
-from .model_text import prime_schema, recover_json, strip_think_spans
+from .summarize_chat import ModelClient as ModelClient, _chat_structured
+from .summarize_combine import combine_summary as combine_summary
+from .summarize_requests import (
+    CombineSummaryRequest as CombineSummaryRequest,
+    SummarizeFileRequest as SummarizeFileRequest,
+)
+from .summarize_text import (
+    MAX_READS as MAX_READS,
+    ONE_LINER_MAX as ONE_LINER_MAX,
+    READ_WINDOW_DEFAULT as READ_WINDOW_DEFAULT,
+    READ_WINDOW_MAX as READ_WINDOW_MAX,
+    READ_WINDOW_MIN as READ_WINDOW_MIN,
+    TextWindow as TextWindow,
+    _ceil_char_boundary as _ceil_char_boundary,
+    _first_nonempty_line as _first_nonempty_line,
+    _floor_char_boundary as _floor_char_boundary,
+    _num as _num,
+    clean_one_liner as clean_one_liner,
+    json_str_field as json_str_field,
+    read_args as read_args,
+    read_text_tool as read_text_tool,
+    read_window as read_window,
+    smart_filter as smart_filter,
+    strip_markup_blocks as strip_markup_blocks,
+)
 
-# --- constants (verbatim from summarize.rs / extraction/window.rs) ----------
-
-#: ADD-27: extra reads the model may request per file (summarize.rs MAX_READS).
-MAX_READS: int = 4
-
-#: extraction/window.rs — the default/min/max for ONE read window (bytes).
-READ_WINDOW_DEFAULT: int = 4_000
-READ_WINDOW_MIN: int = 200
-READ_WINDOW_MAX: int = 64_000
-
-
-# --- text windowing (ported from extraction/window.rs, BYTE-exact) ----------
-#
-# Rust slices the file's extracted text on BYTE offsets (snapped to char
-# boundaries), and the char-budget arithmetic counts bytes. To keep a Hebrew or
-# other multi-byte file summarized identically, we operate on the UTF-8 bytes and
-# report the same byte offsets Rust would.
-
-
-@dataclass(slots=True)
-class TextWindow:
-    """One window of a file's text. Offsets are BYTE positions into the filtered
-    text, always on char boundaries so decoding can never fail."""
-
-    text: str
-    offset: int
-    end: int
-    total: int
-    found: bool
-
-    @property
-    def nbytes(self) -> int:
-        """UTF-8 byte length of ``text`` (== end - offset); the budget unit."""
-        return self.end - self.offset
+def _restore_chat_text(content: str, engaged: Any | None) -> str:
+    """Restore protected values when the outbound privacy door was engaged."""
+    if engaged is None:
+        return content
+    return engaged.restore_text(content)
 
 
-def _floor_char_boundary(data: bytes, i: int) -> int:
-    # Rust is_char_boundary(len) is True, so position len (and 0) is a boundary —
-    # only step back off an interior continuation byte (0b10xxxxxx).
-    i = min(i, len(data))
-    while 0 < i < len(data) and (data[i] & 0xC0) == 0x80:
-        i -= 1
-    return i
+def _restore_tool_calls(calls: list[ToolCall], engaged: Any | None) -> list[ToolCall]:
+    """Restore protected values in tool arguments for the local tool runner."""
+    if engaged is None:
+        return calls
+    for call in calls:
+        call.arguments = engaged.restore_value(call.arguments)
+    return calls
 
 
-def _ceil_char_boundary(data: bytes, i: int) -> int:
-    i = min(i, len(data))
-    while i < len(data) and (data[i] & 0xC0) == 0x80:
-        i += 1
-    return i
+def _restored_chat_result(
+    content: str, calls: list[ToolCall], engaged: Any | None
+) -> tuple[str, list[ToolCall]]:
+    return _restore_chat_text(content, engaged), _restore_tool_calls(calls, engaged)
 
 
-def _looks_like_noise(line: str) -> bool:
-    """window.rs ``looks_like_noise``: a long line that is mostly symbols, or holds
-    an unbroken 80+ char run (base64/hex/minified), is junk for a summary."""
-    if len(line.encode("utf-8")) < 40:  # Rust line.len() is BYTES
-        return False
-    total = max(len(line), 1)  # Rust chars().count()
-    allowed = set(".,;:!?'\"()-/&%$€@")
-    wordish = sum(1 for c in line if c.isalnum() or c.isspace() or c in allowed)
-    if wordish / total < 0.7:
-        return True
-    return any(len(w.encode("utf-8")) > 80 for w in line.split())  # Rust w.len() bytes
+async def _external_chat(
+    generate_external: Any,
+    model: str,
+    messages: list[Message],
+    format: dict[str, Any] | None,  # noqa: A002 - Ollama arg name
+    engaged: Any | None,
+) -> tuple[str, list[ToolCall]]:
+    """Use a CLI engine, whose summarize seam has no native tool protocol."""
+    content = await generate_external(model, messages, format=format)
+    return _restored_chat_result(content, [], engaged)
 
 
-def smart_filter(text: str) -> str:
-    """window.rs ``smart_filter``: drop the low-signal lines a big extraction is
-    full of (binary/base64 junk, repeated boilerplate, blank runs). Conservative:
-    prose, code and tables pass through untouched."""
-    out: list[str] = []
-    prev_line = ""
-    blank_run = 0
-    # Rust iterates str::lines(): split on '\n' but WITHOUT the trailing empty
-    # segment a final newline would produce (a trailing '\r' is stripped by the
-    # per-line rstrip below, matching Rust's trim_end()).
-    lines = text.split("\n")
-    if lines and lines[-1] == "":
-        lines.pop()
-    for line in lines:
-        trimmed = line.rstrip()
-        if not trimmed.strip():
-            blank_run += 1
-            if blank_run == 1:
-                out.append("")
-            continue
-        blank_run = 0
-        if trimmed == prev_line:  # repeated page header/footer
-            continue
-        if _looks_like_noise(trimmed):
-            continue
-        out.append(trimmed)
-        prev_line = trimmed
-    # Rust pushes each kept line + '\n' and a single '\n' per blank run, so the
-    # result always ends with a trailing newline after the last non-blank line.
-    joined = "".join(s + "\n" if s != "" else "\n" for s in out)
-    return joined
+async def _ignore_provider_delta(_value: str) -> None:
+    """Summarize needs the completed provider turn rather than live deltas."""
+    return None
 
 
-def read_window(data: bytes, offset: int, limit: int, find: str | None) -> TextWindow:
-    """window.rs ``read_window``: cut one window out of the filtered text bytes.
+async def _provider_result(
+    api: Any,
+    messages: list[Message],
+    tools: list[dict[str, Any]] | None,
+    format: dict[str, Any] | None,  # noqa: A002 - Ollama arg name
+) -> tuple[str, list[ToolCall]]:
+    if tools:
+        content, calls, _usage = await api.stream(messages, tools, _ignore_provider_delta)
+        return content, calls
+    return await api.generate(messages, format=format), []
 
-    ``limit`` is clamped to [MIN, MAX]. ``find`` (trimmed, non-empty) jumps to the
-    first ASCII-case-insensitive occurrence at-or-after ``offset``, starting ~200
-    bytes early for context; a miss leaves the window at ``offset`` with
-    ``found=False`` so the model learns it missed.
-    """
-    total = len(data)
-    limit = max(READ_WINDOW_MIN, min(limit, READ_WINDOW_MAX))
-    start = _floor_char_boundary(data, min(offset, total))
-    found = False
-    needle = (find or "").strip()
-    if needle:
-        # bytes.lower() lowercases only ASCII, leaving other bytes (and therefore
-        # every byte offset) exact — same as Rust to_ascii_lowercase.
-        hay = data[start:].lower()
-        pos = hay.find(needle.encode("utf-8").lower())
-        if pos != -1:
-            start = _floor_char_boundary(data, max(0, start + pos - 200))
-            found = True
-    end = _ceil_char_boundary(data, min(start + limit, total))
-    return TextWindow(
-        text=data[start:end].decode("utf-8", "replace"),
-        offset=start,
-        end=end,
-        total=total,
-        found=found,
+
+async def _provider_chat(
+    model: str,
+    provider: Any,
+    temperature: float | None,
+    messages: list[Message],
+    tools: list[dict[str, Any]] | None,
+    format: dict[str, Any] | None,  # noqa: A002 - Ollama arg name
+    engaged: Any | None,
+) -> tuple[str, list[ToolCall]]:
+    """Run the OpenAI-compatible path under the summarize error contract."""
+    from .provider_api import OpenAICompatibleChatModel
+
+    api = OpenAICompatibleChatModel(model, provider, temperature)
+    try:
+        content, calls = await _provider_result(api, messages, tools, format)
+    except Exception as exc:  # noqa: BLE001 - the public seam classifies all provider failures
+        raise _classify(exc) from exc
+    return _restored_chat_result(content, calls, engaged)
+
+
+def _request_json_chars(value: dict[str, Any] | list[dict[str, Any]] | None) -> int:
+    return json_chars(value) if value else 0
+
+
+async def _ollama_options(
+    model: str,
+    base_url: str,
+    messages: list[Message],
+    tools: list[dict[str, Any]] | None,
+    format: dict[str, Any] | None,  # noqa: A002 - Ollama arg name
+    temperature: float | None,
+    num_ctx: int | None,
+) -> dict[str, Any]:
+    """Build the direct Ollama payload options, always pinning its context."""
+    window = num_ctx
+    if window is None:
+        native = await native_context_length(model, base_url)
+        request_bytes = sum(msg_len(message) for message in messages)
+        request_bytes += _request_json_chars(tools) + _request_json_chars(format)
+        window = pick_num_ctx(request_bytes, native)
+    options: dict[str, Any] = {"num_ctx": window}
+    if temperature is not None:
+        options["temperature"] = temperature
+    return options
+
+
+def _ollama_think(model: str, think_on: bool) -> bool | None:
+    """Only qwen3 non-instruct variants understand Ollama's think parameter."""
+    return think_on if "qwen3" in model and "instruct" not in model else None
+
+
+def _ollama_tool_call(index: int, raw_call: Any, engaged: Any | None) -> ToolCall | None:
+    name = getattr(raw_call.function, "name", "") or ""
+    if not name:
+        return None
+    arguments = dict(raw_call.function.arguments or {})
+    if engaged is not None:
+        arguments = engaged.restore_value(arguments)
+    call_id = f"call_{index}"
+    return ToolCall(
+        name=name,
+        arguments=arguments,
+        id=call_id,
+        raw={"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}},
     )
 
 
-# --- reply cleanup (ported from retrieval.rs / summarize.rs / ollama.rs) -----
+def _ollama_tool_calls(raw_calls: list[Any] | None, engaged: Any | None) -> list[ToolCall]:
+    calls: list[ToolCall] = []
+    for index, raw_call in enumerate(raw_calls or []):
+        call = _ollama_tool_call(index, raw_call, engaged)
+        if call is not None:
+            calls.append(call)
+    return calls
 
 
-def strip_markup_blocks(content: str) -> str:
-    """retrieval.rs ``strip_markup_blocks``: remove fenced ```boxes / ```annotation
-    UI-markup payloads (viewer data, not conversation text)."""
-    out = content
-    for tag in ("```boxes", "```annotation"):
-        while (start := out.find(tag)) != -1:
-            after = out[start + len(tag):]
-            end = after.find("```")
-            out = (out[:start] + after[end + 3:]) if end != -1 else out[:start]
-            out = out.strip()
-    return out
-
-
-#: Ceiling for a file's one-line description (summarize.rs ``clean_one_liner``).
-ONE_LINER_MAX: int = 200
-
-#: A sentence terminator that really ENDS a sentence — followed by whitespace or
-#: the end of the line, so a version number or "e.g." is not mistaken for one.
-_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
-
-
-def clean_one_liner(raw: str) -> str:
-    """summarize.rs ``clean_one_liner``: trim a reply down to one clean sentence —
-    first non-empty line, list markers stripped, capped at ``ONE_LINER_MAX``.
-
-    An over-long line is cut at the last SENTENCE end that still leaves a real
-    description, else at a word boundary with an ellipsis marking the cut. This
-    line is what the generated Room summary prints and what the assistant reads
-    when it lists the room's files, so a hard slice at exactly 200 characters
-    ended it mid-word with nothing showing it had been cut.
-    """
-    stripped = strip_markup_blocks(raw)
-    line = ""
-    for candidate in stripped.split("\n"):
-        t = candidate.strip()
-        if t:
-            line = t
-            break
-    line = line.lstrip("-*#> ").strip()
-    if len(line) <= ONE_LINER_MAX:
-        return line
-    head = line[:ONE_LINER_MAX]
-    ends = [m.end() for m in _SENTENCE_END.finditer(head)]
-    # Only take a sentence end that leaves at least half the budget behind —
-    # otherwise a stray "1." near the start would truncate the whole description.
-    if ends and ends[-1] >= ONE_LINER_MAX // 2:
-        return head[: ends[-1]].strip()
-    cut = head.rfind(" ")
-    kept = head[:cut] if cut > 0 else head[: ONE_LINER_MAX - 1]
-    return kept.rstrip(" ,;:-") + "…"
-
-
-def json_str_field(raw: str, key: str) -> str | None:
-    """json.rs ``json_str_field``: the trimmed string at ``key`` of a JSON object,
-    or None when the reply isn't JSON / isn't an object / has no string there."""
+async def _ollama_chat(
+    client_factory: Any,
+    base_url: str,
+    model: str,
+    messages: list[Message],
+    tools: list[dict[str, Any]] | None,
+    format: dict[str, Any] | None,  # noqa: A002 - Ollama arg name
+    temperature: float | None,
+    num_ctx: int | None,
+    keep_alive: str,
+    think_on: bool,
+    engaged: Any | None,
+) -> tuple[str, list[ToolCall]]:
+    """Call loopback Ollama and translate its response into the model seam."""
+    options = await _ollama_options(model, base_url, messages, tools, format, temperature, num_ctx)
     try:
-        obj = json.loads(raw.strip())
-    except (ValueError, TypeError):
-        return None
-    if isinstance(obj, dict) and isinstance(obj.get(key), str):
-        return obj[key].strip()
-    return None
-
-
-# --- the read_text tool + its argument parsing (summarize.rs) ---------------
-
-
-def read_text_tool() -> list[dict[str, Any]]:
-    """summarize.rs ``read_text_tool``: the one tool offered during the gather
-    phase — a paged, filtered read over the file's OWN text."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "read_text",
-                "description": (
-                    "Read another part of this file's text. offset picks where to "
-                    "start (0 = beginning), limit is how many characters to read "
-                    "(200-6000), find jumps to the next place a word or phrase "
-                    "appears at or after offset."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "offset": {"type": "integer", "description": "Character position to read from"},
-                        "limit": {"type": "integer", "description": "How many characters to read"},
-                        "find": {"type": "string", "description": "Optional word or phrase to jump to"},
-                    },
-                },
-            },
-        }
-    ]
-
-
-def _num(v: Any) -> int | None:
-    """summarize.rs ``read_args::num``: a usize tolerating int/float/str, clamped
-    at 0 (a negative float floors to 0, like ``f.max(0.0) as usize``)."""
-    if isinstance(v, bool):  # bool is an int subclass — never a coordinate
-        return None
-    if isinstance(v, int):
-        return max(0, v)
-    if isinstance(v, float):
-        return int(max(0.0, v))
-    if isinstance(v, str):
-        try:
-            return int(v.strip())
-        except ValueError:
-            return None
-    return None
-
-
-def read_args(args: dict[str, Any]) -> tuple[int, int, str | None]:
-    """summarize.rs ``read_args``: (offset, limit, find) out of a read_text call,
-    tolerating numbers as strings/floats and a blank ``find``."""
-    offset = _num(args.get("offset"))
-    offset = offset if offset is not None else 0
-    limit = _num(args.get("limit"))
-    limit = limit if limit is not None else READ_WINDOW_DEFAULT
-    find_raw = args.get("find")
-    find = find_raw.strip() if isinstance(find_raw, str) and find_raw.strip() else None
-    return offset, limit, find
-
-
-# --- the model seam ---------------------------------------------------------
-#
-# One thin async class over the loopback Ollama server. Kept behind a Protocol so
-# the orchestration is testable with a scripted fake — no network, no weights.
-
-
-class ModelClient(Protocol):
-    async def chat_tools(
-        self,
-        model: str,
-        messages: list[Message],
-        tools: list[dict[str, Any]],
-        *,
-        temperature: float | None,
-        num_ctx: int | None,
-        keep_alive: str,
-    ) -> tuple[str, list[ToolCall]]:
-        ...
-
-    async def generate(
-        self,
-        model: str,
-        messages: list[Message],
-        *,
-        temperature: float | None,
-        num_ctx: int | None,
-        keep_alive: str,
-        format: dict[str, Any] | None = None,  # noqa: A002 - Ollama arg name
-    ) -> str:
-        ...
+        response = await client_factory(host=base_url).chat(
+            model=model,
+            messages=[dict(message) for message in messages],
+            tools=tools,
+            format=format,
+            options=options,
+            keep_alive=keep_alive,
+            think=_ollama_think(model, think_on),
+            stream=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - re-raised as the sentinel contract
+        raise _classify(exc) from exc
+    content = response.message.content or ""
+    return _restored_chat_result(content, _ollama_tool_calls(response.message.tool_calls, engaged), engaged)
 
 
 class OllamaModelClient:
@@ -385,87 +243,30 @@ class OllamaModelClient:
         messages, _, engaged = guard_outbound(model, messages, self.privacy)
 
         if is_external_model(model):
-            text = await generate_external(model, messages, format=format)
-            return (engaged.restore_text(text) if engaged else text), []
+            return await _external_chat(generate_external, model, messages, format, engaged)
         if self.provider is not None:
-            from .provider_api import OpenAICompatibleChatModel
-
-            api = OpenAICompatibleChatModel(model, self.provider, temperature)
-
-            async def ignore_delta(_value: str) -> None:
-                return None
-
-            try:
-                if tools:
-                    content, calls, _usage = await api.stream(messages, tools, ignore_delta)
-                else:
-                    content = await api.generate(messages, format=format)
-                    calls = []
-            except Exception as exc:  # noqa: BLE001
-                raise _classify(exc) from exc
-            if engaged is not None:
-                content = engaged.restore_text(content)
-                for call in calls:
-                    call.arguments = engaged.restore_value(call.arguments)
-            return content, calls
-
-        # A LOCAL call MUST carry an explicit num_ctx. This client talks to
-        # `ollama.AsyncClient` directly rather than through `llm.generate`, so
-        # it does not inherit `chat.OllamaChatModel`'s payload-fitted window —
-        # and with none sent, the daemon loads its own ~4k default and silently
-        # context-shifts the FRONT of the prompt away (see model_limits.py).
-        # That is fatal here of all places: this path deliberately gathers whole
-        # read windows, so the system prompt and the instruction were the first
-        # things to vanish.
-        options: dict[str, Any] = {}
-        window = num_ctx
-        if window is None:
-            native = await native_context_length(model, self.base_url)
-            window = pick_num_ctx(
-                sum(msg_len(m) for m in messages)
-                + (json_chars(tools) if tools else 0)
-                + (json_chars(format) if format else 0),
-                native,
+            return await _provider_chat(
+                model,
+                self.provider,
+                temperature,
+                messages,
+                tools,
+                format,
+                engaged,
             )
-        options["num_ctx"] = window
-        if temperature is not None:
-            options["temperature"] = temperature
-        # ollama.rs:603 — only qwen3 non-instruct models accept (and need) the flag.
-        think = think_on if ("qwen3" in model and "instruct" not in model) else None
-        try:
-            resp = await AsyncClient(host=self.base_url).chat(
-                model=model,
-                messages=[dict(m) for m in messages],
-                tools=tools,
-                format=format,
-                options=options,
-                keep_alive=keep_alive,
-                think=think,
-                stream=False,
-            )
-        except Exception as exc:  # noqa: BLE001 - re-raised as the sentinel contract
-            raise _classify(exc) from exc
-        content = resp.message.content or ""
-        if engaged is not None:
-            content = engaged.restore_text(content)
-        calls: list[ToolCall] = []
-        for i, tc in enumerate(resp.message.tool_calls or []):
-            name = getattr(tc.function, "name", "") or ""
-            if not name:
-                continue
-            args = dict(tc.function.arguments or {})
-            if engaged is not None:
-                args = engaged.restore_value(args)
-            cid = f"call_{i}"
-            calls.append(
-                ToolCall(
-                    name=name,
-                    arguments=args,
-                    id=cid,
-                    raw={"id": cid, "type": "function", "function": {"name": name, "arguments": args}},
-                )
-            )
-        return content, calls
+        return await _ollama_chat(
+            AsyncClient,
+            self.base_url,
+            model,
+            messages,
+            tools,
+            format,
+            temperature,
+            num_ctx,
+            keep_alive,
+            think_on,
+            engaged,
+        )
 
     async def chat_tools(
         self,
@@ -516,31 +317,6 @@ class OllamaModelClient:
 # --- chat_structured (ollama.rs) --------------------------------------------
 
 
-async def _chat_structured(
-    client: ModelClient,
-    model: str,
-    messages: list[Message],
-    temperature: float | None,
-    keep_alive: str,
-    schema: dict[str, Any],
-) -> str:
-    """ollama.rs ``chat_structured``: a one-shot call CONSTRAINED to ``schema`` via
-    Ollama ``format`` (grammar token masking), plus the schema appended to the last
-    user turn (a small model fills a forced JSON shape with empty strings unless it
-    SEES the field names), and ``recover_json`` on the reply.
-    """
-    primed = prime_schema(messages, schema)
-    raw = await client.generate(
-        model,
-        primed,
-        temperature=temperature,
-        num_ctx=None,
-        keep_alive=keep_alive,
-        format=schema,
-    )
-    return recover_json(raw)
-
-
 # --- the map step: summarize_one_file (summarize.rs) ------------------------
 
 
@@ -582,6 +358,202 @@ async def _gather_window(client: ModelClient, model: str) -> int:
     return min(ceiling, native) if native else ceiling
 
 
+@dataclass(slots=True)
+class _FileSummaryContext:
+    data: bytes
+    head: TextWindow
+    samples: list[tuple[str, TextWindow]]
+    remaining: int
+
+    @property
+    def whole(self) -> bool:
+        return self.head.end >= len(self.data)
+
+
+@dataclass(slots=True)
+class _ReadState:
+    remaining: int
+    reads: int = 0
+    seen: set[str] = field(default_factory=set)
+
+    @property
+    def can_read(self) -> bool:
+        return self.reads < MAX_READS and self.remaining >= READ_WINDOW_MIN
+
+
+def _baseline_samples(data: bytes, head: TextWindow) -> list[tuple[str, TextWindow]]:
+    """Return the distinct middle and end samples that follow the head sample."""
+    samples: list[tuple[str, TextWindow]] = []
+    for label, start in (("middle", len(data) // 2), ("end", len(data) - 2_000)):
+        window = read_window(data, max(start, head.end), 2_000, None)
+        if window.nbytes and all(window.offset != prior.offset for _, prior in samples):
+            samples.append((label, window))
+    return samples
+
+
+async def _summary_context(client: ModelClient, model: str, filtered: str) -> _FileSummaryContext:
+    """Build the samples and bounded read budget for one filtered file."""
+    data = filtered.encode("utf-8")
+    head = read_window(data, 0, READ_WINDOW_DEFAULT, None)
+    samples = _baseline_samples(data, head)
+    budget = window_budget_bytes(await _gather_window(client, model))
+    remaining = max(0, budget - (head.nbytes + sum(window.nbytes for _, window in samples) + 8_000))
+    return _FileSummaryContext(data=data, head=head, samples=samples, remaining=remaining)
+
+
+def _summary_prompts(name: str, mime: str, context: _FileSummaryContext) -> tuple[str, str]:
+    """Build the unchanged whole-file or sampled-long-file prompt pair."""
+    if context.whole:
+        return _whole_file_prompts(name, mime, context.head)
+    return _long_file_prompts(name, mime, context)
+
+
+def _whole_file_prompts(name: str, mime: str, head: TextWindow) -> tuple[str, str]:
+    system = "You describe a single file in ONE short, factual sentence based only on what is given."
+    user = f"File name: {name}\nType: {mime}\n\nIts text:\n{head.text}\n\nIn one sentence, what is this file about?"
+    return system, user
+
+
+def _long_file_prompts(name: str, mime: str, context: _FileSummaryContext) -> tuple[str, str]:
+    system = (
+        "You describe a single file in ONE short, factual sentence based only "
+        "on what you read from it. You see samples of a longer file. If the "
+        "samples hint that the important content is elsewhere (a table of "
+        "contents, a reference to a later section, a phrase worth locating), "
+        "you MUST call read_text to look there (find jumps to a phrase, offset "
+        "picks a position) before answering. If the samples already show what "
+        "the file is, answer directly."
+    )
+    blocks = "".join(
+        f"Characters {window.offset}-{window.end} ({label}):\n{window.text}\n\n"
+        for label, window in context.samples
+    )
+    user = (
+        f"File name: {name}\nType: {mime}\nText length: {context.head.total} characters\n\n"
+        f"Characters 0-{context.head.end} (beginning):\n{context.head.text}\n\n"
+        f"{blocks}In one sentence, what is this file about?"
+    )
+    return system, user
+
+
+async def _request_read_calls(
+    client: ModelClient,
+    model: str,
+    messages: list[Message],
+    tools: list[dict[str, Any]],
+    keep_alive: str,
+) -> list[ToolCall] | None:
+    """Request tool calls, returning ``None`` when tool support degrades."""
+    try:
+        _content, calls = await client.chat_tools(
+            model, list(messages), tools, temperature=0.2, num_ctx=None, keep_alive=keep_alive
+        )
+        return calls
+    except LlmError as exc:
+        if exc.code in ("OLLAMA_DOWN", "MODEL_MISSING"):
+            raise
+        return None
+
+
+def _append_tool_call_turn(messages: list[Message], calls: list[ToolCall]) -> None:
+    messages.append({"role": "assistant", "content": "", "tool_calls": [call.to_raw() for call in calls]})
+
+
+def _read_budget_reply() -> str:
+    return "The read budget for this file is used up — answer from what you have already read."
+
+
+def _duplicate_read_reply() -> str:
+    return "You already read exactly this window; ask for a different offset or find, or answer now."
+
+
+def _follow_find_past_head(
+    data: bytes,
+    head: TextWindow,
+    limit: int,
+    find: str | None,
+    window: TextWindow,
+) -> TextWindow:
+    """Prefer a matching window after the already-shown head when available."""
+    if not window.found or window.offset >= head.end:
+        return window
+    again = read_window(data, head.end, limit, find)
+    return again if again.found else window
+
+
+def _window_reply(window: TextWindow, find: str | None) -> str:
+    note = f' ("{find}" was not found after that offset)' if find and not window.found else ""
+    return f"Characters {window.offset}-{window.end} of {window.total}{note}:\n{window.text}"
+
+
+def _read_window_reply(context: _FileSummaryContext, state: _ReadState, call: ToolCall) -> str:
+    offset, limit, find = read_args(call.arguments)
+    window = read_window(context.data, offset, min(limit, state.remaining), find)
+    window = _follow_find_past_head(context.data, context.head, min(limit, state.remaining), find, window)
+    state.remaining = max(0, state.remaining - window.nbytes)
+    return _window_reply(window, find)
+
+
+def _tool_reply(context: _FileSummaryContext, state: _ReadState, call: ToolCall) -> str:
+    if not state.can_read:
+        return _read_budget_reply()
+    if call.name != "read_text":
+        return "Unknown tool: only read_text is available."
+    key = canonical_json(call.arguments)
+    if key in state.seen:
+        return _duplicate_read_reply()
+    state.seen.add(key)
+    state.reads += 1
+    return _read_window_reply(context, state, call)
+
+
+def _append_tool_replies(
+    messages: list[Message],
+    calls: list[ToolCall],
+    context: _FileSummaryContext,
+    state: _ReadState,
+) -> None:
+    for call in calls:
+        messages.append({"role": "tool", "content": _tool_reply(context, state, call), "tool_name": call.name})
+
+
+async def _gather_file_reads(
+    client: ModelClient,
+    model: str,
+    keep_alive: str,
+    context: _FileSummaryContext,
+    messages: list[Message],
+) -> None:
+    """Let the model request bounded additional windows, preserving failures."""
+    state = _ReadState(remaining=context.remaining)
+    tools = read_text_tool()
+    while state.can_read:
+        calls = await _request_read_calls(client, model, messages, tools, keep_alive)
+        if not calls:
+            break
+        _append_tool_call_turn(messages, calls)
+        _append_tool_replies(messages, calls, context, state)
+    messages.append(
+        {"role": "user", "content": "Based on everything you read, in one sentence, what is this file about?"}
+    )
+
+
+async def _final_summary(
+    client: ModelClient,
+    model: str,
+    messages: list[Message],
+    keep_alive: str,
+) -> str:
+    schema = {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}
+    raw = await _chat_structured(client, model, messages, 0.2, keep_alive, schema)
+    return clean_one_liner(_summary_text(raw))
+
+
+def _summary_text(raw: str) -> str:
+    summary = json_str_field(raw, "summary")
+    return raw if summary is None else summary
+
+
 async def summarize_one_file(
     client: ModelClient,
     model: str,
@@ -590,277 +562,16 @@ async def summarize_one_file(
     text: str,
     keep_alive: str,
 ) -> str:
-    """summarize.rs ``summarize_one_file``: describe a single file in ONE sentence.
-
-    ``text`` is the file's FULL extracted text; it is noise-filtered, and when it
-    doesn't fit one window the model drives the reading (``read_text``) up to
-    ``MAX_READS`` extra windows before a final schema-constrained call.
-    """
+    """Describe one file in a sentence, using model-directed reads when needed."""
     filtered = smart_filter(text)
     if not filtered.strip():
-        # Nothing survived the noise filter — a binary blob, a base64 dump, a
-        # failed extraction. Asking "what is this file about?" with NO text
-        # attached leaves the model only the file NAME to guess from, and that
-        # guess was then stored and shown as if it had been read out of the file.
-        # An empty one-liner is a contract Rust already handles: summarize.rs
-        # falls back to the file's mime type when the description is blank.
         return ""
-    data = filtered.encode("utf-8")
-    head = read_window(data, 0, READ_WINDOW_DEFAULT, None)
-    whole = head.end >= len(data)
-    # Deterministic baseline samples for a long file, and a cumulative read
-    # budget derived from the largest window THIS MODEL will actually be given.
-    # `MAX_READS` alone is NOT a bound: four reads of up to
-    # READ_WINDOW_MAX plus the samples is ~264 KB, far past any window, and the
-    # daemon's answer to an oversized prompt is to drop the FRONT of it — the
-    # system prompt and the instruction. Spend the window on file text, but
-    # spend only what there is. All arithmetic is in BYTES.
-    #
-    # Each sample starts at or after the END of the head window and any sample
-    # that lands on an already-taken offset is dropped: just past the 4 KB head
-    # boundary the "middle" and "end" samples both fell INSIDE the head, so the
-    # same passage was sent to the model three times and the file's real tail was
-    # never shown.
-    samples: list[tuple[str, TextWindow]] = []
-    for label, start in (("middle", len(data) // 2), ("end", len(data) - 2_000)):
-        w = read_window(data, max(start, head.end), 2_000, None)
-        if w.nbytes and all(w.offset != prev.offset for _, prev in samples):
-            samples.append((label, w))
-    remaining = max(
-        0,
-        window_budget_bytes(await _gather_window(client, model))
-        - (head.nbytes + sum(w.nbytes for _, w in samples) + 8_000),
-    )
-
-    if whole:
-        system = (
-            "You describe a single file in ONE short, factual sentence based only "
-            "on what is given."
-        )
-        user = (
-            f"File name: {name}\nType: {mime}\n\nIts text:\n{head.text}\n\n"
-            "In one sentence, what is this file about?"
-        )
-    else:
-        system = (
-            "You describe a single file in ONE short, factual sentence based only "
-            "on what you read from it. You see samples of a longer file. If the "
-            "samples hint that the important content is elsewhere (a table of "
-            "contents, a reference to a later section, a phrase worth locating), "
-            "you MUST call read_text to look there (find jumps to a phrase, offset "
-            "picks a position) before answering. If the samples already show what "
-            "the file is, answer directly."
-        )
-        # Beginning, middle and end up front, so even a model that never touches
-        # read_text summarizes the file's whole shape, not just page one.
-        blocks = "".join(
-            f"Characters {w.offset}-{w.end} ({label}):\n{w.text}\n\n" for label, w in samples
-        )
-        user = (
-            f"File name: {name}\nType: {mime}\nText length: {head.total} characters\n\n"
-            f"Characters 0-{head.end} (beginning):\n{head.text}\n\n"
-            f"{blocks}"
-            "In one sentence, what is this file about?"
-        )
-
-    messages: list[Message] = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-
-    if not whole:
-        tools = read_text_tool()
-        seen: set[str] = set()
-        reads = 0
-        while reads < MAX_READS and remaining >= READ_WINDOW_MIN:
-            # ADD-27: thinking ON — without it, qwen3-family models answer straight
-            # from the samples and never touch the tool.
-            try:
-                _content, calls = await client.chat_tools(
-                    model, list(messages), tools, temperature=0.2, num_ctx=None, keep_alive=keep_alive
-                )
-            except LlmError as exc:
-                # Ollama down / model missing: every remaining call would fail too.
-                if exc.code in ("OLLAMA_DOWN", "MODEL_MISSING"):
-                    raise
-                # A model with no tool support must not lose its summary: degrade to
-                # answering from the samples alone (pre-ADD-27 behavior).
-                break
-            if not calls:
-                break
-            messages.append(
-                {"role": "assistant", "content": "", "tool_calls": [c.to_raw() for c in calls]}
-            )
-            for call in calls:
-                if reads >= MAX_READS or remaining < READ_WINDOW_MIN:
-                    # The budget ran out part-way through a BATCH of calls. Every
-                    # call still needs its own reply: an OpenAI-compatible
-                    # provider rejects an assistant turn whose tool_calls are not
-                    # all answered (a local Ollama shrugs it off), and the whole
-                    # summary failed. The outer `while` ends the loop after this.
-                    result = (
-                        "The read budget for this file is used up — answer from "
-                        "what you have already read."
-                    )
-                elif call.name != "read_text":
-                    result = "Unknown tool: only read_text is available."
-                elif canonical_json(call.arguments) in seen:
-                    result = (
-                        "You already read exactly this window; ask for a different "
-                        "offset or find, or answer now."
-                    )
-                else:
-                    seen.add(canonical_json(call.arguments))
-                    reads += 1
-                    offset, limit, find = read_args(call.arguments)
-                    limit = min(limit, remaining)  # spend at most what's left
-                    w = read_window(data, offset, limit, find)
-                    # A find that lands inside the already-shown head sample wastes
-                    # the read — jump to the next occurrence past the shown region.
-                    if w.found and w.offset < head.end:
-                        again = read_window(data, head.end, limit, find)
-                        if again.found:
-                            w = again
-                    remaining = max(0, remaining - w.nbytes)
-                    note = (
-                        f' ("{find}" was not found after that offset)'
-                        if find and not w.found
-                        else ""
-                    )
-                    result = f"Characters {w.offset}-{w.end} of {w.total}{note}:\n{w.text}"
-                messages.append({"role": "tool", "content": result, "tool_name": call.name})
-        messages.append(
-            {
-                "role": "user",
-                "content": "Based on everything you read, in one sentence, what is this file about?",
-            }
-        )
-
-    # ADD-22: a single guaranteed string field, so a chatty model can't wrap the
-    # sentence in preamble/markup. The engine owns the context window.
-    schema = {
-        "type": "object",
-        "properties": {"summary": {"type": "string"}},
-        "required": ["summary"],
-    }
-    raw = await _chat_structured(client, model, messages, 0.2, keep_alive, schema)
-    # A reply that isn't the JSON envelope still usually contains the sentence, so
-    # fall back to the raw text rather than losing the summary.
-    summary = json_str_field(raw, "summary")
-    if summary is None:
-        summary = raw
-    return clean_one_liner(summary)
-
-
-# --- the reduce step: combine_summary (summarize.rs) ------------------------
-
-
-async def combine_summary(
-    client: ModelClient,
-    model: str,
-    room_name: str,
-    memories: list[str],
-    file_lines: str,
-) -> tuple[str, list[str]]:
-    """summarize.rs ``combine_summary``: the "What this room is for" paragraph +
-    three suggested questions, from the per-file one-liners Rust gathered.
-
-    TWO single-purpose calls (ADD-22 fix): free-text prose for the purpose (what a
-    4B model does most reliably) and a plain string array for the questions. The
-    purpose call's errors propagate (Rust ``?``); the questions call swallows
-    errors and yields ``[]`` (Rust ``unwrap_or_default``).
-    """
-    context = f"Room name: {room_name}\n\nFiles and what each is:\n{file_lines}\n"
-    if memories:
-        context += "\nMemory notes the user saved for this room:\n"
-        for m in memories:
-            context += f"- {m}\n"
-
-    # Purpose: free-text prose. chat_stream_tools with no tools == a plain no-tools
-    # Chat-tier generate; strip any leaked <think> span.
-    purpose_messages: list[Message] = [
-        {
-            "role": "system",
-            "content": (
-                "You describe what a personal document room is for. In 2-4 "
-                "sentences, say what the room is about and the main topics it "
-                "covers, based only on the file list. Be specific and concrete. No "
-                "preamble, no bullet lists, no file names."
-            ),
-        },
-        {"role": "user", "content": context},
-    ]
-    purpose_raw = await client.generate(
-        model,
-        purpose_messages,
-        temperature=0.4,
-        num_ctx=None,
-        keep_alive=config.KEEP_ALIVE_WARM,
-    )
-    purpose = strip_think_spans(purpose_raw).strip()
-
-    # Questions: a plain string array, schema-constrained at the Chat tier. Errors
-    # are swallowed to an empty list (Rust unwrap_or_default).
-    questions_messages: list[Message] = [
-        {
-            "role": "system",
-            "content": (
-                "You suggest example questions a user could ask about their own "
-                "documents. Give exactly three short, specific questions that these "
-                "files would actually answer."
-            ),
-        },
-        {"role": "user", "content": context},
-    ]
-    schema = {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 3}
-    try:
-        questions_raw = await _chat_structured(
-            client, model, questions_messages, 0.4, config.KEEP_ALIVE_WARM, schema
-        )
-    except LlmError:
-        questions_raw = ""
-    questions = parse_string_list(questions_raw)[:3]
-
-    return purpose, questions
-
-
-# --- HTTP request bodies ----------------------------------------------------
-#
-# Defined here (not the parallel-contended config module) to keep the whole
-# feature self-contained. Each carries the Ollama ``base_url`` the sidecar should
-# use (ollama::resolved_base_url() on the Rust side).
-
-
-class SummarizeFileRequest(BaseModel):
-    """Body of ``POST /summarize_file`` — the map step for ONE file."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    model: str
-    name: str
-    text: str
-    mime: str = ""
-    base_url: str = "http://127.0.0.1:11434"
-    keep_alive: str = "30m"
-    #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
-    privacy: dict[str, Any] | None = None
-    provider: config.ProviderConfig | None = None
-
-
-class CombineSummaryRequest(BaseModel):
-    """Body of ``POST /combine_summary`` — the reduce step from the one-liners."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    model: str
-    room_name: str
-    file_lines: str
-    memories: list[str] = Field(default_factory=list)
-    base_url: str = "http://127.0.0.1:11434"
-    keep_alive: str = "30m"
-    #: PRIV-1: room privacy policy payload (config.RunRequest docstring).
-    privacy: dict[str, Any] | None = None
-    provider: config.ProviderConfig | None = None
+    context = await _summary_context(client, model, filtered)
+    system, user = _summary_prompts(name, mime, context)
+    messages: list[Message] = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    if not context.whole:
+        await _gather_file_reads(client, model, keep_alive, context, messages)
+    return await _final_summary(client, model, messages, keep_alive)
 
 
 __all__ = [

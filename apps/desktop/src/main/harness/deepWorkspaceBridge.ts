@@ -1,4 +1,4 @@
-import type { RoomManagerState } from "../roomManager.js";
+import type { Room, RoomManagerState } from "../roomManager.js";
 import { createWorkspaceMcpBridge } from "../workspace/workspaceMcp.js";
 
 interface BaselineRow {
@@ -27,27 +27,9 @@ export function createDeepWorkspaceBridgeGrant(
   runId: string,
   requestedWrite: boolean,
 ): DeepWorkspaceBridgeGrant {
-  if (!/^[A-Za-z0-9_-]{1,100}$/.test(runId)) throw new Error("The agent run ID is invalid.");
-  const room = state.room;
-  if (
-    room?.workspace === undefined
-    || room.descriptor?.kind !== "workspace-folder"
-  ) {
-    throw new Error("The Deep Harness requires an unlocked workspace room.");
-  }
-
-  let writeEnabled = false;
-  if (requestedWrite) {
-    const baseline = room.conn.prepare(
-      `SELECT baseline_completed, status
-       FROM agent_runs
-       WHERE run_id = ? AND room_id = ?`,
-    ).get(runId, room.descriptor.roomId) as BaselineRow | undefined;
-    if (baseline === undefined || baseline.baseline_completed !== 1 || baseline.status !== "running") {
-      throw new Error("The write workspace bridge cannot start before its rollback baseline is complete.");
-    }
-    writeEnabled = true;
-  }
+  validateDeepWorkspaceRunId(runId);
+  const room = deepWorkspaceRoom(state);
+  const writeEnabled = deepWorkspaceWriteEnabled(room, runId, requestedWrite);
 
   return {
     workspace: createWorkspaceMcpBridge(state, writeEnabled),
@@ -56,4 +38,38 @@ export function createDeepWorkspaceBridgeGrant(
       baselineRunId: writeEnabled ? runId : "",
     },
   };
+}
+
+type DeepWorkspaceRoom = Room & {
+  workspace: NonNullable<Room["workspace"]>;
+  descriptor: NonNullable<Room["descriptor"]> & { kind: "workspace-folder" };
+};
+
+function validateDeepWorkspaceRunId(runId: string): void {
+  if (!/^[A-Za-z0-9_-]{1,100}$/.test(runId)) throw new Error("The agent run ID is invalid.");
+}
+
+function deepWorkspaceRoom(state: RoomManagerState): DeepWorkspaceRoom {
+  const room = state.room;
+  if (room?.workspace === undefined || room.descriptor?.kind !== "workspace-folder") {
+    throw new Error("The Deep Harness requires an unlocked workspace room.");
+  }
+  return room as DeepWorkspaceRoom;
+}
+
+function deepWorkspaceWriteEnabled(room: DeepWorkspaceRoom, runId: string, requestedWrite: boolean): boolean {
+  if (!requestedWrite) return false;
+  const baseline = room.conn.prepare(
+    `SELECT baseline_completed, status
+     FROM agent_runs
+     WHERE run_id = ? AND room_id = ?`,
+  ).get(runId, room.descriptor.roomId) as BaselineRow | undefined;
+  if (!hasCompletedDeepWorkspaceBaseline(baseline)) {
+    throw new Error("The write workspace bridge cannot start before its rollback baseline is complete.");
+  }
+  return true;
+}
+
+function hasCompletedDeepWorkspaceBaseline(baseline: BaselineRow | undefined): boolean {
+  return baseline !== undefined && baseline.baseline_completed === 1 && baseline.status === "running";
 }

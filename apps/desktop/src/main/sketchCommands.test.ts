@@ -38,6 +38,7 @@ import { clearPolicy, setPolicyForTests } from "./privacy.js";
 import { applyScript, defaultSketch, type Sketch, sketchFromJson, sketchToJson } from "./sketchDoc.js";
 import {
   createSketch,
+  createSketchInRoom,
   DRAW_FOLLOWUP,
   execDraw,
   execReadDrawing,
@@ -46,6 +47,7 @@ import {
   SKETCH_EXT,
   type SketchToolOutcome,
   writeSketch,
+  writeSketchInRoom,
 } from "./sketchCommands.js";
 import { DRAW_TOOL_NAMES } from "./toolSpecs.js";
 
@@ -130,6 +132,19 @@ describe("createSketch and naming", () => {
     expect(listed?.libraryVisibility).toBe("sectionOnly");
     expect(meta.mimeType).toBe("application/json");
   });
+
+  it("room-aware creation and saving preserve legacy database behavior", async () => {
+    const db = freshRoom();
+    const room = { db, path: tmpDir };
+    const meta = await createSketchInRoom(room, "Room flow");
+    const doc = drawn('text 10 20 blue 18 "Saved through the room boundary"');
+
+    await writeSketchInRoom(room, meta.id, sketchToJson(doc), false);
+
+    expect(meta.name).toBe("Room flow.sketch");
+    expect(loadDoc(db, meta.id).elements).toHaveLength(1);
+    expect(getFileExtractedText(db, meta.id)).toContain("Saved through the room boundary");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -206,6 +221,19 @@ describe("execDraw", () => {
     const msg = text(execDraw(db, { name: "Order flow", script: 'rect 10 10 100 100 blue "box"' }));
     expect(msg).toMatch(/^Started "Order flow\.sketch" and /);
     expect(sketchNames(db)).toEqual(["Order flow.sketch", "Something.sketch"]);
+  });
+
+  it("does not claim a corrupt blank-looking sketch for a new drawing", () => {
+    const db = freshRoom();
+    insertFile(db, "Broken.sketch", "application/json", Buffer.from("not json"), null, "generated");
+
+    const result = text(execDraw(db, {
+      name: "New flow",
+      script: 'rect 1 2 30 40 red "New"',
+    }));
+
+    expect(result).toContain('Started "New flow.sketch"');
+    expect(sketchNames(db)).toEqual(["Broken.sketch", "New flow.sketch"]);
   });
 
   it("requires a name", () => {

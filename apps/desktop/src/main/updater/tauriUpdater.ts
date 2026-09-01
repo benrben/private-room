@@ -161,33 +161,47 @@ export async function checkForUpdate(
   endpoint: string = TAURI_UPDATE_ENDPOINT,
   targetKeys?: readonly string[],
 ): Promise<CheckResult> {
-  let resp: Response;
+  const response = await updateManifestResponse(fetchImpl, endpoint);
+  if (isNoContentUpdateResponse(response, endpoint)) return { available: false, reason: "no_content" };
+  const manifest = await parsedUpdateManifest(response, endpoint);
+  return updateManifestResult(manifest, currentVersion, targetKeys ?? DARWIN_AARCH64_TARGET_KEYS);
+}
+
+async function updateManifestResponse(fetchImpl: FetchLike, endpoint: string): Promise<Response> {
   try {
-    resp = await fetchImpl(endpoint, {
+    return await fetchImpl(endpoint, {
       headers: { Accept: "application/json", "User-Agent": USER_AGENT },
       redirect: "follow",
     });
-  } catch (e) {
-    throw new UpdateCheckError("network_error", `could not reach ${endpoint}: ${(e as Error).message}`);
+  } catch (error) {
+    throw new UpdateCheckError("network_error", `could not reach ${endpoint}: ${(error as Error).message}`);
   }
+}
 
+function isNoContentUpdateResponse(response: Response, endpoint: string): boolean {
   // 204 is the protocol's explicit "nothing for you" — distinct from a failure.
-  if (resp.status === 204) return { available: false, reason: "no_content" };
-  if (!resp.ok) {
-    throw new UpdateCheckError("http_error", `${endpoint} returned HTTP ${resp.status}`);
-  }
+  if (response.status === 204) return true;
+  if (!response.ok) throw new UpdateCheckError("http_error", `${endpoint} returned HTTP ${response.status}`);
+  return false;
+}
 
-  let manifest: UpdateManifest;
+async function parsedUpdateManifest(response: Response, endpoint: string): Promise<UpdateManifest> {
   try {
-    manifest = parseUpdateManifest(await resp.text());
-  } catch (e) {
-    throw new UpdateCheckError("manifest_invalid", (e as Error).message);
+    return parseUpdateManifest(await response.text());
+  } catch (error) {
+    throw new UpdateCheckError("manifest_invalid", (error as Error).message);
   }
+}
 
+function updateManifestResult(
+  manifest: UpdateManifest,
+  currentVersion: string,
+  targetKeys: readonly string[]
+): CheckResult {
   if (!isUpdateAvailable(manifest.version, currentVersion)) {
     return { available: false, reason: "not_newer", manifest };
   }
-  const platform = selectPlatformEntry(manifest, targetKeys ?? DARWIN_AARCH64_TARGET_KEYS);
+  const platform = selectPlatformEntry(manifest, targetKeys);
   if (!platform) {
     return { available: false, reason: "no_matching_target", manifest };
   }

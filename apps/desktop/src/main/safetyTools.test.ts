@@ -28,6 +28,7 @@ import { listFileVersions as dbListFileVersions } from "./db-host/fileVersionsLi
 import { verifyPassword, rekeyCopy } from "./db-host/rekey.js";
 import { checkpointCkPaths, checkpointsDir, writeCheckpoint } from "./db-host/checkpoints.js";
 import { hasRecovery, writeRecovery } from "./db-host/recovery.js";
+import { getRecMeta, setRecMeta } from "./db-host/recordings.js";
 import {
   changePassword,
   changePasswordCore,
@@ -334,6 +335,19 @@ describe("versionContent", () => {
     expect(row?.provenance).toBeNull();
     expect(getFileExtractedText(db, fid)).toBe("v1 by a person");
   });
+
+  it("restores a recording version's metadata together with its bytes", () => {
+    freshRoom();
+    const fid = addFile("session.wav", "old transcript", "audio/wav");
+    setRecMeta(db, fid, JSON.stringify({ durationCs: 10, segments: [{ text: "old" }] }));
+    snapshotFileVersion(db, fid, "before transcript edit");
+    const versionId = dbListFileVersions(db, fid)[0]!.id;
+    setRecMeta(db, fid, JSON.stringify({ durationCs: 20, segments: [{ text: "new" }] }));
+    updateFileContent(db, fid, Buffer.from("new transcript"), "new transcript");
+
+    expect(restoreVersionInto(db, versionId)).toBe(fid);
+    expect(JSON.parse(getRecMeta(db, fid)!)).toEqual({ durationCs: 10, segments: [{ text: "old" }] });
+  });
 });
 
 // ============================================================================
@@ -462,6 +476,30 @@ describe("exportFile", () => {
     freshRoom();
     expect(() => exportFile(db, "no-such-file", path.join(tmpDir, "x.txt"))).toThrow();
   });
+
+  it("keeps distinct no-content and filesystem-write failures", () => {
+    freshRoom();
+    const empty = addFile("empty.txt", "placeholder");
+    db.prepare("UPDATE files SET original_bytes = NULL WHERE id = ?").run(empty);
+    expect(() => exportFile(db, empty, path.join(tmpDir, "empty.txt"))).toThrow(
+      "This file has no stored content to export."
+    );
+
+    const id = addFile("note.txt", "contents");
+    const directoryDestination = path.join(tmpDir, "folder-target");
+    mkdirSync(directoryDestination);
+    expect(() => exportFile(db, id, directoryDestination)).toThrow("Could not save the file:");
+  });
+
+  it("keeps a downloaded file's quarantine-mark dispatch after writing its bytes", () => {
+    freshRoom();
+    const id = addFile("download.txt", "from the web");
+    db.prepare("UPDATE files SET origin_url = ? WHERE id = ?").run("https://example.test/download.txt", id);
+    const destination = path.join(tmpDir, "download.txt");
+
+    exportFile(db, id, destination);
+    expect(readFileSync(destination, "utf8")).toBe("from the web");
+  });
 });
 
 describe("exportAll", () => {
@@ -484,6 +522,18 @@ describe("exportAll", () => {
     await expect(exportAll(db, path.join(tmpDir, "does-not-exist"))).rejects.toThrow(
       "Choose a folder to export into."
     );
+  });
+
+  it("never overwrites an existing destination while sanitizing the stored name", async () => {
+    freshRoom();
+    addFile("../report.txt", "inside the room");
+    const outDir = path.join(tmpDir, "out");
+    mkdirSync(outDir);
+    writeFileSync(path.join(outDir, "report.txt"), "already outside");
+
+    await expect(exportAll(db, outDir)).resolves.toBe(1);
+    expect(readFileSync(path.join(outDir, "report.txt"), "utf8")).toBe("already outside");
+    expect(readFileSync(path.join(outDir, "report (2).txt"), "utf8")).toBe("inside the room");
   });
 });
 
@@ -867,5 +917,249 @@ describe("registerSafetyIpc", () => {
       { current: "correct horse battery staple", newPassword: "new-password-xx" }
     );
     expect(changedTo).toBe("new-password-xx");
+  });
+
+  it("dispatches every classic-room maintenance branch through the IPC handlers", async () => {
+    freshRoom();
+    const fileId = addFile("notes.txt", "before");
+    snapshotFileVersion(db, fileId, "before edit");
+    const versionId = dbListFileVersions(db, fileId)[0]!.id;
+    const handle = vi.fn();
+    registerSafetyIpc({ handle }, roomSource(true));
+
+    await expect(listener(handle, "get_file_version")({}, { versionId })).resolves.toMatchObject({
+      fileName: "notes.txt",
+    });
+    const exported = path.join(tmpDir, "notes-export.txt");
+    expect(listener(handle, "export_file")({}, { id: fileId, destPath: exported })).toBeUndefined();
+    const exportDir = path.join(tmpDir, "exports");
+    mkdirSync(exportDir);
+    await expect(listener(handle, "export_all")({}, { destDir: exportDir })).resolves.toBe(1);
+    const duplicate = path.join(tmpDir, "duplicate.roomai");
+    await expect(listener(handle, "duplicate_room")({}, { destPath: duplicate, newPassword: null })).resolves.toBeUndefined();
+    await expect(listener(handle, "compact_room")({})).resolves.toBe("Nothing to recover.");
+    await expect(listener(handle, "delete_file_version")({}, { versionId })).resolves.toBeUndefined();
+  });
+
+  it("keeps emits best-effort and rejects mutating IPC calls in read-only workspaces", async () => {
+    freshRoom();
+    const fileId = addFile("notes.txt", "before");
+    snapshotFileVersion(db, fileId, "before edit");
+    const versionId = dbListFileVersions(db, fileId)[0]!.id;
+    const handle = vi.fn();
+    registerSafetyIpc({ handle }, roomSource(true), {
+      emit: () => { throw new Error("window gone"); },
+    });
+    await expect(listener(handle, "restore_file_version")({}, { versionId })).resolves.toBeUndefined();
+
+    const readOnlyHandle = vi.fn();
+    registerSafetyIpc({ handle: readOnlyHandle }, {
+      currentRoom: () => ({ conn: db, path: roomPath, password: "correct horse battery staple", readOnly: true }),
+    });
+    for (const [channel, args] of [
+      ["change_password", { current: "correct horse battery staple", newPassword: "new-password-xx" }],
+      ["duplicate_room", { destPath: path.join(tmpDir, "never.roomai"), newPassword: null }],
+      ["compact_room", {}],
+    ] as const) {
+      await expect(Promise.resolve().then(() => listener(readOnlyHandle, channel)({}, args))).rejects.toThrow(
+        "This workspace is read-only because another Arcelle process owns the writer lease."
+      );
+    }
+  });
+
+  it("keeps workspace export and duplicate validation ahead of stream/package work", async () => {
+    freshRoom();
+    const workspace = {
+      readStream: () => Readable.from([]),
+    } as unknown as WorkspaceService;
+    const handle = vi.fn();
+    registerSafetyIpc({ handle }, {
+      currentRoom: () => ({
+        conn: db,
+        path: roomPath,
+        password: "correct horse battery staple",
+        workspace,
+        descriptor: { kind: "workspace-folder", roomId: "room-1", dbPath: roomPath },
+      }),
+    });
+    await expect(listener(handle, "export_all")({}, { destDir: path.join(tmpDir, "missing") })).rejects.toThrow(
+      "Choose a folder to export into."
+    );
+    await expect(listener(handle, "duplicate_room")({}, {
+      destPath: path.join(tmpDir, "never"),
+      newPassword: "short",
+    })).rejects.toThrow("Password must be at least 8 characters.");
+  });
+
+  it("removes a partial workspace export when its stream errors", async () => {
+    freshRoom();
+    const fileId = addFile("notes.txt", "stored bytes");
+    const workspace = {
+      readStream: () => Readable.from((async function* () { throw new Error("stream broke"); })()),
+    } as unknown as WorkspaceService;
+    const handle = vi.fn();
+    registerSafetyIpc({ handle }, {
+      currentRoom: () => ({ conn: db, path: roomPath, password: "correct horse battery staple", workspace }),
+    });
+    const destination = path.join(tmpDir, "partial.txt");
+    await expect(listener(handle, "export_file")({}, { id: fileId, destPath: destination })).rejects.toThrow(
+      "Could not save the file: stream broke"
+    );
+    expect(existsSync(destination)).toBe(false);
+  });
+});
+
+// ============================================================================
+// Deterministic native-failure seams — real filesystem/keychain failures are
+// platform-dependent, so these pin their public error/recovery contracts.
+// ============================================================================
+
+function restoreSafetyModuleMocks(): void {
+  vi.doUnmock("koffi");
+  vi.doUnmock("node:fs");
+  vi.doUnmock("./db-host/checkpoints.js");
+  vi.doUnmock("./db-host/files.js");
+  vi.doUnmock("./db-host/recovery.js");
+  vi.doUnmock("./db-host/rekey.js");
+  vi.doUnmock("./keychain.js");
+  vi.resetModules();
+}
+
+function setPlatform(platform: NodeJS.Platform): () => void {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { ...descriptor, value: platform });
+  return () => Object.defineProperty(process, "platform", descriptor);
+}
+
+describe("safety native failure boundaries", () => {
+  it("loads and caches quarantine support on macOS, but remains a no-op elsewhere or on FFI failure", async () => {
+    const calls: string[] = [];
+    let restorePlatform = setPlatform("darwin");
+    try {
+      vi.resetModules();
+      vi.doMock("koffi", () => ({
+        default: {
+          load: () => ({ func: () => (...args: unknown[]) => calls.push(String(args[0])) }),
+        },
+      }));
+      const tools = await import("./safetyTools.js");
+      tools.markAsDownloaded("one");
+      tools.markAsDownloaded("two");
+      expect(calls).toEqual(["one", "two"]);
+    } finally {
+      restorePlatform();
+      restoreSafetyModuleMocks();
+    }
+
+    restorePlatform = setPlatform("linux");
+    try {
+      const tools = await import("./safetyTools.js");
+      expect(() => tools.markAsDownloaded("ignored")).not.toThrow();
+    } finally {
+      restorePlatform();
+      restoreSafetyModuleMocks();
+    }
+
+    restorePlatform = setPlatform("darwin");
+    try {
+      vi.doMock("koffi", () => ({ default: { load: () => { throw new Error("ffi unavailable"); } } }));
+      const tools = await import("./safetyTools.js");
+      expect(() => tools.markAsDownloaded("ignored")).not.toThrow();
+    } finally {
+      restorePlatform();
+      restoreSafetyModuleMocks();
+    }
+  });
+
+  it("deletes stale biometric/recovery state after refresh failures without undoing the rekey", async () => {
+    const calls: string[] = [];
+    try {
+      vi.resetModules();
+      vi.doMock("./db-host/checkpoints.js", () => ({ checkpointCkPaths: () => ["checkpoint"] }));
+      vi.doMock("./db-host/rekey.js", () => ({
+        reclaimableBytes: () => 0,
+        rekey: () => calls.push("rekey"),
+        rekeyCopy: () => calls.push("checkpoint"),
+        vacuum: () => {},
+        vacuumInto: () => {},
+        verifyPassword: (path: string) => calls.push(`verify:${path}`),
+      }));
+      vi.doMock("./keychain.js", () => ({
+        has: (path: string) => { calls.push(`keychain-has:${path}`); return true; },
+        store: (path: string) => { calls.push(`keychain-store:${path}`); throw new Error("store failed"); },
+        deleteEntry: (path: string) => { calls.push(`keychain-delete:${path}`); throw new Error("delete failed"); },
+      }));
+      vi.doMock("./db-host/recovery.js", () => ({
+        hasRecovery: (path: string) => { calls.push(`recovery-has:${path}`); return true; },
+        writeRecovery: async (path: string) => { calls.push(`recovery-write:${path}`); throw new Error("write failed"); },
+        removeRecovery: async (path: string) => { calls.push(`recovery-remove:${path}`); throw new Error("remove failed"); },
+      }));
+      const tools = await import("./safetyTools.js");
+      await expect(tools.changePasswordCore({} as Database.Database, "room", "old", "new", {
+        databasePath: "database",
+        biometricPath: "biometric",
+        recoveryPath: "recovery",
+        checkpointsPath: "checkpoints",
+      })).resolves.toBeNull();
+      expect(calls).toEqual([
+        "verify:database",
+        "rekey",
+        "keychain-has:biometric",
+        "keychain-store:biometric",
+        "keychain-delete:biometric",
+        "recovery-has:recovery",
+        "recovery-write:recovery",
+        "recovery-remove:recovery",
+        "checkpoint",
+      ]);
+    } finally {
+      restoreSafetyModuleMocks();
+    }
+  });
+
+  it("turns an export write failure into its exact name-bearing error", async () => {
+    try {
+      vi.resetModules();
+      vi.doMock("node:fs", async (importOriginal) => ({
+        ...(await importOriginal()),
+        existsSync: (entry: string) => entry === "/exports",
+        statSync: () => ({ isDirectory: () => true }),
+        writeFileSync: () => { throw new Error("disk full"); },
+      }));
+      vi.doMock("./db-host/files.js", async (importOriginal) => ({
+        ...(await importOriginal()),
+        fileOriginUrl: () => null,
+        getFileBytes: () => Buffer.from("bytes"),
+        listFiles: () => [{ id: "f-1", name: "note.txt" }],
+      }));
+      const tools = await import("./safetyTools.js");
+      await expect(tools.exportAll({} as Database.Database, "/exports")).rejects.toThrow(
+        'Could not write "note.txt": disk full'
+      );
+    } finally {
+      restoreSafetyModuleMocks();
+    }
+  });
+
+  it("keeps duplicate cleanup best-effort when a failed rekey leaves no removable file", async () => {
+    try {
+      vi.resetModules();
+      vi.doMock("node:fs", async (importOriginal) => ({
+        ...(await importOriginal()),
+        unlinkSync: () => { throw new Error("already gone"); },
+      }));
+      vi.doMock("./db-host/rekey.js", () => ({
+        reclaimableBytes: () => 0,
+        rekey: () => {},
+        rekeyCopy: () => { throw new Error("rekey failed"); },
+        vacuum: () => {},
+        vacuumInto: () => {},
+        verifyPassword: () => {},
+      }));
+      const tools = await import("./safetyTools.js");
+      expect(() => tools.duplicateRoomCore({} as Database.Database, "old", "/copy", "new")).toThrow("rekey failed");
+    } finally {
+      restoreSafetyModuleMocks();
+    }
   });
 });

@@ -246,26 +246,60 @@ export class Browser {
 
   // ----------------------------------------------------------------- lifecycle
 
-  /** Open a page in a NEW tab and show it. Port of `new_tab` + `create`. */
-  newTab(url: string): string {
-    const parsed = this.guardDestination(url);
-    // The cap REFUSES a ninth page rather than quietly closing one the user was
-    // reading.
+  private assertTabCapacity(): void {
     if (this.registry.count() >= MAX_TABS) {
       throw new Error(
         `The private browser is limited to ${MAX_TABS} open pages — close one first.`,
       );
     }
+  }
+
+  private browserWindow(): WindowContentView {
     const windowContentView = this.deps.windowContentView();
     if (!windowContentView) throw new Error("The app window is gone.");
+    return windowContentView;
+  }
 
-    const id = this.registry.nextId();
+  private createPage(id: string): LivePage {
     const build = this.deps.createPage ?? createLivePage;
-    const page = build(id, {
+    return build(id, {
       contentBlocking: this.webRequestFunnelDepsFor(id),
       downloadGating: this.downloadGatingDeps(),
       navigation: this.navigationDepsFor(id),
     });
+  }
+
+  private attachPage(windowContentView: WindowContentView, page: LivePage): void {
+    try {
+      attachToWindow(windowContentView, page, saneBounds(this.currentBounds ?? PARKED));
+    } catch (error) {
+      destroyLivePage(windowContentView, page);
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+  }
+
+  private registerPage(id: string, page: LivePage, url: string): void {
+    this.pages.set(id, page);
+    this.registry.addPage({
+      id,
+      url,
+      title: "",
+      protection: page.protection,
+      blockedCount: 0,
+    });
+    this.journalBlockerVerdict(page.protection);
+  }
+
+  /** Open a page in a NEW tab and show it. Port of `new_tab` + `create`. */
+  newTab(url: string): string {
+    const parsed = this.guardDestination(url);
+    // The cap REFUSES a ninth page rather than quietly closing one the user was
+    // reading.
+    this.assertTabCapacity();
+    const windowContentView = this.browserWindow();
+
+    const id = this.registry.nextId();
+    const page = this.createPage(id);
 
     // The agent can open a page from any area, so there may be no measured rect
     // yet. Such a page is PARKED until it has one, exactly like a background
@@ -279,26 +313,13 @@ export class Browser {
     // not to keep, and it would count against the tab cap forever. Attaching
     // fetches nothing (`loadURL`, below, is what starts a request), so nothing
     // goes out unblocked by moving this up.
-    try {
-      attachToWindow(windowContentView, page, saneBounds(this.currentBounds ?? PARKED));
-    } catch (e) {
-      destroyLivePage(windowContentView, page);
-      throw e instanceof Error ? e : new Error(String(e));
-    }
-    this.pages.set(id, page);
+    this.attachPage(windowContentView, page);
 
     // Recorded BEFORE anything is loaded, exactly as `register_page` runs before
     // the navigation: a page not yet in the ledger has nowhere to keep a
     // verdict, and the blocker's verdict is already known by now. This is also
     // what OPENS the browsing sitting, so every line below carries it.
-    this.registry.addPage({
-      id,
-      url: parsed.toString(),
-      title: "",
-      protection: page.protection,
-      blockedCount: 0,
-    });
-    this.journalBlockerVerdict(page.protection);
+    this.registerPage(id, page, parsed.toString());
 
     this.selectTab(id);
     this.load(page, parsed.toString());

@@ -1,0 +1,485 @@
+
+
+.ckpt-notice {
+  margin-top: var(--sp-2);
+  font-size: var(--fs-body);
+  color: var(--sem-done);
+}
+
+/* A total is a figure, so it is set in the mono face with tabular figures —
+   the one treatment this system gives numbers that have to line up. */
+.ckpt-total {
+  margin-top: var(--sp-4);
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The disk-usage warning is a marked note, so its words stay --text. A hue's
+   own ink on a wash of the same hue is the one combination in this palette
+   that fails — dark-mode yellow ink on a yellow wash measures 4.43:1 — and
+   the meaning was never coming from the letter colour anyway: it comes from
+   the sentence plus the marker edge behind it. */
+.ckpt-warn {
+  color: var(--text);
+}
+
+/* The list gets its own scroll box so a room with forty checkpoints does not
+   turn the page into a mile of rows. */
+.ckpt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: var(--sp-2);
+  padding: var(--sp-2);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.ckpt-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: 40px;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-sm);
+}
+
+.ckpt-row:hover {
+  background: var(--hover);
+}
+
+/* The dot is decoration with a title attribute behind it; the row's name and
+   date carry the meaning, so this stays a quiet mark. */
+.ckpt-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.ckpt-dot.auto {
+  background: var(--faint);
+}
+
+.ckpt-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.ckpt-name {
+  font-size: var(--fs-body);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ckpt-sub {
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ckpt-actions {
+  flex-shrink: 0;
+  display: inline-flex;
+  gap: var(--sp-2);
+}
+
+.ckpt-action {
+  font-size: var(--fs-meta);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--radius-sm);
+}
+
+/* The inline destructive question. Red edge plus the sentence, so a step that
+   erases a copy of the whole room never looks like a row. */
+.ckpt-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--sem-urgent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--sem-urgent-fill) 10%, transparent);
+}
+
+.ckpt-confirm-q {
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  color: var(--text);
+}
+
+.ckpt-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}
+
+/* ==========================================================================
+   10. CLOUD PRIVACY
+   The blocked-item list and its editors. This is the section a user opens to
+   check a promise, so nothing on it is quieter than --fs-body.
+   ========================================================================== */
+
+/* The two standing corrections. Both are marked notes (the section supplies
+   the meaning class); this only sets their size, because a sentence about
+   what leaves this Mac is instruction copy of the highest kind and the type
+   scale says instructions are never set small.
+
+   The connector seam does not follow the switch above it, so its note is
+   neither an alarm nor a throwaway hint — it is a standing correction to what
+   the switch appears to promise, and it is drawn in the caution hue while the
+   open-door warning above it is drawn in the urgent one. */
+.cpv-off-warning,
+.cpv-seam-note {
+  font-size: var(--fs-lead);
+}
+
+.cpv-add-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  align-items: center;
+  margin: var(--sp-2) 0 var(--sp-3);
+}
+
+.cpv-add-row input {
+  flex: 1;
+  min-width: 200px;
+  font-size: var(--fs-body);
+}
+
+.cpv-cat {
+  font-size: var(--fs-body);
+}
+
+.cpv-list {
+  list-style: none;
+  margin: var(--sp-2) 0 var(--sp-3);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.cpv-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 34px;
+  padding: var(--sp-1) var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-body);
+  background: transparent;
+}
+
+.cpv-real {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 40%;
+}
+
+.cpv-arrow {
+  color: var(--faint);
+}
+
+/* The placeholder is the literal token a cloud model would receive. Mono,
+   because it is a string the user has to be able to read character by
+   character. */
+.cpv-placeholder {
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  color: var(--muted);
+}
+
+/* "guaranteed" vs "found by scan" — two different strengths of promise, so
+   they are drawn as two different tape strips and each keeps its word. */
+.cpv-source {
+  margin-left: auto;
+  flex: none;
+  font-size: var(--fs-micro);
+  padding: 1px var(--sp-2);
+  border-radius: 2px 3px 2px 4px / 4px 2px 3px 2px;
+  color: var(--ink);
+  background: color-mix(in srgb, var(--sem-pending-fill) 30%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sem-pending-fill) 46%, transparent);
+  white-space: nowrap;
+}
+
+.cpv-source.user {
+  background: color-mix(in srgb, var(--sem-done-fill) 30%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sem-done-fill) 46%, transparent);
+}
+
+.cpv-remove {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: none;
+  border: 1px solid transparent;
+  color: var(--muted);
+  font-size: var(--fs-lead);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.cpv-remove:hover {
+  color: var(--sem-urgent);
+  border-color: var(--sem-urgent);
+  background: none;
+}
+
+.cpv-concepts {
+  width: 100%;
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  resize: vertical;
+}
+
+.cpv-scan-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin: var(--sp-2) 0 var(--sp-3);
+}
+
+.cpv-scan-row .settings-hint {
+  margin: 0;
+}
+
+.cpv-inline-hint {
+  margin: var(--sp-2) 0;
+}
+
+/* An inline "do this instead" inside a hint line — the way back to the
+   app-wide default, which used to be a one-way door. */
+.cpv-inline-hint .linkish {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.cpv-inline-hint .linkish:hover {
+  color: var(--accent-2);
+  background: none;
+}
+
+/* The honest-limits paragraph. It used to be dimmed with opacity, which is a
+   contrast hazard on the one paragraph that admits what this feature cannot
+   do. It is quieter now by position and by ink, at full legibility. */
+.cpv-honesty {
+  margin-top: var(--sp-4);
+}
+
+/* ==========================================================================
+   11. TABLES
+   The support matrix is two tables that can both outgrow the modal. Each gets
+   its own scroll box in BOTH axes and a tighter type scale, rather than the
+   whole sheet shrinking to accommodate them.
+   ========================================================================== */
+
+.cap-matrix-scroll {
+  overflow: auto;
+  max-height: 340px;
+  margin: var(--sp-3) 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+/* border-collapse is SEPARATE on purpose: a collapsed table's cell borders
+   belong to the table, not to the cell, so they scroll out from under a
+   sticky header and leave it floating with no edge. Separate + zero spacing
+   draws the same grid and keeps each border attached to its own cell. */
+.cap-matrix {
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: var(--fs-meta);
+  font-variant-numeric: tabular-nums;
+  min-width: 100%;
+}
+
+.cap-matrix th,
+.cap-matrix td {
+  border: 0;
+  border-right: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
+  padding: var(--sp-2) var(--sp-3);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.cap-matrix th:last-child,
+.cap-matrix td:last-child {
+  border-right: 0;
+}
+
+.cap-matrix tbody tr:last-child th,
+.cap-matrix tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+/* The header row and the row-name column stay put while the grid scrolls
+   under them — a wide matrix is unreadable the moment the row you are on
+   loses its label. Opaque, because a sticky cell has to occlude the rows
+   passing beneath it. */
+.cap-matrix thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--raised);
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+.cap-matrix tbody th[scope="row"] {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: var(--raised);
+  font-weight: 500;
+  color: var(--text);
+}
+
+.cap-matrix thead th:first-child {
+  left: 0;
+  z-index: 2;
+}
+
+.cap-cell {
+  text-align: center;
+}
+
+/* The three marks are colour-coded AND shaped differently AND carry
+   screen-reader words, so the answer never depends on colour alone. "unknown"
+   is deliberately quiet: it is not a No. It is drawn in --faint rather than
+   with opacity, because dimming a glyph with opacity fails contrast on the
+   one mark that already means "we could not find out". */
+.cap-yes {
+  color: var(--sem-done);
+}
+
+.cap-no {
+  color: var(--sem-urgent);
+}
+
+.cap-unknown {
+  color: var(--faint);
+}
+
+.cap-unavailable th,
+.cap-unavailable td {
+  color: var(--muted);
+}
+
+.cap-note {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+/* Screen-reader text for the mark glyphs — the table must read as words, not
+   as "check, cross, dash". */
+.cap-cell .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+   12. PROGRESS
+   A model download. Shared with the image viewer and the chat pane, so this
+   stays a general-purpose bar rather than a settings-only one.
+   ========================================================================== */
+
+.pull-progress {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+/* The status string is technical data (Ollama's own words, a size, a
+   percentage) and takes the mono face — but a BUTTON inside the row is
+   interface, and interface is always the sans. */
+.pull-progress button {
+  font-family: var(--sans);
+}
+
+/* `display: block` because two callers render this as a <span> outside a flex
+   row, and an inline element ignores height — the bar would vanish. */
+.pull-bar {
+  display: block;
+  height: 8px;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rule) 70%, transparent);
+  border-radius: 999px 999px 999px 999px / 8px 6px 8px 6px;
+  overflow: hidden;
+}
+
+/* Inside the settings/viewer progress block the bar takes a line of its own
+   and the percentage is written out beneath it — progress is never a length
+   and a colour alone. The chat banner lays its own copy out differently
+   (`.banner-pull .pull-bar` in onboarding.css) and is deliberately not
+   touched here. */
+.pull-progress > .pull-bar {
+  flex: 1 0 100%;
+}
+
+/* A marker stroke wiped across the page, with the highlighter's own uneven
+   alpha ramp — the same recipe as .nb-progress-fill in paper.css. */
+.pull-bar-fill {
+  height: 100%;
+  background-image: linear-gradient(
+    99deg,
+    color-mix(in srgb, var(--accent-fill) 72%, transparent) 0%,
+    color-mix(in srgb, var(--accent-fill) 52%, transparent) 46%,
+    color-mix(in srgb, var(--accent-fill) 68%, transparent) 88%,
+    color-mix(in srgb, var(--accent-fill) 46%, transparent) 100%
+  );
+  box-shadow: inset 0 0 0 1px var(--accent);
+  border-radius: inherit;
+  transition: width var(--dur-slow) var(--ease-pen);
+}
+
+/* ==========================================================================
+   13. VOICE
+   ========================================================================== */
+
+/* The data boundary. It is the first thing on the page for a reason: speaking
+   always uses the cloud voice, and a naive reader must not have to infer
+   that. Drawn as a marked note; the section sets the meaning class. */
+.voice-boundary {
+  margin: 0 0 var(--sp-4);
+}

@@ -1,187 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-import { locateQuoteHebrewAware, makeReceiptBadge } from "./highlight";
 import { useFileBytes } from "./useFileBytes";
 import "./pdf.css";
+import { highlightQuoteOnPage, type PdfTarget } from "./pdfHighlights";
+import { renderPdfPage } from "./pdfRendering";
+import { applyPdfTarget, buildPdfPages, focusFindInput, pdfShortcut, runPdfFind, runPdfShortcut, viewerIsActive } from "./pdfNavigation";
+import { PdfFailurePanels, PdfFindPanel, PdfPages, PdfProgress, PdfScanStatus, PdfToolbar } from "./PdfControls";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
-/** Render this far beyond the viewport so scrolling never shows a blank page. */
-const RENDER_AHEAD_PX = 1500;
-/** Rasterized pages kept alive at once. Far pages collapse back to
- * placeholders (their height preserved), so a 1,200-page book costs the
- * memory of ~28 canvases, not 1,200 — the old fix for that was a hard
- * MAX_PAGES=100 cap, which simply cut long documents off. */
-const MAX_LIVE_PAGES = 28;
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 3;
 const SCALE_STEP = 0.25;
-
-export interface PdfTarget {
-  page?: number;
-  quote?: string;
-}
-
-interface TextItem {
-  str?: string;
-  width?: number;
-  transform: number[];
-  hasEOL?: boolean;
-}
-
-/** pdf.js v6's getTextContent() iterates a ReadableStream with
- * `for await`, which WKWebView/Safari doesn't support — it throws
- * "undefined is not a function". Read the stream manually instead. */
-async function readTextItems(page: pdfjs.PDFPageProxy): Promise<TextItem[]> {
-  const reader = (
-    page.streamTextContent() as ReadableStream<{ items: TextItem[] }>
-  ).getReader();
-  const items: TextItem[] = [];
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    items.push(...value.items);
-  }
-  return items;
-}
-
-/** Join a page's text items into readable text (reading order + line
- * breaks). pdf.js emits `hasEOL` on the item that ends a line. */
-function pageTextFromItems(items: TextItem[]): string {
-  let out = "";
-  for (const it of items) {
-    out += it.str ?? "";
-    if (it.hasEOL) out += "\n";
-  }
-  return out.replace(/[ \t]+\n/g, "\n").trim();
-}
-
-/** Concatenate a page's text items into one source string, plus a
- * per-character map back to the originating item index. A `\n` is inserted
- * at each `hasEOL` boundary so line-end hyphenation and whitespace
- * collapsing (see locateQuote) see the line breaks. The map lets a match
- * that spans several items resolve back to every item it touched. */
-function pageSource(items: TextItem[]): { text: string; map: number[] } {
-  let text = "";
-  const map: number[] = [];
-  items.forEach((it, idx) => {
-    const s = it.str ?? "";
-    for (let i = 0; i < s.length; i++) {
-      text += s[i];
-      map.push(idx);
-    }
-    if (it.hasEOL) {
-      text += "\n";
-      map.push(idx);
-    }
-  });
-  return { text, map };
-}
-
-/** A per-page "Copy text" button (UX-2). Built imperatively because the
- * pages themselves are rendered imperatively into the container. */
-function makeCopyButton(text: string): HTMLButtonElement {
-  const btn = document.createElement("button");
-  btn.type = "button";
-  btn.className = "pdf-copy-btn";
-  btn.textContent = "Copy text";
-  btn.title = "Copy this page's text";
-  const reset = () => {
-    btn.textContent = "Copy text";
-    btn.classList.remove("copied");
-  };
-  btn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    navigator.clipboard
-      .writeText(text)
-      .then(() => {
-        btn.textContent = "Copied";
-        btn.classList.add("copied");
-        window.setTimeout(reset, 1200);
-      })
-      .catch(() => {
-        btn.textContent = "Copy failed";
-        window.setTimeout(reset, 1200);
-      });
-  });
-  return btn;
-}
-
-/**
- * Find `quote` in a page's text items and paint absolutely-positioned
- * highlight divs over the canvas. Item-level granularity: every text run
- * the match passes through gets a box. `scroll` brings the first box into
- * view (suppressed on zoom re-renders, which preserve reading position).
- *
- * `opts` separates the two callers: a CITATION paints `.pdf-hl` and earns the
- * green receipt badge (the quote was verified on this page); an ordinary
- * ⌘F find paints `.pdf-find-hl` and earns nothing — it is the reader's own
- * search, not a claim about where a sentence came from.
- */
-async function highlightQuoteOnPage(
-  page: pdfjs.PDFPageProxy,
-  wrap: HTMLDivElement,
-  quote: string,
-  scroll = true,
-  opts?: { className?: string; badge?: boolean },
-): Promise<boolean> {
-  const boxClass = opts?.className ?? "pdf-hl";
-  const wantBadge = opts?.badge ?? true;
-  // Normalization-tolerant match: locateQuote folds case, whitespace,
-  // newlines, soft hyphens, line-end hyphenation and typographic
-  // look-alikes, and can span the many items pdf.js splits a line into.
-  const items = await readTextItems(page);
-  const { text, map } = pageSource(items);
-  // Hebrew-aware: visual-order PDFs store lines mirrored — the fallback
-  // mirrors them back and still maps the hit to original char positions.
-  const hit = locateQuoteHebrewAware(text, quote);
-  if (!hit) return false;
-
-  // Overlays go in the page BOX (exactly the page's own coordinate space),
-  // never in the wrap, which can be wider than the page.
-  const box = wrap.querySelector<HTMLDivElement>(".pdf-page-box");
-  const canvas = box?.querySelector("canvas");
-  if (!box || !canvas) return false;
-  const cssWidth = parseFloat(canvas.style.width) || canvas.clientWidth;
-  const base = page.getViewport({ scale: 1 });
-  const viewport = page.getViewport({ scale: cssWidth / base.width });
-  // Every item the (inclusive) matched source range touches gets a box.
-  const matched = [...new Set(map.slice(hit.start, hit.end + 1))];
-  let first: HTMLDivElement | null = null;
-  for (const idx of matched) {
-    const it = items[idx];
-    if (!it?.str?.trim()) continue;
-    const tx = pdfjs.Util.transform(viewport.transform, it.transform);
-    const fontH = Math.hypot(tx[2], tx[3]);
-    const hl = document.createElement("div");
-    hl.className = boxClass;
-    hl.style.left = `${tx[4]}px`;
-    hl.style.top = `${tx[5] - fontH}px`;
-    hl.style.width = `${Math.max((it.width ?? 0) * viewport.scale, 2)}px`;
-    hl.style.height = `${fontH * 1.2}px`;
-    box.appendChild(hl);
-    first = first ?? hl;
-  }
-  // A painted highlight means locateQuote found the quote verbatim on this
-  // page — a receipt. Tag the first box with a green "verified" check.
-  if (first && wantBadge) {
-    const badge = makeReceiptBadge();
-    badge.classList.add("pdf-hl-badge");
-    // Position only (look comes from the .receipt-badge CSS): sit just above
-    // the first matched run.
-    badge.style.position = "absolute";
-    badge.style.left = first.style.left;
-    badge.style.top = first.style.top;
-    badge.style.transform = "translateY(-115%)";
-    badge.style.pointerEvents = "none";
-    badge.style.zIndex = "3";
-    badge.style.whiteSpace = "nowrap";
-    box.appendChild(badge);
-  }
-  if (scroll) first?.scrollIntoView({ block: "center", behavior: "smooth" });
-  return first != null;
-}
 
 export default function PdfView({
   mediaToken,
@@ -268,104 +99,22 @@ export default function PdfView({
   /** Rasterize page `p` into its wrap (idempotent), then recycle the pages
    * farthest from it once more than MAX_LIVE_PAGES are alive. */
   const renderPage = useCallback(
-    async (p: number, token: number): Promise<void> => {
-      const pdf = pdfRef.current;
-      const container = containerRef.current;
-      const wrap = pageWrapsRef.current[p - 1];
-      if (!pdf || !container || !wrap) return;
-      if (token !== renderTokenRef.current) return;
-      if (wrap.dataset.rendered === "1" || wrap.dataset.rendering === "1") {
-        const live = livePagesRef.current;
-        const i = live.indexOf(p);
-        if (i >= 0) {
-          live.splice(i, 1);
-          live.push(p); // touch
-        }
-        return;
-      }
-      wrap.dataset.rendering = "1";
-      try {
-        const page = await pdf.getPage(p);
-        if (token !== renderTokenRef.current) return;
-        const fitWidth = Math.max(container.clientWidth - 16, 400);
-        const cssWidth = fitWidth * scaleRef.current;
-        const base = page.getViewport({ scale: 1 });
-        const dpr = window.devicePixelRatio || 1;
-        const viewport = page.getViewport({
-          scale: (cssWidth / base.width) * dpr,
-        });
-        const canvas = document.createElement("canvas");
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
-        canvas.style.width = `${cssWidth}px`;
-        canvas.className = "pdf-page";
-        await page.render({ canvas, viewport }).promise;
-        if (token !== renderTokenRef.current) return;
-        // The page BOX is exactly the page: canvas, selectable text and any
-        // quote highlight all share one coordinate space inside it.
-        const cssScale = cssWidth / base.width;
-        const box = document.createElement("div");
-        box.className = "pdf-page-box";
-        box.style.width = `${cssWidth}px`;
-        box.style.setProperty("--total-scale-factor", String(cssScale));
-        box.style.setProperty("--scale-round-x", "1px");
-        box.style.setProperty("--scale-round-y", "1px");
-        box.appendChild(canvas);
-        wrap.replaceChildren(box);
-        wrap.style.minHeight = "";
-        wrap.dataset.rendered = "1";
-
-        // Selectable text: pdf.js positions transparent spans over the raster,
-        // so a sentence can be dragged over and copied like on any web page.
-        // Without it a PDF is a picture of words.
-        const textLayerDiv = document.createElement("div");
-        textLayerDiv.className = "textLayer";
-        box.appendChild(textLayerDiv);
-        const textLayer = new pdfjs.TextLayer({
-          textContentSource: page.streamTextContent(),
-          container: textLayerDiv,
-          viewport: page.getViewport({ scale: cssScale }),
-        });
-        await textLayer.render().catch(() => {
-          /* a page whose text can't be laid out still shows its raster */
-        });
-        if (token !== renderTokenRef.current) return;
-
-        // UX-2: per-page copy button, hidden when the page has no text.
-        const pageText = pageTextFromItems(await readTextItems(page));
-        if (token !== renderTokenRef.current) return;
-        if (pageText) wrap.appendChild(makeCopyButton(pageText));
-
-        // If this page carries the target-quote highlight and was recycled
-        // meanwhile, repaint it (without stealing the scroll position).
-        const hl = highlightRef.current;
-        if (hl && hl.page === p) {
-          await highlightQuoteOnPage(page, wrap, hl.quote, false);
-        }
-        // Same for the ⌘F hit on screen, so the find bar's count and the page
-        // never disagree after a recycle.
-        const fh = findHlRef.current;
-        if (fh && fh.page === p) {
-          await highlightQuoteOnPage(page, wrap, fh.quote, false, {
-            className: "pdf-find-hl",
-            badge: false,
-          });
-        }
-
-        const live = livePagesRef.current;
-        live.push(p);
-        if (live.length > MAX_LIVE_PAGES) {
-          // Recycle the live pages farthest from the one just rendered.
-          live.sort((a, b) => Math.abs(b - p) - Math.abs(a - p));
-          while (live.length > MAX_LIVE_PAGES) {
-            const victim = live.shift();
-            if (victim != null && victim !== p) recyclePage(victim);
-          }
-        }
-      } finally {
-        delete wrap.dataset.rendering;
-      }
-    },
+    (page: number, token: number) =>
+      renderPdfPage(
+        {
+          pdfRef,
+          containerRef,
+          pageWrapsRef,
+          renderTokenRef,
+          livePagesRef,
+          scaleRef,
+          highlightRef,
+          findHlRef,
+          recyclePage,
+        },
+        page,
+        token,
+      ),
     [recyclePage],
   );
 
@@ -387,89 +136,21 @@ export default function PdfView({
    * document and the pages already on screen.
    */
   const applyTarget = useCallback(
-    async (token: number) => {
-      const pdf = pdfRef.current;
-      const wraps = pageWrapsRef.current;
-      const tgt = targetRef.current;
-      if (!pdf || wraps.length === 0) return;
-
-      if (tgt?.quote) {
-        const quote = tgt.quote;
-        const order = [...Array(pdf.numPages).keys()].map((i) => i + 1);
-        if (tgt.page && tgt.page >= 1 && tgt.page <= pdf.numPages) {
-          order.splice(order.indexOf(tgt.page), 1);
-          order.unshift(tgt.page);
-        }
-        let foundPage: number | null = null;
-        scanCancelRef.current = false;
-        // Reading every page of a long book is a real wait, and it is the
-        // worst wait when the passage isn't there at all: narrate it every few
-        // pages (not every fifty, which reads as frozen) and offer a way out.
-        const narrate = order.length > 20;
-        if (narrate) setScan({ at: 0, total: order.length });
-        try {
-          for (let k = 0; k < order.length; k++) {
-            const p = order[k];
-            if (token !== renderTokenRef.current) return;
-            if (scanCancelRef.current) {
-              setStatus("Search stopped — the document is still open.");
-              return;
-            }
-            if (narrate && k % 5 === 0) setScan({ at: k, total: order.length });
-            const page = await pdf.getPage(p);
-            const { text } = pageSource(await readTextItems(page));
-            if (locateQuoteHebrewAware(text, quote)) {
-              foundPage = p;
-              break;
-            }
-            // Release the page's parsed operator list again — scanning a
-            // 1,200-page book otherwise grows memory the whole way down.
-            if (wraps[p - 1]?.dataset.rendered !== "1") page.cleanup();
-          }
-        } finally {
-          setScan(null);
-        }
-        if (token !== renderTokenRef.current) return;
-        setStatus("");
-        if (foundPage != null) {
-          highlightRef.current = { page: foundPage, quote };
-          const wrap = wraps[foundPage - 1];
-          wrap?.scrollIntoView({ block: "center" });
-          await renderPage(foundPage, token);
-          if (token !== renderTokenRef.current) return;
-          // renderPage only paints the highlight while it RASTERIZES a page; a
-          // page that was already live — the normal case for a follow-up
-          // citation near where the reader already is — bails out of it early,
-          // and clearHighlightBoxes has just wiped the previous highlight. So
-          // paint it here when it isn't already there, exactly as showFindHit
-          // does for its own hits.
-          if (wrap && !wrap.querySelector(".pdf-hl")) {
-            const page = await pdf.getPage(foundPage);
-            if (token !== renderTokenRef.current) return;
-            await highlightQuoteOnPage(page, wrap, quote, false);
-            if (token !== renderTokenRef.current) return;
-          }
-          const box = wrap?.querySelector(".pdf-hl");
-          box?.scrollIntoView({ block: "center", behavior: "smooth" });
-        } else {
-          setStatus(
-            tgt.page
-              ? `Couldn't locate the highlighted text — showing page ${tgt.page} instead.`
-              : "Couldn't locate the highlighted text in this PDF.",
-          );
-          if (tgt.page) {
-            wraps[Math.min(tgt.page, pdf.numPages) - 1]?.scrollIntoView({
-              block: "start",
-              behavior: "smooth",
-            });
-          }
-        }
-      } else if (tgt?.page) {
-        wraps[
-          Math.min(Math.max(tgt.page, 1), pdf.numPages) - 1
-        ]?.scrollIntoView({ block: "start", behavior: "smooth" });
-      }
-    },
+    (token: number) =>
+      applyPdfTarget(
+        {
+          pdfRef,
+          pageWrapsRef,
+          renderTokenRef,
+          scanCancelRef,
+          targetRef,
+          highlightRef,
+          setScan,
+          setStatus,
+          renderPage,
+        },
+        token,
+      ),
     [renderPage],
   );
 
@@ -480,79 +161,26 @@ export default function PdfView({
    * re-renders) scrolls that page back to the top afterwards.
    */
   const buildPages = useCallback(
-    async (renderScale: number, restoreIdx: number | null) => {
-      const pdf = pdfRef.current;
-      const container = containerRef.current;
-      if (!pdf || !container) return;
-      const token = ++renderTokenRef.current;
-      const restoring = restoreIdx != null;
-
-      observerRef.current?.disconnect();
-      container.innerHTML = "";
-      livePagesRef.current = [];
-      // These name the TARGET, not the DOM. Clearing them on a zoom re-render
-      // threw the citation highlight and its receipt away for good — the pages
-      // came back at the new scale with nothing painted on them — and did the
-      // same to the ⌘F hit while the find bar went on counting it. Kept on a
-      // re-render, `renderPage` repaints both as each page rasterizes.
-      if (!restoring) {
-        highlightRef.current = null;
-        findHlRef.current = null;
-      }
-      const wraps: HTMLDivElement[] = [];
-      pageWrapsRef.current = wraps;
-
-      try {
-        // Uniform placeholder height from page 1 (books are uniform; a page
-        // that differs corrects itself the moment it renders).
-        const page1 = await pdf.getPage(1);
-        if (token !== renderTokenRef.current) return;
-        const fitWidth = Math.max(container.clientWidth - 16, 400);
-        const cssWidth = fitWidth * renderScale;
-        const base1 = page1.getViewport({ scale: 1 });
-        const estH = (base1.height / base1.width) * cssWidth;
-        estHeightRef.current = estH;
-
-        for (let p = 1; p <= pdf.numPages; p++) {
-          const wrap = document.createElement("div");
-          wrap.className = "pdf-page-wrap";
-          wrap.dataset.page = String(p);
-          wrap.style.minHeight = `${estH}px`;
-          container.appendChild(wrap);
-          wraps.push(wrap);
-        }
-
-        const obs = new IntersectionObserver(
-          (entries) => {
-            for (const e of entries) {
-              if (!e.isIntersecting) continue;
-              const p = Number((e.target as HTMLElement).dataset.page);
-              if (p >= 1) void renderPage(p, renderTokenRef.current);
-            }
-          },
-          { root: null, rootMargin: `${RENDER_AHEAD_PX}px 0px` },
-        );
-        wraps.forEach((w) => obs.observe(w));
-        observerRef.current = obs;
-        setStatus("");
-
-        // Zoom re-render: put the page the reader was on back at the top.
-        if (restoring && restoreIdx != null) {
-          wraps[Math.min(restoreIdx, wraps.length - 1)]?.scrollIntoView({
-            block: "start",
-          });
-          return;
-        }
-
-        await applyTarget(token);
-      } catch (e) {
-        if (token === renderTokenRef.current) {
-          console.error("PDF render failed:", e);
-          setStatus("");
-          setFailed("damaged");
-        }
-      }
-    },
+    (renderScale: number, restoreIdx: number | null) =>
+      buildPdfPages(
+        {
+          pdfRef,
+          containerRef,
+          pageWrapsRef,
+          renderTokenRef,
+          observerRef,
+          livePagesRef,
+          estHeightRef,
+          highlightRef,
+          findHlRef,
+          setStatus,
+          setFailed,
+          renderPage,
+          applyTarget,
+        },
+        renderScale,
+        restoreIdx,
+      ),
     [renderPage, applyTarget],
   );
 
@@ -674,43 +302,21 @@ export default function PdfView({
    * first hit. Same normalization the citation highlight uses, so a phrase
    * broken across lines or hyphenated still matches. */
   const runFind = useCallback(
-    async (raw: string) => {
-      const pdf = pdfRef.current;
-      const needle = raw.trim();
-      clearFindBoxes();
-      setFindHits([]);
-      setFindAt(0);
-      findForRef.current = needle;
-      if (!pdf || !needle) return;
-      const token = ++findTokenRef.current;
-      setFinding(true);
-      const hits: number[] = [];
-      try {
-        for (let p = 1; p <= pdf.numPages; p++) {
-          if (token !== findTokenRef.current) return;
-          const page = await pdf.getPage(p);
-          const { text } = pageSource(await readTextItems(page));
-          if (locateQuoteHebrewAware(text, needle)) {
-            hits.push(p);
-            // Publish EACH hit as it is found, rather than after every page has
-            // been parsed. On a 462-page book the old tail-publish left the nav
-            // buttons disabled and the readout on "Searching…" for the whole
-            // document — indistinguishable, to the person waiting, from the
-            // find box being broken. A fresh array each time so React sees it.
-            setFindHits([...hits]);
-            if (hits.length === 1) {
-              setFindAt(0);
-              await showFindHit(p, needle);
-            }
-          }
-          // Same memory discipline as the citation scan: a page parsed only
-          // to be read is released again.
-          if (pageWrapsRef.current[p - 1]?.dataset.rendered !== "1") page.cleanup();
-        }
-      } finally {
-        if (token === findTokenRef.current) setFinding(false);
-      }
-    },
+    (raw: string) =>
+      runPdfFind(
+        {
+          pdfRef,
+          pageWrapsRef,
+          findTokenRef,
+          findForRef,
+          clearFindBoxes,
+          setFindHits,
+          setFindAt,
+          setFinding,
+          showFindHit,
+        },
+        raw,
+      ),
     [clearFindBoxes, showFindHit],
   );
 
@@ -811,6 +417,14 @@ export default function PdfView({
   const zoomIn = useCallback(() => setScale((s) => clamp(s + SCALE_STEP)), []);
   const zoomOut = useCallback(() => setScale((s) => clamp(s - SCALE_STEP)), []);
   const fitWidth = useCallback(() => setScale(1), []);
+  const openFind = useCallback(() => {
+    setFindOpen(true);
+    window.setTimeout(() => focusFindInput(findInputRef, false), 0);
+  }, []);
+  const openFindShortcut = useCallback(() => {
+    setFindOpen(true);
+    window.setTimeout(() => focusFindInput(findInputRef, true), 0);
+  }, []);
 
   // ⌘+ / ⌘- / ⌘0 / ⌘F while the viewer is focused, or hovered with the caret
   // nowhere — see `typing` below.
@@ -822,42 +436,20 @@ export default function PdfView({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!e.metaKey) return;
-      const root = rootRef.current;
-      const el = document.activeElement;
-      // The pointer may only decide when nothing is being typed into. With the
-      // caret in the chat composer and the pointer left resting over the page
-      // — where it sits after any scroll — ⌘F used to open this find bar and
-      // suppress the room-wide search, and ⌘+ zoomed the PDF mid-sentence.
-      const typing =
-        el instanceof HTMLElement &&
-        (el.isContentEditable ||
-          el.tagName === "INPUT" ||
-          el.tagName === "TEXTAREA");
-      const inViewer = root ? root.contains(el) : false;
-      const active = inViewer || (hoverRef.current && !typing);
-      if (!active) return;
-      if (e.key === "+" || e.key === "=") {
-        e.preventDefault();
-        zoomIn();
-      } else if (e.key === "-" || e.key === "_") {
-        e.preventDefault();
-        zoomOut();
-      } else if (e.key === "0") {
-        e.preventDefault();
-        fitWidth();
-      } else if (e.key.toLowerCase() === "f") {
-        e.preventDefault();
-        setFindOpen(true);
-        // After the bar has mounted; select so a second ⌘F retypes.
-        window.setTimeout(() => {
-          findInputRef.current?.focus();
-          findInputRef.current?.select();
-        }, 0);
-      }
+      if (!viewerIsActive(rootRef.current, hoverRef.current, document.activeElement)) return;
+      const shortcut = pdfShortcut(e.key);
+      if (!shortcut) return;
+      e.preventDefault();
+      runPdfShortcut(shortcut, {
+        zoomIn,
+        zoomOut,
+        fit: fitWidth,
+        find: openFindShortcut,
+      });
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [zoomIn, zoomOut, fitWidth]);
+  }, [zoomIn, zoomOut, fitWidth, openFindShortcut]);
 
   return (
     <div
@@ -870,237 +462,38 @@ export default function PdfView({
         hoverRef.current = false;
       }}
     >
-      {/* The bytes stream in before pdf.js sees them, so a read that fails
-          (a staged token evicted, the room locked) has to say so on its own —
-          otherwise the pane just sits empty with a live zoom bar over it. */}
-      {readError && !failed && (
-        <div className="pdf-failed" role="alert">
-          <div className="pdf-failed-title">This PDF could not be read.</div>
-          <p className="pdf-failed-body">{readError}</p>
-        </div>
-      )}
-      {/* "Opening {object}…" is the whole family's word for the byte fetch —
-          this was the one that named a file format instead. */}
-      {readLoading && !failed && (
-        <div className="viewer-status">Opening document…</div>
-      )}
-      {failed === "locked" && (
-        <div className="pdf-failed" role="alert">
-          <div className="pdf-failed-title">This PDF is password-protected.</div>
-          <p className="pdf-failed-body">
-            It is encrypted, and this app can neither open it nor read its text
-            — so it won't appear in search either. Unlock it in an app that can
-            ask for the password and import the unlocked copy, or{" "}
-            <strong>Export</strong> the original from the toolbar above. The
-            file itself is stored here unchanged.
-          </p>
-        </div>
-      )}
-      {failed === "damaged" && (
-        <div className="pdf-failed" role="alert">
-          <div className="pdf-failed-title">This PDF could not be opened.</div>
-          <p className="pdf-failed-body">
-            The file may be incomplete or damaged. You can{" "}
-            <strong>Export</strong> the original from the toolbar above to
-            inspect it, replace it by importing the file again, or{" "}
-            <strong>Close</strong> it.
-          </p>
-        </div>
-      )}
-      {/* HOW FAR THROUGH THE DOCUMENT, as a marker stroke across the top.
-          `curPage` is set from where the pages actually are on screen as you
-          scroll, so this is a real position and not a decoration — at exactly
-          the granularity the "Page 4 of 21" readout beside it already claims.
-          aria-hidden: that readout is the accessible statement of it, and a
-          live region announcing a percentage on every scroll frame would make
-          the document unusable with a screen reader. */}
-      {!failed && numPages > 0 && (
-        <div
-          className="rdr-progress pdf-progress"
-          aria-hidden
-          style={
-            { "--nb-val": `${Math.round((curPage / numPages) * 100)}%` } as React.CSSProperties
-          }
-        >
-          <i />
-        </div>
-      )}
-      {!failed && (
-      <div className="pdf-zoombar">
-        <button
-          type="button"
-          className="pdf-zoom-btn"
-          onClick={zoomOut}
-          disabled={scale <= MIN_SCALE + 1e-9}
-          title="Zoom out (⌘−)"
-          aria-label="Zoom out"
-        >
-          −
-        </button>
-        <span className="pdf-zoom-pct">{Math.round(scale * 100)}%</span>
-        <button
-          type="button"
-          className="pdf-zoom-btn"
-          onClick={zoomIn}
-          disabled={scale >= MAX_SCALE - 1e-9}
-          title="Zoom in (⌘+)"
-          aria-label="Zoom in"
-        >
-          +
-        </button>
-        <button
-          type="button"
-          className="pdf-zoom-fit"
-          onClick={fitWidth}
-          title="Fit width (⌘0)"
-        >
-          Fit width
-        </button>
-        {numPages > 0 && (
-          <label className="pdf-page-jump">
-            Page
-            <input
-              type="text"
-              inputMode="numeric"
-              aria-label={`Page number, ${numPages} pages in this document`}
-              value={pageDraft === "" ? String(curPage) : pageDraft}
-              onChange={(e) => setPageDraft(e.target.value.replace(/\D/g, ""))}
-              onFocus={(e) => e.currentTarget.select()}
-              onBlur={() => setPageDraft("")}
-              onKeyDown={(e) => {
-                if (e.key !== "Enter") return;
-                e.preventDefault();
-                const n = parseInt(pageDraft, 10);
-                if (!Number.isNaN(n)) goToPage(n);
-                setPageDraft("");
-                e.currentTarget.blur();
-              }}
-            />
-            <span className="pdf-page-total">of {numPages}</span>
-          </label>
-        )}
-        <button
-          type="button"
-          className="pdf-zoom-fit"
-          onClick={() => {
-            setFindOpen(true);
-            window.setTimeout(() => findInputRef.current?.focus(), 0);
-          }}
-          title="Find in this document (⌘F)"
-        >
-          Find
-        </button>
-      </div>
-      )}
-      {!failed && findOpen && (
-        <div className="pdf-findbar" role="search">
-          <input
-            ref={findInputRef}
-            type="text"
-            className="pdf-find-input"
-            dir="auto"
-            placeholder="Find in this document"
-            aria-label="Find in this document"
-            value={findQuery}
-            onChange={(e) => setFindQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") {
-                e.preventDefault();
-                closeFind();
-                return;
-              }
-              if (e.key !== "Enter") return;
-              e.preventDefault();
-              // Enter searches a new phrase, and steps through the hits of one
-              // already searched (Shift+Enter goes back) — what every find bar
-              // does, and it saves re-reading the whole document per hit.
-              if (findQuery.trim() && findQuery.trim() === findForRef.current) {
-                stepFind(e.shiftKey ? -1 : 1);
-              } else {
-                void runFind(findQuery);
-              }
-            }}
-          />
-          {/* Always says something once there is a query. The blank branch this
-              replaces is why the bar read as dead: with `runFind` unreachable
-              from typing, `findQuery !== findForRef.current` was permanently
-              true, so this rendered "" forever no matter what was typed. Even
-              with the search now running as you type, a silent readout would
-              leave the sub-2-character case unexplained. */}
-          <span className="pdf-find-count" role="status">
-            {findQuery.trim() === ""
-              ? ""
-              : findQuery.trim().length < 2
-                ? "Keep typing…"
-                : finding && findHits.length === 0
-                  ? "Searching…"
-                  : findHits.length === 0
-                    ? "No matches"
-                    : `Page ${findHits[findAt]} · ${findAt + 1} of ${findHits.length}${
-                        finding ? "…" : ""
-                      }`}
-          </span>
-          <button
-            type="button"
-            className="pdf-zoom-btn"
-            onClick={() => stepFind(-1)}
-            disabled={findHits.length === 0}
-            title="Previous match (⇧⏎)"
-            aria-label="Previous match"
-          >
-            ↑
-          </button>
-          <button
-            type="button"
-            className="pdf-zoom-btn"
-            onClick={() => stepFind(1)}
-            disabled={findHits.length === 0}
-            title="Next match (⏎)"
-            aria-label="Next match"
-          >
-            ↓
-          </button>
-          <button
-            type="button"
-            className="pdf-zoom-btn"
-            onClick={closeFind}
-            title="Close the find bar (Esc)"
-            aria-label="Close the find bar"
-          >
-            ✕
-          </button>
-        </div>
-      )}
-      {/* A long, possibly fruitless scan gets a moving readout and a way out
-          — the old one repainted every 50 pages and could not be stopped. */}
-      {scan && (
-        <div className="viewer-status pdf-scan" role="status">
-          <span>
-            Searching for the passage… page {scan.at + 1} of {scan.total}
-          </span>
-          <span className="pdf-scan-bar" aria-hidden>
-            <i style={{ width: `${Math.round((scan.at / scan.total) * 100)}%` }} />
-          </span>
-          <button
-            type="button"
-            className="subtle"
-            onClick={() => {
-              scanCancelRef.current = true;
-            }}
-          >
-            Cancel
-          </button>
-        </div>
-      )}
-      {status && <div className="viewer-status">{status}</div>}
-      {/* Named landmark + page count so assistive tech keeps its bearings
-          even when far pages are collapsed to placeholders. */}
-      <div
-        ref={containerRef}
-        className="pdf-pages"
-        role="document"
-        aria-label={numPages > 0 ? `PDF document, ${numPages} pages` : "PDF document"}
+      <PdfFailurePanels readError={readError} readLoading={readLoading} failed={failed} />
+      <PdfProgress failed={failed} currentPage={curPage} totalPages={numPages} />
+      <PdfToolbar
+        failed={failed}
+        scale={scale}
+        totalPages={numPages}
+        currentPage={curPage}
+        pageDraft={pageDraft}
+        setPageDraft={setPageDraft}
+        zoomIn={zoomIn}
+        zoomOut={zoomOut}
+        fitWidth={fitWidth}
+        goToPage={goToPage}
+        openFind={openFind}
       />
+      <PdfFindPanel
+        failed={failed}
+        open={findOpen}
+        inputRef={findInputRef}
+        query={findQuery}
+        finding={finding}
+        hits={findHits}
+        at={findAt}
+        setQuery={setFindQuery}
+        closeFind={closeFind}
+        stepFind={stepFind}
+        runFind={runFind}
+        findForRef={findForRef}
+      />
+      <PdfScanStatus scan={scan} cancel={() => { scanCancelRef.current = true; }} />
+      {status && <div className="viewer-status">{status}</div>}
+      <PdfPages containerRef={containerRef} totalPages={numPages} />
     </div>
   );
 }

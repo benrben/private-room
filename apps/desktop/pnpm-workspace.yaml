@@ -1,0 +1,6 @@
+allowBuilds:
+  better-sqlite3-multiple-ciphers: set this to true or false
+  electron-winstaller: set this to true or false
+  esbuild: set this to true or false
+  koffi: set this to true or false
+  sharp: set this to true or false

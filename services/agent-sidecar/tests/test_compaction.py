@@ -300,6 +300,13 @@ def test_a_cloud_digest_pass_scales_so_compaction_is_affordable() -> None:
     # And it is bounded — an advertised 1M window must not make one pass try to
     # read a megabyte of conversation.
     assert digest_chunk_bytes(1_000_000, cloud=True) == compaction.CLOUD_DIGEST_CHUNK_BYTES
+    assert digest_chunk_bytes(None, cloud=True) == compaction.CLOUD_DIGEST_CHUNK_BYTES
+
+
+def test_cache_size_reports_only_the_number_of_held_digests() -> None:
+    assert compaction.cache_size() == 0
+    compaction._CACHE["private-digest"] = "room content"
+    assert compaction.cache_size() == 1
 
 
 async def test_the_chunk_size_is_honoured() -> None:
@@ -610,3 +617,30 @@ async def test_two_chunks_differing_only_in_their_calls_are_not_one_digest():
     a = [{"role": "tool", "content": "RESULT", "tool_name": "web_search"}]
     b = [{"role": "tool", "content": "RESULT", "tool_name": "search_room"}]
     assert compaction._key(a) != compaction._key(b)
+
+
+def test_calls_text_renders_function_and_legacy_provider_shapes() -> None:
+    assert compaction._calls_text(
+        [
+            {
+                "function": {
+                    "name": "browse_read",
+                    "arguments": {"url": "https://example.org/lease"},
+                }
+            },
+            {"name": "search_room", "arguments": "query=deposit"},
+        ]
+    ) == 'browse_read({"url":"https://example.org/lease"}), search_room(query=deposit)'
+
+
+def test_calls_text_keeps_empty_and_malformed_calls_visible() -> None:
+    assert compaction._calls_text(
+        [
+            {"function": {"name": "none", "arguments": None}},
+            {"function": {"name": "mapping", "arguments": {}}},
+            {"function": {"name": "string", "arguments": ""}},
+            {"function": {"arguments": [1, 2]}},
+            {"function": "not-a-mapping"},
+            ["not-a-call"],
+        ]
+    ) == "none(), mapping(), string(), tool([1,2]), tool(), tool()"

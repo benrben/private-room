@@ -40,9 +40,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 __all__ = ["PageMeta", "extract_page_meta"]
 
@@ -69,14 +70,17 @@ class PageMeta:
         knew. `source_url`/`captured_at` are deliberately excluded, matching
         the Rust method exactly -- they are the room's facts, not the page's.
         """
-        return (
-            self.title is None
-            and self.byline is None
-            and self.site_name is None
-            and self.published is None
-            and self.modified is None
-            and self.excerpt is None
-            and self.lang is None
+        return all(
+            field is None
+            for field in (
+                self.title,
+                self.byline,
+                self.site_name,
+                self.published,
+                self.modified,
+                self.excerpt,
+                self.lang,
+            )
         )
 
 
@@ -119,6 +123,32 @@ def _looks_article_shaped(item: dict[str, Any]) -> bool:
     )
 
 
+def _dictionary_items(items: list[Any]) -> list[dict[str, Any]]:
+    """Keep JSON-LD object nodes, in their declared order."""
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _first_matching_item(
+    items: list[dict[str, Any]],
+    predicate: Callable[[dict[str, Any]], bool],
+) -> dict[str, Any] | None:
+    """The earliest item that satisfies a JSON-LD selection rule."""
+    for item in items:
+        if predicate(item):
+            return item
+    return None
+
+
+def _has_json_ld_type(item: dict[str, Any]) -> bool:
+    """Whether a JSON-LD object explicitly identifies its type."""
+    return "@type" in item
+
+
+def _accept_json_ld_item(_: dict[str, Any]) -> bool:
+    """The final JSON-LD fallback accepts the earliest object node."""
+    return True
+
+
 def _first_article_like(items: list[Any]) -> dict[str, Any] | None:
     """The one dict in `items` this module reads JSON-LD fields from.
 
@@ -130,63 +160,67 @@ def _first_article_like(items: list[Any]) -> dict[str, Any] | None:
     entry that at least carries an `@type`, else the first entry that is a
     dict at all -- some declared node beats none.
     """
-    for item in items:
-        if isinstance(item, dict) and _looks_article_shaped(item):
-            return item
-    for item in items:
-        if isinstance(item, dict) and "@type" in item:
-            return item
-    for item in items:
-        if isinstance(item, dict):
+    objects = _dictionary_items(items)
+    for predicate in (_looks_article_shaped, _has_json_ld_type, _accept_json_ld_item):
+        item = _first_matching_item(objects, predicate)
+        if item is not None:
             return item
     return None
 
 
+_NO_JSON_LD = object()
+
+
+def _parsed_json_ld(tag: Tag) -> Any:
+    """Return a JSON-LD script's value, or a sentinel when it is unusable.
+
+    The sentinel deliberately differs from JSON's `null`: a valid `null`
+    declaration stops the scan and is normalized to no metadata, while an
+    absent, blank, or malformed script must let a later script participate.
+    """
+    raw = tag.string
+    if raw is None:
+        raw = tag.get_text()
+    if raw is None or not raw.strip():
+        return _NO_JSON_LD
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return _NO_JSON_LD
+
+
+def _article_from_items(items: list[Any]) -> dict[str, Any]:
+    """Choose the declared article node from a JSON-LD graph or list."""
+    found = _first_article_like(items)
+    return found if found is not None else {}
+
+
+def _json_ld_object(value: dict[str, Any]) -> dict[str, Any]:
+    """Normalize an object-shaped JSON-LD declaration."""
+    graph = value.get("@graph")
+    return _article_from_items(graph) if isinstance(graph, list) else value
+
+
+def _normalized_json_ld(value: Any) -> dict[str, Any]:
+    """Normalize supported JSON-LD shapes to the one metadata object."""
+    if isinstance(value, dict):
+        return _json_ld_object(value)
+    if isinstance(value, list):
+        return _article_from_items(value)
+    return {}
+
+
 def _json_ld(soup: BeautifulSoup) -> dict[str, Any]:
-    """The page's JSON-LD metadata object, best-effort.
+    """The first valid JSON-LD script's article metadata, best-effort.
 
-    Finds the first `<script type="application/ld+json">` tag whose content
-    parses as JSON (scanning past any that don't -- malformed JSON-LD on an
-    earlier tag must not hide a valid one further down). That tag's parsed
-    value is then normalized to a single object:
-
-    * a JSON object is used directly;
-    * a JSON object with an `"@graph"` list searches that list;
-    * a bare JSON list searches the list itself;
-
-    "searches the list" means: the first entry that looks article-shaped
-    (see `_looks_article_shaped`) wins, even over an earlier entry that
-    merely carries an `@type` (a `WebSite`/`Organization` node preceding
-    the `Article`/`NewsArticle` node in a `@graph` must not win by
-    ordering alone) -- see `_first_article_like`. If nothing in the list
-    qualifies, or the tag's JSON was some other shape entirely (a number, a
-    string, ...), the page is treated as having declared no JSON-LD
-    metadata at all.
-
-    Never raises on malformed JSON -- an unparseable or absent tag is
-    treated as no JSON-LD, exactly like a page that never included any.
+    A malformed or blank script is ignored so a later valid declaration can
+    still supply metadata. Once a script parses, its object/list shape is
+    normalized; another JSON shape declares no JSON-LD metadata.
     """
     for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
-        raw = tag.string
-        if raw is None:
-            raw = tag.get_text()
-        if raw is None or not raw.strip():
-            continue
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            continue
-
-        if isinstance(parsed, dict):
-            graph = parsed.get("@graph")
-            if isinstance(graph, list):
-                found = _first_article_like(graph)
-                return found if found is not None else {}
-            return parsed
-        if isinstance(parsed, list):
-            found = _first_article_like(parsed)
-            return found if found is not None else {}
-        return {}
+        parsed = _parsed_json_ld(tag)
+        if parsed is not _NO_JSON_LD:
+            return _normalized_json_ld(parsed)
     return {}
 
 
@@ -200,32 +234,89 @@ def _ld_str(ld: dict[str, Any], key: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _ld_byline(value: Any) -> str | None:
-    """JSON-LD `author`: a string, or an object/list of objects each with a
-    `"name"` field. Multiple names are joined with `", "`. A list entry that
-    is itself a bare string is also accepted (some pages declare authors
-    that way even though schema.org expects `Person`/`Organization`
-    objects) -- accepting it costs nothing and loses no declared name.
-    """
+def _ld_author_name(value: Any) -> str | None:
+    """The declared name from one JSON-LD author value, when it has one."""
     if isinstance(value, str):
         return value
     if isinstance(value, dict):
         name = value.get("name")
         return name if isinstance(name, str) else None
-    if isinstance(value, list):
-        names: list[str] = []
-        for item in value:
-            candidate: str | None = None
-            if isinstance(item, dict):
-                item_name = item.get("name")
-                candidate = item_name if isinstance(item_name, str) else None
-            elif isinstance(item, str):
-                candidate = item
-            candidate = _some_text(candidate)
-            if candidate:
-                names.append(candidate)
-        return ", ".join(names) if names else None
     return None
+
+
+def _ld_byline_list(values: list[Any]) -> str | None:
+    """Join the nonblank declared author names in a JSON-LD author list."""
+    names: list[str] = []
+    for value in values:
+        name = _some_text(_ld_author_name(value))
+        if name:
+            names.append(name)
+    return ", ".join(names) if names else None
+
+
+def _ld_byline(value: Any) -> str | None:
+    """Read a JSON-LD `author` string, object, or list of either."""
+    return _ld_byline_list(value) if isinstance(value, list) else _ld_author_name(value)
+
+
+def _first_text(*values: str | None) -> str | None:
+    """The first nonblank declared string, after normalizing each value."""
+    for value in values:
+        text = _some_text(value)
+        if text is not None:
+            return text
+    return None
+
+
+def _title_tag_text(soup: BeautifulSoup) -> str | None:
+    """The document title's text, when a title element exists."""
+    title_tag = soup.title
+    return title_tag.get_text() if title_tag is not None else None
+
+
+def _title(soup: BeautifulSoup, ld: dict[str, Any]) -> str | None:
+    """Read the title cascade from structured data through the title tag."""
+    return _first_text(
+        _ld_str(ld, "headline"),
+        _meta_content(soup, property="og:title"),
+        _meta_content(soup, name="twitter:title"),
+        _title_tag_text(soup),
+    )
+
+
+def _byline(soup: BeautifulSoup, ld: dict[str, Any]) -> str | None:
+    """Read the author cascade from JSON-LD through article metadata."""
+    return _first_text(
+        _ld_byline(ld.get("author")),
+        _meta_content(soup, name="author"),
+        _meta_content(soup, property="article:author"),
+    )
+
+
+def _article_time(
+    soup: BeautifulSoup,
+    ld: dict[str, Any],
+    *,
+    meta_property: str,
+    json_ld_key: str,
+) -> str | None:
+    """Read an article date while preserving meta-tag precedence."""
+    return _first_text(_meta_content(soup, property=meta_property), _ld_str(ld, json_ld_key))
+
+
+def _excerpt(soup: BeautifulSoup) -> str | None:
+    """Read a declared description without deriving text from the body."""
+    return _first_text(
+        _meta_content(soup, name="description"),
+        _meta_content(soup, property="og:description"),
+    )
+
+
+def _document_lang(soup: BeautifulSoup) -> str | None:
+    """Read the document language only when the HTML element declares it."""
+    html_tag = soup.find("html")
+    lang = html_tag.get("lang") if html_tag is not None else None
+    return _some_text(lang) if isinstance(lang, str) else None
 
 
 def extract_page_meta(html: str, url: str | None) -> PageMeta:
@@ -243,49 +334,24 @@ def extract_page_meta(html: str, url: str | None) -> PageMeta:
     soup = BeautifulSoup(html, "html.parser")
     ld = _json_ld(soup)
 
-    title = _some_text(_ld_str(ld, "headline"))
-    if title is None:
-        title = _some_text(_meta_content(soup, property="og:title"))
-    if title is None:
-        title = _some_text(_meta_content(soup, name="twitter:title"))
-    if title is None:
-        title_tag = soup.title
-        title = _some_text(title_tag.get_text()) if title_tag is not None else None
-
-    byline = _some_text(_ld_byline(ld.get("author")))
-    if byline is None:
-        byline = _some_text(_meta_content(soup, name="author"))
-    if byline is None:
-        byline = _some_text(_meta_content(soup, property="article:author"))
-
-    site_name = _some_text(_meta_content(soup, property="og:site_name"))
-
-    published = _some_text(_meta_content(soup, property="article:published_time"))
-    if published is None:
-        published = _some_text(_ld_str(ld, "datePublished"))
-
-    modified = _some_text(_meta_content(soup, property="article:modified_time"))
-    if modified is None:
-        modified = _some_text(_ld_str(ld, "dateModified"))
-
-    excerpt = _some_text(_meta_content(soup, name="description"))
-    if excerpt is None:
-        excerpt = _some_text(_meta_content(soup, property="og:description"))
-
-    html_tag = soup.find("html")
-    html_lang = html_tag.get("lang") if html_tag is not None else None
-    lang = _some_text(html_lang) if isinstance(html_lang, str) else None
-
-    source_url = _some_text(url)
-
     return PageMeta(
-        title=title,
-        byline=byline,
-        site_name=site_name,
-        published=published,
-        modified=modified,
-        excerpt=excerpt,
-        lang=lang,
-        source_url=source_url,
+        title=_title(soup, ld),
+        byline=_byline(soup, ld),
+        site_name=_some_text(_meta_content(soup, property="og:site_name")),
+        published=_article_time(
+            soup,
+            ld,
+            meta_property="article:published_time",
+            json_ld_key="datePublished",
+        ),
+        modified=_article_time(
+            soup,
+            ld,
+            meta_property="article:modified_time",
+            json_ld_key="dateModified",
+        ),
+        excerpt=_excerpt(soup),
+        lang=_document_lang(soup),
+        source_url=_some_text(url),
         captured_at=None,
     )

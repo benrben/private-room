@@ -388,4 +388,28 @@ describe("registerLibraryIpc", () => {
     await listener(handle, "delete_folder")({}, { id: folder.id });
     expect(((await listener(handle, "list_folders")({})) as unknown[]).length).toBe(0);
   });
+
+  it("forwards memory updates, folder renames, and nullable folder moves", async () => {
+    const db = freshRoom();
+    const handle = vi.fn();
+    const deps = policyDeps(roomSource({ db, path: "irrelevant" }));
+    registerLibraryIpc({ handle }, deps);
+
+    const memory = await listener(handle, "add_memory")({}, { content: "tea", category: null }) as { id: string };
+    await listener(handle, "update_memory")({}, {
+      id: memory.id,
+      content: "green tea",
+      category: "preference",
+    });
+    expect((await listener(handle, "list_memories")({}) as Array<{ content: string }>)[0]?.content)
+      .toBe("green tea");
+
+    const folder = await listener(handle, "create_folder")({}, { name: "Drafts" }) as { id: string };
+    await listener(handle, "rename_folder")({}, { id: folder.id, name: "Final" });
+    expect((await listener(handle, "list_folders")({}) as Array<{ name: string }>)[0]?.name).toBe("Final");
+
+    const fileId = addFile(db, "move.txt", "content");
+    await listener(handle, "move_file_to_folder")({}, { fileId, folderId: folder.id });
+    await listener(handle, "move_file_to_folder")({}, { fileId });
+  });
 });

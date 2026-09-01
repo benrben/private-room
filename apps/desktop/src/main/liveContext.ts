@@ -104,7 +104,7 @@
  */
 
 import { CancelFlag } from "./cancel.js";
-import { CmdCtx, type CmdCtxDeps, type RunCommandDeps } from "./chatCommands.js";
+import { CmdCtx, type CmdCtxDeps, type CmdCtxOpts, type RunCommandDeps } from "./chatCommands.js";
 import { generateStream as generateStreamReal } from "./chatCommandsGenerate.js";
 import { withRealAdvisorCli, withRealPrivacyGates, type ExecToolDeps } from "./execTool.js";
 // `CancelFlagLike` from here rather than `mcpBridge.ts`'s identical twin: it is
@@ -254,6 +254,28 @@ export interface LiveCmdCtxOptions {
   temperature?: number | null;
 }
 
+/** The caller-owned values of a direct command context, with CmdCtx defaults
+ * made explicit at the live boundary. Keeping these together makes the
+ * constructor call below describe only live wiring. */
+function cmdCtxRequestOptions(
+  opts: LiveCmdCtxOptions,
+): Pick<CmdCtxOpts, "model" | "refs" | "args" | "history" | "temperature" | "turn"> {
+  return {
+    model: opts.model,
+    refs: opts.refs ?? [],
+    args: opts.args ?? "",
+    history: opts.history ?? "",
+    temperature: opts.temperature ?? null,
+    turn: opts.turn,
+  };
+}
+
+/** A direct context must always have a flag: prefer an explicit or live flag,
+ * then faithfully represent an unregistered turn with a fresh flag. */
+function cmdCtxCancel(state: RoomManagerState, opts: LiveCmdCtxOptions): CancelFlag {
+  return opts.cancel ?? registeredCancelFor(state, opts.turn.runId) ?? new CancelFlag();
+}
+
 /**
  * A real, complete {@link CmdCtx} for `state`'s open room — for a caller that
  * wants ONE command body's real behavior without `runCommand`'s catalog
@@ -269,13 +291,8 @@ export function assembleCmdCtx(
   stt?: { userDataDir: string; resourcesPath: string | null },
 ): CmdCtx {
   return new CmdCtx({
-    model: opts.model,
-    refs: opts.refs ?? [],
-    args: opts.args ?? "",
-    history: opts.history ?? "",
-    temperature: opts.temperature ?? null,
-    cancel: opts.cancel ?? registeredCancelFor(state, opts.turn.runId) ?? new CancelFlag(),
-    turn: opts.turn,
+    ...cmdCtxRequestOptions(opts),
+    cancel: cmdCtxCancel(state, opts),
     room: liveTurnRoomSource(state),
     send,
     emit: send,
@@ -314,6 +331,51 @@ export interface LiveExecToolDepsOptions {
   services?: LiveAppServices;
 }
 
+function execToolTurn(opts: LiveExecToolDepsOptions): TurnId | null {
+  return opts.turn ?? null;
+}
+
+function execToolCancel(
+  state: RoomManagerState,
+  opts: LiveExecToolDepsOptions,
+  turn: TurnId | null,
+): CancelFlagLike | null {
+  if (opts.cancel !== undefined) return opts.cancel;
+  return turn === null ? null : registeredCancelFor(state, turn.runId);
+}
+
+function execToolBaseDeps(
+  state: RoomManagerState,
+  send: EventSender,
+  turn: TurnId | null,
+  cancel: CancelFlagLike | null,
+): ExecToolDeps {
+  return {
+    db: toRoomSource(state).current()?.db ?? null,
+    cancel,
+    runId: turn?.runId ?? null,
+    emit: send,
+    routes: [],
+  };
+}
+
+function execAdvisorOptions(
+  cancel: CancelFlagLike | null,
+  supplied: RunExternalOptions | undefined,
+): RunExternalOptions | undefined {
+  if (cancel === null && supplied === undefined) return undefined;
+  return { ...(cancel === null ? {} : { cancel }), ...supplied };
+}
+
+function withLiveServices(
+  core: ExecToolDeps,
+  state: RoomManagerState,
+  send: EventSender,
+  services: LiveAppServices | undefined,
+): ExecToolDeps {
+  return services === undefined ? core : applyLiveAppServices(core, state, send, services);
+}
+
 /**
  * A real, complete {@link ExecToolDeps} for `state`'s currently open room — the
  * object a running app hands to `execTool`, or to
@@ -345,29 +407,16 @@ export function liveExecToolDeps(
   send: EventSender,
   opts: LiveExecToolDepsOptions = {}
 ): ExecToolDeps {
-  const turn = opts.turn ?? null;
-  const cancel: CancelFlagLike | null =
-    opts.cancel !== undefined ? opts.cancel : turn !== null ? registeredCancelFor(state, turn.runId) : null;
-
-  const base: ExecToolDeps = {
-    db: toRoomSource(state).current()?.db ?? null,
-    cancel,
-    runId: turn?.runId ?? null,
-    emit: send,
-    routes: [],
-  };
+  const turn = execToolTurn(opts);
+  const cancel = execToolCancel(state, opts, turn);
+  const base = execToolBaseDeps(state, send, turn, cancel);
 
   // A consult with no flag bound is unkillable — see the module doc. Passing
   // no options at all when there is nothing to bind keeps the flagless
   // `realRunAdvisorCli` (the identical function `withRealAdvisorCli` installs
   // by default), rather than an indistinguishable rebound copy of it.
-  const advisorOptions: RunExternalOptions | undefined =
-    cancel === null && opts.advisorOptions === undefined
-      ? undefined
-      : { ...(cancel !== null ? { cancel } : {}), ...opts.advisorOptions };
-
-  const core = withRealAdvisorCli(withRealPrivacyGates(base), advisorOptions);
-  return opts.services === undefined ? core : applyLiveAppServices(core, state, send, opts.services);
+  const core = withRealAdvisorCli(withRealPrivacyGates(base), execAdvisorOptions(cancel, opts.advisorOptions));
+  return withLiveServices(core, state, send, opts.services);
 }
 
 // ============================================================================

@@ -1,155 +1,23 @@
-/**
- * Port of `src-tauri/src/commands/edit_gate.rs` (524 lines, read in full,
- * including its `#[cfg(test)] mod tests`) — Wave 2 (Idea 6)'s opt-in
- * diff-preview APPROVAL GATE for the four file-mutating tool arms `edit_file`
- * / `edit_files` / `write_file` / `set_cells`: oneshot + 180s timeout,
- * decline-by-default, "Apply for the rest of this answer" only on the
- * run-scoped sink. Default OFF — the instant-apply + auto-snapshot +
- * one-click Undo model already covers regret post-hoc; A2's scale check
- * (`isLargeScaleEdit`) forces a preview even with the gate off, once a single
- * call changes enough places that "instant" stops feeling safe.
+/** Approval gate for model-requested file mutations.
  *
- * ============================================================================
- * WHAT THIS FILE GATES, AND WHAT IT DOES NOT — read this before touching
- * `docx_edit.rs`/`office.rs`
- * ============================================================================
- * `edit_gate.rs` exists ONLY for the tool-invoked mutations `agent.rs`'s
- * `exec_tool` dispatches: `edit_file` / `edit_files` / `write_file` /
- * `set_cells`, each wrapped in `gated_write` around `edit_match.rs`'s
- * `plan_single_edit` / `plan_batch` / `plan_write_file` / `plan_set_cells`.
- *
- * `docx_edit.rs`'s `update_docx_text` (the Word-viewer Save button) is
- * CONFIRMED INDEPENDENT of this gate — it writes directly through
- * `store_file_bytes` under the room lock, with no `gated_write` wrapper
- * anywhere in its body. `docxEdit.ts`'s own module doc reaches the identical
- * conclusion independently ("NOT PORTED: edit_gate.rs ... is a SEPARATE Rust
- * module this command never calls"), which is the cross-check this batch's
- * instructions asked for.
- *
- * `office.rs`'s `slide_preview`/`office_html` are READ-ONLY renders (Quick
- * Look / `textutil`, cached, never touching `files.rows`) — there is no
- * mutation for a gate to sit in front of; they never call `gated_write` or
- * `store_file_bytes` either.
- *
- * NOT A MODEL TOOL EITHER: this file's own `#[tauri::command]`,
- * `resolve_edit_approval`, has no `exec_tool` arm and no entry in
- * `toolSpecs.ts`/`toolSchema.ts` (confirmed by grep, same check `docxEdit.ts`
- * ran for `update_docx_text`) — it exists purely so the renderer can answer
- * the `edit-approve-request` card, exactly like `resolve_mcp_call` /
- * `resolve_agent_ui` / `resolve_script_run` answer THEIR own cards. Nothing in
- * this file is wired into `execTool.ts`'s dispatch.
- *
- * WHAT STILL BLOCKS THE `execTool.ts` "Batch D" stub on `edit_file` /
- * `edit_files` / `write_file` / `set_cells` (out of scope for THIS file,
- * flagged for whichever batch wires those arms): `edit_match.ts` (the
- * plan/commit machinery) and this file's {@link gatedWrite} are now both
- * real, but the tool arms in `agent.rs` also call three helpers that live in
- * `agent.rs` itself, not in `edit_gate.rs` or `edit_match.rs`, and have no
- * port yet: `dry_run_summary` (the `dry_run: true` early-return path),
- * `write_file_summary` (the success sentence for `write_file`) and
- * `validate_cell_refs` (`set_cells`'s cell-reference validation). Nothing
- * else is missing — `edit_match.rs`'s `EditMethod::outcome()` in particular
- * does NOT need a separate port: it is an identity mapping onto the same five
- * strings `editMatch.ts`'s `EditMethod` type already IS, so `p.method` is
- * already the outcome string on this side of the port.
- *
- * ============================================================================
- * THE LOCK, AND WHY THIS PORT HAS NONE
- * ============================================================================
- * Rust's hard part is lock discipline: `state.room` is a `std::sync::Mutex`
- * whose guard is not `Send`, so it can never be held across the approval
- * `.await` — `gated_write` locks (phase 1: compute + decide), drops, awaits,
- * then re-locks (phase 3: re-check + apply).
- *
- * Node has no threads and therefore no `Mutex` to hold or drop — the
- * property that actually matters is narrower: never CACHE a room reference
- * across the await, because the awaited approval genuinely can take the
- * user long enough for the room to close (or a different one to open) in
- * the meantime. {@link GatedWriteDeps.rooms} is read fresh in phase 1 and
- * again, independently, in phase 3 — the exact "re-read rather than reusing
- * the handle" idiom `turnEngine.ts`'s `handoffChat` already established for
- * this identical shape of problem. `RoomSource`/`OpenRoom` are redeclared
- * locally rather than imported from `turnEngine.ts`, matching `docxEdit.ts`'s
- * own choice (same batch, same reasoning): no ported `AppState` exists yet,
- * so each call site keeps the minimal shape it needs rather than depending on
- * a "room access" module that might rename its own contract later.
- *
- * A cross-room switch between phase 1 and phase 3 needs NO special detection
- * beyond what phase 3 already checks: the plan's `fileId` simply will not
- * resolve to `p.realName` in a room that never had that id, which is already
- * the "renamed or removed" refusal below — identical to how Rust's own
- * re-locked guard would behave if a totally different `Room` sat behind it.
- *
- * ============================================================================
- * THE ONESHOT CHANNEL, COLLAPSED
- * ============================================================================
- * Rust's `tokio::sync::oneshot` gives `deliver_edit_decision` two distinct
- * failure shapes — the id is not in the map (already answered, or the 180s
- * timeout already reclaimed it), OR the id IS in the map but the `Receiver`
- * was independently dropped (the awaiting task died first) — and its own test
- * exercises both ("live" answered twice; an "orphan" whose `rx` is dropped
- * out from under a live `tx`).
- *
- * `editPending` here is `Map<string, (decision: EditDecision) => void>` (the
- * exact shape `roomManager.ts`'s `RoomManagerState.editPending` already
- * declares, matching `McpDecision`'s sibling registries) — a plain callback,
- * not a channel with two independently droppable halves. There is no JS
- * analogue of "the receiver task died while the sender still holds the slot":
- * the callback IS the only handle on the awaiting promise, so removing it
- * from the map is the one and only way "no longer waiting" can become true.
- * {@link deliverEditDecision} therefore has a single failure case (not
- * pending), which still proves the property the Rust test cares about —
- * answering a dead request is always an ERROR, never a silent no-op — just
- * without a separate branch for a failure mode this design cannot produce.
- *
- * `NO_LONGER_WAITING` is a local, byte-identical copy of
- * `commands::agent_ui::NO_LONGER_WAITING` — `agent_ui.rs` (the AgentUi
- * screen-driving bridge) has no Electron port yet (see `execTool.ts`'s
- * `ui_snapshot`/`ui_act` stub), so this file cannot import it the way the
- * Rust source's `crate::commands::agent_ui::NO_LONGER_WAITING` does. A future
- * `agentUi.ts` port should become the one true source and this copy should
- * then import from it instead.
- *
- * ============================================================================
- * WHAT IS REAL HERE (checked line by line against the Rust source)
- * ============================================================================
- *   - {@link approvalNeeded} / {@link REPLACE_ALL_PREVIEW_THRESHOLD} /
- *     {@link isLargeScaleEdit} — the cadence and scale-forcing rules, pure.
- *   - {@link decisionFromStr} / {@link deliverEditDecision} /
- *     {@link resolveEditApproval} — the frontend decision parse and the
- *     command body that delivers it to a pending card.
- *   - {@link buildPreview} — plans to the `EditPreview`/`FilePreview` shape
- *     the approve-request event carries.
- *   - {@link applyWithStaleness} — the phase-3 re-check (identity FIRST, for
- *     every plan including rename-only ones with no byte token, THEN the
- *     byte-hash staleness check) followed by {@link commitPlans}.
- *   - {@link editCallApproved} / {@link finish} / {@link gatedWrite} — the
- *     full three-phase orchestration, over injected {@link GatedWriteDeps}
- *     rather than a live `tauri::Window`/`State`.
- *   - {@link registerEditGateIpc} — thin `ipcMain.handle` registration for
- *     `resolve_edit_approval`, unwired from any bootstrap (rule 4), the same
- *     posture `recIpc.ts`/`docxEdit.ts` already take for their own commands.
- *
- * NEITHER RUST'S OWN TEST MODULE NOR THIS PORT'S exercises `gated_write` /
- * `edit_call_approved` directly in Rust — they need a live async runtime plus
- * a `tauri::Window`, so Rust's own coverage stops at the pure helpers above.
- * This port adds real coverage for the full three-phase flow too (own
- * section in `editGate.test.ts`), since the orchestration is exactly the
- * riskiest part and a fixture room + a fake `GatedWriteDeps` make it cheap to
- * exercise for real.
+ * The room handle is re-read after awaiting consent, every approved plan is
+ * checked for identity and byte staleness, and no answer declines by default.
+ * Encrypted-workspace apply/rollback lives in `editGateWorkspace.ts`.
+ * Viewer saves and read-only previews are intentionally outside this gate.
  */
 
 import { randomUUID } from "node:crypto";
-import path from "node:path";
-import { Readable } from "node:stream";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type Database from "better-sqlite3-multiple-ciphers";
-import { getFileBytes, getFileName, setFileExtractedText } from "./db-host/files.js";
+import { getFileBytes, getFileName } from "./db-host/files.js";
 import { getSetting } from "./db-host/settings.js";
-import { EditError, commitPlans, extractText, hashBytes, type PlannedWrite } from "./editMatch.js";
+import { EditError, commitPlans, hashBytes, type PlannedWrite } from "./editMatch.js";
 import type { EditDecision } from "./roomManager.js";
 import type { ToolEffects } from "./execTool.js";
 import type { WorkspaceService } from "./workspace/workspaceService.js";
+import { applyWorkspaceWithStaleness } from "./editGateWorkspace.js";
+
+export { applyWorkspaceWithStaleness } from "./editGateWorkspace.js";
 
 // ------------------------------------------------------------- room/emit plumbing
 
@@ -415,107 +283,6 @@ export function applyWithStaleness(db: Database.Database, plans: readonly Planne
   }
 }
 
-function strictText(bytes: Buffer): string | null {
-  try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
-  catch { return null; }
-}
-
-/** Workspace phase-3 commit. Every file is preflighted before the first
- * mutation, every byte write has an expected-hash guard, and every outgoing
- * head is stored in the encrypted object-backed version history. */
-export async function applyWorkspaceWithStaleness(
-  db: Database.Database,
-  workspace: WorkspaceService,
-  plans: readonly PlannedWrite[],
-  cause: string,
-): Promise<void> {
-  const current = new Map<string, { relativePath: string; hash: string }>();
-  for (const plan of plans) {
-    const row = db.prepare(
-      `SELECT name, relative_path FROM files
-       WHERE id = ? AND storage_kind = 'workspace' AND trashed_at IS NULL`,
-    ).get(plan.fileId) as { name: string; relative_path: string } | undefined;
-    if (row === undefined || row.name !== plan.realName) {
-      throw new EditError(
-        `"${plan.realName}" was renamed or removed while the approval was pending; ` +
-          "nothing was applied. Look it up again and retry.",
-        "stale",
-      );
-    }
-    const bytes = await workspace.readBuffer(plan.fileId);
-    const hash = hashBytes(bytes).toString("hex");
-    if (plan.staleness !== null && hash !== plan.staleness.toString("hex")) {
-      throw new EditError(
-        `"${plan.realName}" changed while the approval was pending; nothing was applied. ` +
-          "Read it again and retry.",
-        "stale",
-      );
-    }
-    current.set(plan.fileId, { relativePath: row.relative_path, hash });
-  }
-
-  const versions = new Map<string, string>();
-  for (const plan of plans) {
-    if (plan.newBytes !== null) versions.set(plan.fileId, await workspace.snapshotVersion(plan.fileId, cause));
-  }
-  const applied: Array<{ plan: PlannedWrite; finalHash: string; renamed: boolean }> = [];
-  try {
-    for (const plan of plans) {
-      const before = current.get(plan.fileId)!;
-      let expectedHash = before.hash;
-      let recorded = false;
-      if (plan.newBytes !== null) {
-        await workspace.writeAtomic(plan.fileId, Readable.from([plan.newBytes]), expectedHash);
-        expectedHash = hashBytes(plan.newBytes).toString("hex");
-        setFileExtractedText(
-          db,
-          plan.fileId,
-          extractText(plan.realName, plan.newBytes) ?? strictText(plan.newBytes) ?? "",
-        );
-        applied.push({ plan, finalHash: expectedHash, renamed: false });
-        recorded = true;
-      }
-      if (plan.renameTo !== null) {
-        const parent = path.posix.dirname(before.relativePath);
-        const destination = parent === "." ? plan.renameTo : path.posix.join(parent, plan.renameTo);
-        await workspace.move(plan.fileId, destination, expectedHash);
-        if (recorded) applied[applied.length - 1]!.renamed = true;
-      }
-      if (!recorded) applied.push({ plan, finalHash: expectedHash, renamed: plan.renameTo !== null });
-    }
-  } catch (error) {
-    let rollbackFailed = false;
-    for (const { plan, finalHash, renamed } of [...applied].reverse()) {
-      try {
-        const before = current.get(plan.fileId)!;
-        if (renamed) await workspace.move(plan.fileId, before.relativePath, finalHash);
-        const versionId = versions.get(plan.fileId);
-        if (versionId !== undefined) {
-          const snapshot = await workspace.versionSnapshot(versionId);
-          await workspace.writeAtomic(plan.fileId, Readable.from([snapshot.bytes]), finalHash);
-          if (snapshot.text !== null) setFileExtractedText(db, plan.fileId, snapshot.text);
-        }
-      } catch {
-        rollbackFailed = true;
-      }
-    }
-    // Snapshots are useful evidence if rollback could not be completed. When
-    // rollback succeeded, remove the transient versions produced by a batch
-    // that ultimately changed nothing.
-    if (!rollbackFailed) {
-      for (const versionId of versions.values()) await workspace.deleteVersion(versionId).catch(() => undefined);
-    }
-    if (rollbackFailed) {
-      throw new EditError(
-        "The batch hit a conflict and Arcelle could not safely restore every earlier file. " +
-          "Review the changed files and use History to restore them.",
-        "error",
-      );
-    }
-    throw error;
-  }
-}
-
 // ----------------------------------------------------------------------- gate
 
 /** How the diff card ended. Nobody answering is NOT the same fact as a
@@ -615,6 +382,116 @@ export type GateOutcome =
   | { kind: "declined"; message: string }
   | { kind: "error"; error: EditError };
 
+function canApplyWithoutApproval(
+  tool: string,
+  setting: string | null,
+  effects: ToolEffects,
+  plans: readonly PlannedWrite[],
+): boolean {
+  return !approvalNeeded(setting, effects) && !isLargeScaleEdit(tool, plans);
+}
+
+function writeFailure(error: unknown): GateOutcome {
+  return {
+    kind: "error",
+    error: error instanceof EditError ? error : new EditError(errMessage(error), "error"),
+  };
+}
+
+function applyImmediateWrite(
+  room: OpenRoom,
+  deps: GatedWriteDeps,
+  effects: ToolEffects,
+  plans: PlannedWrite[],
+  cause: string,
+): GateOutcome | Promise<GateOutcome> {
+  if (room.workspace !== undefined) {
+    return applyWorkspaceWithStaleness(room.db, room.workspace, plans, cause)
+      .then((): GateOutcome => {
+        finish(deps, effects, plans);
+        return { kind: "applied", plans };
+      })
+      .catch(writeFailure);
+  }
+  try {
+    commitPlans(room.db, plans, cause);
+  } catch (error) {
+    return writeFailure(error);
+  }
+  finish(deps, effects, plans);
+  return { kind: "applied", plans };
+}
+
+function immediateGateOutcome(
+  tool: string,
+  cause: string,
+  deps: GatedWriteDeps,
+  effects: ToolEffects,
+  room: OpenRoom,
+  setting: string | null,
+  plans: PlannedWrite[],
+): GateOutcome | Promise<GateOutcome> | null {
+  if (plans.length === 0) {
+    return { kind: "error", error: new EditError("Nothing to change.", "error") };
+  }
+  if (canApplyWithoutApproval(tool, setting, effects, plans)) {
+    return applyImmediateWrite(room, deps, effects, plans, cause);
+  }
+  return null;
+}
+
+function declinedApprovalOutcome(verdict: EditVerdict): GateOutcome | null {
+  if (verdict === "approved") return null;
+  if (verdict === "declined") {
+    return {
+      kind: "declined",
+      message:
+        "The user declined the proposed change after seeing the preview, so nothing was " +
+        "modified. Ask what they'd like instead.",
+    };
+  }
+  return {
+    kind: "declined",
+    message:
+      "Nobody answered the preview of this change in time, so nothing was modified. " +
+      "That is not a decision the user made — say the change is still waiting and " +
+      "offer to propose it again.",
+  };
+}
+
+async function applyApprovedWrite(
+  room: OpenRoom,
+  deps: GatedWriteDeps,
+  effects: ToolEffects,
+  plans: PlannedWrite[],
+  cause: string,
+): Promise<GateOutcome> {
+  try {
+    if (room.workspace === undefined) applyWithStaleness(room.db, plans, cause);
+    else await applyWorkspaceWithStaleness(room.db, room.workspace, plans, cause);
+  } catch (error) {
+    return writeFailure(error);
+  }
+  finish(deps, effects, plans);
+  return { kind: "applied", plans };
+}
+
+async function completeApprovedWrite(
+  tool: string,
+  cause: string,
+  deps: GatedWriteDeps,
+  effects: ToolEffects,
+  plans: PlannedWrite[],
+  allowTurn: boolean,
+): Promise<GateOutcome> {
+  const verdict = await editCallApproved(deps, effects, buildPreview(tool, plans, allowTurn));
+  const declined = declinedApprovalOutcome(verdict);
+  if (declined !== null) return declined;
+  const room = deps.rooms.currentRoom();
+  if (room === null) return { kind: "error", error: new EditError(NO_ROOM_OPEN, "error") };
+  return applyApprovedWrite(room, deps, effects, plans, cause);
+}
+
 /**
  * Run a file mutation through the diff-preview gate. `compute` produces the
  * proposed writes with no writes of its own — it MUST throw an
@@ -642,69 +519,17 @@ export async function gatedWrite(
 ): Promise<GateOutcome> {
   // Phase 1 (sync): compute proposed writes, decide whether to gate.
   const room1 = deps.rooms.currentRoom();
-  if (room1 === null) {
-    return { kind: "error", error: new EditError(NO_ROOM_OPEN, "error") };
-  }
+  if (room1 === null) return { kind: "error", error: new EditError(NO_ROOM_OPEN, "error") };
   let plans: PlannedWrite[];
   try {
     const computed = compute(room1.db, room1.workspace);
     plans = computed instanceof Promise ? await computed : computed;
-  } catch (e) {
-    const err = e instanceof EditError ? e : new EditError(errMessage(e), "error");
-    return { kind: "error", error: err };
-  }
-  if (plans.length === 0) {
-    return { kind: "error", error: new EditError("Nothing to change.", "error") };
+  } catch (error) {
+    return writeFailure(error);
   }
   const setting = getSetting(room1.db, "edit_approval");
   const allowTurn = setting === "turn" && effects.runScoped;
-  if (!approvalNeeded(setting, effects) && !isLargeScaleEdit(tool, plans)) {
-    // Gate off (or "turn" already granted), and not a mass replace: apply now.
-    try {
-      if (room1.workspace === undefined) commitPlans(room1.db, plans, cause);
-      else await applyWorkspaceWithStaleness(room1.db, room1.workspace, plans, cause);
-    } catch (e) {
-      return { kind: "error", error: new EditError(errMessage(e), "error") };
-    }
-    finish(deps, effects, plans);
-    return { kind: "applied", plans };
-  }
-
-  // Phase 2 (await): show the diff and await consent.
-  const preview = buildPreview(tool, plans, allowTurn);
-  const verdict = await editCallApproved(deps, effects, preview);
-  if (verdict === "declined") {
-    return {
-      kind: "declined",
-      message:
-        "The user declined the proposed change after seeing the preview, so nothing was " +
-        "modified. Ask what they'd like instead.",
-    };
-  }
-  if (verdict === "no_answer") {
-    return {
-      kind: "declined",
-      message:
-        "Nobody answered the preview of this change in time, so nothing was modified. " +
-        "That is not a decision the user made — say the change is still waiting and " +
-        "offer to propose it again.",
-    };
-  }
-
-  // Phase 3 (sync): staleness re-check, then apply the computed bytes. The
-  // room is re-read rather than reusing `room1` — the await above is exactly
-  // the gap in which it can close, or a different one open.
-  const room2 = deps.rooms.currentRoom();
-  if (room2 === null) {
-    return { kind: "error", error: new EditError(NO_ROOM_OPEN, "error") };
-  }
-  try {
-    if (room2.workspace === undefined) applyWithStaleness(room2.db, plans, cause);
-    else await applyWorkspaceWithStaleness(room2.db, room2.workspace, plans, cause);
-  } catch (e) {
-    const err = e instanceof EditError ? e : new EditError(errMessage(e), "error");
-    return { kind: "error", error: err };
-  }
-  finish(deps, effects, plans);
-  return { kind: "applied", plans };
+  const immediate = immediateGateOutcome(tool, cause, deps, effects, room1, setting, plans);
+  if (immediate !== null) return immediate;
+  return completeApprovedWrite(tool, cause, deps, effects, plans, allowTurn);
 }

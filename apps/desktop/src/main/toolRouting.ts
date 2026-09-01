@@ -74,9 +74,6 @@ const NAME_MARKERS: readonly string[] = ["called ", "named ", "titled ", "as fil
  */
 function findCi(haystack: string, needleLower: string): [number, number] | null {
   const n = [...needleLower].length;
-  if (n === 0) {
-    return null;
-  }
   // Code-point boundaries as UTF-16 indexes into `haystack`, plus the final
   // end-of-string boundary — the JS analogue of Rust's `char_indices()` +
   // `haystack.len()`. `idx[k]` is where the k-th CODE POINT starts, so a

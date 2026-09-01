@@ -30,15 +30,19 @@ import {
   displaysToGeometryScreens,
   formatReadyMarker,
   grantDisplayMediaRequest,
+  handleBootstrapFailure,
   PRIVILEGED_SCHEMES,
   preloadPath,
   READY_MARKER_PREFIX,
+  roomDocResponse,
+  roomMediaResponse,
   STABLE_USER_DATA_DIR_NAME,
   stableUserDataPath,
   type BootstrapElectron,
   type ReadyMarker,
 } from "./index.js";
 import { saveGeometryPath } from "./windowGeometry.js";
+import type { FileRuntimeStores } from "./fileRuntimeSurfaceIpc.js";
 import { CLOSE_ID, QUIT_ID, VIEW_ASSISTANT_ID, VIEW_LIBRARY_ID } from "./menu.js";
 import { QUIT_REQUESTED } from "./quitDoor.js";
 import type { RunCommandRequest } from "./chatCommands.js";
@@ -57,6 +61,40 @@ describe("room viewer protocols", () => {
       corsEnabled: true,
       stream: true,
     });
+  });
+
+  it("serves staged HTML and media from the injected in-memory stores", async () => {
+    const runtimeStores = fakeRuntimeStores();
+    runtimeStores.htmlPreviews.map.set("preview", "<h1>fake preview</h1>");
+
+    const preview = roomDocResponse(runtimeStores, new Request("roomdoc://host/preview"));
+    expect(preview.status).toBe(200);
+    expect(preview.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(await preview.text()).toBe("<h1>fake preview</h1>");
+
+    const missingPreview = roomDocResponse(runtimeStores, new Request("roomdoc://host/missing"));
+    expect(missingPreview.status).toBe(404);
+
+    const media = await roomMediaResponse(
+      runtimeStores,
+      new Request("roommedia://host/clip", { headers: { range: "bytes=0-3" } }),
+    );
+    expect(media.status).toBe(206);
+    expect(await media.text()).toBe("fake");
+  });
+
+  it("registers the custom protocol callbacks on an injected Electron protocol fake", async () => {
+    const handle = vi.fn();
+    const electron = fakeElectron({ protocol: { handle } });
+    await bootstrap({ electron, resourcesPath: null });
+
+    expect(handle.mock.calls.map(([scheme]) => scheme)).toEqual(["roomdoc", "roommedia"]);
+    const docHandler = handle.mock.calls[0]?.[1] as ((request: Request) => Response) | undefined;
+    const mediaHandler = handle.mock.calls[1]?.[1] as
+      | ((request: Request) => Promise<Response>)
+      | undefined;
+    expect(docHandler?.(new Request("roomdoc://host/missing")).status).toBe(404);
+    expect((await mediaHandler?.(new Request("roommedia://host/missing")))?.status).toBe(404);
   });
 });
 
@@ -109,6 +147,7 @@ class FakeBrowserWindow {
   id = FakeBrowserWindow.idCounter++;
   opts: unknown;
   shown = false;
+  loadedUrl: string | null = null;
   destroyed = false;
   fullScreen = false;
   minimized = false;
@@ -156,6 +195,15 @@ class FakeBrowserWindow {
       return;
     }
     // The friendly ordering: a macrotask after the load resolves.
+    setTimeout(() => this.emit("ready-to-show"), 0);
+  }
+
+  async loadURL(url: string): Promise<void> {
+    this.loadedUrl = url;
+    if (FakeBrowserWindow.readyToShowTiming === "sync") {
+      this.emit("ready-to-show");
+      return;
+    }
     setTimeout(() => this.emit("ready-to-show"), 0);
   }
 
@@ -240,6 +288,7 @@ function fakeElectron(overrides?: {
   requestSingleInstanceLock?: boolean;
   userDataDir?: string;
   appDataDir?: string;
+  protocol?: BootstrapElectron["protocol"];
 }): FakeElectron {
   const appListeners = new Map<string, ((...args: unknown[]) => void)[]>();
   const appDataDir = overrides?.appDataDir ?? freshUserDataDir();
@@ -304,8 +353,22 @@ function fakeElectron(overrides?: {
       showItemInFolder: vi.fn(),
       trashItem: vi.fn(() => Promise.resolve()),
     } as unknown as BootstrapElectron["shell"],
+    protocol: overrides?.protocol,
   };
   return fake;
+}
+
+function fakeRuntimeStores(): FileRuntimeStores {
+  return {
+    htmlPreviews: { next: 0, map: new Map() },
+    mediaStreams: {
+      next: 1,
+      map: new Map([
+        ["clip", { bytes: Buffer.from("fake media"), mime: "audio/fake", seq: 0 }],
+      ]),
+    },
+    fileContents: new Map(),
+  };
 }
 
 // ------------------------------------------------------- reading the fakes --
@@ -406,6 +469,19 @@ describe("formatReadyMarker", () => {
   });
 });
 
+describe("handleBootstrapFailure", () => {
+  it("logs the boot error and exits with a failure status", () => {
+    const app = { exit: vi.fn() };
+    const error = new Error("registry failed");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    handleBootstrapFailure(app, error);
+
+    expect(logged).toHaveBeenCalledWith("Arcelle failed to boot:", error);
+    expect(app.exit).toHaveBeenCalledWith(1);
+  });
+});
+
 describe("bootstrap", () => {
   it("refuses to boot a second instance when the single-instance lock is already held", async () => {
     const electron = fakeElectron({ requestSingleInstanceLock: false });
@@ -444,6 +520,63 @@ describe("bootstrap", () => {
 
     // never shown by default (module doc step 9)
     expect(win.shown).toBe(false);
+  });
+
+  it("loads the development renderer URL when one is supplied", async () => {
+    const electron = fakeElectron();
+    const result = await bootstrap({
+      electron,
+      resourcesPath: null,
+      rendererUrl: "http://127.0.0.1:5173",
+    });
+
+    expect((result.window as unknown as FakeBrowserWindow).loadedUrl).toBe("http://127.0.0.1:5173");
+  });
+
+  it("logs preload and renderer-console diagnostics registered on the window", async () => {
+    const electron = fakeElectron();
+    const result = await bootstrap({ electron, resourcesPath: null });
+    const win = result.window as unknown as FakeBrowserWindow;
+    const registered = win.webContents.on.mock.calls as unknown[][];
+    const preload = registered.find(([event]) => event === "preload-error")?.[1] as
+      | ((event: unknown, pathname: string, error: Error) => void)
+      | undefined;
+    const rendererConsole = registered.find(([event]) => event === "console-message")?.[1] as
+      | ((event: { level: string; message: string }) => void)
+      | undefined;
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    preload?.(undefined, "/broken/preload.cjs", new Error("preload exploded"));
+    rendererConsole?.({ level: "warning", message: "renderer warning" });
+
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("ARCELLE_PRELOAD_ERROR /broken/preload.cjs"));
+    expect(log).toHaveBeenCalledWith("ARCELLE_RENDERER_CONSOLE [warning] renderer warning");
+  });
+
+  it("refuses startup when the injected registry reports an incomplete command surface", async () => {
+    const electron = fakeElectron();
+    const registerAllIpcFn = vi.fn(() => ({
+      registeredChannels: new Set<string>(),
+      completeness: {
+        ok: false,
+        totalCommandCount: 1,
+        registeredCount: 0,
+        missingUndocumented: ["missing_command"],
+        goneStale: ["stale_command"],
+        unexpectedChannels: ["unexpected_command"],
+      },
+      runtimeStores: fakeRuntimeStores(),
+    }));
+
+    await expect(bootstrap({
+      electron,
+      resourcesPath: null,
+      registerAllIpcFn: registerAllIpcFn as never,
+    })).rejects.toThrow(
+      'missingUndocumented=["missing_command"] goneStale=["stale_command"] unexpectedChannels=["unexpected_command"]'
+    );
+    expect(registerAllIpcFn).toHaveBeenCalledOnce();
   });
 
   it("resolves even when ready-to-show fires DURING loadFile, before its promise settles", async () => {
@@ -539,6 +672,19 @@ describe("bootstrap", () => {
 
     expect(focusSpy).toHaveBeenCalledOnce();
     expect(restoreSpy).toHaveBeenCalledOnce();
+  });
+
+  it("browser_focus_app focuses the live window and refuses after it is destroyed", async () => {
+    const electron = fakeElectron();
+    const result = await bootstrap({ electron, resourcesPath: null });
+    const win = result.window as unknown as FakeBrowserWindow;
+    const focus = vi.spyOn(win, "focus");
+
+    await findHandler(electron, "browser_focus_app")(undefined, {});
+    expect(focus).toHaveBeenCalledOnce();
+
+    win.destroyed = true;
+    expect(() => findHandler(electron, "browser_focus_app")(undefined, {})).toThrow("The app window is gone.");
   });
 
   it("second-instance does NOT call restore() on an already-unminimized window", async () => {
@@ -953,6 +1099,26 @@ describe("the dialog/shell plugin surfaces, as this bootstrap wires them", () =>
 
     expect(electron.shell.showItemInFolder).toHaveBeenNthCalledWith(1, "/a/one");
     expect(electron.shell.showItemInFolder).toHaveBeenNthCalledWith(2, "/b/two");
+  });
+
+  it("reveal_logs opens the resolved log directory through the host shell", async () => {
+    const electron = fakeElectron();
+    await bootstrap({ electron, resourcesPath: null, openWithApp: vi.fn() });
+
+    const logs = await findHandler(electron, "reveal_logs")(undefined, {});
+
+    expect(typeof logs).toBe("string");
+    expect(electron.shell.openPath).toHaveBeenCalledWith(logs);
+  });
+
+  it("reveal_logs propagates Electron's openPath failure string", async () => {
+    const electron = fakeElectron();
+    electron.shell.openPath = vi.fn(async () => "the logs directory is unavailable");
+    await bootstrap({ electron, resourcesPath: null, openWithApp: vi.fn() });
+
+    await expect(findHandler(electron, "reveal_logs")(undefined, {})).rejects.toThrow(
+      "the logs directory is unavailable"
+    );
   });
 
   it("`with` goes to the injected /usr/bin/open bridge, never to shell.openExternal", async () => {

@@ -101,13 +101,7 @@
  * live main-process entrypoint by this batch (rule of this migration).
  */
 
-import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
-import * as fsp from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
 import { Readable } from "node:stream";
-import { promisify } from "node:util";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { CancelFlag, guardCommit } from "./cancel.js";
@@ -115,7 +109,6 @@ import type { RoomHandle, RoomSource } from "./jobs.js";
 import {
   getFileMeta,
   insertFile,
-  fileByExactName,
   setFileExtractedText,
   type FileMeta,
 } from "./db-host/files.js";
@@ -128,131 +121,26 @@ import {
   type PodcastHost,
   type PodcastTurn,
 } from "./db-host/podcasts.js";
-import { webAccessEnabled } from "./browser/webAccess.js";
-import { remoteSeamRedactor } from "./privacy.js";
-import { emptyPrivacyReport } from "./privacyRedact.js";
 import { sidecarJsonCancellable } from "./sidecarJsonCancellable.js";
-import { safeScopeName } from "./studiosCmds.js";
+import { encodeEpisode, timedTranscript } from "./studiosPodcastEncoding.js";
+import { nextTakeName } from "./studiosPodcastNaming.js";
+import {
+  asRecord,
+  speakOne,
+  speakableText,
+  successfulSidecarValue,
+  type SidecarOutcome,
+} from "./studiosSpeech.js";
 
-const execFileAsync = promisify(execFile);
-
-// =============================================================================
-// the speech door — a necessary slice of `speech_cmds.rs` (see module doc)
-// =============================================================================
-
-/** Per-call synthesis cap — mirror of the sidecar's `tts.MAX_TTS_CHARS`.
- * Ported from `speech_cmds::MAX_SPEAK_CHARS`. */
-export const MAX_SPEAK_CHARS = 1_000;
-
-/** What the room says when the internet switch is off and something tried to
- * speak. Ported verbatim from `speech_cmds::SPEECH_OFFLINE_MESSAGE`. */
-export const SPEECH_OFFLINE_MESSAGE =
-  "Reading an answer aloud sends that sentence to an online voice service, and this room's " +
-  "internet switch is off (Settings → Online features). Nothing was sent.";
-
-/**
- * One sentence, redacted, gated on the room's internet switch. Returns the
- * text as it may leave the Mac, or throws the refusal to show instead. Ported
- * verbatim from `speakable_text`.
- *
- * THE TWO HOLES THIS CLOSES (the Rust source's own audit note, 2026-08-02):
- * the master internet switch and the privacy door both used to miss this
- * seam, because the `/tts` body carries no `model` field so nothing ever
- * attached the room's policy to it. This function is the fix, called per line
- * by {@link renderPodcastAudio} and once by {@link speakOne}.
- */
-export function speakableText(db: Database.Database, text: string): string {
-  if (!webAccessEnabled(db)) {
-    throw new Error(SPEECH_OFFLINE_MESSAGE);
-  }
-  return redactForSpeech(text);
-}
-
-/** The door half of {@link speakableText}, split out so it is testable
- * without a room. Ported verbatim from `redact_for_speech`. */
-export function redactForSpeech(text: string): string {
-  const policy = remoteSeamRedactor();
-  if (policy === null) {
-    // No entity map in this room: nothing to mask mechanically, exactly as at
-    // the connector seam. The sentence travels as written.
-    return text;
-  }
-  return policy.redactor.redact(text, emptyPrivacyReport());
-}
-
-/** Length validation, split out for the same reason: the empty/oversize
- * refusals happen before any state is touched and before anything leaves.
- * Ported verbatim from `speak_precheck`. */
-function speakPrecheck(text: string): string {
-  const trimmed = text.trim();
-  if (trimmed === "") {
-    throw new Error("nothing to speak");
-  }
-  // Rust's `.chars().count()` counts Unicode SCALAR VALUES; `Array.from`
-  // spreads by code point rather than UTF-16 code unit, matching it (an
-  // astral character must count as one, not two).
-  if (Array.from(trimmed).length > MAX_SPEAK_CHARS) {
-    throw new Error("text too long to speak in one chunk");
-  }
-  return trimmed;
-}
-
-function asRecord(v: unknown): Record<string, unknown> | null {
-  return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : null;
-}
-
-/**
- * One sentence through the door and the service — the body both spoken-
- * answer playback and the podcast panel's per-host Preview share. Ported
- * verbatim from `speak_one`.
- *
- * DEVIATION, behavior-preserving: Rust calls the NON-cancellable
- * `sidecar_json` here (this file's one caller of it, `preview_podcast_voice`,
- * has no Stop button). `sidecarJsonCancellable.ts` collapsed Rust's
- * cancellable/non-cancellable pair into one function (its own module doc:
- * "nothing else in this port needs the non-cancellable variant"), so this
- * passes a fresh, private {@link CancelFlag} that nothing ever sets — a flag
- * that is never flipped behaves identically to no cancellation at all.
- */
-export async function speakOne(
-  db: Database.Database,
-  text: string,
-  voice: string | undefined,
-  rate: string | undefined,
-  pitch: string | undefined
-): Promise<string> {
-  const trimmed = speakPrecheck(text);
-  const outbound = speakableText(db, trimmed);
-  const body: Record<string, unknown> = { text: outbound };
-  // Each knob is only sent when the caller set it, so an unset one falls to
-  // the sidecar's product default rather than to an empty string the service
-  // would reject.
-  for (const [key, value] of [
-    ["voice", voice],
-    ["rate", rate],
-    ["pitch", pitch],
-  ] as const) {
-    const v = value?.trim();
-    if (v !== undefined && v !== "") {
-      body[key] = v;
-    }
-  }
-  const outcome = await sidecarJsonCancellable("/tts", body, new CancelFlag());
-  if (outcome.kind === "error") {
-    throw new Error(outcome.error.error);
-  }
-  if (outcome.kind === "stopped") {
-    // Unreachable in practice (the flag above is never set), kept only so
-    // this function's control flow covers every `SidecarPostOutcome` variant.
-    throw new Error("Stopped.");
-  }
-  const resp = asRecord(outcome.value);
-  const audioB64 = resp !== null && typeof resp.audio_b64 === "string" ? resp.audio_b64 : null;
-  if (audioB64 === null) {
-    throw new Error("neural voice returned no audio");
-  }
-  return audioB64;
-}
+export { encodeEpisode, timedTranscript } from "./studiosPodcastEncoding.js";
+export { nextTakeName } from "./studiosPodcastNaming.js";
+export {
+  MAX_SPEAK_CHARS,
+  redactForSpeech,
+  SPEECH_OFFLINE_MESSAGE,
+  speakOne,
+  speakableText,
+} from "./studiosSpeech.js";
 
 // =============================================================================
 // `studios.rs::safe_scope_name`
@@ -345,10 +233,6 @@ function anyOpenDb(rooms: RoomSource): Database.Database {
   return room.db;
 }
 
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null;
-}
-
 /** Rust's `base64::engine::general_purpose::STANDARD.decode`, with a
  * light-weight validity check standing in for `Err(e)` — Node's
  * `Buffer.from(s, "base64")` never throws on malformed input, so a
@@ -359,6 +243,151 @@ function decodeBase64Strict(s: string): Buffer {
     throw new Error("the voice service returned unreadable audio: invalid base64");
   }
   return Buffer.from(s, "base64");
+}
+
+interface PreparedPodcastAudio {
+  title: string;
+  turns: PodcastTurn[];
+  outbound: Array<{ text: string; voice: string; rate: string; pitch: string }>;
+  spoken: string[];
+  capped: number;
+}
+
+interface SynthesizedPodcastAudio {
+  wav: Buffer;
+  offsets: number[];
+}
+
+interface EncodedPodcastAudio {
+  bytes: Buffer;
+  mime: string;
+  ext: string;
+  transcript: string;
+}
+
+function podcastForRender(db: Database.Database, scriptFileId: string): Podcast {
+  const podcast = dbGetPodcast(db, scriptFileId);
+  if (podcast === null) {
+    throw new Error(
+      "This file has no podcast script attached. Scripts made before voices existed have to be " +
+        "generated again before they can be recorded."
+    );
+  }
+  if (podcast.turns.length === 0) throw new Error("This script has no lines to read.");
+  return podcast;
+}
+
+function episodeTurns(podcast: Podcast): { turns: PodcastTurn[]; capped: number } {
+  return {
+    turns: podcast.turns.slice(0, MAX_PODCAST_TURNS),
+    capped: Math.max(0, podcast.turns.length - MAX_PODCAST_TURNS),
+  };
+}
+
+function outboundPodcastTurn(
+  db: Database.Database,
+  cast: readonly PodcastHost[],
+  turn: PodcastTurn,
+): { text: string; voice: string; rate: string; pitch: string } {
+  const text = speakableText(db, turn.line);
+  const matchedHost = cast.find((host) => eqIgnoreAsciiCase(host.name, turn.speaker.trim()));
+  return {
+    text,
+    voice: matchedHost?.voice ?? "",
+    rate: matchedHost?.rate ?? "",
+    pitch: matchedHost?.pitch ?? "",
+  };
+}
+
+function prepareOutboundPodcastTurns(
+  rooms: RoomSource,
+  cast: readonly PodcastHost[],
+  turns: readonly PodcastTurn[],
+): { outbound: PreparedPodcastAudio["outbound"]; spoken: string[] } {
+  const outbound: PreparedPodcastAudio["outbound"] = [];
+  const spoken: string[] = [];
+  for (const turn of turns) {
+    // "Some room is open" — NOT re-pinned to `roomPath`; see this module's
+    // own doc for why that matches Rust's `speakable_text` exactly.
+    const rendered = outboundPodcastTurn(anyOpenDb(rooms), cast, turn);
+    outbound.push(rendered);
+    // The TRANSCRIPT records what was actually said, which after redaction is
+    // not always what the script says.
+    spoken.push(rendered.text);
+  }
+  return { outbound, spoken };
+}
+
+function preparePodcastAudio(
+  rooms: RoomSource,
+  scriptFileId: string,
+  roomPath: string | null,
+): PreparedPodcastAudio {
+  const podcast = podcastForRender(pinnedRoom(rooms, roomPath).db, scriptFileId);
+  const { turns, capped } = episodeTurns(podcast);
+  const { outbound, spoken } = prepareOutboundPodcastTurns(rooms, podcast.cast, turns);
+  return { title: podcast.title, turns, outbound, spoken, capped };
+}
+
+function synthesizePodcastOutcome(outcome: SidecarOutcome): SynthesizedPodcastAudio {
+  const response = asRecord(successfulSidecarValue(outcome, "Stopped — the podcast recording was not saved.")) ?? {};
+  const wavB64 = typeof response.audio_b64 === "string" ? response.audio_b64 : null;
+  if (wavB64 === null) throw new Error("the voice service returned no audio");
+  const offsetsRaw = Array.isArray(response.offsets_ms) ? response.offsets_ms : [];
+  return {
+    wav: decodeBase64Strict(wavB64),
+    offsets: offsetsRaw.filter((offset): offset is number => typeof offset === "number"),
+  };
+}
+
+function recordingStep(turnCount: number): { step: string; local: boolean } {
+  return {
+    step: `Recording ${turnCount} turns — each line is sent to the cloud voice service…`,
+    local: false,
+  };
+}
+
+async function encodePodcastAudio(
+  prepared: PreparedPodcastAudio,
+  synthesized: SynthesizedPodcastAudio,
+  cancel: CancelFlag,
+  sink: StudioStepSink,
+): Promise<EncodedPodcastAudio> {
+  guardOrThrow(cancel, "the podcast recording");
+  sink.emit({ step: "Encoding the episode…", local: true });
+  const { bytes, mime, ext } = await encodeEpisode(synthesized.wav);
+  return {
+    bytes,
+    mime,
+    ext,
+    transcript: timedTranscript(prepared.title, prepared.turns, prepared.spoken, synthesized.offsets, prepared.capped),
+  };
+}
+
+function notifyPodcastFilesChanged(sink: StudioStepSink): void {
+  try {
+    sink.filesChanged();
+  } catch {
+    // Swallowed deliberately, matching Rust's `let _ = window.emit(...)`.
+  }
+}
+
+async function storeRenderedPodcastAudio(
+  rooms: RoomSource,
+  scriptFileId: string,
+  roomPath: string | null,
+  cancel: CancelFlag,
+  prepared: PreparedPodcastAudio,
+  encoded: EncodedPodcastAudio,
+  sink: StudioStepSink,
+): Promise<FileMeta> {
+  guardOrThrow(cancel, "the podcast recording");
+  const room = pinnedRoom(rooms, roomPath);
+  const name = nextTakeName(room.db, prepared.title, encoded.ext);
+  const meta = await storePodcastAudioOutput(room, name, encoded.mime, encoded.bytes, encoded.transcript);
+  setPodcastAudio(room.db, scriptFileId, meta.id);
+  notifyPodcastFilesChanged(sink);
+  return meta;
 }
 
 /**
@@ -379,96 +408,21 @@ export async function renderPodcastAudio(
   sink: StudioStepSink = NULL_STUDIO_STEP_SINK
 ): Promise<FileMeta> {
   // Phase 1 (locked): read the script, the cast, and the outbound text.
-  const room1 = pinnedRoom(rooms, roomPath);
-  const podcast = dbGetPodcast(room1.db, scriptFileId);
-  if (podcast === null) {
-    throw new Error(
-      "This file has no podcast script attached. Scripts made before voices existed have to be " +
-        "generated again before they can be recorded."
-    );
-  }
-  if (podcast.turns.length === 0) {
-    throw new Error("This script has no lines to read.");
-  }
-  const { title, cast } = podcast;
-  const capped = Math.max(0, podcast.turns.length - MAX_PODCAST_TURNS);
-  const turns = podcast.turns.slice(0, MAX_PODCAST_TURNS);
-
-  // THE DOOR. Every line goes through the same function one spoken sentence
-  // does: the room's internet switch, then the privacy redactor. Done per
-  // line rather than over the joined script so a refusal names the seam
-  // exactly as the speaking path does, and so what is sent is what is
-  // stamped into the transcript below.
-  const outbound: Array<{ text: string; voice: string; rate: string; pitch: string }> = [];
-  const spoken: string[] = [];
-  for (const t of turns) {
-    // "Some room is open" — NOT re-pinned to `roomPath`; see this module's
-    // own doc for why that matches Rust's `speakable_text` exactly.
-    const text = speakableText(anyOpenDb(rooms), t.line);
-    const matchedHost = cast.find((h) => eqIgnoreAsciiCase(h.name, t.speaker.trim()));
-    outbound.push({
-      text,
-      voice: matchedHost?.voice ?? "",
-      rate: matchedHost?.rate ?? "",
-      pitch: matchedHost?.pitch ?? "",
-    });
-    // The TRANSCRIPT records what was actually said, which after redaction is
-    // not always what the script says.
-    spoken.push(text);
-  }
+  const prepared = preparePodcastAudio(rooms, scriptFileId, roomPath);
 
   guardOrThrow(cancel, "the podcast recording");
-  sink.emit({
-    step: `Recording ${turns.length} turns — each line is sent to the cloud voice service…`,
-    local: false,
-  });
+  sink.emit(recordingStep(prepared.turns.length));
 
   // Phase 2 (unlocked): the long one. Minutes of network work, so no room
   // access happens here at all — a job that pinned the room for ten minutes
   // would freeze every other operation in the app.
-  const outcome = await sidecarJsonCancellable("/tts/podcast", { turns: outbound, gap_ms: 420 }, cancel);
-  if (outcome.kind === "error") {
-    throw new Error(outcome.error.error);
-  }
-  if (outcome.kind === "stopped") {
-    throw new Error("Stopped — the podcast recording was not saved.");
-  }
-  const resp = isRecord(outcome.value) ? outcome.value : {};
-  const wavB64 = typeof resp.audio_b64 === "string" ? resp.audio_b64 : null;
-  if (wavB64 === null) {
-    throw new Error("the voice service returned no audio");
-  }
-  const offsetsRaw = Array.isArray(resp.offsets_ms) ? resp.offsets_ms : [];
-  const offsets: number[] = offsetsRaw.filter((x): x is number => typeof x === "number");
-  const wav = decodeBase64Strict(wavB64);
-
-  guardOrThrow(cancel, "the podcast recording");
-  sink.emit({ step: "Encoding the episode…", local: true });
-  const { bytes, mime, ext } = await encodeEpisode(wav);
-
-  // The transcript AudioView already knows how to read. Built from the
-  // offsets the synthesizer measured, so every row seeks to the exact line.
-  const transcript = timedTranscript(title, turns, spoken, offsets, capped);
-
+  const outcome = await sidecarJsonCancellable("/tts/podcast", { turns: prepared.outbound, gap_ms: 420 }, cancel);
+  const synthesized = synthesizePodcastOutcome(outcome);
+  const encoded = await encodePodcastAudio(prepared, synthesized, cancel, sink);
   // Phase 3 (locked): the write. Re-pinned and re-guarded immediately before
   // the side effect — a Stop pressed during the long call above must not land
   // a file after the UI has said the run stopped.
-  guardOrThrow(cancel, "the podcast recording");
-  const room2 = pinnedRoom(rooms, roomPath);
-  const name = nextTakeName(room2.db, title, ext);
-  const meta = await storePodcastAudioOutput(room2, name, mime, bytes, transcript);
-  // Link it to the script, so the panel can say "recorded" and offer to play
-  // it rather than offering to record it again.
-  setPodcastAudio(room2.db, scriptFileId, meta.id);
-  // `let _ = window.emit("room-files-changed", ())` — best-effort, and
-  // swallowed exactly like Rust's `let _`: a failed UI notification must never
-  // turn an episode that IS in the room into a failed render.
-  try {
-    sink.filesChanged();
-  } catch {
-    // Swallowed deliberately, matching Rust's `let _ = window.emit(...)`.
-  }
-  return meta;
+  return storeRenderedPodcastAudio(rooms, scriptFileId, roomPath, cancel, prepared, encoded, sink);
 }
 
 /** Publish the finished episode through the room's active content backend. */
@@ -496,139 +450,6 @@ function guardOrThrow(cancel: CancelFlag, what: string): void {
     throw new Error(g.error);
   }
 }
-
-/**
- * The next unused episode name for this script: `Title - episode.m4a`, then
- * `Title - episode 2.m4a`, and so on. Ported from `next_take_name`.
- *
- * The first take carries no number ("take 1" on the only recording that
- * exists is noise); numbering starts at the second. Probes for a free name
- * rather than counting takes: a room where an old episode was trashed, or
- * renamed, must not hand a new file a name something else already answers to.
- */
-export function nextTakeName(db: Database.Database, title: string, ext: string): string {
-  const base = `${safeScopeName(title)} - episode`;
-  const first = `${base}.${ext}`;
-  if (fileByExactName(db, first) === null) {
-    return first;
-  }
-  // Bounded, not unbounded: a hundred takes of one script is already absurd,
-  // and an unbounded probe against a table is not worth the one line it
-  // saves.
-  for (let n = 2; n <= 99; n++) {
-    const candidate = `${base} ${n}.${ext}`;
-    if (fileByExactName(db, candidate) === null) {
-      return candidate;
-    }
-  }
-  // Past that, uniqueness still matters more than tidiness — a collision here
-  // would put two episodes under one name, which is the bug being fixed.
-  const tail = randomUUID();
-  return `${base} ${tail.slice(0, 8)}.${ext}`;
-}
-
-/**
- * WAV → AAC in an MPEG-4 container, via macOS's own `afconvert`. Ported from
- * `encode_episode`.
- *
- * Falls back to the WAV when the encoder is unavailable or refuses — a big
- * file that plays is strictly better than no episode at all, and the caller
- * learns which it got from the returned mime/extension rather than from a
- * guess. Reaches `/usr/bin/afconvert` directly via `node:child_process`, the
- * same real-native-tool convention `videoTools.ts`'s `avconvert` port and
- * `mediaProbe.ts`'s own module doc establish for this exact family of
- * OS-bundled converters — this is NOT the `stt::decode_bytes_to_pcm` gap
- * `peaksTools.ts` documents (that function dispatches across many input
- * FORMATS with its own tempfile handling; this is one fixed WAV→m4a pipeline
- * belonging to `podcast_audio.rs` itself, not a cross-module dependency).
- */
-export async function encodeEpisode(wav: Buffer): Promise<{ bytes: Buffer; mime: string; ext: string }> {
-  const dir = path.join(os.tmpdir(), `arcelle-podcast-${randomUUID()}`);
-  const cleanup = async () => {
-    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
-  };
-  await fsp.mkdir(dir, { recursive: true });
-  const src = path.join(dir, "episode.wav");
-  const dst = path.join(dir, "episode.m4a");
-  try {
-    await fsp.writeFile(src, wav);
-  } catch (err) {
-    await cleanup();
-    throw err instanceof Error ? err : new Error(String(err));
-  }
-  let out: Buffer | null = null;
-  try {
-    await execFileAsync(
-      "/usr/bin/afconvert",
-      [
-        "-f",
-        "m4af", // MPEG-4 audio
-        "-d",
-        "aac", // …containing AAC
-        "-b",
-        "64000", // plenty for one mono voice; ~5 MB per 10 minutes
-        "-s",
-        "3", // VBR-constrained: constant quality, no bitrate spikes
-        src,
-        dst,
-      ],
-      { maxBuffer: 16 * 1024 * 1024 }
-    );
-    out = await fsp.readFile(dst);
-  } catch {
-    // Spawn failure, non-zero exit, or the file was never written — Rust's
-    // `encoded` match collapses all three into the same `_ => None`.
-    out = null;
-  }
-  await cleanup();
-  if (out !== null && out.length > 0) {
-    return { bytes: out, mime: "audio/mp4", ext: "m4a" };
-  }
-  // Not an error: the episode exists, it is just larger.
-  return { bytes: wav, mime: "audio/wav", ext: "wav" };
-}
-
-/**
- * `[m:ss] Speaker: line` rows — the shape `AudioView`'s own parser reads, so
- * the saved episode is clickable and speaker-labelled with no new viewer.
- * Ported verbatim from `timed_transcript`.
- *
- * A leading provenance line, like every other transcript the room writes: a
- * synthetic reading of a script is not a recording of people, and a file
- * that did not say so would eventually be mistaken for one.
- */
-export function timedTranscript(
-  title: string,
-  turns: readonly PodcastTurn[],
-  spoken: readonly string[],
-  offsets: readonly number[],
-  capped: number
-): string {
-  let out = `Podcast episode "${title}" — synthetic voices reading a script generated in this room. Not a recording of people.\n`;
-  if (capped > 0) {
-    // A truncated episode must say so IN the artifact. The job card is gone
-    // tomorrow; this file is not.
-    out += `Only the first ${turns.length} turns were recorded — ${capped} more were not.\n`;
-  }
-  turns.forEach((t, i) => {
-    // No offset for this row means the synthesizer and this list disagree
-    // about length, which should be impossible. Falling back to 0 would
-    // stamp every remaining line at the start; skipping the stamp is honest
-    // about not knowing.
-    const line = spoken[i] ?? t.line;
-    const ms = offsets[i];
-    if (ms !== undefined) {
-      const secs = Math.max(0, Math.floor(ms / 1000));
-      const mm = Math.floor(secs / 60);
-      const ss = String(secs % 60).padStart(2, "0");
-      out += `[${mm}:${ss}] ${t.speaker}: ${line}\n`;
-    } else {
-      out += `${t.speaker}: ${line}\n`;
-    }
-  });
-  return out;
-}
-
 // =============================================================================
 // commands: get_podcast / set_podcast_cast / preview_podcast_voice
 // =============================================================================

@@ -1,215 +1,9 @@
-"""Streaming dictation — the Python port of ``src-tauri/src/commands/stt_cmds
-.rs`` lines ~460-887: the capture half (``DictState``/``DictSession``/
-``DictMsg``, ``dict_start``/``dict_push_audio``/``dict_stop``/``dict_cancel``/
-``dict_worker``, ``DICT_PARTIAL_STEP_SECS``/``dict_partial_step``,
-``DICT_MAX_SECS``, ``DICT_STOP_BASE``/``DICT_STOP_PER_AUDIO_SEC``/
-``dict_stop_timeout``) and the shaping half (``DICT_TRANSLATE``/
-``DICT_REWRITE``/``DICT_TAIL``/``DICT_PROMPT_OPTIMIZER``/
-``dict_mode_guidance``/``dict_pass_text``/``shape_text``/``run_dict_pass``).
-Transport uses one WebSocket per audio session.
+"""Streaming dictation capture and session transport.
 
-Deliberately NOT the recording engine (``rec/``): dictation must never create a
-Recording file, touch diarization, or take the room lock. The composer, the
-journal, the file mic and the memory mic all share ONE physical microphone, so
-there is one session at a time and the final text is one whole-utterance decode
-at Stop — identical quality to the old batch path.
-
-=============================================================================
-1. WS /dict/session — all four Rust commands, on one socket
-=============================================================================
-
-Rust split this across four ``#[tauri::command]``s plus a background OS
-thread, because Tauri IPC has no notion of a client holding a socket open.
-Once the transport IS a socket all four collapse into the socket's own
-lifecycle — the same collapse ``rec/session_ws.py``'s ``/rec/session`` made for
-the recording engine, one lane simpler (a single producer, one buffer, no
-lanes/diarization/spool/persist):
-
-- **dict_start** = opening the WebSocket. ``?modelPath=`` carries the whisper
-  weights, ALREADY RESOLVED by Electron (bundled vs. downloaded — Rust's
-  ``stt_effective_model``), exactly the division of labour
-  ``StartSessionRequest.model_path`` uses in ``rec/session_ws.py``.
-
-  A missing or nonexistent ``modelPath`` closes the handshake with **4404**
-  before ``accept()``, answering Rust's ``Err("STT_MODEL_MISSING")``. THIS
-  CHECK IS LOAD-BEARING, not a courtesy: ``pywhispercpp`` does not raise on a
-  model file that is not there. Constructing ``Model()`` logs "failed to open
-  '(null)'" and hands back a live object, and the first real decode against it
-  **aborts the process** — measured on this tree, the interpreter dies inside
-  the native library with no Python traceback and no chance to answer. A
-  dictation started against a model the user has since deleted would therefore
-  take down the whole sidecar: every recording, every chat, mid-flight. Rust
-  never faced this because ``stt_effective_model`` returns ``Option`` and
-  ``dict_start`` refuses on ``None``; this route is that refusal.
-
-- **dict_push_audio** = a binary frame: ``u32 rate (LE), u32 n (LE)`` then
-  exactly ``n`` little-endian f32 samples. Rust's own wire shape for that
-  command (``rate: u32, data_b64: String``) minus the base64 (a WS frame is
-  already binary), and ``rec/session_ws.py``'s 12-byte header minus the
-  ``lane``/``pad``/``seq`` fields dictation has no use for — one producer, so
-  there is nothing to tell apart. A malformed frame (short read, ``n`` not
-  matching the bytes that follow) is logged and DROPPED, never fatal: the same
-  discipline ``rec/session_ws.py``'s ``_decode_audio_frame`` documents.
-
-- **dict_stop** = a ``{"type":"stop"}`` text frame. Answered on the SAME socket
-  with ``{"type":"final","ok":true,"text":...}`` (or ``{"ok":false,"error":
-  ...}``), then the socket is closed — there is nothing further to say once
-  the one whole-utterance decode is in. An empty transcript is a SUCCESS, not
-  a failure: Rust's ``dict_stop`` may return ``Ok("")`` and its caller shows
-  "No speech detected".
-
-- **dict_cancel** = a ``{"type":"cancel"}`` text frame, or simply
-  disconnecting. Either abandons the session with no final decode — Rust's
-  ``dict_cancel`` semantics, reached by cancelling the worker task instead of
-  by dropping an mpsc sender. The explicit frame exists because "the client
-  went away" and "the client changed its mind" are worth distinguishing at the
-  call site even though this module treats them identically.
-
-- **dict_worker** = :func:`_dict_worker`, one ``asyncio.Task`` per connection,
-  reading one ``asyncio.Queue`` the route's receive loop fills. Every rule
-  Rust's worker spells out survives:
-
-  * :func:`dict_partial_step` — the growing-budget repaint cadence, ported
-    verbatim (see its own docstring).
-  * :data:`DICT_MAX_SECS` — the leak guard (:class:`_NativeBuffer`).
-  * THE DRAIN-EVERYTHING-QUEUED-BEFORE-DECIDING RULE (stt_cmds.rs:644-661):
-    one blocking ``await queue.get()``, then a ``get_nowait()`` drain until the
-    queue is empty or a stop is found, and only THEN the decision to repaint.
-    A stop found mid-drain finalizes immediately against everything drained
-    ahead of it, never against a buffer still missing samples.
-  * Decodes run on ``asyncio.to_thread`` — ``stt/engine.py`` already owns the
-    warm-context cache and its lock, so the only job left here is not to block
-    the event loop, exactly as ``rec/engine.py`` does.
-  * **One writer per socket.** ONLY the worker task ever sends: the partial
-    repaints, the one ``final``, and the close. The receive loop only reads and
-    enqueues. Two writers racing on one socket is the ordering bug
-    ``rec/session_ws.py``'s §2 ("DELIVERY IS ORDERED") exists to prevent, and
-    it also removes any way for the route handler to end up waiting on the
-    worker — see the merge note at the bottom of this docstring.
-
-=============================================================================
-2. Auth, and the single-session slot
-=============================================================================
-
-``/dict/session`` implements no auth of its own: it rides
-``server.TokenAuthMiddleware``'s existing ``?token=`` websocket branch,
-unmodified, exactly like ``/rec/session`` (see that module's §6 for why the
-check lives in one place and nowhere else).
-
-:class:`DictSessionManager` holds the one slot, on ``app.state.dict_manager``
-— per APP, never a module global, for the reason ``RecSessionManager`` isn't
-one: two ``create_app()`` instances must not share a dictation.
-
-UNLIKE ``RecSessionManager``, which REFUSES a second ``/rec/start`` with 409, a
-second ``/dict/session`` **REPLACES** the first. That is ``dict_start``'s own
-documented behaviour ("Replacing a stale session drops its sender; that worker
-sees the disconnect and exits on its own"): the four mics share one
-microphone, so a second session starting IS the first one ending, not a rival
-to turn away. The superseded session's worker is cancelled (no final decode
-ever runs for it — ``dict_cancel``'s contract, not ``dict_stop``'s) and its
-socket is closed with 4409, rather than left to discover the replacement on
-its own.
-
-=============================================================================
-3. Shaping: shape_text / run_dict_pass — no route in this batch
-=============================================================================
-
-Rust's ``shape_text`` reaches ``ollama::list_models``/``ollama::generate`` plus
-three routing functions with no Python port yet: ``model_setting`` (the room's
-configured model, out of the encrypted DB Electron owns), ``best_local_default``
-(installed-model triage) and ``runs_on_this_mac`` (the capability/transport
-check that also excludes ``:cloud``-suffixed Ollama tags — dictated words stay
-on this Mac, the ONE deliberate exception to engine parity and an explicit
-Settings-screen promise). None of that layer exists here yet, so rather than
-invent an Ollama client that would either skip the ``:cloud`` exclusion or
-invent a routing policy nobody signed off on, :func:`shape_text` takes an
-injected :class:`LocalModelHooks`. Model SELECTION is stubbed to "the first
-name listed" and loudly TODO'd. :func:`shape_text` and :func:`run_dict_pass`
-are pure, injectable async functions; no HTTP/WS route is added for them here.
-
-**Never lose the words.** Rust returns ``Result<String, String>`` and lets the
-caller fall back to the transcript it already holds; this batch's instructions
-are that shaping must never raise past its caller, so the fallback lives here
-instead and the outcome is a :class:`ShapeResult` — the best text available,
-plus human-readable ``notes`` for anything that fell back, so a UI can still
-say "Kept the exact transcript — …" without an exception to branch on. The
-STAGE SEMANTICS are Rust's, exactly:
-
-===================== ================================================
-Rust                  here
-===================== ================================================
-``list_models`` fails  text unchanged + Rust's own message as a note
-no models installed    text unchanged + Rust's own message as a note
-translate FAILS        **stop**; return the exact pre-translate text
-                       + a note (Rust propagates the error and its
-                       caller keeps the exact transcript "AND says
-                       so" — shaping the untranslated words instead
-                       would hand back a cleaned-up sentence in the
-                       language it was spoken in, presented as the
-                       answer to a translate request: the one outcome
-                       stt_cmds.rs:801-806 exists to prevent)
-translate EMPTY        keep the prior text and carry on to the shape
-                       pass, silently (Rust's ``if !t.is_empty()``)
-shape pass FAILS       return the best text so far + a note
-shape pass EMPTY       return the prior text (alfred's resilience rule)
-===================== ================================================
-
-=============================================================================
-4. DICT_STOP_BASE / DICT_STOP_PER_AUDIO_SEC are the CALLER's
-=============================================================================
-
-Ported as constants plus the pure :func:`dict_stop_timeout`, NOT as a ceiling
-this module imposes on itself. Per the migration plan §2 the scaled timeout is
-"enforced by the caller — Electron main ports ``dict_stop_timeout``". This
-sidecar answers ``stop`` whenever the whole-utterance decode actually finishes,
-matching ``/rec/stop``'s own "no deadline of its own". A caller that gives up
-early simply stops listening; the reply's failed send is swallowed.
-
-=============================================================================
-MERGE NOTE: this file merges two independent candidate implementations
-=============================================================================
-
-``stt/dictation_a.py`` and ``stt/dictation_b.py`` (both now deleted) were read
-against ``stt_cmds.rs`` and against each other. Both got ``dict_partial_step``,
-the leak guard, the drain-before-finalize rule and every prompt string right —
-the prompts are byte-for-byte identical to the Rust literals in BOTH, and
-``tests/test_dictation.py`` now re-derives them from ``stt_cmds.rs`` on every
-run rather than trusting either transcription. What each got wrong, and which
-piece of each survived:
-
-- **A accepted any ``modelPath``** and only discovered a missing model at
-  decode time — which, as §1 records, is a native abort that kills the whole
-  sidecar. B's connect-time existence check is here (tightened to
-  ``is_file()``: a directory passes ``exists()`` and aborts just the same).
-- **B's ``stop`` answer was awaited by the ROUTE HANDLER**, on a future the
-  worker resolved. Cancelling that worker — which is exactly what the single
-  slot's REPLACE path does — leaves the future unresolved for ever and the
-  handler pending for ever, holding the socket, the queue and the whole audio
-  buffer. Reproduced directly against B: enqueue a ``stop``, cancel the
-  worker, and the handler coroutine never completes and never sends anything.
-  A's shape is here instead: the worker owns every send, so cancelling it
-  leaves nothing waiting.
-- **A swallowed a failed translate** and then shaped the untranslated text,
-  returning it with no indication the translation never happened — the exact
-  misrepresentation stt_cmds.rs:801-806 documents as already fixed once. B
-  reported it in ``notes`` but still shaped on. Neither matched Rust, which
-  stops. See §3's table.
-- **B's ``ShapeResult`` + ``notes``** is here (A returned a bare string, so
-  "no local AI installed" and "the model shaped it into exactly this" were
-  indistinguishable), carrying Rust's own two verbatim message strings.
-- **B's ``_NativeBuffer``** is here (A's inline closure re-concatenated its
-  chunk list on every decode and could not be tested without a socket).
-- **A's leak-guard end-to-end test** is here: with the cap shrunk under a
-  RUNNING worker it spies on the decoder and asserts that the array reaching it
-  — through the real resampler, not a stand-in — respects the shrunk cap. B's
-  real-wire equivalent asserted only that the session "answered at all", which
-  no cap violation would have broken.
-- **B's ``assert session.ws is not None``** is gone — an ``assert`` vanishes
-  under ``python -O``, the same finding ``rec/session_ws.py``'s own merge note
-  records against its candidate B.
-- **B's explicit ``{"type":"cancel"}`` frame** is here (A had disconnect-only).
-- **A's ``DICT_STOP_PER_AUDIO_SEC`` as an ``int``** is here, matching Rust's
-  ``u32``; B widened it to ``2.0``.
+The module keeps the Rust capture semantics: one native-rate buffer, periodic
+whole-buffer partial decoding, a bounded leak guard, and one final decode on
+Stop.  Text shaping lives in :mod:`dictation_shape`; this module remains the
+public facade for its constants, seams, and helpers.
 """
 
 from __future__ import annotations
@@ -222,15 +16,25 @@ import struct
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Protocol
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from arcelle_sidecar.media.wav import resample_to_16k
-from arcelle_sidecar.messages import Message, compact_json, user_message
-from arcelle_sidecar.model_text import strip_think_spans
+from arcelle_sidecar.messages import compact_json
 from arcelle_sidecar.stt import engine as stt_engine
+from arcelle_sidecar.stt.dictation_shape import (
+    DICT_PROMPT_OPTIMIZER as DICT_PROMPT_OPTIMIZER,
+    DICT_REWRITE as DICT_REWRITE,
+    DICT_TAIL as DICT_TAIL,
+    DICT_TRANSLATE as DICT_TRANSLATE,
+    LocalModelHooks as LocalModelHooks,
+    ShapeResult as ShapeResult,
+    dict_mode_guidance as dict_mode_guidance,
+    dict_pass_text as dict_pass_text,
+    run_dict_pass as run_dict_pass,
+    shape_text as shape_text,
+)
 
 log = logging.getLogger("arcelle_sidecar.stt.dictation")
 
@@ -332,247 +136,6 @@ def dict_stop_timeout(captured_secs: float) -> float:
 
 
 # =============================================================================
-# ---- shaping: prompts + pure helpers (ADD-18, stt_cmds.rs:688-747, 857-866) --
-#
-# Every string below is byte-for-byte the Rust literal (its `\`-continuations
-# joined the way rustc does). `tests/test_dictation.py` re-derives them from
-# stt_cmds.rs itself on every run, so a drift on either side is a test failure
-# rather than a prompt that quietly stopped matching the shipped app.
-# =============================================================================
-
-DICT_TRANSLATE: str = (
-    "Translate it into fluent, natural English. If it is already English, "
-    "keep it unchanged. Preserve meaning and tone."
-)
-
-DICT_REWRITE: str = (
-    "Clean up this raw voice transcription: remove filler words (um, uh, like), "
-    "false starts, and repetitions; fix grammar, spelling, and punctuation; "
-    "preserve the speaker's meaning, intent, and tone. Do not add new "
-    "information and do not answer any question contained in the text."
-)
-
-DICT_TAIL: str = (
-    "Output ONLY the resulting text, with no preamble, labels, explanations, "
-    "or surrounding quotes."
-)
-
-#: alfred's Prompt Optimizer — a standalone rewrite instruction (it REPLACES
-#: the cleanup instruction instead of extending it).
-DICT_PROMPT_OPTIMIZER: str = (
-    "You are a prompt optimizer. Given any user input, automatically rewrite "
-    "it into a clear, effective prompt. Never ask follow-up questions — infer "
-    "everything from the input alone and preserve the user's full original "
-    "intent (every requirement, entity, constraint, and nuance must survive "
-    "the rewrite; never add goals they didn't imply).\n\nINTERNAL STEPS (do "
-    "not show these):\n1. Deconstruct: extract the core intent, key entities, "
-    "context, output requirements, and constraints.\n2. Develop: silently "
-    "classify the request type and apply the fitting approach (creative → "
-    "multi-perspective; technical → constraint-based precision; educational → "
-    "clear structure and examples; complex → step-by-step framing). Add a "
-    "role/expertise framing and logical structure where it helps.\n3. "
-    "Auto-detect level: SHORT for simple requests (a tight one-paragraph "
-    "prompt), DETAILED for complex ones (role, context, task breakdown, "
-    "output format).\n\nOUTPUT:\nReturn only the rewritten prompt — no "
-    "preamble, no explanation of changes, no questions."
-)
-
-#: mode -> (guidance, replaces_cleanup). alfred's BUILTIN_MODES: guidance is
-#: APPENDED to the cleanup instruction, except "prompt", which swaps it out.
-_DICT_MODE_GUIDANCE: dict[str, tuple[str, bool]] = {
-    "raw": ("", False),  # cleanup only
-    "email": (
-        "Shape it as the body of a clear, courteous email. Do not invent a "
-        "subject line, greeting, or signature unless they were dictated.",
-        False,
-    ),
-    "message": ("Shape it as a concise, natural chat/Slack message.", False),
-    "commit": (
-        "Shape it as a git commit message: a short imperative summary line "
-        "(<=72 chars), then a blank line, then bullet points if warranted.",
-        False,
-    ),
-    "notes": (
-        "Shape it as clean, organized notes (short paragraphs or bullets).",
-        False,
-    ),
-    "prompt": (DICT_PROMPT_OPTIMIZER, True),
-}
-
-
-def dict_mode_guidance(mode: str) -> tuple[str, bool] | None:
-    """Intent guidance for ``mode`` as ``(guidance, replaces_cleanup)``, or
-    ``None`` for "off" and anything unrecognized — Rust's ``_ => None``, which
-    means no rewrite stage at all rather than a default one."""
-    return _DICT_MODE_GUIDANCE.get(mode)
-
-
-def dict_pass_text(raw: str) -> str:
-    """What a shaping pass hands back as the user's dictated words.
-
-    ``generate`` returns the model's RAW text and a thinking model prefixes it
-    with ``<think>…</think>``. This text is typed into the composer AS the
-    user's own sentence, so an unstripped monologue is dictation putting the
-    model's private reasoning in their mouth — and, in ``prompt`` mode, in the
-    next thing they send. (stt_cmds.rs ``dict_pass_text``.)
-    """
-    return strip_think_spans(raw).strip()
-
-
-# =============================================================================
-# ---- shaping: the injected local-model seam (see the module docstring §3) ----
-# =============================================================================
-
-
-class GenerateFn(Protocol):
-    """``generate(model, messages, temperature=…, keep_alive=…) -> text``.
-
-    TODO(engine-routing batch): production wires this to a thin adapter over
-    ``arcelle_sidecar.llm.generate`` pinned to a base URL, once
-    ``model_setting``/``runs_on_this_mac``/``best_local_default`` are ported.
-    """
-
-    def __call__(
-        self,
-        model: str,
-        messages: list[Message],
-        *,
-        temperature: float | None = None,
-        keep_alive: str | None = None,
-    ) -> Awaitable[str]: ...
-
-
-class ListLocalModelsFn(Protocol):
-    """``list_local_models() -> ["qwen3.5:4b", …]`` — installed LOCAL models
-    only. NEVER a ``:cloud`` tag: dictated words do not leave this Mac, and
-    whoever implements this for production owns keeping that true."""
-
-    def __call__(self) -> Awaitable[list[str]]: ...
-
-
-@dataclass
-class LocalModelHooks:
-    """What :func:`shape_text` needs from the not-yet-ported Ollama routing
-    layer — see the module docstring §3 for why this is an injection point
-    rather than a real client."""
-
-    generate: GenerateFn
-    list_local_models: ListLocalModelsFn
-
-
-@dataclass
-class ShapeResult:
-    """:func:`shape_text`'s answer: the best text produced, plus human-readable
-    notes for every stage that fell back instead of failing outright. Empty
-    ``notes`` means every requested pass ran and produced real output."""
-
-    text: str
-    notes: list[str] = field(default_factory=list)
-
-
-#: Rust's own two refusal strings, verbatim (stt_cmds.rs:785, 787).
-_NO_LOCAL_AI = "The local AI (Ollama) isn't running — raw transcript kept."
-_NO_LOCAL_MODEL = "No local AI model is installed — raw transcript kept."
-_TRANSLATE_FAILED = "Translating failed — kept the exact transcript."
-_SHAPE_FAILED = "Cleaning up failed — kept the transcript as dictated."
-
-
-async def run_dict_pass(
-    model: str, steps: list[str], text: str, generate: GenerateFn
-) -> str:
-    """One dictation-shaping model call. A single instruction gets a plain
-    prompt; multiple instructions keep the numbered "operations in order" shape
-    (ADD-22). Temperature and keep-alive match Rust's call exactly (``Some(0.2)``,
-    ``"5m"``). MAY RAISE — :func:`shape_text` decides what a failed pass means.
-    """
-    if len(steps) == 1:
-        prompt = f"{steps[0]}\n\n{DICT_TAIL}\n\nINPUT TEXT:\n{text}"
-    else:
-        numbered = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(steps))
-        prompt = (
-            "You are a text post-processor. Apply the following operations to "
-            f"the INPUT TEXT, in order:\n{numbered}\n\n{DICT_TAIL}\n\nINPUT TEXT:\n{text}"
-        )
-    raw = await generate(model, [user_message(prompt)], temperature=0.2, keep_alive="5m")
-    return dict_pass_text(raw)
-
-
-async def shape_text(
-    text: str, translate: bool, mode: str, hooks: LocalModelHooks
-) -> ShapeResult:
-    """Post-process dictated text on a LOCAL model: an optional
-    translate-to-English pass plus an optional intent rewrite, as TWO separate
-    model calls (ADD-22: one instruction at a time is far more reliable for a
-    small model than translate+cleanup+shape crammed into one prompt).
-
-    ``mode="off"`` with ``translate=False`` returns the text unchanged, with no
-    model call at all. Never raises; see the module docstring §3 for the
-    stage-by-stage fallback table this implements.
-    """
-    # Build the shaping steps WITHOUT translate — translate is its own pass.
-    shape_steps: list[str] = []
-    guidance = dict_mode_guidance(mode)
-    if guidance is not None:
-        instruction, replaces_cleanup = guidance
-        if replaces_cleanup:
-            shape_steps.append(instruction)
-        elif instruction == "":
-            shape_steps.append(DICT_REWRITE)
-        else:
-            shape_steps.append(DICT_REWRITE)
-            shape_steps.append(instruction)
-    if not translate and not shape_steps:
-        return ShapeResult(text=text)
-
-    try:
-        models = await hooks.list_local_models()
-    except Exception:  # noqa: BLE001 - never fatal; the words are what matter
-        log.warning("dictation.shape_text: could not reach the local AI", exc_info=True)
-        return ShapeResult(text=text, notes=[_NO_LOCAL_AI])
-    if not models:
-        return ShapeResult(text=text, notes=[_NO_LOCAL_MODEL])
-
-    # TODO(engine-routing batch): Rust picked the SPECIFIC local model here via
-    # `model_setting` (the room's configured one) / `runs_on_this_mac` (which
-    # refuses a `:cloud` tag) / `best_local_default` (stt_cmds.rs:789-798).
-    # None of that is ported yet, so this naively takes whichever model is
-    # listed first — correct only by accident once more than one is installed.
-    # Replace this ONE line, not the surrounding pass logic, when that lands.
-    model = models[0]
-
-    # Pass 1: translate, on its own.
-    #
-    # A FAILED translate STOPS here with the exact pre-translate text. Carrying
-    # on to shape it would hand back a cleaned-up sentence in the language it
-    # was spoken in as the answer to a translate request — the one outcome that
-    # misrepresents what happened (stt_cmds.rs:801-806, where Rust propagates
-    # the error precisely so its caller keeps the exact transcript AND says so).
-    if translate:
-        try:
-            translated = await run_dict_pass(model, [DICT_TRANSLATE], text, hooks.generate)
-        except Exception:  # noqa: BLE001 - never fatal; see this function's docstring
-            log.warning("dictation.shape_text: the translate pass failed", exc_info=True)
-            return ShapeResult(text=text, notes=[_TRANSLATE_FAILED])
-        translated = translated.strip()
-        if translated:
-            text = translated
-        # An EMPTY translate keeps the prior text and carries on, silently —
-        # Rust's own `if !t.is_empty()`, which does not treat it as an error.
-
-    # Pass 2: cleanup + optional mode shaping (or the prompt optimizer).
-    if not shape_steps:
-        return ShapeResult(text=text)
-    try:
-        shaped = await run_dict_pass(model, shape_steps, text, hooks.generate)
-    except Exception:  # noqa: BLE001 - never fatal; see this function's docstring
-        log.warning("dictation.shape_text: the shaping pass failed", exc_info=True)
-        return ShapeResult(text=text, notes=[_SHAPE_FAILED])
-    shaped = shaped.strip()
-    # Resilience (alfred): never lose the words — empty output -> prior text.
-    return ShapeResult(text=shaped if shaped else text)
-
-
-# =============================================================================
 # ---- the /dict/session frame protocol ----------------------------------------
 # =============================================================================
 
@@ -649,102 +212,88 @@ async def _send_json(websocket: WebSocket, payload: dict) -> None:
         await websocket.send_text(compact_json(payload))
 
 
+@dataclass
+class _DictWorkerState:
+    buffer: _NativeBuffer = field(default_factory=_NativeBuffer)
+    rate: int = 16000
+    decoded_len: int = 0
+    last_text: str = ""
+    last_decode_secs: float = 0.0
+
+
+async def _finalize_dictation(
+    websocket: WebSocket, model_path: str, state: _DictWorkerState
+) -> None:
+    """Decode and send the one terminal result, including any failure."""
+    try:
+        pcm = resample_to_16k(state.buffer.array(), state.rate)
+        text = await asyncio.to_thread(stt_engine.transcribe, model_path, pcm, False)
+    except Exception as exc:  # noqa: BLE001 - reported over the wire, never raised
+        log.warning("dict/session: the final decode failed", exc_info=True)
+        payload = {"type": "final", "ok": False, "error": str(exc)}
+    else:
+        payload = {"type": "final", "ok": True, "text": text}
+    await _send_json(websocket, payload)
+    with contextlib.suppress(Exception):
+        await websocket.close()
+
+
+def _append_dictation_audio(state: _DictWorkerState, message: _MsgAudio) -> None:
+    state.rate = message.rate
+    state.buffer.extend(message.samples, state.rate)
+
+
+def _drain_dictation_queue(
+    queue: "asyncio.Queue[_MsgAudio | _MsgStop]", state: _DictWorkerState
+) -> bool:
+    """Add queued audio in order, stopping only when the sentinel is found."""
+    while True:
+        try:
+            message = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return False
+        if isinstance(message, _MsgStop):
+            return True
+        _append_dictation_audio(state, message)
+
+
+async def _send_dictation_partial(
+    websocket: WebSocket, model_path: str, state: _DictWorkerState
+) -> None:
+    if len(state.buffer) - state.decoded_len < dict_partial_step(
+        state.rate, state.last_decode_secs
+    ):
+        return
+    state.decoded_len = len(state.buffer)
+    began = time.monotonic()
+    try:
+        pcm = resample_to_16k(state.buffer.array(), state.rate)
+        decoded = await asyncio.to_thread(stt_engine.transcribe, model_path, pcm, False)
+    except Exception:  # noqa: BLE001 - partial failures are cosmetic
+        log.warning("dict/session: a partial decode failed", exc_info=True)
+        decoded = None
+    state.last_decode_secs = time.monotonic() - began
+    if decoded is not None and decoded != state.last_text:
+        state.last_text = decoded
+        await _send_json(websocket, {"type": "partial", "text": decoded})
+
+
 async def _dict_worker(
     websocket: WebSocket, model_path: str, queue: "asyncio.Queue[_MsgAudio | _MsgStop]"
 ) -> None:
-    """Port of ``dict_worker`` (stt_cmds.rs:619-686). One task per connection,
-    owning all of its state locally exactly as Rust's worker owns its stack,
-    and the ONLY thing that ever writes to this socket."""
-    buffer = _NativeBuffer()
-    rate = 16000
-    decoded_len = 0
-    last_text = ""
-    last_decode_secs = 0.0
-
-    async def finalize() -> None:
-        """The one whole-utterance decode at Stop. An EMPTY transcript is a
-        success (Rust's ``Ok("")`` — the caller shows "No speech detected");
-        only a decode that actually failed is reported as ``ok: false``.
-
-        The RESAMPLE is inside the guard, not before it. Rust's is infallible
-        (``Vec<f32>`` in, ``Vec<f32>`` out); this one allocates several arrays
-        proportional to the whole buffer — ten minutes of 48 kHz audio is
-        hundreds of megabytes of numpy temporaries — so it can raise where
-        Rust's cannot. Raising here rather than answering kills the worker with
-        NOTHING sent, and the caller — the only side holding a deadline at all
-        (see the module docstring §4) — sits out that whole scaled wait before
-        it can even say the dictation was lost. Every way this decode can fail
-        is a ``final``.
-        """
-        try:
-            pcm = resample_to_16k(buffer.array(), rate)
-            text = await asyncio.to_thread(stt_engine.transcribe, model_path, pcm, False)
-        except Exception as exc:  # noqa: BLE001 - reported over the wire, never raised
-            log.warning("dict/session: the final decode failed", exc_info=True)
-            payload = {"type": "final", "ok": False, "error": str(exc)}
-        else:
-            payload = {"type": "final", "ok": True, "text": text}
-        await _send_json(websocket, payload)
-        with contextlib.suppress(Exception):
-            await websocket.close()
+    """Run one socket's ordered dictation queue and own every socket write."""
+    state = _DictWorkerState()
 
     while True:
         msg = await queue.get()
         if isinstance(msg, _MsgStop):
-            await finalize()
+            await _finalize_dictation(websocket, model_path, state)
             return
-        rate = msg.rate
-        buffer.extend(msg.samples, rate)
-
-        # Drain everything ALREADY queued before deciding to decode — a partial
-        # that took longer than the mic's push cadence must not make the loop
-        # fall ever further behind it (stt_cmds.rs:644-646). A stop found in
-        # here finalizes against everything drained ahead of it, which is what
-        # secures the ordering contract: the client awaits its last push before
-        # sending stop, one socket delivers in order, so every sample sent
-        # before the stop is already in this queue when the stop is read.
-        stop_now = False
-        while True:
-            try:
-                nxt = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if isinstance(nxt, _MsgStop):
-                stop_now = True
-                break
-            rate = nxt.rate
-            buffer.extend(nxt.samples, rate)
-        if stop_now:
-            await finalize()
+        _append_dictation_audio(state, msg)
+        if _drain_dictation_queue(queue, state):
+            await _finalize_dictation(websocket, model_path, state)
             return
-
-        step = dict_partial_step(rate, last_decode_secs)
-        if len(buffer) - decoded_len >= step:
-            decoded_len = len(buffer)
-            began = time.monotonic()
-            decoded: str | None
-            # The resample is INSIDE the guard for the reason `finalize` spells
-            # out — it can raise where Rust's cannot, and a repaint that raised
-            # would kill the worker, so the `stop` behind it would never be read
-            # and the whole dictation would be lost to a cosmetic failure. It is
-            # therefore also inside the measured cost: preparing the decoder's
-            # input is part of what a repaint over the whole buffer costs, and
-            # the budget exists to charge a repaint for what it really took.
-            try:
-                pcm = resample_to_16k(buffer.array(), rate)
-                decoded = await asyncio.to_thread(
-                    stt_engine.transcribe, model_path, pcm, False
-                )
-            except Exception:  # noqa: BLE001 - partial failures are cosmetic; the
-                # final decode at Stop is the one that must not lose words.
-                log.warning("dict/session: a partial decode failed", exc_info=True)
-                decoded = None
-            # Timed whether or not it succeeded: a decode that blew up after
-            # 30 s still cost 30 s, and the next step must reflect that.
-            last_decode_secs = time.monotonic() - began
-            if decoded is not None and decoded != last_text:
-                last_text = decoded
-                await _send_json(websocket, {"type": "partial", "text": decoded})
+        await _send_dictation_partial(websocket, model_path, state)
 
 
 # =============================================================================
@@ -803,6 +352,66 @@ class DictSessionManager:
             self.current = None
 
 
+async def _accept_dictation_session(websocket: WebSocket) -> str | None:
+    """Accept a session only after its model file passes the safety check."""
+    model_path = websocket.query_params.get("modelPath") or ""
+    if model_path and Path(model_path).is_file():
+        await websocket.accept()
+        return model_path
+    # Rust's `STT_MODEL_MISSING`. A rejected WS handshake has no JSON body to
+    # carry that in, so the close code is the whole signal — and this refusal
+    # keeps a decode against a deleted model from aborting the process.
+    await websocket.close(code=4404, reason="STT_MODEL_MISSING")
+    return None
+
+
+def _new_live_dict_session(websocket: WebSocket, model_path: str) -> LiveDictSession:
+    """Create the queue and single writer task for one accepted socket."""
+    queue: asyncio.Queue[_MsgAudio | _MsgStop] = asyncio.Queue()
+    worker = asyncio.create_task(_dict_worker(websocket, model_path, queue))
+    return LiveDictSession(websocket=websocket, queue=queue, worker=worker)
+
+
+def _dictation_message_ends_session(
+    message: dict, queue: "asyncio.Queue[_MsgAudio | _MsgStop]"
+) -> bool:
+    """Dispatch one received frame and say whether it cancels the session."""
+    if message["type"] == "websocket.disconnect":
+        return True
+    data = message.get("bytes")
+    if data is not None:
+        _handle_audio_frame(queue, data)
+        return False
+    text = message.get("text")
+    return text is not None and _handle_control_text(queue, text)
+
+
+async def _receive_dictation_messages(
+    websocket: WebSocket, queue: "asyncio.Queue[_MsgAudio | _MsgStop]"
+) -> None:
+    """Read until the peer disconnects or explicitly cancels the session."""
+    try:
+        while True:
+            if _dictation_message_ends_session(await websocket.receive(), queue):
+                return
+    except WebSocketDisconnect:
+        return
+
+
+async def _close_dictation_session(
+    manager: DictSessionManager, session: LiveDictSession
+) -> None:
+    """Release the slot, cancel its writer, and leave no live socket behind."""
+    manager.clear(session)
+    await session.stop_worker()
+    # The session is over however we got here, so leave no socket dangling for
+    # a client to keep pushing audio into. Both other exits already closed it —
+    # the worker after `stop`, the client itself on a disconnect — and closing
+    # twice is a no-op.
+    with contextlib.suppress(Exception):
+        await session.websocket.close()
+
+
 def register_dict_routes(app: FastAPI) -> DictSessionManager:
     """Mount the dictation WebSocket surface onto the sidecar's existing
     FastAPI app. Called once from ``server.create_app``.
@@ -820,42 +429,15 @@ def register_dict_routes(app: FastAPI) -> DictSessionManager:
 
     @app.websocket("/dict/session")
     async def dict_session_ws(websocket: WebSocket) -> None:
-        model_path = websocket.query_params.get("modelPath") or ""
-        # Rust's `STT_MODEL_MISSING`. A rejected WS handshake has no JSON body
-        # to carry that in, so the close code is the whole signal — and this
-        # refusal is what keeps a decode against a model that is not there from
-        # aborting the process (see the module docstring §1).
-        if not model_path or not Path(model_path).is_file():
-            await websocket.close(code=4404, reason="STT_MODEL_MISSING")
+        model_path = await _accept_dictation_session(websocket)
+        if model_path is None:
             return
-        await websocket.accept()
-        queue: "asyncio.Queue[_MsgAudio | _MsgStop]" = asyncio.Queue()
-        worker = asyncio.create_task(_dict_worker(websocket, model_path, queue))
-        session = LiveDictSession(websocket=websocket, queue=queue, worker=worker)
+        session = _new_live_dict_session(websocket, model_path)
         await manager.replace(session)
         try:
-            while True:
-                message = await websocket.receive()
-                if message["type"] == "websocket.disconnect":
-                    break
-                data = message.get("bytes")
-                if data is not None:
-                    _handle_audio_frame(queue, data)
-                    continue
-                text = message.get("text")
-                if text is not None and _handle_control_text(queue, text):
-                    break  # `cancel`: abandon with no final decode
-        except WebSocketDisconnect:
-            pass
+            await _receive_dictation_messages(websocket, session.queue)
         finally:
-            manager.clear(session)
-            await session.stop_worker()
-            # The session is over however we got here, so leave no socket
-            # dangling for a client to keep pushing audio into. Both other
-            # exits already closed it — the worker after `stop`, the client
-            # itself on a disconnect — and closing twice is a no-op.
-            with contextlib.suppress(Exception):
-                await websocket.close()
+            await _close_dictation_session(manager, session)
 
     return manager
 

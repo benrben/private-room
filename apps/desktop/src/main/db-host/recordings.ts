@@ -181,6 +181,73 @@ export async function finalizeRecAudioHybrid(
   clearRecChunks(db, fileId);
 }
 
+function recordingStorageKind(db: Database.Database, fileId: string): string | undefined {
+  const row = db.prepare(
+    "SELECT storage_kind FROM files WHERE id = ? AND trashed_at IS NULL",
+  ).get(fileId) as { storage_kind: string } | undefined;
+  return row?.storage_kind;
+}
+
+function checkpointSamples(db: Database.Database, fileId: string, base: Float32Array): Float32Array {
+  const chunks = queryRows(
+    db,
+    "SELECT pcm FROM rec_chunks WHERE file_id = ? ORDER BY seq",
+    [fileId],
+    (row: Row) => row[0] as Buffer,
+  );
+  let total = base.length;
+  for (const pcm of chunks) total += Math.trunc(pcm.length / 2);
+  const samples = new Float32Array(total);
+  samples.set(base, 0);
+  let at = base.length;
+  for (const pcm of chunks) {
+    for (let index = 0; index < Math.trunc(pcm.length / 2); index++) {
+      samples[at++] = pcm.readInt16LE(index * 2) / 32768;
+    }
+  }
+  return samples;
+}
+
+async function recoverWorkspaceRecording(
+  db: Database.Database,
+  workspace: WorkspaceService,
+  fileId: string,
+): Promise<void> {
+  const stored = await workspace.readBuffer(fileId);
+  const base = stored.length > 0 ? decodeWav(stored) : new Float32Array(0);
+  const samples = checkpointSamples(db, fileId, base);
+  await finalizeRecAudioHybrid(db, workspace, fileId, encodeWav(samples), getFileExtractedText(db, fileId));
+}
+
+async function recoverKnownRecordingHybrid(
+  db: Database.Database,
+  workspace: WorkspaceService,
+  fileId: string,
+  storageKind: string,
+): Promise<boolean> {
+  try {
+    if (storageKind === "workspace") {
+      await recoverWorkspaceRecording(db, workspace, fileId);
+    } else {
+      recoverOne(db, fileId, getFileBytes(db, fileId));
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function recoveryFailure(ids: string[], recovered: number, failed: number): Error | undefined {
+  if (failed === 0) {
+    return undefined;
+  }
+  return new Error(
+    `${failed} of ${ids.length} interrupted recording(s) could not be restored ` +
+      `(${recovered} were). Their audio is still stored in the room and the ` +
+      "rescue runs again the next time you unlock it.",
+  );
+}
+
 /** Recover live PCM checkpoints for a workspace recording without moving its
  * current WAV back into `files.original_bytes`. */
 export async function recoverRecChunksHybrid(
@@ -191,50 +258,19 @@ export async function recoverRecChunksHybrid(
   let recovered = 0;
   let failed = 0;
   for (const id of ids) {
-    const row = db.prepare(
-      "SELECT storage_kind FROM files WHERE id = ? AND trashed_at IS NULL",
-    ).get(id) as { storage_kind: string } | undefined;
-    if (row === undefined) continue;
-    if (row.storage_kind !== "workspace") {
-      try {
-        recoverOne(db, id, getFileBytes(db, id));
-        recovered++;
-      } catch {
-        failed++;
-      }
+    const storageKind = recordingStorageKind(db, id);
+    if (storageKind === undefined) {
       continue;
     }
-    try {
-      const stored = await workspace.readBuffer(id);
-      const base = stored.length > 0 ? decodeWav(stored) : new Float32Array(0);
-      const chunks = queryRows(
-        db,
-        "SELECT pcm FROM rec_chunks WHERE file_id = ? ORDER BY seq",
-        [id],
-        (r: Row) => r[0] as Buffer,
-      );
-      let total = base.length;
-      for (const pcm of chunks) total += Math.trunc(pcm.length / 2);
-      const samples = new Float32Array(total);
-      samples.set(base, 0);
-      let at = base.length;
-      for (const pcm of chunks) {
-        for (let i = 0; i < Math.trunc(pcm.length / 2); i++) {
-          samples[at++] = pcm.readInt16LE(i * 2) / 32768;
-        }
-      }
-      await finalizeRecAudioHybrid(db, workspace, id, encodeWav(samples), getFileExtractedText(db, id));
+    if (await recoverKnownRecordingHybrid(db, workspace, id, storageKind)) {
       recovered++;
-    } catch {
+    } else {
       failed++;
     }
   }
-  if (failed > 0) {
-    throw new Error(
-      `${failed} of ${ids.length} interrupted recording(s) could not be restored ` +
-        `(${recovered} were). Their audio is still stored in the room and the ` +
-        `rescue runs again the next time you unlock it.`,
-    );
+  const failure = recoveryFailure(ids, recovered, failed);
+  if (failure !== undefined) {
+    throw failure;
   }
   return recovered;
 }
@@ -279,14 +315,9 @@ export function recoverRecChunks(db: Database.Database): number {
       failed++;
     }
   }
-  if (failed > 0) {
-    // Counts only — a recording's name is room content. `recovered` is reported
-    // alongside so the message can never read as a total loss.
-    throw new Error(
-      `${failed} of ${ids.length} interrupted recording(s) could not be restored ` +
-        `(${recovered} were). Their audio is still stored in the room and the ` +
-        `rescue runs again the next time you unlock it.`
-    );
+  const failure = recoveryFailure(ids, recovered, failed);
+  if (failure !== undefined) {
+    throw failure;
   }
   return recovered;
 }
@@ -300,26 +331,7 @@ function recoverOne(db: Database.Database, id: string, stored: Buffer | null): v
   // rows this rejects are genuinely damaged ones — which is the point: their
   // checkpoints are kept for the next attempt rather than spliced onto rubble.
   const base = stored !== null ? decodeWav(stored) : new Float32Array(0);
-  const chunks = queryRows(
-    db,
-    "SELECT pcm FROM rec_chunks WHERE file_id = ? ORDER BY seq",
-    [id],
-    (r: Row) => r[0] as Buffer
-  );
-  let total = base.length;
-  for (const pcm of chunks) {
-    total += Math.trunc(pcm.length / 2);
-  }
-  const samples = new Float32Array(total);
-  samples.set(base, 0);
-  let at = base.length;
-  for (const pcm of chunks) {
-    const count = Math.trunc(pcm.length / 2);
-    for (let i = 0; i < count; i++) {
-      samples[at + i] = pcm.readInt16LE(i * 2) / 32768;
-    }
-    at += count;
-  }
+  const samples = checkpointSamples(db, id, base);
   const wav = encodeWav(samples);
   // The transcript was checkpointed by every flush and is CURRENT — it must
   // ride through, or this rescue would erase it.

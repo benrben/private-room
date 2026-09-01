@@ -123,14 +123,33 @@ def read_zip_entry_capped(data: bytes, entry: str, cap: int) -> str | None:
     every one of these collapses to `None`, matching the Rust source's
     `.ok()?` chain.
     """
+    archive = _open_zip_archive(data)
+    if archive is None:
+        return None
+    info = _zip_entry_info(archive, entry)
+    if info is None:
+        return None
+    raw = _zip_entry_capped_bytes(archive, info, cap)
+    return _decode_zip_utf8(raw) if raw is not None else None
+
+
+def _open_zip_archive(data: bytes) -> zipfile.ZipFile | None:
     try:
-        archive = zipfile.ZipFile(io.BytesIO(data))
+        return zipfile.ZipFile(io.BytesIO(data))
     except _ZIP_READ_ERRORS:
         return None
+
+
+def _zip_entry_info(archive: zipfile.ZipFile, entry: str) -> zipfile.ZipInfo | None:
     try:
-        info = archive.getinfo(entry)
+        return archive.getinfo(entry)
     except KeyError:
         return None
+
+
+def _zip_entry_capped_bytes(
+    archive: zipfile.ZipFile, info: zipfile.ZipInfo, cap: int
+) -> bytes | None:
     # Declared size can lie, so the bounded read below is the real guard;
     # checking the header first just skips the allocation for an honest
     # oversized entry.
@@ -141,8 +160,10 @@ def read_zip_entry_capped(data: bytes, entry: str, cap: int) -> str | None:
             raw = fh.read(cap + 1)
     except _ZIP_READ_ERRORS:
         return None
-    if len(raw) > cap:
-        return None
+    return raw if len(raw) <= cap else None
+
+
+def _decode_zip_utf8(raw: bytes) -> str | None:
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -178,28 +199,42 @@ def zip_inflated_size_within(data: bytes, cap: int) -> bool:
     refuse the whole archive too -- callers must only ever see bytes that
     verified within bounds.
     """
-    try:
-        archive = zipfile.ZipFile(io.BytesIO(data))
-    except _ZIP_READ_ERRORS:
+    archive = _open_zip_archive(data)
+    if archive is None:
         return False
+    return _zip_entries_inflated_within(archive, cap)
+
+
+def _zip_entries_inflated_within(archive: zipfile.ZipFile, cap: int) -> bool:
     remaining = cap
     for info in archive.infolist():
-        try:
-            with archive.open(info) as fh:
-                n = 0
-                to_read = remaining + 1
-                while to_read > 0:
-                    chunk = fh.read(min(65536, to_read))
-                    if not chunk:
-                        break
-                    n += len(chunk)
-                    to_read -= len(chunk)
-        except _ZIP_READ_ERRORS:
+        inflated = _inflated_entry_size(archive, info, remaining + 1)
+        if inflated is None or inflated > remaining:
             return False
-        if n > remaining:
-            return False
-        remaining -= n
+        remaining -= inflated
     return True
+
+
+def _inflated_entry_size(
+    archive: zipfile.ZipFile, info: zipfile.ZipInfo, limit: int
+) -> int | None:
+    try:
+        with archive.open(info) as fh:
+            return _count_zip_bytes(fh, limit)
+    except _ZIP_READ_ERRORS:
+        return None
+
+
+def _count_zip_bytes(fh, limit: int) -> int:
+    total = 0
+    remaining = limit
+    while remaining > 0:
+        chunk = fh.read(min(65536, remaining))
+        if not chunk:
+            break
+        total += len(chunk)
+        remaining -= len(chunk)
+    return total
 
 
 # ------------------------------------------------------------- tag/text primitives
@@ -241,22 +276,30 @@ def strip_tags(input: str) -> str:  # noqa: A002 - mirrors the Rust parameter na
     in_tag = False
     quote: str | None = None
     for c in input:
-        if in_tag:
-            if quote is not None:
-                if c == quote:
-                    quote = None
-                # else: still inside the quoted value, ignore.
-            elif c in ('"', "'"):
-                quote = c
-            elif c == ">":
-                in_tag = False
-                out.append(" ")
-            # else: ordinary character inside the tag, ignore.
-        elif c == "<":
-            in_tag = True
-        else:
-            out.append(c)
+        in_tag, quote, emitted = _strip_tag_character(c, in_tag, quote)
+        if emitted is not None:
+            out.append(emitted)
     return decode_basic_entities("".join(out))
+
+
+def _strip_tag_character(
+    character: str, in_tag: bool, quote: str | None
+) -> tuple[bool, str | None, str | None]:
+    if not in_tag:
+        return _outside_tag_character(character)
+    if quote is not None:
+        return True, None if character == quote else quote, None
+    if character in ('"', "'"):
+        return True, character, None
+    if character == ">":
+        return False, None, " "
+    return True, None, None
+
+
+def _outside_tag_character(character: str) -> tuple[bool, None, str | None]:
+    if character == "<":
+        return True, None, None
+    return False, None, character
 
 
 def xml_paras_to_text(xml: str, para_close: str) -> str:
@@ -315,12 +358,15 @@ def _ascii_ci_eq(a: str, b: str) -> bool:
     if len(a) != len(b):
         return False
     for x, y in zip(a, b):
-        if x == y:
-            continue
-        if x.isascii() and y.isascii() and x.lower() == y.lower():
-            continue
-        return False
+        if not _ascii_char_ci_eq(x, y):
+            return False
     return True
+
+
+def _ascii_char_ci_eq(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    return a.isascii() and b.isascii() and a.lower() == b.lower()
 
 
 def _lookup_named_entity(body: str) -> str | None:
@@ -341,17 +387,25 @@ def _parse_u32(digits: str, base: int) -> int | None:
     `_`, or surrounding whitespace all fail to parse -- unlike Python's own
     `int(str, base)`, which accepts all three.
     """
-    if digits.startswith("+"):
-        digits = digits[1:]
-    if not digits:
-        return None
-    alphabet = "0123456789abcdefABCDEF" if base == 16 else "0123456789"
-    if any(c not in alphabet for c in digits):
+    digits = _without_leading_plus(digits)
+    if not _u32_digits_are_valid(digits, base):
         return None
     value = int(digits, base)
-    if value > 0xFFFFFFFF:
-        return None
-    return value
+    return value if value <= 0xFFFFFFFF else None
+
+
+def _without_leading_plus(digits: str) -> str:
+    return digits[1:] if digits.startswith("+") else digits
+
+
+def _u32_digits_are_valid(digits: str, base: int) -> bool:
+    if not digits:
+        return False
+    return all(character in _u32_alphabet(base) for character in digits)
+
+
+def _u32_alphabet(base: int) -> str:
+    return "0123456789abcdefABCDEF" if base == 16 else "0123456789"
 
 
 def _char_from_u32(code: int) -> str | None:
@@ -392,42 +446,55 @@ def decode_basic_entities(s: str) -> str:
     # Nothing to do, and the overwhelmingly common case for non-HTML sources.
     if "&" not in s:
         return s
+    return _decode_entity_references(s)
+
+
+def _decode_entity_references(s: str) -> str:
     out: list[str] = []
     rest = s
     while True:
         amp = rest.find("&")
         if amp == -1:
             break
-        out.append(rest[:amp])
-        after = rest[amp + 1 :]
-        semi = _entity_body_end(after)
-        if semi is None:
-            # A bare `&` -- emit it and carry on from just after it, so the
-            # next `find` cannot rediscover this same one and loop forever.
-            out.append("&")
-            rest = after
-            continue
-        body = after[:semi]
-        decoded: str | None
-        if body.startswith("#"):
-            digits = body[1:]
-            if digits[:1] in ("x", "X"):
-                code = _parse_u32(digits[1:], 16)
-            else:
-                code = _parse_u32(digits, 10)
-            decoded = _char_from_u32(code) if code is not None else None
-        else:
-            decoded = _lookup_named_entity(body)
-        if decoded is not None:
-            out.append(decoded)
-        else:
-            # Unrecognized: keep it verbatim, `&` and `;` included.
-            out.append("&")
-            out.append(body)
-            out.append(";")
-        rest = after[semi + 1 :]
+        rest = _consume_entity_reference(out, rest, amp)
     out.append(rest)
     return "".join(out)
+
+
+def _consume_entity_reference(out: list[str], rest: str, amp: int) -> str:
+    out.append(rest[:amp])
+    after = rest[amp + 1 :]
+    semi = _entity_body_end(after)
+    if semi is None:
+        # A bare `&` -- emit it and carry on from just after it, so the next
+        # `find` cannot rediscover this same one and loop forever.
+        out.append("&")
+        return after
+    body = after[:semi]
+    _append_decoded_entity(out, body)
+    return after[semi + 1 :]
+
+
+def _append_decoded_entity(out: list[str], body: str) -> None:
+    decoded = _decode_entity_body(body)
+    if decoded is not None:
+        out.append(decoded)
+        return
+    # Unrecognized: keep it verbatim, `&` and `;` included.
+    out.extend(("&", body, ";"))
+
+
+def _decode_entity_body(body: str) -> str | None:
+    if not body.startswith("#"):
+        return _lookup_named_entity(body)
+    code = _parse_entity_code(body[1:])
+    return _char_from_u32(code) if code is not None else None
+
+
+def _parse_entity_code(digits: str) -> int | None:
+    if digits[:1] in ("x", "X"):
+        return _parse_u32(digits[1:], 16)
+    return _parse_u32(digits, 10)
 
 
 def normalize_whitespace(s: str) -> str:

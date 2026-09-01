@@ -30,6 +30,7 @@ from the module's own docstring. In particular:
 from __future__ import annotations
 
 import codecs
+from types import SimpleNamespace
 
 import pytest
 
@@ -113,6 +114,43 @@ def test_empty_input_decodes_as_utf8_empty_string():
 
 
 # -------------------------------------------------------------- detect
+
+
+def _detector_result(encoding: str | None, *, no_best: bool = False):
+    best = None if no_best else SimpleNamespace(encoding=encoding)
+
+    def detect(_: bytes):
+        return SimpleNamespace(best=lambda: best)
+
+    return detect
+
+
+@pytest.mark.parametrize(
+    ("detected_name", "expected_label"),
+    [
+        ("cp1252", "windows-1252"),
+        ("cp932", "shift_jis"),
+        ("ascii", "windows-1252"),
+    ],
+)
+def test_guess_choice_resolves_direct_alias_and_unmapped_codecs(
+    monkeypatch: pytest.MonkeyPatch, detected_name: str, expected_label: str
+) -> None:
+    monkeypatch.setattr(td, "_cn_from_bytes", _detector_result(detected_name))
+
+    assert td._guess_choice(b"single-byte input") is td._BY_KEY[expected_label]
+
+
+@pytest.mark.parametrize(
+    ("encoding", "no_best"),
+    [(None, True), ("", False), ("not-a-python-codec", False)],
+)
+def test_guess_choice_defaults_when_the_detector_has_no_usable_codec(
+    monkeypatch: pytest.MonkeyPatch, encoding: str | None, no_best: bool
+) -> None:
+    monkeypatch.setattr(td, "_cn_from_bytes", _detector_result(encoding, no_best=no_best))
+
+    assert td._guess_choice(b"single-byte input") is td._DEFAULT_CHOICE
 
 
 def test_ambiguous_single_byte_legacy_text_is_detected_and_readable():

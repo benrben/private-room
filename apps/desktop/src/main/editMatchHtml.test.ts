@@ -109,6 +109,12 @@ describe("htmlReplaceText", () => {
     expect(htmlReplaceText("<div>Hello</p/>World</div>", "HelloWorld", "x").ok).toBe(false);
   });
 
+  it("trims Unicode whitespace before a malformed block close tag", () => {
+    // The scanner follows Rust's Unicode `trim_start`, so even a malformed
+    // `< EM SPACE /p>` boundary cannot let a quote cross from A into B.
+    expect(htmlReplaceText("<div>A< \u2003/p>B</div>", "AB", "x").ok).toBe(false);
+  });
+
   it("a match starting on a ligature's second half rewrites the WHOLE ligature", () => {
     // A CHARACTERIZATION test, pinned deliberately. `foldEditChar` expands
     // U+FB01 to `f` + `i` and maps BOTH halves to the same source character, so
@@ -165,6 +171,19 @@ describe("htmlReplaceText", () => {
     const miss = htmlReplaceText("<p>anything</p>", "   ", "x");
     expect(miss.ok).toBe(false);
   });
+
+  it("reports a normal no-match when the quote cannot fit in the readable text", () => {
+    const miss = htmlReplaceText("<p>x</p>", "a much longer quote", "x");
+    expect(miss.ok).toBe(false);
+    if (!miss.ok) {
+      expect(miss.error).toContain("exact text");
+    }
+  });
+
+  it("normalizes folded ligatures and trailing whitespace before matching", () => {
+    expect(replaced("<p>fi</p>", "\u{FB01}", "x").html).toBe("<p>x</p>");
+    expect(replaced("<p>word </p>", "word ", "x").html).toBe("<p>x </p>");
+  });
 });
 
 describe("scanHtmlRuns", () => {
@@ -176,6 +195,20 @@ describe("scanHtmlRuns", () => {
     const html = `<style>${DOTTED_I.repeat(10)}</style><p>the target here</p>`;
     const runs = scanHtmlRuns(html).runs.map((r) => r.chars.join(""));
     expect(runs).toEqual(["the target here"]);
+  });
+
+  it("keeps numeric entities but treats invalid and overlong entities as literal source text", () => {
+    const html = "<p>&#x1F600; &#128512; &#xD800; &unknown; &this_entity_name_is_far_too_long_to_decode;</p>";
+    expect(scanHtmlRuns(html).runs.map((run) => run.chars.join(""))).toEqual([
+      "😀 😀 &#xD800; &unknown; &this_entity_name_is_far_too_long_to_decode;",
+    ]);
+  });
+
+  it("stops safely at malformed comments, tags, and non-content elements", () => {
+    expect(scanHtmlRuns("<p>keep</p><!-- unfinished").runs.map((run) => run.chars.join(""))).toEqual(["keep"]);
+    expect(scanHtmlRuns("<p>keep</p><style>unfinished").runs.map((run) => run.chars.join(""))).toEqual(["keep"]);
+    expect(scanHtmlRuns("<p>keep</p><style").runs.map((run) => run.chars.join(""))).toEqual(["keep"]);
+    expect(scanHtmlRuns("<p>keep</p><unfinished").runs.map((run) => run.chars.join(""))).toEqual(["keep"]);
   });
 });
 
@@ -244,6 +277,13 @@ describe("scanHeadings / findSectionRangeHtml", () => {
     }
     expect(html.slice(range.start, range.end)).toBe("<p>a</p>");
   });
+
+  it("retains already-read headings before malformed comment or tag tails", () => {
+    expect(scanHeadings("<h1>Keep</h1><!-- unfinished").map((heading) => heading.text)).toEqual(["Keep"]);
+    expect(scanHeadings("<h1>Keep</h1><h2").map((heading) => heading.text)).toEqual(["Keep"]);
+    expect(scanHeadings("<h1>missing close")).toEqual([]);
+    expect(scanHeadings("<h1>missing close</h1")).toEqual([]);
+  });
 });
 
 describe("stripHtml", () => {
@@ -265,6 +305,12 @@ describe("stripHtml", () => {
     expect(out).toContain("keep me");
     expect(out).not.toContain("menu");
     expect(out).not.toContain("var x");
+  });
+
+  it("does not discard readable text after an unclosed chrome element", () => {
+    // An unclosed tag has no safe close offset. The stripping pipeline must
+    // leave it for tag removal rather than swallow the document tail.
+    expect(stripHtml("<p>keep</p><nav>tail without a close")).toContain("tail without a close");
   });
 });
 

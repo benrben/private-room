@@ -1,18 +1,27 @@
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, open as openFile, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, open: vi.fn(actual.open) };
+});
+vi.mock("../db-host/open.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../db-host/open.js")>();
+  return { ...actual, openRoom: vi.fn(actual.openRoom) };
+});
 import { insertFile } from "../db-host/files.js";
 import { setRecMeta } from "../db-host/recordings.js";
 import { createFolder, moveFileToFolder } from "../db-host/folders.js";
 import { setMeta } from "../db-host/meta.js";
-import { createRoom, openRoomReadonly } from "../db-host/open.js";
+import { createRoom, openRoom, openRoomReadonly } from "../db-host/open.js";
 import { createRoomManagerState } from "../roomManager.js";
 import { HarnessController, type HarnessProvider } from "../harness/controller.js";
 import type { HarnessContext, HarnessRun, HarnessRuntime } from "../harness/types.js";
 import { sha256File } from "./hash.js";
 import { openWorkspaceRoom } from "./roomLayout.js";
-import { convertLegacyRoomToWorkspace } from "./conversion.js";
+import { convertLegacyRoomToWorkspace, discardWorkspaceConversion } from "./conversion.js";
 import { createWorkspaceMcpBridge } from "./workspaceMcp.js";
 import { WorkspaceService } from "./workspaceService.js";
 import { audioPeaksForRoom, createPeakCache } from "../peaksTools.js";
@@ -206,6 +215,315 @@ describe("legacy workspace conversion", () => {
     expect(await readFile(path.join(destinationPath, "one.txt"), "utf8")).toBe("one");
     expect(await readFile(path.join(destinationPath, "two.txt"), "utf8")).toBe("two");
     expect(await sha256File(sourcePath)).toBe(sourceHash);
+  });
+
+  it("records legacy rows without current bytes as skipped while publishing the empty workspace", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-convert-missing-bytes-"));
+    roots.push(root);
+    const sourcePath = path.join(root, "Legacy.roomai");
+    const destinationPath = path.join(root, "Missing Bytes Room");
+    const password = "correct horse battery staple";
+    const legacy = createRoom(sourcePath, password, "Legacy");
+    const missing = insertFile(legacy, "gone.txt", "text/plain", Buffer.from("gone"), null, "upload");
+    legacy.prepare("UPDATE files SET original_bytes = NULL WHERE id = ?").run(missing.id);
+    legacy.close();
+
+    const report = await convertLegacyRoomToWorkspace(sourcePath, password, destinationPath);
+
+    expect(report.convertedFiles).toBe(0);
+    expect(report.skipped).toEqual([{
+      fileId: missing.id,
+      name: "gone.txt",
+      reason: "This legacy row has no current file bytes.",
+    }]);
+    expect((await stat(path.join(destinationPath, ".arcelle", "room.db"))).isFile()).toBe(true);
+  });
+
+  it("does not publish when validation finds an exported normal file missing", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-convert-validate-"));
+    roots.push(root);
+    const sourcePath = path.join(root, "Legacy.roomai");
+    const destinationPath = path.join(root, "Validation Room");
+    const password = "correct horse battery staple";
+    const legacy = createRoom(sourcePath, password, "Legacy");
+    insertFile(legacy, "notes.txt", "text/plain", Buffer.from("notes"), "notes", "upload");
+    legacy.close();
+    const tempRoot = path.join(root, ".Validation Room.arcelle-conversion.tmp");
+
+    await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath, {
+      afterFile: async () => rm(path.join(tempRoot, "notes.txt"), { force: true }),
+    })).rejects.toThrow("Conversion validation found 0 files but expected 1.");
+
+    await expect(stat(destinationPath)).rejects.toThrow();
+    expect((await stat(path.join(tempRoot, ".arcelle", "room.db"))).isFile()).toBe(true);
+  });
+
+  it("rejects a source that changes after the conversion copy was opened, before publishing", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-convert-source-change-"));
+    roots.push(root);
+    const sourcePath = path.join(root, "Legacy.roomai");
+    const destinationPath = path.join(root, "Changed Source Room");
+    const password = "correct horse battery staple";
+    const legacy = createRoom(sourcePath, password, "Legacy");
+    insertFile(legacy, "notes.txt", "text/plain", Buffer.from("notes"), "notes", "upload");
+    legacy.close();
+
+    await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath, {
+      afterFile: async () => writeFile(sourcePath, "source changed after copy", "utf8"),
+    })).rejects.toThrow("The legacy source changed during conversion. The workspace was not published.");
+
+    await expect(stat(destinationPath)).rejects.toThrow();
+  });
+
+  it("keeps the resumable temp workspace when a close reports an error after publication is refused", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-convert-close-"));
+    roots.push(root);
+    const sourcePath = path.join(root, "Legacy.roomai");
+    const destinationPath = path.join(root, "Close Room");
+    const password = "correct horse battery staple";
+    const legacy = createRoom(sourcePath, password, "Legacy");
+    insertFile(legacy, "notes.txt", "text/plain", Buffer.from("notes"), "notes", "upload");
+    legacy.close();
+    const actualOpen = vi.mocked(openRoom).getMockImplementation();
+    expect(actualOpen).toBeDefined();
+    vi.mocked(openRoom).mockImplementation((filePath, roomPassword) => {
+      const db = actualOpen!(filePath, roomPassword);
+      let closeCount = 0;
+      return new Proxy(db, {
+        get(target, property) {
+          if (property === "close") {
+            return () => {
+              closeCount += 1;
+              if (closeCount > 1) throw new Error("simulated close failure");
+              return target.close();
+            };
+          }
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    });
+
+    try {
+      await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath, {
+        afterFile: async () => writeFile(sourcePath, "source changed after copy", "utf8"),
+      })).rejects.toThrow("The legacy source changed during conversion. The workspace was not published.");
+      await expect(stat(destinationPath)).rejects.toThrow();
+    } finally {
+      vi.mocked(openRoom).mockImplementation(actualOpen!);
+    }
+  });
+
+  it("keeps destination preflight refusal order and rejects sealed backups before creating a temp workspace", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-convert-preflight-"));
+    roots.push(root);
+    const sourcePath = path.join(root, "Legacy.roomai");
+    const destinationPath = path.join(root, "Destination");
+    const password = "correct horse battery staple";
+    const legacy = createRoom(sourcePath, password, "Legacy");
+    legacy.close();
+
+    await expect(convertLegacyRoomToWorkspace(sourcePath, password, sourcePath)).rejects.toThrow(
+      "Choose a different destination folder for the workspace.",
+    );
+    await writeFile(destinationPath, "already occupied", "utf8");
+    await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath)).rejects.toThrow(
+      "A file or folder already exists at the destination.",
+    );
+    await rm(destinationPath);
+
+    const sealed = openRoom(sourcePath, password);
+    sealed.exec("CREATE TABLE sealed_package_meta (id TEXT)");
+    sealed.close();
+    await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath)).rejects.toThrow(
+      "This is a sealed backup. Use sealed import instead of legacy conversion.",
+    );
+    await expect(stat(path.join(root, ".Destination.arcelle-conversion.tmp"))).rejects.toThrow();
+  });
+
+  it("rejects a damaged persisted report when resuming, leaving its temp workspace for recovery", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-convert-report-"));
+    roots.push(root);
+    const sourcePath = path.join(root, "Legacy.roomai");
+    const destinationPath = path.join(root, "Report Room");
+    const password = "correct horse battery staple";
+    const legacy = createRoom(sourcePath, password, "Legacy");
+    insertFile(legacy, "notes.txt", "text/plain", Buffer.from("notes"), "notes", "upload");
+    legacy.close();
+
+    await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath, {
+      afterFile: () => { throw new Error("pause after commit"); },
+    })).rejects.toThrow("pause after commit");
+    const tempDb = path.join(root, ".Report Room.arcelle-conversion.tmp", ".arcelle", "room.db");
+    const resumed = openRoom(tempDb, password);
+    setMeta(resumed, "workspace_conversion_report", "{damaged");
+    resumed.close();
+
+    await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath)).rejects.toThrow(
+      "The saved workspace conversion report is damaged.",
+    );
+    expect((await stat(tempDb)).isFile()).toBe(true);
+  });
+
+  it("refuses to resume a temp workspace created from a different legacy source", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-convert-resume-source-"));
+    roots.push(root);
+    const sourcePath = path.join(root, "Legacy.roomai");
+    const replacementPath = path.join(root, "Replacement.roomai");
+    const destinationPath = path.join(root, "Resume Source Room");
+    const password = "correct horse battery staple";
+    const legacy = createRoom(sourcePath, password, "Legacy");
+    insertFile(legacy, "notes.txt", "text/plain", Buffer.from("notes"), "notes", "upload");
+    legacy.close();
+    await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath, {
+      afterFile: () => { throw new Error("pause after commit"); },
+    })).rejects.toThrow("pause after commit");
+
+    const replacement = createRoom(replacementPath, password, "Replacement");
+    insertFile(replacement, "replacement.txt", "text/plain", Buffer.from("changed"), "changed", "upload");
+    replacement.close();
+    await rename(replacementPath, sourcePath);
+
+    await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath)).rejects.toThrow(
+      "The legacy source changed after this conversion started. Remove the temporary conversion and try again.",
+    );
+  });
+
+  it("re-exports an existing normal file when a crashed conversion left its BLOB row pending", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-convert-reexport-"));
+    roots.push(root);
+    const sourcePath = path.join(root, "Legacy.roomai");
+    const destinationPath = path.join(root, "Re-export Room");
+    const password = "correct horse battery staple";
+    const legacy = createRoom(sourcePath, password, "Legacy");
+    const file = insertFile(legacy, "notes.txt", "text/plain", Buffer.from("source bytes"), "notes", "upload");
+    legacy.close();
+
+    await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath, {
+      afterFile: () => { throw new Error("pause after commit"); },
+    })).rejects.toThrow("pause after commit");
+    const tempRoot = path.join(root, ".Re-export Room.arcelle-conversion.tmp");
+    const resumed = openRoom(path.join(tempRoot, ".arcelle", "room.db"), password);
+    resumed.prepare("UPDATE files SET storage_kind = 'blob', original_bytes = ? WHERE id = ?")
+      .run(Buffer.from("re-exported bytes"), file.id);
+    resumed.close();
+
+    await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath)).resolves.toMatchObject({
+      resumed: true,
+      convertedFiles: 1,
+    });
+    expect(await readFile(path.join(destinationPath, "notes.txt"), "utf8")).toBe("re-exported bytes");
+  });
+
+  it("detects a same-sized normal-file hash mismatch during validation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-convert-hash-"));
+    roots.push(root);
+    const sourcePath = path.join(root, "Legacy.roomai");
+    const destinationPath = path.join(root, "Hash Room");
+    const password = "correct horse battery staple";
+    const legacy = createRoom(sourcePath, password, "Legacy");
+    insertFile(legacy, "notes.txt", "text/plain", Buffer.from("notes"), "notes", "upload");
+    legacy.close();
+    const tempRoot = path.join(root, ".Hash Room.arcelle-conversion.tmp");
+
+    await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath, {
+      afterFile: async () => writeFile(path.join(tempRoot, "notes.txt"), "other", "utf8"),
+    })).rejects.toThrow("Conversion validation failed for file");
+  });
+
+  it("refuses publication while a live legacy blob remains in the copied database", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-convert-live-blob-"));
+    roots.push(root);
+    const sourcePath = path.join(root, "Legacy.roomai");
+    const destinationPath = path.join(root, "Live Blob Room");
+    const password = "correct horse battery staple";
+    const legacy = createRoom(sourcePath, password, "Legacy");
+    const file = insertFile(legacy, "notes.txt", "text/plain", Buffer.from("notes"), "notes", "upload");
+    legacy.close();
+    const tempRoot = path.join(root, ".Live Blob Room.arcelle-conversion.tmp");
+
+    await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath, {
+      afterFile: async () => {
+        const copied = openRoom(path.join(tempRoot, ".arcelle", "room.db"), password);
+        copied.prepare("UPDATE files SET storage_kind = 'blob', original_bytes = ? WHERE id = ?")
+          .run(Buffer.from("notes"), file.id);
+        copied.close();
+        await rm(path.join(tempRoot, "notes.txt"));
+      },
+    })).rejects.toThrow(
+      "Conversion validation found live file bytes still stored in SQLCipher.",
+    );
+    await expect(stat(destinationPath)).rejects.toThrow();
+  });
+
+  it("reports a useful error instead of reusing more than ten thousand colliding paths", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-convert-collision-"));
+    roots.push(root);
+    const sourcePath = path.join(root, "Legacy.roomai");
+    const destinationPath = path.join(root, "Collision Room");
+    const password = "correct horse battery staple";
+    const legacy = createRoom(sourcePath, password, "Legacy");
+    insertFile(legacy, "notes.txt", "text/plain", Buffer.from("notes"), "notes", "upload");
+    legacy.close();
+    const originalHas = Set.prototype.has;
+    const collisions = vi.spyOn(Set.prototype, "has").mockImplementation(function (value) {
+      const allocatorCall = new Error().stack?.includes("availableRelativePath") === true;
+      return allocatorCall ? true : originalHas.call(this, value);
+    });
+
+    try {
+      await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath)).rejects.toThrow(
+        "Could not create a unique workspace path for notes.txt.",
+      );
+    } finally {
+      collisions.mockRestore();
+    }
+  });
+
+  it("treats directory fsync refusal as nonfatal because validation still protects publication", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-convert-sync-"));
+    roots.push(root);
+    const sourcePath = path.join(root, "Legacy.roomai");
+    const destinationPath = path.join(root, "Sync Room");
+    const password = "correct horse battery staple";
+    const legacy = createRoom(sourcePath, password, "Legacy");
+    insertFile(legacy, "notes.txt", "text/plain", Buffer.from("notes"), "notes", "upload");
+    legacy.close();
+    const actualOpen = vi.mocked(openFile).getMockImplementation();
+    expect(actualOpen).toBeDefined();
+    vi.mocked(openFile).mockImplementation(async (...args) => {
+      if (args[1] === "r") {
+        throw new Error("simulated filesystem does not support directory sync");
+      }
+      return actualOpen!(...args);
+    });
+
+    try {
+      await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath)).resolves.toMatchObject({
+        convertedFiles: 1,
+      });
+    } finally {
+      vi.mocked(openFile).mockImplementation(actualOpen!);
+    }
+  });
+
+  it("removes an abandoned resumable conversion root", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-convert-discard-"));
+    roots.push(root);
+    const sourcePath = path.join(root, "Legacy.roomai");
+    const destinationPath = path.join(root, "Discard Room");
+    const password = "correct horse battery staple";
+    const legacy = createRoom(sourcePath, password, "Legacy");
+    insertFile(legacy, "notes.txt", "text/plain", Buffer.from("notes"), "notes", "upload");
+    legacy.close();
+
+    await expect(convertLegacyRoomToWorkspace(sourcePath, password, destinationPath, {
+      afterFile: () => { throw new Error("pause after commit"); },
+    })).rejects.toThrow("pause after commit");
+    const tempRoot = path.join(root, ".Discard Room.arcelle-conversion.tmp");
+    expect((await stat(tempRoot)).isDirectory()).toBe(true);
+    await discardWorkspaceConversion(destinationPath);
+    await expect(stat(tempRoot)).rejects.toThrow();
   });
 
   it("opens converted files to native and Deep agent tools with rollback and no live blobs", async () => {

@@ -6,304 +6,201 @@ import { WSActions } from "../actions";
 import { SchedulePopover } from "../workflows/SchedulePopover";
 import { RunHistory } from "../workflows/RunHistory";
 
-function fmtWhen(ts: string | null | undefined): string {
-  if (!ts) return "";
-  const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? "" : d.toLocaleString();
+function fmtWhen(timestamp: string | null | undefined): string {
+  if (!timestamp) return "";
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime()) ? "" : date.toLocaleString();
 }
 
-/** The opening words of the two paragraphs `script_run.rs` appends after the
- * stderr tail — the only text in a script failure that is ADVICE rather than
- * the failure itself. Recognised by their wording rather than by the blank
- * line in front of them: a blank line is not the runner's signature. CPython
- * puts one either side of "During handling of the above exception…" on every
- * re-raise, and treating that as the boundary read a swallowed inner exception
- * as the cause and printed the rest of the traceback as a suggestion. */
 const GUIDANCE_OPENERS = [
   "Couldn't auto-install '",
   "This script imports a package that isn't installed.",
 ];
 
-/** A script failure, split into the two different things the runner writes.
- *
- * `script_run.rs` stores "The script failed (exit N):" + the stderr tail and
- * then, for the two commonest failures (a package it could not auto-install, a
- * module nothing declared), appends a blank line and a paragraph of GUIDANCE.
- * Taking the last line of the whole text put that guidance under the title
- * "same error", so the cause of a failing run read "Or ask the assistant to
- * declare the script's dependencies." and the exception was only in a tooltip.
- * Wording the runner does not recognise as its own is all stderr, and the
- * card offers no advice nobody wrote.
- */
-function splitError(err: string): { cause: string; advice: string } {
-  const paragraphs = err.split("\n\n");
+function splitError(error: string): { cause: string; advice: string } {
+  const paragraphs = error.split("\n\n");
   const tail = paragraphs.length > 1 ? paragraphs[paragraphs.length - 1].trim() : "";
-  const advice = GUIDANCE_OPENERS.some((o) => tail.startsWith(o)) ? tail : "";
-  const stderr = advice ? paragraphs.slice(0, -1).join("\n\n") : err;
-  const lines = stderr.split("\n").map((l) => l.trim()).filter(Boolean);
-  // Within the stderr the LAST line is the exception; the first is the
-  // executor's own header, which is the only thing an empty tail leaves.
+  const advice = GUIDANCE_OPENERS.some((opener) => tail.startsWith(opener)) ? tail : "";
+  const stderr = advice ? paragraphs.slice(0, -1).join("\n\n") : error;
+  const lines = stderr.split("\n").map((line) => line.trim()).filter(Boolean);
   return {
-    cause: lines[lines.length - 1] || lines[0] || err.trim(),
+    cause: lines[lines.length - 1] || lines[0] || error.trim(),
     advice: advice.replace(/\s+/g, " "),
   };
 }
 
-/** One script's row on the Scripts page: identity + deps/inputs/outputs chips,
- * approval state, last-run status, and Run / Schedule / History actions. */
-export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActions }) {
-  const [schedOpen, setSchedOpen] = useState(false);
-  const [histOpen, setHistOpen] = useState(false);
-  const [runs, setRuns] = useState<WorkflowRun[]>([]);
-
-  // Live progress for this script's latest run (workflow jobs are jobs).
+function scriptLive(sc: ScriptInfo, state: WSState) {
   const jobId = sc.lastRun?.jobId ?? undefined;
-  const live = jobId ? s.jobProgress[jobId] : undefined;
-  const lastStatus = sc.lastRun?.status ?? null;
-  const incident = sc.lastError ? splitError(sc.lastError) : null;
+  return jobId ? state.jobProgress[jobId] : undefined;
+}
 
+function ScriptTitle({ sc }: { sc: ScriptInfo }) {
+  return <span className="script-row-title" title={sc.name}>
+    <ScriptIcon size={14} /> {sc.name}
+    <span className="script-lang">{sc.lang}</span>
+  </span>;
+}
+
+function ReviewRibbon({ changed }: { changed: boolean }) {
+  if (!changed) return null;
+  return <span
+    className="script-ribbon"
+    title="This script's current content isn't remembered on this Mac — running it will ask for approval again. That is normal after an “Allow once” run, and it is also what an edit looks like."
+  >
+    Needs review
+  </span>;
+}
+
+function LastRunStatus({ sc }: { sc: ScriptInfo }) {
+  const status = sc.lastRun?.status;
+  if (!status) return <span className="caption">never run</span>;
+  const finishedAt = sc.lastRun?.finishedAt;
+  return <span className={`wf-badge ${status === "error" ? "dot-err" : "dot-ok"}`}>
+    {status}{finishedAt ? ` · ${fmtWhen(finishedAt)}` : ""}
+  </span>;
+}
+
+function ScriptRunStatus({ live, sc }: { live: ReturnType<typeof scriptLive>; sc: ScriptInfo }) {
+  if (live) return <span className="script-running"><span className="rec-dot" /> {live.label}</span>;
+  if (sc.consecutiveFailures >= 1) return <span className="wf-badge dot-err">Failed {sc.consecutiveFailures}×</span>;
+  return <LastRunStatus sc={sc} />;
+}
+
+function ScriptHeader({ live, sc }: { live: ReturnType<typeof scriptLive>; sc: ScriptInfo }) {
+  return <div className="script-row-main">
+    <ScriptTitle sc={sc} />
+    <ReviewRibbon changed={sc.changedSinceApproval} />
+    <span className="script-row-status"><ScriptRunStatus live={live} sc={sc} /></span>
+  </div>;
+}
+
+function incidentTitle(count: number) {
+  return count === 1 ? " time" : " times in a row — same error";
+}
+
+function IncidentActions({ sc, a }: { sc: ScriptInfo; a: WSActions }) {
+  return <div className="script-incident-actions">
+    <button className="subtle btn-ic" title="Open the script to fix the cause above" onClick={() => void a.viewFile(sc.fileId)}>Open to fix</button>
+    <button
+      className="subtle btn-ic"
+      title={sc.changedSinceApproval ? "Run this script's current content — it will ask for approval first" : "Run again"}
+      onClick={() => void a.runScript(sc.fileId)}
+    >
+      <PlayIcon size={12} /> {sc.changedSinceApproval ? "Run current version" : "Run again"}
+    </button>
+  </div>;
+}
+
+function ScriptIncident({ sc, a, live }: { sc: ScriptInfo; a: WSActions; live: ReturnType<typeof scriptLive> }) {
+  if (live || sc.consecutiveFailures < 1 || !sc.lastError) return null;
+  const incident = splitError(sc.lastError);
+  return <div className="script-incident">
+    <div className="script-incident-body">
+      <div className="script-incident-title">This script failed {sc.consecutiveFailures}{incidentTitle(sc.consecutiveFailures)}</div>
+      <div className="script-incident-cause" title={sc.lastError}>{incident.cause}</div>
+      {incident.advice && <div className="caption">{incident.advice}</div>}
+    </div>
+    <IncidentActions sc={sc} a={a} />
+  </div>;
+}
+
+function ScriptField({ title, value }: { title: string; value: string }) {
+  return <div className="script-field"><dt title={title}>{title}</dt><dd><code>{value}</code></dd></div>;
+}
+
+function ListField({ title, values }: { title: string; values: string[] }) {
+  if (values.length === 0) return null;
+  return <ScriptField title={title} value={values.join(", ")} />;
+}
+
+function ScriptShortcut({ shortcut }: { shortcut: ScriptInfo["shortcut"] }) {
+  if (shortcut === "none") return null;
+  return <div className="script-field"><dt title="Shows as a one-click shortcut">Shortcut</dt><dd>{shortcut === "global" ? "top-bar shortcut" : "file shortcut"}</dd></div>;
+}
+
+function hasManifest(sc: ScriptInfo) {
+  return sc.deps.length > 0 || sc.inputs.length > 0 || sc.outputs.length > 0 || sc.shortcut !== "none";
+}
+
+function ScriptManifest({ sc }: { sc: ScriptInfo }) {
+  if (!hasManifest(sc)) return null;
+  return <dl className="script-fields">
+    <ListField title="Installs" values={sc.deps} />
+    <ListField title="Reads" values={sc.inputs} />
+    <ListField title="Writes back" values={sc.outputs} />
+    <ScriptShortcut shortcut={sc.shortcut} />
+  </dl>;
+}
+
+function ApprovalCaution({ approved }: { approved: boolean }) {
+  if (approved) return null;
+  return <p className="script-caution">
+    This version has not been approved on this Mac. <strong>Review script</strong> opens the run-consent card, which spells out exactly what would run and what it would be allowed to touch — nothing runs until you approve it.
+  </p>;
+}
+
+function ScriptRunButton({ sc, a, live }: { sc: ScriptInfo; a: WSActions; live: ReturnType<typeof scriptLive> }) {
+  const label = sc.approved ? "Run" : "Review script";
+  const title = sc.approved
+    ? "Run this script now — outputs are saved into the room"
+    : "This version has not been approved — opens the review card; nothing runs until you approve it";
+  return <button className={`btn-ic script-go${sc.approved ? "" : " needs-review"}`} title={title} disabled={!!live} onClick={() => void a.runScript(sc.fileId)}>
+    <PlayIcon size={14} /> {label}
+  </button>;
+}
+
+function ScheduleControl({ sc, a }: { sc: ScriptInfo; a: WSActions }) {
+  const [open, setOpen] = useState(false);
+  if (!sc.approved) return <span className="script-sched-wrap" title="Run this script once and choose “Always allow” — then you can schedule it.">
+    <button className="subtle btn-ic" disabled aria-disabled="true"><ClockIcon size={14} /> Schedule</button>
+  </span>;
+  return <span className="script-sched-wrap">
+    <button className={`subtle btn-ic${sc.schedule?.enabled ? " active" : ""}`} title="Schedule this script" onClick={() => setOpen((value) => !value)}>
+      <ClockIcon size={14} />{sc.schedule?.enabled ? `${sc.schedule.kind}` : "Schedule"}
+    </button>
+    {open && <div className="script-sched-pop"><SchedulePopover schedule={sc.schedule} disabled={false} onSave={(arg) => void a.scheduleScript(sc.fileId, arg)} onClose={() => setOpen(false)} /></div>}
+  </span>;
+}
+
+function RunHistoryControl({ workflowId }: { workflowId: string | null | undefined }) {
+  const [open, setOpen] = useState(false);
+  const [runs, setRuns] = useState<WorkflowRun[]>([]);
   async function toggleHistory() {
-    if (histOpen) {
-      setHistOpen(false);
+    if (open) {
+      setOpen(false);
       return;
     }
-    setHistOpen(true);
-    if (sc.workflowId) {
-      try {
-        setRuns(await api.getWorkflowRuns(sc.workflowId));
-      } catch {
-        setRuns([]);
-      }
+    setOpen(true);
+    if (!workflowId) return;
+    try {
+      setRuns(await api.getWorkflowRuns(workflowId));
+    } catch {
+      setRuns([]);
     }
   }
+  if (!workflowId) return null;
+  return <>
+    <button className="subtle btn-ic" aria-expanded={open} onClick={() => void toggleHistory()}>{open ? "Hide runs" : "Runs"}</button>
+    {open && <div className="script-history"><div className="script-history-label">Run history</div><RunHistory runs={runs} nodeCount={1} /></div>}
+  </>;
+}
 
-  return (
-    <div className={`script-row${sc.changedSinceApproval ? " needs-review" : ""}`}>
-      <div className="script-row-main">
-        <span className="script-row-title" title={sc.name}>
-          <ScriptIcon size={14} /> {sc.name}
-          <span className="script-lang">{sc.lang}</span>
-        </span>
-        {sc.changedSinceApproval && (
-          // `changedSinceApproval` means "this exact content is not remembered
-          // on this Mac" — and it CANNOT tell an "Allow once" run apart from an
-          // edit after "Always allow" (see the Rust field's doc comment). So the
-          // tooltip must not claim the script changed: approving a script just
-          // this once left it permanently ribboned as though someone had edited
-          // a file they never touched.
-          <span
-            className="script-ribbon"
-            title="This script's current content isn't remembered on this Mac — running it will ask for approval again. That is normal after an “Allow once” run, and it is also what an edit looks like."
-          >
-            Needs review
-          </span>
-        )}
-        <span className="script-row-status">
-          {live ? (
-            <span className="script-running">
-              <span className="rec-dot" /> {live.label}
-            </span>
-          ) : sc.consecutiveFailures >= 1 ? (
-            <span className="wf-badge dot-err">
-              Failed {sc.consecutiveFailures}×
-            </span>
-          ) : lastStatus ? (
-            <span className={`wf-badge ${lastStatus === "error" ? "dot-err" : "dot-ok"}`}>
-              {lastStatus}
-              {sc.lastRun?.finishedAt ? ` · ${fmtWhen(sc.lastRun.finishedAt)}` : ""}
-            </span>
-          ) : (
-            <span className="caption">never run</span>
-          )}
-        </span>
-      </div>
+function ScriptActions({ sc, a, live }: { sc: ScriptInfo; a: WSActions; live: ReturnType<typeof scriptLive> }) {
+  return <div className="script-row-actions">
+    <ScriptRunButton sc={sc} a={a} live={live} />
+    <ScheduleControl sc={sc} a={a} />
+    <RunHistoryControl workflowId={sc.workflowId} />
+  </div>;
+}
 
-      {/* ONE incident instead of N identical error rows: cause + a single
-          recovery path. The old raw-error-times-5 spam lived here. */}
-      {!live && sc.consecutiveFailures >= 1 && sc.lastError && (
-        <div className="script-incident">
-          <div className="script-incident-body">
-            <div className="script-incident-title">
-              This script failed {sc.consecutiveFailures}
-              {sc.consecutiveFailures === 1 ? " time" : " times in a row — same error"}
-            </div>
-            <div className="script-incident-cause" title={sc.lastError}>
-              {incident?.cause}
-            </div>
-            {/* What to do about it, when the runner had something to say —
-                kept OUT of the cause line above, which is stderr and nothing
-                else. */}
-            {incident?.advice && <div className="caption">{incident.advice}</div>}
-          </div>
-          <div className="script-incident-actions">
-            <button
-              className="subtle btn-ic"
-              title="Open the script to fix the cause above"
-              onClick={() => void a.viewFile(sc.fileId)}
-            >
-              Open to fix
-            </button>
-            <button
-              className="subtle btn-ic"
-              disabled={!!live}
-              // Same restraint as the ribbon: the flag does not know whether
-              // anyone edited anything, so neither the label nor the tooltip
-              // may say so.
-              title={
-                sc.changedSinceApproval
-                  ? "Run this script's current content — it will ask for approval first"
-                  : "Run again"
-              }
-              onClick={() => void a.runScript(sc.fileId)}
-            >
-              <PlayIcon size={12} />{" "}
-              {sc.changedSinceApproval ? "Run current version" : "Run again"}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* The manifest, as notebook fields rather than as a row of chips.
-          A chip carried its meaning only in a hover tooltip ("→ portfolio.csv"
-          with title "Reads this room file"), which a keyboard never sees and a
-          screen reader reads as an arrow. The keys are the same three words the
-          run-consent card uses — Installs / Reads / Writes back — so the page
-          and the card that gates it describe a script in one vocabulary. */}
-      {(sc.deps.length > 0 ||
-        sc.inputs.length > 0 ||
-        sc.outputs.length > 0 ||
-        sc.shortcut !== "none") && (
-        <dl className="script-fields">
-          {sc.deps.length > 0 && (
-            <div className="script-field">
-              <dt title="Python packages (installed by uv)">Installs</dt>
-              <dd>
-                <code>{sc.deps.join(", ")}</code>
-              </dd>
-            </div>
-          )}
-          {sc.inputs.length > 0 && (
-            <div className="script-field">
-              <dt title="Reads these room files">Reads</dt>
-              <dd>
-                <code>{sc.inputs.join(", ")}</code>
-              </dd>
-            </div>
-          )}
-          {sc.outputs.length > 0 && (
-            <div className="script-field">
-              <dt title="Writes these room files back">Writes back</dt>
-              <dd>
-                <code>{sc.outputs.join(", ")}</code>
-              </dd>
-            </div>
-          )}
-          {sc.shortcut !== "none" && (
-            <div className="script-field">
-              <dt title="Shows as a one-click shortcut">Shortcut</dt>
-              <dd>{sc.shortcut === "global" ? "top-bar shortcut" : "file shortcut"}</dd>
-            </div>
-          )}
-        </dl>
-      )}
-
-      {/* An unapproved script has ALWAYS been blocked — `run_script_inner`
-          refuses content whose hash is not approved on this Mac. Until now the
-          only place that said so was the Run button's tooltip, so a script that
-          had never been approved and never been run looked exactly like one
-          that had been. A caution note states it in words, at readable size, in
-          the interface sans: this is a security fact, never an aside, and never
-          the hand. */}
-      {!sc.approved && (
-        <p className="script-caution">
-          This version has not been approved on this Mac.{" "}
-          <strong>Review script</strong> opens the run-consent card, which
-          spells out exactly what would run and what it would be allowed to
-          touch — nothing runs until you approve it.
-        </p>
-      )}
-
-      <div className="script-row-actions">
-        {/* An unapproved script has ALWAYS been blocked — `run_script_inner`
-            refuses to execute content whose hash is not approved on this Mac,
-            and raises the consent card naming the interpreter, the declared
-            manifest and every room file the run would decrypt. What was wrong
-            was the BUTTON: labelled "Run", it promised execution that could not
-            happen, so the review gate read as broken rather than as working.
-            Live QA reported it twice as "unreviewed scripts can still run".
-            The gate is unchanged; the button now says what it actually does.
-
-            It is also the one action in this row drawn as a real outlined
-            control — Schedule and Runs stay quiet — so the row has a first
-            thing to press instead of four equal-weight links. */}
-        <button
-          className={`btn-ic script-go${sc.approved ? "" : " needs-review"}`}
-          title={
-            sc.approved
-              ? "Run this script now — outputs are saved into the room"
-              : "This version has not been approved — opens the review card; nothing runs until you approve it"
-          }
-          disabled={!!live}
-          onClick={() => void a.runScript(sc.fileId)}
-        >
-          <PlayIcon size={14} /> {sc.approved ? "Run" : "Review script"}
-        </button>
-        {/* Scheduling requires an approved script (the executor parks a scheduled
-            run whose content isn't approved on this Mac). */}
-        {sc.approved ? (
-          <span className="script-sched-wrap">
-            <button
-              className={`subtle btn-ic${sc.schedule?.enabled ? " active" : ""}`}
-              title="Schedule this script"
-              onClick={() => setSchedOpen((o) => !o)}
-            >
-              <ClockIcon size={14} />
-              {sc.schedule?.enabled ? `${sc.schedule.kind}` : "Schedule"}
-            </button>
-            {schedOpen && (
-              <div className="script-sched-pop">
-                <SchedulePopover
-                  schedule={sc.schedule}
-                  disabled={false}
-                  onSave={(arg) => void a.scheduleScript(sc.fileId, arg)}
-                  onClose={() => setSchedOpen(false)}
-                />
-              </div>
-            )}
-          </span>
-        ) : (
-          // Scheduling is locked until the script is approved. Render a clearly
-          // DISABLED Schedule button — not tappable text that reads like an
-          // action — so a click can't feel like a silent no-op. The wrapping
-          // span carries the tooltip, since a disabled button swallows hover.
-          <span
-            className="script-sched-wrap"
-            title="Run this script once and choose “Always allow” — then you can schedule it."
-          >
-            <button className="subtle btn-ic" disabled aria-disabled="true">
-              <ClockIcon size={14} /> Schedule
-            </button>
-          </span>
-        )}
-        {sc.workflowId && (
-          <button
-            className="subtle btn-ic"
-            aria-expanded={histOpen}
-            onClick={() => void toggleHistory()}
-          >
-            {histOpen ? "Hide runs" : "Runs"}
-          </button>
-        )}
-      </div>
-
-      {histOpen && (
-        <div className="script-history">
-          {/* The log gets a name of its own: without one it opened straight
-              onto a bare list of statuses hanging off the bottom of the row. */}
-          <div className="script-history-label">Run history</div>
-          <RunHistory runs={runs} nodeCount={1} />
-        </div>
-      )}
-    </div>
-  );
+/** One script's identity, permission state, run recovery, and controls. */
+export function ScriptRow({ sc, s, a }: { sc: ScriptInfo; s: WSState; a: WSActions }) {
+  const live = scriptLive(sc, s);
+  return <div className={`script-row${sc.changedSinceApproval ? " needs-review" : ""}`}>
+    <ScriptHeader sc={sc} live={live} />
+    <ScriptIncident sc={sc} a={a} live={live} />
+    <ScriptManifest sc={sc} />
+    <ApprovalCaution approved={sc.approved} />
+    <ScriptActions sc={sc} a={a} live={live} />
+  </div>;
 }

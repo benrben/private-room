@@ -32,18 +32,27 @@
  * tests exercises the same encrypted-room path the app does.
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import type Database from "better-sqlite3-multiple-ciphers";
 import { insertFile, updateFileContent } from "./db-host/files.js";
 import { createJob, putJobArtifact } from "./db-host/jobs.js";
 import { createRoom } from "./db-host/open.js";
-import { createWorkflow, getSchedule, getWorkflow, listWorkflows } from "./db-host/workflows.js";
+import {
+  createWorkflow,
+  createWorkflowRun,
+  finishWorkflowRunByJob,
+  getSchedule,
+  getWorkflow,
+  listWorkflows,
+} from "./db-host/workflows.js";
 import {
   addScriptApproval,
   agentListScripts,
+  agentListScriptsInRoom,
   agentRunScript,
   approveScriptBytes,
   approveWorkflowScripts,
@@ -51,8 +60,10 @@ import {
   createPendingScriptApprovals,
   ensureScriptWorkflow,
   getScriptManifest,
+  getScriptManifestInRoom,
   interpreterLine,
   listScripts,
+  listScriptsInRoom,
   parseScriptDecision,
   printedOutput,
   readScriptApprovals,
@@ -64,9 +75,13 @@ import {
   scriptFingerprint,
   scriptOutput,
   setScriptSchedule,
+  setScriptScheduleInRoom,
   stampScriptConsents,
+  stampScriptConsentsInRoom,
   wfIsForScript,
 } from "./scriptConsent.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
+import { WorkspaceService } from "./workspace/workspaceService.js";
 
 // --------------------------------------------------------------------------
 // fixtures — every temp dir and every open handle is cleaned up, so a suite
@@ -210,6 +225,12 @@ describe("the approval store (per-Mac, outside any room)", () => {
     expect(readScriptApprovals(dir)).toEqual([]); // unparseable
     writeFileSync(scriptApprovalsFile(dir), '{"approved":["abc"]}');
     expect(readScriptApprovals(dir)).toEqual([]); // an object, not a list
+  });
+
+  it("fails closed when the approval path cannot be read", () => {
+    const dir = freshUserDataDir();
+    mkdirSync(scriptApprovalsFile(dir));
+    expect(readScriptApprovals(dir)).toEqual([]);
   });
 
   it("persists via REAL file I/O — a restart re-reads it, nothing is cached", () => {
@@ -505,6 +526,112 @@ describe("setScriptSchedule", () => {
 });
 
 // ============================================================================
+// Script rows — ordering, manifest inputs, approval, and failure history
+// ============================================================================
+
+describe("listScripts", () => {
+  it("keeps file order, filters non-scripts, and reports only the newest matching failures", () => {
+    const db = freshRoom();
+    const dir = freshUserDataDir();
+    const ledger = insertFile(db, "Ledger.csv", "text/csv", Buffer.from("amount\n1"), null, "upload");
+    const report = insertFile(
+      db,
+      "report.py",
+      "text/x-python",
+      Buffer.from("# room-inputs: ledger.csv\nprint('Notes.txt')\n"),
+      null,
+      "upload",
+    );
+    const notes = insertFile(db, "Notes.txt", "text/plain", Buffer.from("notes"), null, "upload");
+    const helper = insertFile(db, "helper.js", "text/javascript", Buffer.from("console.log(1)"), null, "upload");
+    addScriptApproval(dir, scriptFingerprint(Buffer.from("console.log(1)")));
+
+    const workflowId = ensureScriptWorkflow(db, report.id, report.name);
+    for (const [jobId, error, startedAt] of [
+      ["run-1", "network unavailable", "2024-01-01T00:00:00Z"],
+      ["run-2", "network unavailable", "2024-01-02T00:00:00Z"],
+      ["run-3", "different failure", "2024-01-03T00:00:00Z"],
+    ] as const) {
+      createWorkflowRun(db, workflowId, jobId, "manual", null);
+      finishWorkflowRunByJob(db, jobId, "error", error);
+      db.prepare("UPDATE workflow_runs SET started_at = ? WHERE job_id = ?").run(startedAt, jobId);
+    }
+
+    const rows = listScripts(db, dir);
+    expect(rows.map((row) => row.fileId)).toEqual([helper.id, report.id]);
+    expect(rows[0]).toMatchObject({ name: "helper.js", approved: true, changedSinceApproval: false });
+    expect(rows[1]).toMatchObject({
+      name: "report.py",
+      approved: false,
+      changedSinceApproval: true,
+      inputs: ["ledger.csv", notes.name],
+      lastRun: { jobId: "run-3", error: "different failure" },
+      consecutiveFailures: 1,
+      lastError: "different failure",
+    });
+    expect(rows[1]!.inputs).not.toContain(ledger.name);
+  });
+});
+
+// ============================================================================
+// Workspace rooms — the content source changes, not the public contract
+// ============================================================================
+
+describe("workspace script consent surfaces", () => {
+  it("reads live workspace bytes for list, stamp, manifest, schedule, and agent output", async () => {
+    const parent = mkdtempSync(path.join(os.tmpdir(), "script-consent-workspace-"));
+    tmpDirs.push(parent);
+    const root = path.join(parent, "Room");
+    const { db } = createWorkspaceRoom(root, "correct horse battery staple", "Room");
+    openDbs.push(db);
+    const workspace = new WorkspaceService(db, root);
+    const bytes = Buffer.from("# room-outputs: report.csv\nprint('ok')\n");
+    const entry = await workspace.createFile("report.py", Readable.from([bytes]), "upload");
+    db.prepare("UPDATE files SET mime_type = 'text/x-python' WHERE id = ?").run(entry.fileId);
+    const room = { db, path: root, workspace };
+    const dir = freshUserDataDir();
+    const sha = scriptFingerprint(bytes);
+
+    const before = await listScriptsInRoom(room, dir);
+    expect(before).toMatchObject([{ fileId: entry.fileId, approved: false, changedSinceApproval: false }]);
+    await expect(setScriptScheduleInRoom(room, dir, entry.fileId, "daily", "09:00", true)).rejects.toThrow(
+      /approve this script/i,
+    );
+    expect(listWorkflows(db).find((workflow) => wfIsForScript(workflow, entry.fileId))).toBeUndefined();
+
+    addScriptApproval(dir, sha);
+    expect((await stampScriptConsentsInRoom(room, scriptRunDef(entry.fileId), new Set([sha]))).get(entry.fileId)).toBe(sha);
+    expect((await stampScriptConsentsInRoom(room, scriptRunDef("missing.py"), new Set([sha]))).size).toBe(0);
+    expect((await getScriptManifestInRoom(room, entry.fileId)).outputs).toEqual(["report.csv"]);
+    await setScriptScheduleInRoom(room, dir, entry.fileId, "daily", "09:00", true);
+
+    const after = await listScriptsInRoom(room, dir);
+    expect(after[0]).toMatchObject({ approved: true, workflowId: expect.any(String) });
+    expect(await agentListScriptsInRoom(room, dir)).toContain("report.py (py)");
+    const row = db.prepare("SELECT original_bytes FROM files WHERE id = ?").get(entry.fileId) as {
+      original_bytes: Buffer | null;
+    };
+    expect(row.original_bytes).toBeNull();
+  });
+
+  it("delegates all room wrappers to legacy rooms unchanged", async () => {
+    const db = freshRoom();
+    const dir = freshUserDataDir();
+    const bytes = Buffer.from("print('legacy')");
+    const file = insertFile(db, "legacy.py", "text/x-python", bytes, null, "upload");
+    const room = { db, path: "legacy.roomai" };
+    const sha = scriptFingerprint(bytes);
+    addScriptApproval(dir, sha);
+
+    expect((await stampScriptConsentsInRoom(room, scriptRunDef(file.id), new Set([sha]))).get(file.id)).toBe(sha);
+    await setScriptScheduleInRoom(room, dir, file.id, "interval", "30", false);
+    expect((await listScriptsInRoom(room, dir))[0]).toMatchObject({ fileId: file.id, approved: true });
+    expect((await getScriptManifestInRoom(room, file.id)).interpreter).toBe("py");
+    expect(await agentListScriptsInRoom(room, dir)).toContain("approved to run");
+  });
+});
+
+// ============================================================================
 // the consent card's pure fragments
 // ============================================================================
 
@@ -663,6 +790,16 @@ describe("printedOutput", () => {
     expect(
       printedOutput(JSON.stringify({ result: JSON.stringify({ ...base, exitCode: "2" }) }))
     ).not.toContain("Exit code");
+  });
+
+  it("ignores malformed optional import and skipped lists", () => {
+    const report = {
+      stdoutTail: "done\n",
+      imported: [null, { name: 42 }],
+      skipped: { note: "nope" },
+    };
+
+    expect(printedOutput(JSON.stringify({ result: JSON.stringify(report) }))).toBe("done");
   });
 });
 

@@ -222,32 +222,58 @@ export function useModelManagement(
   // For the embed model we prefer ensure_embed_model (pulls AND backfills
   // semantic search) over a bare pull.
   async function pullSpecial(name: string, useEnsureEmbed = false) {
-    const label = name || (useEnsureEmbed ? "embed model" : "");
-    if (!label || pulling || pullingSpecial) return;
+    const label = specialPullLabel(name, useEnsureEmbed);
+    if (!canPullSpecial(label, pulling, pullingSpecial)) return;
     setError("");
     setPullingSpecial(label);
     // `ensure_embed_model` pulls under the embed model's own name, so Stop has
     // to reach THAT key, not the empty `name` this was called with.
-    pullingRef.current = name || recommended?.embed || null;
+    pullingRef.current = specialPullKey(name, recommended?.embed);
     setPullStatus("starting…");
     setPullPercent(null);
     try {
-      if (useEnsureEmbed) {
-        await ensureEmbedModel();
-      } else {
-        await api.pullModel(name);
-      }
+      await runSpecialPull(name, useEnsureEmbed);
       setPullStatus("ready ✓");
       onModelsChanged();
     } catch (e) {
-      const msg = String(e);
-      setPullStatus(wasStopped(msg) ? "download stopped" : "");
-      if (!wasStopped(msg)) setError(msg);
+      reportSpecialPullFailure(e);
     } finally {
       pullingRef.current = null;
       setPullingSpecial(null);
       setPullPercent(null);
     }
+  }
+
+  function specialPullLabel(name: string, useEnsureEmbed: boolean): string {
+    if (name) return name;
+    return useEnsureEmbed ? "embed model" : "";
+  }
+
+  function canPullSpecial(
+    label: string,
+    pullInProgress: boolean,
+    specialPullInProgress: string | null,
+  ): boolean {
+    return Boolean(label) && !pullInProgress && !specialPullInProgress;
+  }
+
+  function specialPullKey(name: string, embedModel: string | undefined): string | null {
+    return name || embedModel || null;
+  }
+
+  async function runSpecialPull(name: string, useEnsureEmbed: boolean) {
+    if (useEnsureEmbed) return ensureEmbedModel();
+    return api.pullModel(name);
+  }
+
+  function reportSpecialPullFailure(error: unknown) {
+    const message = String(error);
+    if (wasStopped(message)) {
+      setPullStatus("download stopped");
+      return;
+    }
+    setPullStatus("");
+    setError(message);
   }
 
   // A model counts as installed when its base name (before any ":tag") matches.

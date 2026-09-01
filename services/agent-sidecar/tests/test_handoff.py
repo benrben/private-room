@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from arcelle_sidecar import handoff
+from arcelle_sidecar.config import ProviderConfig
 
 
 def test_transcript_labels_user_and_assistant_turns_and_skips_others() -> None:
@@ -90,3 +91,23 @@ async def test_summarize_for_handoff_placeholders_an_empty_conversation(
     req = handoff.HandoffSummaryRequest(model="qwen3.5:9b", messages=[])
     summary = await handoff.summarize_for_handoff(req)
     assert summary == "(nothing said yet)"
+
+
+async def test_summarize_for_handoff_passes_the_provider_to_the_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_generate(*_args: Any, **kwargs: Any) -> str:
+        captured.update(kwargs)
+        return "recap"
+
+    provider = ProviderConfig(
+        id="openrouter", api_key="secret", base_url="https://example.test", model="provider/model"
+    )
+    monkeypatch.setattr(handoff, "generate", fake_generate)
+    summary = await handoff.summarize_for_handoff(
+        handoff.HandoffSummaryRequest(model="openrouter::provider/model", messages=[], provider=provider)
+    )
+    assert summary == "recap"
+    assert captured["provider"] is provider

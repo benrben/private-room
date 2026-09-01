@@ -248,14 +248,35 @@ describe("registerShellIpc", () => {
   });
 });
 
-describe("execFileOpenWithApp — the real subprocess", () => {
+describe("execFileOpenWithApp — subprocess boundary", () => {
   it("REJECTS for an application macOS cannot resolve, rather than swallowing the failure", async () => {
-    // The one test here that runs a real `/usr/bin/open`. It is given an app
-    // name no Mac has, so nothing is launched; what is being checked is that a
-    // non-zero exit becomes a rejected promise (an `execFile` callback whose
-    // error is dropped would resolve, and the caller would believe VLC opened).
+    const runExecFile = vi.fn((_file, _args, callback) => {
+      callback(new Error("application not found"), "", "");
+      return {} as never;
+    });
+
     await expect(
-      execFileOpenWithApp("Arcelle No Such Application ", "/tmp")
-    ).rejects.toBeInstanceOf(Error);
+      execFileOpenWithApp("Arcelle No Such Application", "/tmp", runExecFile as never)
+    ).rejects.toThrow("application not found");
+    expect(runExecFile).toHaveBeenCalledWith(
+      "/usr/bin/open",
+      ["-a", "Arcelle No Such Application", "/tmp"],
+      expect.any(Function),
+    );
+  });
+
+  it("resolves only after the fixed-path open command succeeds", async () => {
+    const runExecFile = vi.fn((_file, _args, callback) => {
+      callback(null, "", "");
+      return {} as never;
+    });
+
+    await expect(execFileOpenWithApp("Preview", "/tmp/file.pdf", runExecFile as never))
+      .resolves.toBeUndefined();
+    expect(runExecFile).toHaveBeenCalledWith(
+      "/usr/bin/open",
+      ["-a", "Preview", "/tmp/file.pdf"],
+      expect.any(Function),
+    );
   });
 });

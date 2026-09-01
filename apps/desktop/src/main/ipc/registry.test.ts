@@ -284,13 +284,15 @@ describe("registerAllIpc — registration", () => {
     );
   });
 
-  it("WIRED_MODULE_COUNT matches the number of registerXIpc calls in registry.ts itself", () => {
+  it("WIRED_MODULE_COUNT matches the number of registerXIpc calls in the registration modules", () => {
     // A hand-maintained module count is exactly the claim that goes quietly
     // wrong (one merge candidate shipped `moduleCount: 30` beside 31 real
     // calls, with its own test asserting the 30). Count the real call sites in
     // the source instead, so the constant cannot drift from the code.
     const here = path.dirname(fileURLToPath(import.meta.url));
-    const source = readFileSync(path.join(here, "registry.ts"), "utf8");
+    const source = ["registry.ts", "registerAllIpc.ts"]
+      .map((name) => readFileSync(path.join(here, name), "utf8"))
+      .join("\n");
     const callSites = source.match(/^ {2}register[A-Za-z]*Ipc\(\s*$|^ {2}register[A-Za-z]*Ipc\(/gm) ?? [];
     expect(callSites.length).toBe(WIRED_MODULE_COUNT);
   });
@@ -312,7 +314,9 @@ describe("registerAllIpc — registration", () => {
     // how it actually shipped. It cannot catch the WRONG value being passed —
     // `mediaDownloadSurfaceIpc.ts`'s own tests own that half.
     const here = path.dirname(fileURLToPath(import.meta.url));
-    const source = readFileSync(path.join(here, "registry.ts"), "utf8");
+    const source = ["registry.ts", "registerAllIpc.ts"]
+      .map((name) => readFileSync(path.join(here, name), "utf8"))
+      .join("\n");
     const call = /\n {2}registerMediaDownloadSurfaceIpc\(([^;]*?)\n {2}\);/.exec(source);
     expect(call, "registerMediaDownloadSurfaceIpc call site not found — did it get reformatted?")
       .not.toBeNull();

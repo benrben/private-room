@@ -282,6 +282,58 @@ async def test_a_link_is_refused_rather_than_fetched(monkeypatch) -> None:
     assert "link" in str(caught.value)
 
 
+def test_an_inline_url_is_used_when_base64_is_blank() -> None:
+    """Providers sometimes emit both fields but leave raw base64 blank."""
+    mime, artwork = imagegen._first_artwork(
+        {
+            "data": [
+                {
+                    "b64_json": "  ",
+                    "url": f" data:image/jpeg;base64,{PNG_B64} ",
+                }
+            ]
+        },
+        "vendor/painter",
+    )
+    assert mime == "image/jpeg"
+    assert artwork == PNG
+
+
+@pytest.mark.parametrize(
+    ("data", "message"),
+    [
+        ({"data": {}}, "returned no picture"),
+        ({"data": [None]}, "nothing this room could save"),
+    ],
+)
+def test_an_unusable_first_entry_keeps_its_existing_error(data: dict, message: str) -> None:
+    with pytest.raises(imagegen.ImageGenError, match=message):
+        imagegen._first_artwork(data, "vendor/painter")
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (
+            httpx.Response(429, json={"error": "  the provider is busy  "}),
+            "the provider is busy",
+        ),
+        (
+            httpx.Response(502, json={"error": {"message": "   "}}),
+            "the provider refused the request (502)",
+        ),
+        (
+            httpx.Response(503, content=b"not json"),
+            "the provider refused the request (503)",
+        ),
+    ],
+)
+def test_provider_error_fallbacks_keep_their_existing_words(
+    response: httpx.Response, message: str
+) -> None:
+    assert imagegen._error_message(response) == message
+
+
 @pytest.mark.asyncio
 async def test_the_provider_error_is_repeated_in_its_own_words(monkeypatch) -> None:
     mock_client(
@@ -297,6 +349,47 @@ async def test_the_provider_error_is_repeated_in_its_own_words(monkeypatch) -> N
             provider=config(),
         )
     assert str(caught.value) == "Insufficient credits."
+
+
+@pytest.mark.asyncio
+async def test_a_transport_failure_is_named_without_a_second_request(monkeypatch) -> None:
+    """Generation is billed per request, so a network error is never retried."""
+
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("network down", request=request)
+
+    mock_client(monkeypatch, unreachable)
+    with pytest.raises(imagegen.ImageGenError) as caught:
+        await imagegen.generate(
+            prompt="A lighthouse",
+            model="openrouter::vendor/painter",
+            provider=config(),
+        )
+    assert str(caught.value) == "could not reach the provider: network down"
+
+
+@pytest.mark.asyncio
+async def test_a_non_json_provider_reply_is_named(monkeypatch) -> None:
+    mock_client(monkeypatch, lambda request: httpx.Response(200, content=b"not json"))
+    with pytest.raises(imagegen.ImageGenError) as caught:
+        await imagegen.generate(
+            prompt="A lighthouse",
+            model="openrouter::vendor/painter",
+            provider=config(),
+        )
+    assert str(caught.value) == "the provider returned a reply that was not JSON"
+
+
+@pytest.mark.asyncio
+async def test_an_unsupported_artwork_type_is_refused(monkeypatch) -> None:
+    mock_client(monkeypatch, lambda request: reply(media_type="image/tiff"))
+    with pytest.raises(imagegen.ImageGenError) as caught:
+        await imagegen.generate(
+            prompt="A lighthouse",
+            model="openrouter::vendor/painter",
+            provider=config(),
+        )
+    assert str(caught.value) == "the model returned image/tiff, which this room cannot open"
 
 
 @pytest.mark.asyncio

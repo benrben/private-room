@@ -99,193 +99,18 @@ import {
   type Folder,
 } from "./db-host/folders.js";
 import {
-  anyFileName,
-  availableName,
-  findFileLikeQualified,
-  getFileExtractedText,
-  insertFile,
   renameFile,
-  trashFile,
-  type TrashActor,
 } from "./db-host/files.js";
+import {
+  errorText,
+  extensionOf,
+  MAX_BULK_FILES,
+  resolve,
+  trashFilesIn,
+} from "./organizeCore.js";
 
-// ---------------------------------------------------------------------------
-// The slice of bulk.rs organize.rs itself depends on — see the module doc.
-// ---------------------------------------------------------------------------
-
-/**
- * Ceiling on one batch.
- *
- * Not a performance number — a blast radius. The agent reaches these same
- * functions, and "tidy up the room" against a model that miscounted must not
- * be able to sweep an unbounded number of files, or folders, in one round. The
- * caller is TOLD when the cap bites ({@link OrganizeReport.capped},
- * `BulkReport.capped`); a silently truncated batch would report success over
- * work it never did.
- */
-export const MAX_BULK_FILES = 200;
-
-/**
- * `bulk.rs`'s `take_capped`: de-duplicate, then cap.
- *
- * Duplicates matter for the reason bulk.rs's own comment gives — the same id
- * twice would be reported twice, and for trash the second pass fails ("already
- * in the trash"), turning a harmless repeat into a receipt that claims a
- * failure that did not happen.
- */
-function takeCapped(ids: readonly string[]): [string[], number] {
-  const seen = new Set<string>();
-  const unique: string[] = [];
-  for (const id of ids) {
-    if (!seen.has(id)) {
-      seen.add(id);
-      unique.push(id);
-    }
-  }
-  return [unique.slice(0, MAX_BULK_FILES), Math.max(0, unique.length - MAX_BULK_FILES)];
-}
-
-/**
- * Move a set of files to the trash, attributed to `actor` — `bulk.rs`'s
- * `trash_files_in` fused with the `each_file` loop it rides.
- *
- * The name is read BEFORE the file is trashed: afterwards the row is hidden
- * from every ordinary lookup, and a receipt assembled later could only print
- * ids. {@link anyFileName} is exactly the trash-tolerant reader bulk.rs relies
- * on for this, and it answers `null` (rather than throwing) for an id that
- * names nothing, which is an ordinary outcome for a batch.
- */
-function trashFilesIn(
-  db: Database.Database,
-  ids: readonly string[],
-  actor: TrashActor
-): BulkReport {
-  const [kept, capped] = takeCapped(ids);
-  const report: BulkReport = { ok: [], failed: [], capped };
-  for (const id of kept) {
-    const name = anyFileName(db, id) ?? id;
-    try {
-      trashFile(db, id, actor);
-      report.ok.push(name);
-    } catch (e) {
-      report.failed.push({ name, error: errorText(e) });
-    }
-  }
-  return report;
-}
-
-// ---------------------------------------------------------------------------
-// extraction.rs's extension_of, and a mime_guess substitute.
-// ---------------------------------------------------------------------------
-
-/** `extraction::extension_of` — a `std::path::Path` extension: none for a
- * dotfile or a name with no dot, lower-cased. Local copy; see module doc. */
-function extensionOf(name: string): string {
-  const base = name.split(/[/\\]/).pop() ?? name;
-  const idx = base.lastIndexOf(".");
-  return idx <= 0 ? "" : base.slice(idx + 1).toLowerCase();
-}
-
-/** A small, honest substitute for the `mime_guess` crate: real for every
- * extension a merged document actually lands under, and defaulting to
- * `text/plain` exactly as `mime_guess::from_path(..).first_or(TEXT_PLAIN)`
- * does for anything it has no entry for either. Kept identical to
- * `turnEngine.ts`'s table so the two copies collapse cleanly later. */
-const MIME_BY_EXT: Readonly<Record<string, string>> = {
-  md: "text/markdown",
-  markdown: "text/markdown",
-  txt: "text/plain",
-  csv: "text/csv",
-  json: "application/json",
-  html: "text/html",
-  htm: "text/html",
-  py: "text/x-python",
-  js: "text/javascript",
-  xml: "application/xml",
-  yaml: "text/yaml",
-  yml: "text/yaml",
-};
-
-/** `MIME_BY_EXT[extensionOf(name)] ?? "text/plain"`, own-property-guarded —
- * see `docsHtml.ts`'s `noteMime` for the bug this pattern fixes. `into`
- * (`merge_files`'s new-file name, this function's only caller) is MODEL
- * INPUT: an extension of `constructor`/`__proto__`/… reads `Object`/
- * `Object.prototype` off the plain `{}` literal above, `?? "text/plain"`
- * never fires for a non-nullish value, and a non-string mime reaching
- * `insertFile` dies inside better-sqlite3 instead of falling back like
- * `mime_guess::from_path` (no prototype chain to leak) does in Rust. */
-function mimeFor(name: string): string {
-  const ext = extensionOf(name);
-  return Object.prototype.hasOwnProperty.call(MIME_BY_EXT, ext) ? (MIME_BY_EXT[ext] as string) : "text/plain";
-}
-
-/** The message a thrown DB error contributes to a {@link BulkFailure} — the
- * TS stand-in for the `String` Rust's `Result` carried. */
-function errorText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
-
-// ---------------------------------------------------------------------------
-// resolve(): the shared name-resolution pass behind all three verbs.
-// ---------------------------------------------------------------------------
-
-/**
- * A file the agent named, resolved to a real room row — or the reason it could
- * not be. Resolution is reported per NAME rather than failing the batch, for
- * the same reason the bulk verbs are best-effort: one hallucinated filename in
- * a plan of thirty must not discard the twenty-nine real ones.
- */
-interface Resolved {
-  /** (index in the names list, id, real name) — the pairing is carried out of
-   * the resolve rather than recovered later, because the loop that consumes it
-   * RENAMES and MOVES files: a second lookup of the same name runs against a
-   * database the caller has already changed, and matches something else or
-   * nothing at all. */
-  hits: Array<[number, string, string]>;
-  misses: BulkFailure[];
-  /** Names that resolved to a file an earlier name already claimed. */
-  dupes: BulkFailure[];
-}
-
-/**
- * Resolve the names in a plan, in order, dropping duplicates.
- *
- * Uses {@link findFileLikeQualified}, so the folder-prefixed names the agent
- * was shown by `list_room_files` ("Invoices/q3.pdf") resolve — the round trip
- * that silently failed before.
- *
- * De-duplication is by resolved ID, not by the string the model wrote: a plan
- * that names the same file twice, once as `q3.pdf` and once as
- * `Invoices/q3.pdf`, is one file. Left in, the second entry would either
- * double-apply a move or report a bogus failure. The duplicate is REPORTED
- * (`dupes`) rather than dropped in silence — for the verbs where a second
- * entry carried instructions of its own, saying nothing about it is a receipt
- * that claims a plan was carried out whole when part of it never ran.
- */
-function resolve(db: Database.Database, names: readonly string[]): Resolved {
-  const hits: Array<[number, string, string]> = [];
-  const misses: BulkFailure[] = [];
-  const dupes: BulkFailure[] = [];
-  const seen = new Set<string>();
-  names.forEach((raw, at) => {
-    const name = raw.trim();
-    if (name === "") {
-      return;
-    }
-    try {
-      const [id, real] = findFileLikeQualified(db, name);
-      if (seen.has(id)) {
-        dupes.push({ name, error: "names the same file as an earlier entry" });
-      } else {
-        seen.add(id);
-        hits.push([at, id, real]);
-      }
-    } catch (e) {
-      misses.push({ name, error: errorText(e) });
-    }
-  });
-  return { hits, misses, dupes };
-}
+export { MAX_BULK_FILES } from "./organizeCore.js";
+export { merge } from "./organizeMerge.js";
 
 /** The vocabulary that means "the top level" rather than a folder — the same
  * words `move_file`'s own arm accepts, kept in one place so the two tools
@@ -385,37 +210,47 @@ export function organizeSentence(
   dryRun: boolean,
   removedFolderNote = " — their files went to the top level",
 ): string {
-  const verb = (n: number, past: string, future: string): string =>
-    dryRun ? `would ${future} ${n}` : `${past} ${n}`;
-  const parts: string[] = [];
-  if (report.moved.length > 0) {
-    parts.push(`${verb(report.moved.length, "moved", "move")} (${report.moved.join(", ")})`);
-  }
-  if (report.renamed.length > 0) {
-    parts.push(`${verb(report.renamed.length, "renamed", "rename")} (${report.renamed.join(", ")})`);
-  }
-  if (report.foldersMade.length > 0) {
-    parts.push(`created folder(s) ${report.foldersMade.join(", ")}`);
-  }
-  if (report.foldersRemoved.length > 0) {
-    parts.push(`removed folder(s) ${report.foldersRemoved.join(", ")}${removedFolderNote}`);
-  }
-  let out: string;
-  if (parts.length === 0) {
-    out = "Nothing was changed.";
-  } else if (dryRun) {
-    out = `PREVIEW ONLY, nothing was changed — ${parts.join("; ")}.`;
-  } else {
-    out = `${parts.join("; ")}.`;
-  }
-  if (report.failed.length > 0) {
-    const detail = report.failed.slice(0, 10).map((f) => `"${f.name}" (${f.error})`);
-    out += ` ${report.failed.length} could not be done: ${detail.join("; ")}.`;
-  }
-  if (report.capped > 0) {
-    out += ` ${report.capped} entries were not attempted — one call handles at most ${MAX_BULK_FILES}.`;
-  }
-  return out;
+  const sentence = sentenceForChanges(reportChangeClauses(report, dryRun, removedFolderNote), dryRun);
+  return appendReceiptLimits(appendReceiptFailures(sentence, report.failed), report.capped);
+}
+
+function reportChangeClauses(report: OrganizeReport, dryRun: boolean, removedFolderNote: string): string[] {
+  return [
+    changedFileClause(report.moved, "moved", "move", dryRun),
+    changedFileClause(report.renamed, "renamed", "rename", dryRun),
+    folderMadeClause(report.foldersMade),
+    folderRemovedClause(report.foldersRemoved, removedFolderNote),
+  ].filter((clause): clause is string => clause !== null);
+}
+
+function changedFileClause(files: readonly string[], past: string, future: string, dryRun: boolean): string | null {
+  if (files.length === 0) return null;
+  const verb = dryRun ? `would ${future} ${files.length}` : `${past} ${files.length}`;
+  return `${verb} (${files.join(", ")})`;
+}
+
+function folderMadeClause(folders: readonly string[]): string | null {
+  return folders.length === 0 ? null : `created folder(s) ${folders.join(", ")}`;
+}
+
+function folderRemovedClause(folders: readonly string[], note: string): string | null {
+  return folders.length === 0 ? null : `removed folder(s) ${folders.join(", ")}${note}`;
+}
+
+function sentenceForChanges(parts: readonly string[], dryRun: boolean): string {
+  if (parts.length === 0) return "Nothing was changed.";
+  return dryRun ? `PREVIEW ONLY, nothing was changed — ${parts.join("; ")}.` : `${parts.join("; ")}.`;
+}
+
+function appendReceiptFailures(sentence: string, failures: readonly BulkFailure[]): string {
+  if (failures.length === 0) return sentence;
+  const detail = failures.slice(0, 10).map((failure) => `"${failure.name}" (${failure.error})`);
+  return `${sentence} ${failures.length} could not be done: ${detail.join("; ")}.`;
+}
+
+function appendReceiptLimits(sentence: string, capped: number): string {
+  if (capped === 0) return sentence;
+  return `${sentence} ${capped} entries were not attempted — one call handles at most ${MAX_BULK_FILES}.`;
 }
 
 /**
@@ -434,120 +269,141 @@ export function organize(
   removeFolders: readonly string[],
   dryRun: boolean
 ): OrganizeReport {
-  // Every list in one call carries the same ceiling. Folder maintenance used
-  // to have none, so one call could create — or delete — thousands of folders,
-  // and the receipt said nothing had been held back because nothing had been.
-  const report = freshReport(
-    Math.max(0, entries.length - MAX_BULK_FILES) +
-      Math.max(0, makeFolders.length - MAX_BULK_FILES) +
-      Math.max(0, removeFolders.length - MAX_BULK_FILES)
-  );
-
-  // Folders are created FIRST so an empty folder can be made in the same call
-  // that files are moved into it, and so `folder:` on an entry below finds a
-  // folder this very plan asked for rather than making a second one.
-  for (const raw of makeFolders.slice(0, MAX_BULK_FILES)) {
-    const name = raw.trim();
-    if (name === "" || meansTopLevel(name)) {
-      continue;
-    }
-    // An existing folder is not news. Reporting it as "created" would be a
-    // claim about work that did not happen — and this receipt is exactly what
-    // `react_verify` checks the agent's story against.
-    if (existingFolder(db, name) !== null) {
-      continue;
-    }
-    if (dryRun) {
-      report.foldersMade.push(`"${name}"`);
-      continue;
-    }
-    try {
-      report.foldersMade.push(`"${createFolder(db, name).name}"`);
-    } catch (e) {
-      report.failed.push({ name, error: errorText(e) });
-    }
-  }
-
-  const plan = entries.slice(0, MAX_BULK_FILES);
-  const resolved = resolve(
-    db,
-    // `?? ""` is Rust's `#[serde(default)]` on `OrganizeEntry::name`: an entry
-    // with no name resolves to nothing and is skipped by `resolve`.
-    plan.map((e) => e.name ?? "")
-  );
-  report.failed.push(...resolved.misses, ...resolved.dupes);
-
-  // Each hit carries the index of the entry it came from. Looking the name up
-  // a SECOND time here would search a room this very loop is renaming: an
-  // entry that moves "final.md" after an earlier entry renamed something else
-  // to "final.md" would find the wrong file, or none — and a hit with no entry
-  // was silently skipped, done nowhere and reported nowhere.
-  for (const [at, id, realName] of resolved.hits) {
-    // `at` is the index `resolve` was handed, which came from mapping `plan`
-    // itself, so this is always the entry that produced the hit.
-    const entry = plan[at]!;
-    const folder = entry.folder;
-    if (folder !== undefined && folder !== null) {
-      const whereTo = meansTopLevel(folder) ? "the top level" : `"${folder.trim()}"`;
-      if (dryRun) {
-        // Nothing is resolved and nothing is created — a preview that left
-        // folders behind is the bug this branch exists for.
-        report.moved.push(`"${realName}" → ${whereTo}`);
-      } else {
-        try {
-          moveFileToFolder(db, id, folderIdFor(db, folder));
-          report.moved.push(`"${realName}" → ${whereTo}`);
-        } catch (e) {
-          report.failed.push({ name: realName, error: errorText(e) });
-        }
-      }
-    }
-    const newName = entry.newName?.trim();
-    if (newName !== undefined && newName !== "") {
-      // Keep the extension when the model drops it — the same courtesy
-      // `rename_file` extends, and for the same reason: a model renaming
-      // "q3.pdf" to "Q3 report" means the title, not the file type.
-      const finalName = withKeptExtension(newName, realName);
-      if (dryRun) {
-        report.renamed.push(`"${realName}" → "${finalName}"`);
-      } else {
-        try {
-          renameFile(db, id, finalName);
-          report.renamed.push(`"${realName}" → "${finalName}"`);
-        } catch (e) {
-          report.failed.push({ name: realName, error: errorText(e) });
-        }
-      }
-    }
-  }
-
-  // Folders are removed LAST, so a plan that empties a folder and then drops
-  // it does both in the right order. `deleteFolder` never deletes files — they
-  // return to the top level (ADD-16) — which is what makes this safe to give a
-  // model at all.
-  for (const raw of removeFolders.slice(0, MAX_BULK_FILES)) {
-    const name = raw.trim();
-    if (name === "") {
-      continue;
-    }
-    const folder = existingFolder(db, name);
-    if (folder === null) {
-      report.failed.push({ name, error: "no folder by that name" });
-      continue;
-    }
-    if (dryRun) {
-      report.foldersRemoved.push(`"${folder.name}"`);
-    } else {
-      try {
-        deleteFolder(db, folder.id);
-        report.foldersRemoved.push(`"${folder.name}"`);
-      } catch (e) {
-        report.failed.push({ name: folder.name, error: errorText(e) });
-      }
-    }
-  }
-
+  const report = freshReport(cappedOrganizeEntries(entries, makeFolders, removeFolders));
+  createOrganizeFolders(db, makeFolders, dryRun, report);
+  organizeFiles(db, entries.slice(0, MAX_BULK_FILES), dryRun, report);
+  removeOrganizeFolders(db, removeFolders, dryRun, report);
   return report;
+}
+
+function cappedOrganizeEntries(entries: readonly OrganizeEntry[], makeFolders: readonly string[], removeFolders: readonly string[]): number {
+  return cappedLength(entries.length) + cappedLength(makeFolders.length) + cappedLength(removeFolders.length);
+}
+
+function cappedLength(length: number): number {
+  return Math.max(0, length - MAX_BULK_FILES);
+}
+
+function createOrganizeFolders(db: Database.Database, names: readonly string[], dryRun: boolean, report: OrganizeReport): void {
+  for (const raw of names.slice(0, MAX_BULK_FILES)) createOrganizeFolder(db, raw.trim(), dryRun, report);
+}
+
+function createOrganizeFolder(db: Database.Database, name: string, dryRun: boolean, report: OrganizeReport): void {
+  if (skippedCreatedFolder(name) || existingFolder(db, name) !== null) return;
+  if (dryRun) {
+    report.foldersMade.push(`"${name}"`);
+    return;
+  }
+  recordFolderCreation(db, name, report);
+}
+
+function skippedCreatedFolder(name: string): boolean {
+  return name === "" || meansTopLevel(name);
+}
+
+function recordFolderCreation(db: Database.Database, name: string, report: OrganizeReport): void {
+  try {
+    report.foldersMade.push(`"${createFolder(db, name).name}"`);
+  } catch (error) {
+    report.failed.push({ name, error: errorText(error) });
+  }
+}
+
+function organizeFiles(db: Database.Database, plan: readonly OrganizeEntry[], dryRun: boolean, report: OrganizeReport): void {
+  const resolved = resolve(db, plan.map((entry) => entry.name ?? ""));
+  report.failed.push(...resolved.misses, ...resolved.dupes);
+  for (const [at, id, realName] of resolved.hits) organizeResolvedFile(db, id, realName, plan[at]!, dryRun, report);
+}
+
+function organizeResolvedFile(
+  db: Database.Database, id: string, realName: string, entry: OrganizeEntry, dryRun: boolean, report: OrganizeReport,
+): void {
+  organizeFileMove(db, id, realName, entry.folder, dryRun, report);
+  organizeFileRename(db, id, realName, entry.newName, dryRun, report);
+}
+
+function organizeFileMove(
+  db: Database.Database, id: string, realName: string, folder: OrganizeEntry["folder"], dryRun: boolean, report: OrganizeReport,
+): void {
+  if (folder === undefined || folder === null) return;
+  const receipt = `"${realName}" → ${folderDestination(folder)}`;
+  if (dryRun) {
+    report.moved.push(receipt);
+    return;
+  }
+  recordFileMove(db, id, realName, folder, receipt, report);
+}
+
+function folderDestination(folder: string): string {
+  return meansTopLevel(folder) ? "the top level" : `"${folder.trim()}"`;
+}
+
+function recordFileMove(
+  db: Database.Database, id: string, realName: string, folder: string, receipt: string, report: OrganizeReport,
+): void {
+  try {
+    moveFileToFolder(db, id, folderIdFor(db, folder));
+    report.moved.push(receipt);
+  } catch (error) {
+    report.failed.push({ name: realName, error: errorText(error) });
+  }
+}
+
+function organizeFileRename(
+  db: Database.Database, id: string, realName: string, rawName: OrganizeEntry["newName"], dryRun: boolean, report: OrganizeReport,
+): void {
+  const newName = requestedOrganizeName(rawName);
+  if (newName === null) return;
+  const finalName = withKeptExtension(newName, realName);
+  const receipt = `"${realName}" → "${finalName}"`;
+  if (dryRun) {
+    report.renamed.push(receipt);
+    return;
+  }
+  recordFileRename(db, id, realName, finalName, receipt, report);
+}
+
+function requestedOrganizeName(rawName: OrganizeEntry["newName"]): string | null {
+  const name = rawName?.trim();
+  return name === undefined || name === "" ? null : name;
+}
+
+function recordFileRename(
+  db: Database.Database, id: string, realName: string, finalName: string, receipt: string, report: OrganizeReport,
+): void {
+  try {
+    renameFile(db, id, finalName);
+    report.renamed.push(receipt);
+  } catch (error) {
+    report.failed.push({ name: realName, error: errorText(error) });
+  }
+}
+
+function removeOrganizeFolders(db: Database.Database, names: readonly string[], dryRun: boolean, report: OrganizeReport): void {
+  for (const raw of names.slice(0, MAX_BULK_FILES)) removeOrganizeFolder(db, raw.trim(), dryRun, report);
+}
+
+function removeOrganizeFolder(db: Database.Database, name: string, dryRun: boolean, report: OrganizeReport): void {
+  if (name === "") return;
+  const folder = existingFolder(db, name);
+  if (folder === null) {
+    report.failed.push({ name, error: "no folder by that name" });
+    return;
+  }
+  if (dryRun) {
+    report.foldersRemoved.push(`"${folder.name}"`);
+    return;
+  }
+  recordFolderRemoval(db, folder, report);
+}
+
+function recordFolderRemoval(db: Database.Database, folder: Folder, report: OrganizeReport): void {
+  try {
+    deleteFolder(db, folder.id);
+    report.foldersRemoved.push(`"${folder.name}"`);
+  } catch (error) {
+    report.failed.push({ name: folder.name, error: errorText(error) });
+  }
 }
 
 /** `newName` with `oldName`'s extension appended when the model dropped it. */
@@ -583,111 +439,4 @@ export function trashNamed(
   const resolved = resolve(db, names);
   const ids = resolved.hits.map(([, id]) => id);
   return [trashFilesIn(db, ids, { kind: "agent", who: "trash_files" }), resolved.misses];
-}
-
-// --------------------------------------------------------------- merge_files
-
-/**
- * Join several text files into one new room file. Returns
- * `[writtenName, receipt, failures]`.
- *
- * NO MODEL CALL. That is the whole design: the bytes never enter a context
- * window, so this works identically on a 4B and on a cloud engine, and it
- * works on inputs far past any window. The result is a plain concatenation —
- * if the user wanted the documents *synthesized* rather than joined, that is
- * the whole-file pass, and `merge_files`' description points there.
- *
- * Sources are NOT deleted unless asked, and when they are, they go to the
- * trash like everything else the agent removes.
- *
- * Throws (Rust's two `Err` returns) when fewer than two names resolve, or when
- * fewer than two of those carry readable text.
- */
-export function merge(
-  db: Database.Database,
-  names: readonly string[],
-  into: string,
-  headings: boolean,
-  trashSources: boolean
-): [string, string, BulkFailure[]] {
-  const resolved = resolve(db, names);
-  // `misses` only, never `dupes` — the Rust source seeds `failures` from
-  // `resolved.misses` alone, and a name repeated here simply resolves to the
-  // one file it always meant.
-  const failures: BulkFailure[] = [...resolved.misses];
-  if (resolved.hits.length < 2) {
-    const notFound =
-      failures.length === 0 ? "" : ` Not found: ${failures.map((f) => `"${f.name}"`).join(", ")}.`;
-    throw new Error(
-      `merge_files needs at least two files it can find; matched ${resolved.hits.length}.${notFound}`
-    );
-  }
-
-  let body = "";
-  const merged: string[] = [];
-  for (const [, id, name] of resolved.hits) {
-    // A file whose text the room never extracted (a PDF that failed OCR, a
-    // recording with no transcript, an image) has nothing to contribute.
-    // Skipping it SILENTLY would produce a merge that looks complete and is
-    // not, so it is reported as a per-file failure like any other.
-    const text = getFileExtractedText(db, id);
-    if (text === null || text.trim() === "") {
-      failures.push({ name, error: "no readable text in this file" });
-      continue;
-    }
-    if (headings) {
-      // The heading names the SOURCE, so the merged document can still be
-      // traced back — a merge that loses provenance is a merge nobody can
-      // check.
-      body += `\n\n## ${name}\n\n`;
-    } else if (body !== "") {
-      body += "\n\n";
-    }
-    body += text.trim();
-    merged.push(name);
-  }
-  if (merged.length < 2) {
-    throw new Error("merge_files needs at least two files with readable text; the rest had none.");
-  }
-
-  const requested = into.trim();
-  let name: string;
-  if (requested === "") {
-    name = "Merged notes.md";
-  } else if (extensionOf(requested) === "") {
-    name = `${requested}.md`;
-  } else {
-    name = requested;
-  }
-  // `into` names a NEW file (so says the tool's own schema), and the default
-  // is the app's own — so neither may land on a name already in use. Merging
-  // twice with no `into` produced a second "Merged notes.md" beside the first,
-  // same name and different content, and every name-based verb after that
-  // reached only the newest one. The receipt reports the name that was really
-  // written, so it keeps telling the truth about which file that was.
-  name = availableName(db, name);
-  const content = body.trimStart();
-  const meta = insertFile(db, name, mimeFor(name), Buffer.from(content, "utf8"), content, "generated");
-
-  // Only now, and only if asked. Trashing before the write would risk losing
-  // the sources to a failed insert. Only the files that really CONTRIBUTED are
-  // trashed: one that had no readable text was reported as a failure, not
-  // merged, and must not be deleted for a document it is not inside.
-  if (trashSources) {
-    const ids = resolved.hits.filter(([, , n]) => merged.includes(n)).map(([, id]) => id);
-    failures.push(...trashFilesIn(db, ids, { kind: "agent", who: "merge_files" }).failed);
-  }
-
-  const skipped =
-    failures.length === 0
-      ? ""
-      : ` Skipped: ${failures.map((f) => `"${f.name}" (${f.error})`).join("; ")}.`;
-  const receipt =
-    `Merged ${merged.length} files into "${meta.name}" ` +
-    // `[...content].length` counts code points, matching Rust's `chars()`.
-    `(${[...content].length} characters)` +
-    (trashSources ? " and moved the originals to the trash" : " — the originals are untouched") +
-    `.${skipped}`;
-
-  return [meta.name, receipt, failures];
 }

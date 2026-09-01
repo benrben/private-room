@@ -30,8 +30,17 @@ export async function copyRuntimeAssets({ sourceRoot, outputRoot }) {
   }
 }
 
+export function runtimeAssetsOutputRoot(appRoot, args) {
+  const outputFlag = args.indexOf("--output-root");
+  if (outputFlag < 0) return path.join(appRoot, "dist_package");
+  const supplied = args[outputFlag + 1];
+  if (!supplied) throw new Error("--output-root needs a path.");
+  return path.resolve(appRoot, supplied);
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
   const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  await copyRuntimeAssets({ sourceRoot: appRoot, outputRoot: path.join(appRoot, "dist_package") });
-  console.log(`Copied ${RUNTIME_ASSETS.length + SHARED_RUNTIME_ASSETS.length} runtime assets into dist_package/.`);
+  const outputRoot = runtimeAssetsOutputRoot(appRoot, process.argv.slice(2));
+  await copyRuntimeAssets({ sourceRoot: appRoot, outputRoot });
+  console.log(`Copied ${RUNTIME_ASSETS.length + SHARED_RUNTIME_ASSETS.length} runtime assets into ${outputRoot}.`);
 }

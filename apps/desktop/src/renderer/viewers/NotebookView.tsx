@@ -39,45 +39,40 @@ function joined(v: string | string[] | undefined): string {
  * became italics. CommonMark closes a fence only on a run at least as long as
  * the one that opened it, so a longer opener puts the whole cell back inside. */
 function codeFence(source: string): string {
-  const longest = Math.max(0, ...Array.from(source.matchAll(/`+/g), (m) => m[0].length));
+  const longest = Math.max(
+    0,
+    ...Array.from(source.matchAll(/`+/g), (m) => m[0].length),
+  );
   return "`".repeat(Math.max(3, longest + 1));
 }
 
 /** A rendered output: an image, a table, or text. */
 function Output({ out }: { out: RawOutput }) {
-  if (out.output_type === "error" || out.ename) {
-    const trace = (out.traceback ?? []).join("\n");
-    return (
-      <pre className="nb-out nb-error">
-        {trace || `${out.ename ?? "Error"}: ${out.evalue ?? ""}`}
-      </pre>
-    );
-  }
+  if (out.output_type === "error" || out.ename)
+    return <ErrorOutput out={out} />;
   const data = out.data ?? {};
-  // Prefer the richest representation the viewer can actually show, in the
-  // order Jupyter itself prefers them.
-  const png = data["image/png"];
-  if (typeof png === "string") {
-    return <img className="nb-out nb-img" src={`data:image/png;base64,${png}`} alt="" />;
-  }
-  const jpeg = data["image/jpeg"];
-  if (typeof jpeg === "string") {
-    return <img className="nb-out nb-img" src={`data:image/jpeg;base64,${jpeg}`} alt="" />;
-  }
-  const svg = data["image/svg+xml"];
-  if (svg !== undefined) {
-    // Rendered as an image rather than injected as markup: a notebook is an
-    // untrusted file like any other, and inline SVG can carry script.
-    const body = joined(svg);
-    return (
-      <img
-        className="nb-out nb-img"
-        src={`data:image/svg+xml;utf8,${encodeURIComponent(body)}`}
-        alt=""
-      />
-    );
-  }
-  const plain = joined(out.text) || joined(data["text/plain"]);
+  const image = imageSource(data);
+  if (image) return <img className="nb-out nb-img" src={image} alt="" />;
+  return <TextOutput data={data} text={out.text} />;
+}
+
+function ErrorOutput({ out }: { out: RawOutput }) {
+  const trace = (out.traceback ?? []).join("\n");
+  return (
+    <pre className="nb-out nb-error">
+      {trace || `${out.ename ?? "Error"}: ${out.evalue ?? ""}`}
+    </pre>
+  );
+}
+
+function TextOutput({
+  data,
+  text,
+}: {
+  data: Record<string, string | string[]>;
+  text: RawOutput["text"];
+}) {
+  const plain = joined(text) || joined(data["text/plain"]);
   if (plain) return <pre className="nb-out">{plain}</pre>;
   // HTML output (a pandas table) is deliberately shown as its text
   // representation instead of being rendered — see the SVG note above.
@@ -85,6 +80,48 @@ function Output({ out }: { out: RawOutput }) {
     return <pre className="nb-out nb-muted">[HTML output — not rendered]</pre>;
   }
   return null;
+}
+
+function imageSource(data: Record<string, string | string[]>): string | null {
+  const png = data["image/png"];
+  if (typeof png === "string") return `data:image/png;base64,${png}`;
+  const jpeg = data["image/jpeg"];
+  if (typeof jpeg === "string") return `data:image/jpeg;base64,${jpeg}`;
+  const svg = data["image/svg+xml"];
+  if (svg !== undefined)
+    return `data:image/svg+xml;utf8,${encodeURIComponent(joined(svg))}`;
+  return null;
+}
+
+function NotebookCell({ cell, index }: { cell: RawCell; index: number }) {
+  const source = joined(cell.source);
+  if (cell.cell_type === "markdown")
+    return (
+      <div className="nb-cell nb-md">
+        <MarkdownView text={source} />
+      </div>
+    );
+  if (cell.cell_type === "raw")
+    return <pre className="nb-cell nb-raw">{source}</pre>;
+  return (
+    <div className="nb-cell nb-code" key={index}>
+      <div className="nb-gutter" aria-hidden>
+        {cell.execution_count == null ? "[ ]" : `[${cell.execution_count}]`}
+      </div>
+      <div className="nb-body">
+        <CodeSource source={source} />
+        {(cell.outputs ?? []).map((out, outputIndex) => (
+          <Output key={outputIndex} out={out} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CodeSource({ source }: { source: string }) {
+  if (!source) return null;
+  const fence = codeFence(source);
+  return <MarkdownView text={`${fence}python\n${source}\n${fence}`} />;
 }
 
 /**
@@ -109,7 +146,8 @@ export default function NotebookView({ text }: { text: string }) {
     return (
       <div className="empty-hint">
         This notebook could not be read — the file isn't valid notebook JSON.
-        Its source is still stored safely; use <strong>Edit</strong> to inspect it.
+        Its source is still stored safely; use <strong>Edit</strong> to inspect
+        it.
       </div>
     );
   }
@@ -119,44 +157,9 @@ export default function NotebookView({ text }: { text: string }) {
 
   return (
     <div className="nb-view">
-      {parsed.map((cell, i) => {
-        const source = joined(cell.source);
-        const kind = cell.cell_type ?? "code";
-        if (kind === "markdown") {
-          return (
-            <div className="nb-cell nb-md" key={i}>
-              <MarkdownView text={source} />
-            </div>
-          );
-        }
-        if (kind === "raw") {
-          return (
-            <pre className="nb-cell nb-raw" key={i}>
-              {source}
-            </pre>
-          );
-        }
-        return (
-          <div className="nb-cell nb-code" key={i}>
-            <div className="nb-gutter" aria-hidden>
-              {cell.execution_count == null ? "[ ]" : `[${cell.execution_count}]`}
-            </div>
-            <div className="nb-body">
-              {source &&
-                (() => {
-                  // Reuse the markdown renderer's highlighter by handing it a
-                  // fenced block — one code style across the whole app, and no
-                  // second syntax-highlighting dependency.
-                  const fence = codeFence(source);
-                  return <MarkdownView text={`${fence}python\n${source}\n${fence}`} />;
-                })()}
-              {(cell.outputs ?? []).map((out, j) => (
-                <Output key={j} out={out} />
-              ))}
-            </div>
-          </div>
-        );
-      })}
+      {parsed.map((cell, index) => (
+        <NotebookCell key={index} cell={cell} index={index} />
+      ))}
     </div>
   );
 }

@@ -212,6 +212,48 @@ _CACHE: dict[tuple[str, str], tuple[float, int]] = {}
 _CACHE_TTL_SECONDS: float = 300.0
 
 
+def _fresh_cached_length(
+    cached: tuple[float, int] | None,
+    now: float,
+) -> int | None:
+    """Return a cache entry while it is still within its freshness window."""
+    if cached is None:
+        return None
+    read_at, length = cached
+    if now - read_at >= _CACHE_TTL_SECONDS:
+        return None
+    return length
+
+
+def _stale_cached_length(cached: tuple[float, int] | None) -> int | None:
+    """Keep the last successful catalog result available during an outage."""
+    return None if cached is None else cached[1]
+
+
+def _catalog_entry_matches(entry: dict[str, object], model: str) -> bool:
+    """Whether an Ollama catalog entry names the requested model."""
+    return entry.get("model") == model or entry.get("name") == model
+
+
+def _entry_context_length(entry: dict[str, object]) -> int | None:
+    """Read a usable native window from one matching catalog entry."""
+    length = (entry.get("details") or {}).get("context_length")
+    if isinstance(length, int) and length > 0:
+        return length
+    return None
+
+
+def _catalog_context_length(data: dict[str, object], model: str) -> int | None:
+    """Find the first matching Ollama model with a usable native window."""
+    for entry in data.get("models", []):
+        if not _catalog_entry_matches(entry, model):
+            continue
+        length = _entry_context_length(entry)
+        if length is not None:
+            return length
+    return None
+
+
 async def native_context_length(model: str, base_url: str) -> int | None:
     """The model's real context length, straight from Ollama's own catalog.
 
@@ -224,9 +266,10 @@ async def native_context_length(model: str, base_url: str) -> int | None:
     key = (base_url, model)
     cached = _CACHE.get(key)
     now = time.monotonic()
-    if cached is not None and now - cached[0] < _CACHE_TTL_SECONDS:
-        return cached[1]
-    stale = cached[1] if cached is not None else None
+    fresh = _fresh_cached_length(cached, now)
+    if fresh is not None:
+        return fresh
+    stale = _stale_cached_length(cached)
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(f"{base_url}/api/tags")
@@ -234,13 +277,11 @@ async def native_context_length(model: str, base_url: str) -> int | None:
             data = resp.json()
     except Exception:  # noqa: BLE001 - best-effort; caller has a fallback
         return stale
-    for m in data.get("models", []):
-        if m.get("model") == model or m.get("name") == model:
-            length = (m.get("details") or {}).get("context_length")
-            if isinstance(length, int) and length > 0:
-                _CACHE[key] = (now, length)
-                return length
-    return stale
+    length = _catalog_context_length(data, model)
+    if length is None:
+        return stale
+    _CACHE[key] = (now, length)
+    return length
 
 
 __all__ = [

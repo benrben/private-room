@@ -55,7 +55,6 @@ import type { SidecarChatMessage } from "./sidecar.js";
 import { clampBytesMarked } from "./textClamp.js";
 import {
   AGENT_HISTORY_MESSAGES,
-  MAX_ATTACHED_IMAGES,
   MAX_MEMORY_INJECT_CHARS,
   SKILL_BODY_TRUNCATED,
   advertiseSkills,
@@ -72,62 +71,27 @@ import {
 } from "./turnContext.js";
 import { readRoomFile } from "./workspace/roomContent.js";
 import type { WorkspaceService } from "./workspace/workspaceService.js";
+import { processAttachments, type AttachmentResult, type FirstImage } from "./gatherAttachments.js";
+import {
+  advisorToolsEnabled,
+  advisorsEnabled,
+  modelSetting,
+  parseTemperature,
+  webAccessEnabled,
+} from "./gatherSettings.js";
+
+export type { FirstImage } from "./gatherAttachments.js";
+export {
+  advisorToolsEnabled,
+  advisorsEnabled,
+  modelSetting,
+  parseTemperature,
+  webAccessEnabled,
+} from "./gatherSettings.js";
 
 // --------------------------------------------------------- settings reads
 
-/** `models.rs::model_setting` — the room's explicitly chosen engine, or `null`
- * to let `bestDefault` pick. */
-export function modelSetting(db: Database.Database): string | null {
-  return getSetting(db, "model");
-}
-
-/** `commands.rs::web_access_enabled` — `web_provider` keeps its old
- * provider-dropdown values ("duckduckgo", "searxng", …), every one of which
- * meant "internet on", so only `"off"`, `""`, or never having chosen is off. */
-export function webAccessEnabled(db: Database.Database): boolean {
-  const v = getSetting(db, "web_provider");
-  return v !== null && v !== "" && v !== "off";
-}
-
-/** `commands.rs::advisors_enabled` — off by default; while off,
- * `consult_advisor` is not even offered to the model. */
-export function advisorsEnabled(db: Database.Database): boolean {
-  return getSetting(db, "advisors_enabled") === "on";
-}
-
-/** `commands.rs::advisor_tools_enabled` — the sub-option that also gives a
- * consulted advisor the room's connected MCP tools. */
-export function advisorToolsEnabled(db: Database.Database): boolean {
-  return getSetting(db, "advisor_tools_enabled") === "on";
-}
-
-/**
- * The stored `temperature` setting as a number, or `null` when absent or
- * unreadable — Rust's `.and_then(|s| s.parse().ok())`.
- *
- * One deliberate narrowing: a non-finite value (`"inf"`, `"NaN"`), which
- * Rust's `f64::from_str` would accept, is refused here and reads as "unset".
- * Neither is a temperature any UI can produce, and passing one to an engine is
- * strictly worse than falling back to its default.
- */
-export function parseTemperature(raw: string | null): number | null {
-  if (raw === null || raw.trim() === "") {
-    return null;
-  }
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : null;
-}
-
 // ------------------------------------------------------------------ types
-
-/** The first attached image, held back for the deferred grounding pass. */
-export interface FirstImage {
-  fileId: string;
-  name: string;
-  bytes: Buffer;
-  width: number;
-  height: number;
-}
 
 /** Everything Phase 1 produces for the rest of a turn — ported field-for-field
  * from Rust's (private) `QuestionContext`. `chatMessages` uses `sidecar.ts`'s
@@ -179,84 +143,267 @@ export function isDirectSpecialistQuestion(question: string): boolean {
   return /^\s*\*[a-z]+(?:\s|$)/iu.test(question);
 }
 
-// ------------------------------------------------------------- attachments
-
-interface AttachmentResult {
-  images: string[];
-  attachedNotes: string[];
-  sources: string[];
-  firstImage: FirstImage | null;
-  /** How many paperclipped files actually REACHED the model. A dropped one is
-   * not a source (it is not what the answer was built from) and resolves no
-   * anaphora, so this — not `attachments.length` — is what the viewing hint
-   * asks. */
-  carried: number;
+interface ExplicitSkill {
+  name: string;
+  description: string;
+  instructions: string;
+  resources: Array<{ path: string; kind: string }>;
 }
 
-/**
- * Images go to the model as vision input, text files as guaranteed context —
- * and every SKIPPED attachment says out loud that it was skipped. The composer
- * counts what the user clipped ("Attached 6"); when the turn carried four and
- * the model was told nothing, its answer about six read exactly like one that
- * had weighed them.
- */
-function processAttachments(
+interface AmbientContext {
+  connectedMcp: readonly string[];
+  customInstructions: string | null;
+  responseStyle: string | null;
+  roomRole: string | null;
+  memories: string[];
+  availableSkills: ReturnType<typeof listSkills>;
+  history: ReturnType<typeof recentMessages>;
+  inventory: ReturnType<typeof listFileInventory>;
+}
+
+interface RetrievedContext {
+  contextChunks: ReturnType<typeof retrieveContext>[0];
+  contextFallback: boolean;
+}
+
+interface UserContentInput {
+  availableSkills: ReturnType<typeof listSkills>;
+  namedFiles: string[];
+  explicitSkill: ExplicitSkill | null;
+  hardNoEvidence: boolean;
+  memories: string[];
+  effectiveQuestion: string;
+  contextChunks: ReturnType<typeof retrieveContext>[0];
+  contextFallback: boolean;
+  attachedNotes: string[];
+  carried: number;
+  viewing: string | null;
+  hasHistory: boolean;
+  question: string;
+}
+
+function gatheredQuestion(question: string, deps: GatherContextDeps) {
+  const skillRequest = explicitSkillRequest(question);
+  return {
+    prepareImage: deps.prepareImage ?? passthroughPrepareImage,
+    skillRequest,
+    effectiveQuestion: skillRequest === null ? question.trim() : skillRequest.request,
+  };
+}
+
+function selectedSkill(
   db: Database.Database,
+  skillRequest: ReturnType<typeof explicitSkillRequest>,
+): ExplicitSkill | null {
+  if (skillRequest === null) return null;
+  const skill = findSkill(db, skillRequest.name);
+  if (skill === null) throw new Error(`No skill named "${skillRequest.name}" exists.`);
+  if (!skill.enabled) {
+    throw new Error(
+      `The skill "${skillRequest.name}" is still a disabled draft. Review and enable it in Skills before using /${skillRequest.name}.`,
+    );
+  }
+  return { name: skill.name, description: skill.description, instructions: skill.instructions, resources: [] };
+}
+
+function resolvedEvidencePolicy(
+  effectiveQuestion: string,
+  explicitSkill: ExplicitSkill | null,
+  deps: GatherContextDeps,
+): TurnEvidencePolicy {
+  const inferred = resolveTurnEvidencePolicy(effectiveQuestion, explicitSkill?.instructions ?? null);
+  return deps.evidencePolicy === "no-tools-no-sources" || inferred === "no-tools-no-sources"
+    ? "no-tools-no-sources"
+    : "normal";
+}
+
+function skillWithResources(
+  db: Database.Database,
+  explicitSkill: ExplicitSkill | null,
+  hardNoEvidence: boolean,
+): ExplicitSkill | null {
+  if (explicitSkill === null || hardNoEvidence) return explicitSkill;
+  const skill = findSkill(db, explicitSkill.name);
+  const resources = skill === null ? [] : listSkillResources(db, skill.id).map((r) => ({ path: r.path, kind: r.kind }));
+  return { ...explicitSkill, resources };
+}
+
+function emptyAmbientContext(): AmbientContext {
+  return {
+    connectedMcp: [], customInstructions: null, responseStyle: null, roomRole: null,
+    memories: [], availableSkills: [], history: [], inventory: [],
+  };
+}
+
+function ambientContext(
+  db: Database.Database,
+  chatId: string,
+  hardNoEvidence: boolean,
+  deps: GatherContextDeps,
+): AmbientContext {
+  if (hardNoEvidence) return emptyAmbientContext();
+  return {
+    connectedMcp: deps.connectedMcpServers?.() ?? [],
+    customInstructions: getSetting(db, "custom_instructions"),
+    responseStyle: getSetting(db, "response_style"),
+    roomRole: getSetting(db, "room_role"),
+    memories: listMemories(db).map((memory) => memory.content),
+    availableSkills: listSkills(db, true).filter((skill) => skill.agent.trim() === ""),
+    history: [...recentMessages(db, chatId, AGENT_HISTORY_MESSAGES)].reverse(),
+    inventory: listFileInventory(db),
+  };
+}
+
+function completeInventory(
+  db: Database.Database,
+  inventory: ReturnType<typeof listFileInventory>,
+) {
+  return inventory.length <= 100
+    ? inventory
+    : listFilesBrief(db).map(([name, mime, _size, summary]): [string, string, string | null] => [name, mime, summary]);
+}
+
+function contextForQuestion(
+  db: Database.Database,
+  hardNoEvidence: boolean,
+  namedFiles: string[],
+  directSpecialist: boolean,
+  effectiveQuestion: string,
+  questionEmbedding: readonly number[] | null,
+): RetrievedContext {
+  if (hardNoEvidence) return { contextChunks: [], contextFallback: false };
+  if (namedFiles.length > 0) {
+    const [contextChunks, contextFallback] = retrieveContextForFiles(db, effectiveQuestion, namedFiles);
+    return { contextChunks, contextFallback };
+  }
+  if (directSpecialist) return { contextChunks: [], contextFallback: false };
+  const [contextChunks, contextFallback] = retrieveContext(db, effectiveQuestion, questionEmbedding);
+  return { contextChunks, contextFallback };
+}
+
+function namedFilesForQuestion(
+  hardNoEvidence: boolean,
+  effectiveQuestion: string,
+  inventory: ReturnType<typeof listFileInventory>,
+): string[] {
+  return hardNoEvidence ? [] : explicitlyNamedRoomFiles(effectiveQuestion, inventory);
+}
+
+function attachmentsForQuestion(
+  db: Database.Database,
+  hardNoEvidence: boolean,
   attachments: readonly string[],
   prepareImage: (bytes: Buffer) => PreparedImage,
   workspaceAttachmentBytes?: ReadonlyMap<string, Buffer | null>,
 ): AttachmentResult {
-  const images: string[] = [];
-  const attachedNotes: string[] = [];
-  const sources: string[] = [];
-  let firstImage: FirstImage | null = null;
-  let carried = 0;
+  if (hardNoEvidence) return { images: [], attachedNotes: [], sources: [], firstImage: null, carried: 0 };
+  return processAttachments(db, attachments, prepareImage, workspaceAttachmentBytes);
+}
 
-  for (const fileId of attachments) {
-    let row: [string, string | null, Buffer | null, string | null];
-    try {
-      row = getFileFull(db, fileId);
-    } catch {
-      continue;
-    }
-    const [name, mimeRaw, blobBytes, text] = row;
-    const mime = mimeRaw ?? "";
-    if (isImage(mime)) {
-      const bytes = workspaceAttachmentBytes?.has(fileId)
-        ? workspaceAttachmentBytes.get(fileId) ?? null
-        : blobBytes;
-      if (bytes === null) {
-        attachedNotes.push(
-          `(Attached image: ${name} — NOT sent: the room has no image data stored for it. Say so rather than describing it.)`
-        );
-        continue;
-      }
-      if (images.length >= MAX_ATTACHED_IMAGES) {
-        attachedNotes.push(
-          `(Attached image: ${name} — NOT sent: this turn carries at most ${MAX_ATTACHED_IMAGES} images. Say so rather than describing it.)`
-        );
-        continue;
-      }
-      const prepared = prepareImage(bytes);
-      if (firstImage === null) {
-        firstImage = { fileId, name, bytes: prepared.bytes, width: prepared.width, height: prepared.height };
-      }
-      images.push(prepared.bytes.toString("base64"));
-      attachedNotes.push(`(Attached image: ${name})`);
-      sources.push(name);
-      carried += 1;
-    } else if (text !== null && text.trim() !== "") {
-      attachedNotes.push(`[attached file: ${name}]\n${text}`);
-      sources.push(name);
-      carried += 1;
-    } else {
-      attachedNotes.push(
-        `(Attached file: ${name} — no readable text has been extracted from it yet (a scan still to be read, a recording still to be transcribed), so its content is NOT in this turn. Say so rather than guessing at it.)`
-      );
-    }
+function attachRetrievedSources(
+  sources: string[],
+  contextChunks: ReturnType<typeof retrieveContext>[0],
+  contextFallback: boolean,
+): void {
+  if (contextFallback) return;
+  for (const chunk of contextChunks) {
+    if (!sources.includes(chunk.fileName)) sources.push(chunk.fileName);
   }
+}
 
-  return { images, attachedNotes, sources, firstImage, carried };
+function turnSettings(db: Database.Database, hardNoEvidence: boolean) {
+  if (hardNoEvidence) return { webEnabled: false, advisorsOn: false, advisorToolsOn: false };
+  const advisorsOn = advisorsEnabled(db);
+  return { webEnabled: webAccessEnabled(db), advisorsOn, advisorToolsOn: advisorsOn && advisorToolsEnabled(db) };
+}
+
+function scopedFilePreamble(namedFiles: string[]): string {
+  if (namedFiles.length === 0) return "";
+  return `The user explicitly scoped this request to these room files: ${namedFiles.join(", ")}.\n`
+    + "Use only those files and any paperclipped attachments as room-file evidence for this request. "
+    + "Do not search or cite other room files unless the user asks you to broaden the scope.\n\n";
+}
+
+function explicitSkillPreamble(explicitSkill: ExplicitSkill, hardNoEvidence: boolean): string {
+  const instructions = clampBytesMarked(explicitSkill.instructions, 20_000, SKILL_BODY_TRUNCATED);
+  if (hardNoEvidence) {
+    return `Explicitly selected Agent Skill: /${explicitSkill.name}\n`
+      + "Follow only these instructions where they agree with the user's request. This turn has no tools, file reads, bundled resources, or other sources.\n\n"
+      + `Skill instructions:\n${instructions}\n\n`;
+  }
+  const tree = explicitSkill.resources.length === 0
+    ? "(no bundled resources)"
+    : explicitSkill.resources.map((resource) => `- ${resource.path} (${resource.kind})`).join("\n");
+  return `Explicitly selected Agent Skill: /${explicitSkill.name}\n`
+    + "Follow this skill for the current request. The slash selection overrides automatic skill choice, but never the user's request or safety/privacy rules. Read listed resources with read_skill_resource when the instructions call for them.\n"
+    + `Description: ${explicitSkill.description}\n\nSkill instructions:\n${instructions}\n\nBundled resources:\n${tree}\n\n`;
+}
+
+function memoryPreamble(memories: string[], effectiveQuestion: string): string {
+  const chosen = selectMemories(memories, effectiveQuestion, MAX_MEMORY_INJECT_CHARS);
+  if (chosen.length === 0) return "";
+  return `Notes to remember for this room:\n${chosen.map((memory) => `- ${memory}\n`).join("")}\n`;
+}
+
+function contextPreamble(
+  contextFallback: boolean,
+  attachedNotes: string[],
+  contextChunks: ReturnType<typeof retrieveContext>[0],
+): string {
+  if (contextChunks.length === 0 && attachedNotes.length === 0) return "";
+  const heading = contextFallback && attachedNotes.length === 0
+    ? "Recently added content (may be unrelated to the question):\n\n"
+    : "Context from files stored in this room:\n\n";
+  const attachments = attachedNotes.map((note) => `${note}\n\n`).join("");
+  const chunks = contextChunks.map((chunk) => `[file: ${chunk.fileName}]\n${chunk.text}\n\n`).join("");
+  return `${heading}${attachments}${chunks}---\n\n`;
+}
+
+function viewingPreamble(hardNoEvidence: boolean, carried: number, viewing: string | null): string {
+  if (hardNoEvidence || carried !== 0) return "";
+  const open = viewing?.trim() ?? "";
+  if (open === "") return "";
+  return `The user has "${open}" open in the workspace. If their question says "this" or "here" `
+    + "without naming anything, they almost certainly mean that file — open it and work from what it says.\n\n";
+}
+
+function bareSavePreamble(hasHistory: boolean, question: string): string {
+  if (!hasHistory || !isBareSaveReference(question)) return "";
+  return '(Note: the user\'s "that"/"this" refers to earlier content in this conversation — usually your own previous reply. Save THAT full text with create_file or write_file now; do not ask the user to re-provide content that is already above.)\n\n';
+}
+
+function userContent(input: UserContentInput): string {
+  let content = advertiseSkills(input.availableSkills.map((skill): [string, string] => [skill.name, skill.description]));
+  content += scopedFilePreamble(input.namedFiles);
+  if (input.explicitSkill !== null) content += explicitSkillPreamble(input.explicitSkill, input.hardNoEvidence);
+  content += memoryPreamble(input.memories, input.effectiveQuestion);
+  content += contextPreamble(input.contextFallback, input.attachedNotes, input.contextChunks);
+  content += viewingPreamble(input.hardNoEvidence, input.carried, input.viewing);
+  content += bareSavePreamble(input.hasHistory, input.question);
+  return `${content}Question: ${input.effectiveQuestion}`;
+}
+
+function assembledMessages(
+  system: string,
+  history: ReturnType<typeof recentMessages>,
+  explicitModel: string | null,
+  user: string,
+  images: string[],
+): SidecarChatMessage[] {
+  const messages: SidecarChatMessage[] = [{ role: "system", content: system }];
+  for (const [role, content] of compactHistory(history, historyBudgetBytes(explicitModel ?? ""))) {
+    messages.push({ role: role as SidecarChatMessage["role"], content });
+  }
+  messages.push({ role: "user", content: user, ...(images.length > 0 ? { images } : {}) });
+  return messages;
+}
+
+function saveQuestion(db: Database.Database, chatId: string, question: string, effectiveQuestion: string): void {
+  insertMessage(db, chatId, "user", question, [], null);
+  const titleSource = effectiveQuestion === "" ? question : effectiveQuestion;
+  const titleChars = Array.from(titleSource);
+  const title = titleChars.slice(0, 48).join("") + (titleChars.length > 48 ? "…" : "");
+  setChatTitleIfNew(db, chatId, title);
 }
 
 // ------------------------------------------------------------------ main
@@ -285,243 +432,76 @@ export function gatherContextAndSaveQuestion(
   viewing: string | null,
   deps: GatherContextDeps = {}
 ): QuestionContext {
-  const prepareImage = deps.prepareImage ?? passthroughPrepareImage;
-
-  const skillRequest = explicitSkillRequest(question);
-  const effectiveQuestion = skillRequest !== null ? skillRequest.request : question.trim();
-
+  const gathered = gatheredQuestion(question, deps);
   const explicitModel = modelSetting(db);
   const temperature = parseTemperature(getSetting(db, "temperature"));
-
-  let explicitSkill: {
-    name: string;
-    description: string;
-    instructions: string;
-    resources: Array<{ path: string; kind: string }>;
-  } | null = null;
-  if (skillRequest !== null) {
-    const skill = findSkill(db, skillRequest.name);
-    if (skill === null) {
-      throw new Error(`No skill named "${skillRequest.name}" exists.`);
-    }
-    if (!skill.enabled) {
-      throw new Error(
-        `The skill "${skillRequest.name}" is still a disabled draft. Review and enable it in Skills before using /${skillRequest.name}.`
-      );
-    }
-    explicitSkill = {
-      name: skill.name,
-      description: skill.description,
-      instructions: skill.instructions,
-      resources: [],
-    };
-  }
-
-  const inferredPolicy = resolveTurnEvidencePolicy(
-    effectiveQuestion,
-    explicitSkill?.instructions ?? null,
-  );
-  const evidencePolicy = deps.evidencePolicy === "no-tools-no-sources"
-    || inferredPolicy === "no-tools-no-sources"
-    ? "no-tools-no-sources"
-    : "normal";
+  let explicitSkill = selectedSkill(db, gathered.skillRequest);
+  const evidencePolicy = resolvedEvidencePolicy(gathered.effectiveQuestion, explicitSkill, deps);
   const hardNoEvidence = evidencePolicy === "no-tools-no-sources";
+  explicitSkill = skillWithResources(db, explicitSkill, hardNoEvidence);
 
-  // Only the selected skill instructions and the current request survive the
-  // hard boundary. In particular, do not even enumerate resources or general
-  // skills: resource names and descriptions are room-derived evidence too.
-  if (explicitSkill !== null && !hardNoEvidence) {
-    const skill = findSkill(db, explicitSkill.name);
-    explicitSkill.resources = skill === null
-      ? []
-      : listSkillResources(db, skill.id).map((r) => ({ path: r.path, kind: r.kind }));
-  }
+  const ambient = ambientContext(db, chatId, hardNoEvidence, deps);
+  const scopeInventory = completeInventory(db, ambient.inventory);
+  const namedFiles = namedFilesForQuestion(hardNoEvidence, gathered.effectiveQuestion, scopeInventory);
+  const retrieved = contextForQuestion(
+    db,
+    hardNoEvidence,
+    namedFiles,
+    isDirectSpecialistQuestion(gathered.effectiveQuestion),
+    gathered.effectiveQuestion,
+    questionEmbedding,
+  );
+  const attachment = attachmentsForQuestion(
+    db,
+    hardNoEvidence,
+    attachments,
+    gathered.prepareImage,
+    deps.workspaceAttachmentBytes,
+  );
+  attachRetrievedSources(attachment.sources, retrieved.contextChunks, retrieved.contextFallback);
 
-  const connectedMcp = hardNoEvidence ? [] : deps.connectedMcpServers?.() ?? [];
-  const customInstructions = hardNoEvidence ? null : getSetting(db, "custom_instructions");
-  const responseStyle = hardNoEvidence ? null : getSetting(db, "response_style");
-  const roomRole = hardNoEvidence ? null : getSetting(db, "room_role");
-  const memories = hardNoEvidence ? [] : listMemories(db).map((m) => m.content);
-  const availableSkills = hardNoEvidence
-    ? []
-    : listSkills(db, true).filter((s) => s.agent.trim() === "");
-
-  // `recentMessages` is newest-first; the prompt wants chronological order.
-  const history = hardNoEvidence
-    ? []
-    : [...recentMessages(db, chatId, AGENT_HISTORY_MESSAGES)].reverse();
-
-  const inventory = hardNoEvidence ? [] : listFileInventory(db);
-  // `listFileInventory` intentionally stops at 101 rows for the system prompt.
-  // Explicit scope must still recognize an older file in a large room, so only
-  // the name resolver expands to the complete lightweight listing.
-  const scopeInventory =
-    inventory.length <= 100
-      ? inventory
-      : listFilesBrief(db).map(([name, mime, _size, summary]): [string, string, string | null] => [
-          name,
-          mime,
-          summary,
-        ]);
-  const namedFiles = hardNoEvidence
-    ? []
-    : explicitlyNamedRoomFiles(effectiveQuestion, scopeInventory);
-  const directSpecialist = isDirectSpecialistQuestion(effectiveQuestion);
-  const [contextChunks, contextFallback] =
-    hardNoEvidence
-      ? [[], false] as const
-      : namedFiles.length > 0
-      ? retrieveContextForFiles(db, effectiveQuestion, namedFiles)
-      : directSpecialist
-      ? [[], false] as const
-      : retrieveContext(db, effectiveQuestion, questionEmbedding);
-
-  const { images, attachedNotes, sources, firstImage, carried } = hardNoEvidence
-    ? { images: [], attachedNotes: [], sources: [], firstImage: null, carried: 0 }
-    : processAttachments(db, attachments, prepareImage, deps.workspaceAttachmentBytes);
-
-  // Only credit files that genuinely matched the question: on the zero-score
-  // fallback the chunks are just "recent content", so they must not appear as
-  // source chips (CHG-10). Attachments still count.
-  if (!contextFallback) {
-    for (const chunk of contextChunks) {
-      if (!sources.includes(chunk.fileName)) {
-        sources.push(chunk.fileName);
-      }
-    }
-  }
-
-  const webEnabled = hardNoEvidence ? false : webAccessEnabled(db);
-  // ADD-21: whether the advisor tool may be offered this turn, and whether a
-  // consulted Claude advisor may reach the room's tools.
-  const advisorsOn = hardNoEvidence ? false : advisorsEnabled(db);
-  const advisorToolsOn = advisorsOn && advisorToolsEnabled(db);
-
+  const settings = turnSettings(db, hardNoEvidence);
   const system = buildSystemPrompt({
     evidencePolicy,
-    webEnabled,
-    connectedMcp,
-    inventory,
-    roomRoleId: roomRole,
-    responseStyle,
-    customInstructions,
+    webEnabled: settings.webEnabled,
+    connectedMcp: ambient.connectedMcp,
+    inventory: ambient.inventory,
+    roomRoleId: ambient.roomRole,
+    responseStyle: ambient.responseStyle,
+    customInstructions: ambient.customInstructions,
   });
-
-  // ADD-22 (KV cache): the system prompt stays byte-stable across a
-  // conversation, so per-question memory selection lives in the always-new
-  // user message below rather than up here.
-  const chatMessages: SidecarChatMessage[] = [{ role: "system", content: system }];
-  const hasHistory = history.length > 0;
-  for (const [role, content] of compactHistory(history, historyBudgetBytes(explicitModel ?? ""))) {
-    chatMessages.push({ role: role as SidecarChatMessage["role"], content });
-  }
-
-  let userContent = advertiseSkills(availableSkills.map((s): [string, string] => [s.name, s.description]));
-
-  if (namedFiles.length > 0) {
-    userContent +=
-      `The user explicitly scoped this request to these room files: ${namedFiles.join(", ")}.\n` +
-      "Use only those files and any paperclipped attachments as room-file evidence for this request. " +
-      "Do not search or cite other room files unless the user asks you to broaden the scope.\n\n";
-  }
-
-  if (explicitSkill !== null) {
-    const instructions = clampBytesMarked(explicitSkill.instructions, 20_000, SKILL_BODY_TRUNCATED);
-    if (hardNoEvidence) {
-      userContent +=
-        `Explicitly selected Agent Skill: /${explicitSkill.name}\n` +
-        "Follow only these instructions where they agree with the user's request. This turn has no tools, file reads, bundled resources, or other sources.\n\n" +
-        `Skill instructions:\n${instructions}\n\n`;
-    } else {
-      const tree =
-        explicitSkill.resources.length === 0
-          ? "(no bundled resources)"
-          : explicitSkill.resources.map((r) => `- ${r.path} (${r.kind})`).join("\n");
-      userContent +=
-        `Explicitly selected Agent Skill: /${explicitSkill.name}\n` +
-        "Follow this skill for the current request. The slash selection overrides automatic skill choice, but never the user's request or safety/privacy rules. Read listed resources with read_skill_resource when the instructions call for them.\n" +
-        `Description: ${explicitSkill.description}\n\nSkill instructions:\n${instructions}\n\nBundled resources:\n${tree}\n\n`;
-    }
-  }
-
-  if (memories.length > 0) {
-    const chosen = selectMemories(memories, effectiveQuestion, MAX_MEMORY_INJECT_CHARS);
-    if (chosen.length > 0) {
-      userContent += "Notes to remember for this room:\n";
-      for (const m of chosen) {
-        userContent += `- ${m}\n`;
-      }
-      userContent += "\n";
-    }
-  }
-
-  const hasContext = contextChunks.length > 0 || attachedNotes.length > 0;
-  if (hasContext) {
-    userContent +=
-      contextFallback && attachedNotes.length === 0
-        ? "Recently added content (may be unrelated to the question):\n\n"
-        : "Context from files stored in this room:\n\n";
-    for (const note of attachedNotes) {
-      userContent += `${note}\n\n`;
-    }
-    for (const chunk of contextChunks) {
-      userContent += `[file: ${chunk.fileName}]\n${chunk.text}\n\n`;
-    }
-    userContent += "---\n\n";
-  }
-
-  // What the user has open while they ask — in the always-new user message,
-  // never the system prompt (a fact that changes whenever a tab does would
-  // invalidate the cached prefix every turn). The NAME only, stated as what it
-  // is: "has open", not "is looking at", because the flag says a file is
-  // loaded, and the pane can be collapsed or behind Home.
-  //
-  // Skipped when the paperclip carried something: that is an explicit choice
-  // about what this question is about, and there is no anaphora left to
-  // resolve. What was CARRIED, not what was clipped — a paperclip whose
-  // content never reached the model resolves nothing.
-  if (!hardNoEvidence && carried === 0) {
-    const open = viewing?.trim() ?? "";
-    if (open !== "") {
-      userContent +=
-        `The user has "${open}" open in the workspace. If their question says "this" or "here" ` +
-        "without naming anything, they almost certainly mean that file — open it and work from what it says.\n\n";
-    }
-  }
-
-  // Deterministic anaphora hint: a 4B model sees its own previous reply in the
-  // history and still asks the user to re-provide it. The conditional wording
-  // keeps a rare false positive harmless.
-  if (hasHistory && isBareSaveReference(question)) {
-    userContent +=
-      '(Note: the user\'s "that"/"this" refers to earlier content in this conversation — usually your own previous reply. Save THAT full text with create_file or write_file now; do not ask the user to re-provide content that is already above.)\n\n';
-  }
-
-  userContent += `Question: ${effectiveQuestion}`;
-
-  chatMessages.push({
-    role: "user",
-    content: userContent,
-    ...(images.length > 0 ? { images } : {}),
-  });
-
-  insertMessage(db, chatId, "user", question, [], null);
-
-  // The first question names the session.
-  const titleSource = effectiveQuestion === "" ? question : effectiveQuestion;
-  const titleChars = Array.from(titleSource);
-  const title = titleChars.slice(0, 48).join("") + (titleChars.length > 48 ? "…" : "");
-  setChatTitleIfNew(db, chatId, title);
+  const chatMessages = assembledMessages(
+    system,
+    ambient.history,
+    explicitModel,
+    userContent({
+      availableSkills: ambient.availableSkills,
+      namedFiles,
+      explicitSkill,
+      hardNoEvidence,
+      memories: ambient.memories,
+      effectiveQuestion: gathered.effectiveQuestion,
+      contextChunks: retrieved.contextChunks,
+      contextFallback: retrieved.contextFallback,
+      attachedNotes: attachment.attachedNotes,
+      carried: attachment.carried,
+      viewing,
+      hasHistory: ambient.history.length > 0,
+      question,
+    }),
+    attachment.images,
+  );
+  saveQuestion(db, chatId, question, gathered.effectiveQuestion);
 
   return {
     explicitModel,
     chatMessages,
-    sources,
-    firstImage,
+    sources: attachment.sources,
+    firstImage: attachment.firstImage,
     temperature,
-    webEnabled,
-    advisorsOn,
-    advisorToolsOn,
+    webEnabled: settings.webEnabled,
+    advisorsOn: settings.advisorsOn,
+    advisorToolsOn: settings.advisorToolsOn,
     evidencePolicy,
   };
 }
@@ -530,6 +510,43 @@ export interface GatherContextRoom {
   db: Database.Database;
   path: string;
   workspace?: WorkspaceService;
+}
+
+function roomEvidencePolicy(
+  db: Database.Database,
+  question: string,
+  requestedPolicy: TurnEvidencePolicy | undefined,
+): TurnEvidencePolicy {
+  if (requestedPolicy === "no-tools-no-sources") {
+    return requestedPolicy;
+  }
+  return turnEvidencePolicyForQuestion(db, question);
+}
+
+async function workspaceImageBytes(room: GatherContextRoom, fileId: string): Promise<Buffer | null | undefined> {
+  try {
+    const [, mime] = getFileFull(room.db, fileId);
+    if (!isImage(mime ?? "")) {
+      return undefined;
+    }
+    return (await readRoomFile(room, fileId)).bytes;
+  } catch {
+    return null;
+  }
+}
+
+async function workspaceAttachmentImages(
+  room: GatherContextRoom,
+  attachments: readonly string[],
+): Promise<Map<string, Buffer | null>> {
+  const workspaceAttachmentBytes = new Map<string, Buffer | null>();
+  for (const fileId of attachments) {
+    const bytes = await workspaceImageBytes(room, fileId);
+    if (bytes !== undefined) {
+      workspaceAttachmentBytes.set(fileId, bytes);
+    }
+  }
+  return workspaceAttachmentBytes;
 }
 
 /** Async folder-room wrapper. Text remains private indexed state; only image
@@ -544,9 +561,7 @@ export async function gatherContextAndSaveQuestionInRoom(
   viewing: string | null,
   deps: GatherContextDeps = {},
 ): Promise<QuestionContext> {
-  const evidencePolicy = deps.evidencePolicy === "no-tools-no-sources"
-    ? deps.evidencePolicy
-    : turnEvidencePolicyForQuestion(room.db, question);
+  const evidencePolicy = roomEvidencePolicy(room.db, question, deps.evidencePolicy);
   const resolvedDeps = { ...deps, evidencePolicy };
   if (room.workspace === undefined || evidencePolicy === "no-tools-no-sources") {
     return gatherContextAndSaveQuestion(
@@ -559,17 +574,7 @@ export async function gatherContextAndSaveQuestionInRoom(
       resolvedDeps,
     );
   }
-  const workspaceAttachmentBytes = new Map<string, Buffer | null>();
-  for (const fileId of attachments) {
-    try {
-      const [, mime] = getFileFull(room.db, fileId);
-      if (isImage(mime ?? "")) {
-        workspaceAttachmentBytes.set(fileId, (await readRoomFile(room, fileId)).bytes);
-      }
-    } catch {
-      workspaceAttachmentBytes.set(fileId, null);
-    }
-  }
+  const workspaceAttachmentBytes = await workspaceAttachmentImages(room, attachments);
   return gatherContextAndSaveQuestion(
     room.db,
     chatId,

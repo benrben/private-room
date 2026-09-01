@@ -134,6 +134,44 @@ class PrivacyReport:
         }
 
 
+def _normalized_privacy_rules(rules: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Trim usable rules and put longer real values before their prefixes."""
+    pairs = [
+        (real.strip(), placeholder.strip())
+        for real, placeholder in rules
+        if real.strip() and placeholder.strip()
+    ]
+    return sorted(pairs, key=lambda pair: len(pair[0]), reverse=True)
+
+
+def _real_to_placeholder(rules: list[tuple[str, str]]) -> dict[str, str]:
+    """Index compiled rules by their case-insensitive real value."""
+    return {real.casefold(): placeholder for real, placeholder in rules}
+
+
+def _placeholder_to_real(rules: list[tuple[str, str]]) -> dict[str, str]:
+    """Index compiled rules by their case-insensitive placeholder."""
+    return {placeholder.casefold(): real for real, placeholder in rules}
+
+
+def _privacy_patterns(
+    rules: list[tuple[str, str]],
+) -> tuple[re.Pattern[str] | None, re.Pattern[str] | None]:
+    """Compile the outbound and inbound literal alternations for a rule set."""
+    if not rules:
+        return None, None
+    redact = _privacy_literal_pattern([real for real, _ in rules])
+    restore = _privacy_literal_pattern(
+        sorted([placeholder for _, placeholder in rules], key=len, reverse=True)
+    )
+    return redact, restore
+
+
+def _privacy_literal_pattern(values: list[str]) -> re.Pattern[str]:
+    """Compile a case-insensitive, literal-only alternation."""
+    return re.compile("|".join(re.escape(value) for value in values), re.IGNORECASE)
+
+
 @dataclass
 class PrivacyPolicy:
     """The resolved per-request policy Rust sends (already switch-resolved).
@@ -167,21 +205,10 @@ class PrivacyPolicy:
         self._compile()
 
     def _compile(self) -> None:
-        pairs = [(r.strip(), p.strip()) for r, p in self.rules if r.strip() and p.strip()]
-        self.rules = sorted(pairs, key=lambda rp: len(rp[0]), reverse=True)
-        self._by_real = {r.casefold(): p for r, p in self.rules}
-        self._by_placeholder = {p.casefold(): r for r, p in self.rules}
-        if self.rules:
-            self._redact_re = re.compile(
-                "|".join(re.escape(r) for r, _ in self.rules), re.IGNORECASE
-            )
-            restore = sorted((p for _, p in self.rules), key=len, reverse=True)
-            self._restore_re = re.compile(
-                "|".join(re.escape(p) for p in restore), re.IGNORECASE
-            )
-        else:
-            self._redact_re = None
-            self._restore_re = None
+        self.rules = _normalized_privacy_rules(self.rules)
+        self._by_real = _real_to_placeholder(self.rules)
+        self._by_placeholder = _placeholder_to_real(self.rules)
+        self._redact_re, self._restore_re = _privacy_patterns(self.rules)
 
     def add_rules(self, extra: list[tuple[str, str]]) -> None:
         """Append request-scoped rules (the live guard's findings) and recompile."""
@@ -393,9 +420,20 @@ class OutputRedactor:
         if not delta:
             return ""
         self._buf += delta
+        return self._release_safe_prefix()
+
+    def _release_safe_prefix(self) -> str:
         safe_end = max(0, len(self._buf) - self._keep)
         if safe_end == 0:
             return ""
+        pieces, cursor = self._release_redacted_matches(safe_end)
+        release_to = max(safe_end, cursor)
+        if cursor < safe_end:
+            pieces.append(self._buf[cursor:safe_end])
+        self._buf = self._buf[release_to:]
+        return "".join(pieces)
+
+    def _release_redacted_matches(self, safe_end: int) -> tuple[list[str], int]:
         pieces: list[str] = []
         cursor = 0
         for start, end, replacement in self._matches():
@@ -406,11 +444,7 @@ class OutputRedactor:
             pieces.append(self._buf[cursor:start])
             pieces.append(replacement)
             cursor = end
-        release_to = max(safe_end, cursor)
-        if cursor < safe_end:
-            pieces.append(self._buf[cursor:safe_end])
-        self._buf = self._buf[release_to:]
-        return "".join(pieces)
+        return pieces, cursor
 
     def flush(self) -> str:
         ready, self._buf = self._buf, ""

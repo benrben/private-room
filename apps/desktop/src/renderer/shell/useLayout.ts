@@ -7,232 +7,36 @@ import {
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import {
+  bound,
+  CLAMP,
+  clampRatio,
+  DEFAULT_RATIOS,
+  layoutKey,
+  layoutStatusLabel,
+  LAYOUT_VERSION,
+  leavesFocus,
+  loadPersistedLayout,
+  NARROW_QUERY,
+  paneShortcut,
+  PANE_ORDER,
+  PRESETS,
+  RAIL_NARROW_QUERY,
+  splitterVisibility,
+  type PaneKey,
+  type PresetName,
+  type SidePane,
+} from "./layoutState";
 
-/** The three workspace panes. "library" = left (files/sources/area nav),
- * "center" = the primary work surface, "ai" = chat/studio/activity. */
-export type PaneKey = "library" | "center" | "ai";
-
-/** The panes that can be shown and hidden. The centre cannot: it is the one
- * pane the room is always for, and the Layout menu offers Focus instead —
- * see `togglePane`. */
-export type SidePane = Exclude<PaneKey, "center">;
-
-export const PANE_ORDER: PaneKey[] = ["library", "center", "ai"];
-
-/** ⌘-number → the pane it shows or hides — the ONE key this file still claims.
- *
- * ⌘1 and ⌘2 are not here. They are declared by the native View menu
- * (src-tauri/src/menu.rs), which is the right owner for them: macOS hands a
- * key equivalent to the menu bar before the event reaches the key window, so a
- * listener here could only ever be a second owner for the same press — and a
- * pane toggled twice is a pane that never moves. The menu also prints them,
- * which is the whole reason a Mac user opens a menu they already know the
- * contents of.
- *
- * ⌘3 stays, because no menu row can express it: it is an ALIAS for ⌘2, and a
- * row carries one key equivalent. It is not a shim anyone has to maintain —
- * it is the binding this app has always had, left alone for at least one
- * release so nobody's hands have to relearn anything. When it goes, this
- * whole map goes with it. */
-export const PANE_KEYS: Record<string, SidePane> = {
-  "3": "ai",
-};
-
-/** Default proportions (16 / 61 / 23): ONE dominant workspace, with the library
- * a navigable strip and the AI pane a slim contextual column you widen or
- * collapse to a drawer as needed. Ratios, not widths. New rooms (and Reset
- * layout) get this; rooms with a saved custom layout keep theirs.
- *
- * The target is 65-75% of the WINDOW for the thing being worked on, and the
- * arithmetic only reaches it once a side column is out of the way — which is
- * the point of the AI pane being contextual. A hidden pane's track collapses
- * to 0px and its share is redistributed by the `fr` units, so on a 1440px
- * window with the rail expanded (192px) the grid is 1248px and:
- *
- *   all three open   0.61            × 1248 = 761px   53% of the window
- *   AI closed        0.61/0.77 = .79 × 1248 = 989px   69% of the window  ← target
- *   focus mode       1.0             × 1248          87% of the window
- *
- * There is no split that hits 65% with three panes open and still leaves the
- * library navigable and the composer usable: their floors alone (0.13 + 0.20)
- * spend a third of the grid. So the width is earned by CLOSING the column the
- * page does not need, per `setFocusedPage` below, rather than by squeezing two
- * panes down to a size neither works at. */
-const DEFAULT_RATIOS: Record<PaneKey, number> = {
-  library: 0.16,
-  center: 0.61,
-  ai: 0.23,
-};
-
-/** Drag/keyboard clamps: the library stays a navigable strip at the low end and
- * the AI pane stays wide enough for its composer, while `centerMin` is what
- * actually protects the readable center column. The library's max is deliberately
- * generous (GH #2 — it used to stop at 0.32, which read as "won't expand"); with
- * three panes open `centerMin` binds first anyway, so the extra headroom is only
- * reachable when a neighbour is collapsed — which is exactly when a wide file
- * list is what the user wanted. */
-const CLAMP = {
-  library: { min: 0.13, max: 0.5 },
-  ai: { min: 0.2, max: 0.42 },
-  centerMin: 0.4,
-};
-
-/** Below this the three-pane grid stops being readable; the shell shows ONE
- * pane at a time and the pane controls switch instead of toggle. */
-const NARROW_QUERY = "(max-width: 1080px)";
-
-/** Below this the sidebar drops its labels on its own.
- *
- * Deliberately NOT the same breakpoint as NARROW_QUERY. Firing both at one
- * width would take the labels and two of the three panes away in the same
- * frame, which reads as the window breaking rather than as the shell adapting;
- * 1180 gives the rail a step of its own on the way down. */
-const RAIL_NARROW_QUERY = "(max-width: 1180px)";
-
-/** The three shipped layout presets, and what each is FOR.
- *
- * A preset is not a fourth kind of state — it is a named set of the choices
- * the Layout menu already offers one at a time, applied together. That is the
- * whole reason they exist: "get out of the way so I can read this" is three
- * clicks (hide library, hide assistant, widen) that nobody performs, so the
- * layout stays wrong instead.
- *
- * Ratios are re-stated per preset rather than inherited, so applying one is
- * idempotent — running Review twice lands in exactly the same place, whatever
- * the panes had been dragged to in between. */
-export type PresetName = "focus" | "research" | "review";
-
-export const PRESETS: Record<
-  PresetName,
-  { label: string; hint: string; hidden: Record<PaneKey, boolean>; ratios: Record<PaneKey, number> }
-> = {
-  focus: {
-    label: "Focus",
-    hint: "The workspace alone",
-    hidden: { library: true, center: false, ai: true },
-    ratios: { library: 0.16, center: 0.61, ai: 0.23 },
-  },
-  research: {
-    label: "Research",
-    hint: "Sidebar, workspace, and the assistant",
-    hidden: { library: false, center: false, ai: false },
-    ratios: { library: 0.16, center: 0.61, ai: 0.23 },
-  },
-  review: {
-    label: "Review",
-    hint: "Sidebar and workspace, no assistant",
-    hidden: { library: false, center: false, ai: true },
-    // A wider library than the default (26% of the visible width once the
-    // assistant is out, against 21%), because reviewing means moving between
-    // files rather than staying in one.
-    //
-    // THE THREE MUST SUM TO 1, including the pane this preset hides. A hidden
-    // pane's track is 0px, so its ratio looks free — but `applyResize` holds
-    // the SUM of a splitter's two panes constant and compares a pointer
-    // position (a fraction of the whole grid) against a pane's ratio directly.
-    // Both stop being true if the ratios drift off 1, and the drift only shows
-    // up later: apply Review, reopen the assistant, and every pane is the
-    // wrong width with the centre floor silently breached.
-    ratios: { library: 0.2, center: 0.57, ai: 0.23 },
-  },
-};
-
-type Persisted = {
-  ratios?: Partial<Record<PaneKey, number>>;
-  hidden?: Partial<Record<PaneKey, boolean>>;
-  /** GH #2: the activity rail widened to icon + full label. */
-  railExpanded?: boolean;
-  /** Schema version of this record. See `LAYOUT_VERSION`. */
-  v?: number;
-};
-
-/** Bumped when a DEFAULT changes in a way a stored value would hide.
- *
- * v2 made the rail's readable labels the default. Every room saved before it
- * carries `railExpanded: false` — not because anyone chose the icon strip, but
- * because that was the old default and the flag is written on every layout
- * change. Reading those back would mean the labels never appeared for anyone
- * who had ever resized a pane. So a record older than this version keeps its
- * ratios and its collapsed panes (both are real choices) and takes the new
- * rail default once; the next write stamps v2 and the choice is the user's
- * again from then on. */
-const LAYOUT_VERSION = 2;
-
-const LAYOUT_PREFIX = "prLayout:";
-
-/** The saved-layout key for one room.
- *
- * Keyed by a DIGEST OF THE ROOM'S PATH, for two reasons that were both bugs:
- *
- *   • the key used to be `prLayout:<room name>`, so every room you ever opened
- *     left its name in plain browser storage, outside the encrypted file, with
- *     nothing to clear it — not locking, not quitting, not "Clear recent
- *     rooms". A room name is room content;
- *   • it was the NAME, so two rooms called "Work" in different folders shared
- *     one layout and overwrote each other's.
- *
- * 64 bits of FNV-1a (two accumulators): enough that two rooms colliding is not
- * a thing that happens, one-way enough that the key names nothing. */
-export function layoutKey(roomPath: string): string {
-  let a = 0x811c9dc5;
-  let b = 0x01000193;
-  for (let i = 0; i < roomPath.length; i++) {
-    const c = roomPath.charCodeAt(i);
-    a = Math.imul(a ^ c, 0x01000193) >>> 0;
-    b = Math.imul(b ^ c, 0x85ebca6b) >>> 0;
-  }
-  return `${LAYOUT_PREFIX}${a.toString(16).padStart(8, "0")}${b.toString(16).padStart(8, "0")}`;
-}
-
-/** Drop every saved layout — used by "Clear recent rooms", which promises to
- * forget the rooms you have opened and used to leave this behind. */
-export function forgetSavedLayouts(): void {
-  try {
-    for (const k of Object.keys(localStorage)) {
-      if (k.startsWith(LAYOUT_PREFIX)) localStorage.removeItem(k);
-    }
-  } catch {
-    /* private mode etc. — nothing was stored to forget */
-  }
-}
-
-/** Drop one room's saved layout (removing its shortcut from the start screen). */
-export function forgetSavedLayout(roomPath: string): void {
-  try {
-    localStorage.removeItem(layoutKey(roomPath));
-  } catch {
-    /* nothing stored */
-  }
-}
-
-/** Remove the pre-digest entries, which ARE room names sitting in plain
- * storage. Run on every load rather than once behind a flag: the point is that
- * the names go, and there is no honest way to keep them until a flag is set.
- * The old layout itself is not migrated — the ratios are two drags to redo,
- * and reading a legacy key would mean matching on the name again. */
-function sweepLegacyLayoutKeys(): void {
-  try {
-    for (const k of Object.keys(localStorage)) {
-      if (k.startsWith(LAYOUT_PREFIX) && !/^prLayout:[0-9a-f]{16}$/.test(k)) {
-        localStorage.removeItem(k);
-      }
-    }
-  } catch {
-    /* private mode etc. */
-  }
-}
-
-function loadPersisted(key: string): Persisted {
-  sweepLegacyLayoutKeys();
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw) as Persisted;
-    return typeof parsed === "object" && parsed !== null ? parsed : {};
-  } catch {
-    return {};
-  }
-}
+export {
+  forgetSavedLayout,
+  forgetSavedLayouts,
+  layoutKey,
+  PANE_KEYS,
+  PANE_ORDER,
+  PRESETS,
+} from "./layoutState";
+export type { PaneKey, PresetName, SidePane } from "./layoutState";
 
 export type LayoutApi = ReturnType<typeof useLayout>;
 
@@ -241,12 +45,12 @@ export type LayoutApi = ReturnType<typeof useLayout>;
  * Collapse is real — hidden panes and their splitters get 0px tracks. */
 export function useLayout(roomPath: string) {
   const storageKey = layoutKey(roomPath);
-  const persisted = useRef(loadPersisted(storageKey)).current;
+  const persisted = useRef(loadPersistedLayout(storageKey)).current;
 
   const [ratios, setRatios] = useState<Record<PaneKey, number>>(() => ({
-    library: clamp01(persisted.ratios?.library, DEFAULT_RATIOS.library),
-    center: clamp01(persisted.ratios?.center, DEFAULT_RATIOS.center),
-    ai: clamp01(persisted.ratios?.ai, DEFAULT_RATIOS.ai),
+    library: clampRatio(persisted.ratios?.library, DEFAULT_RATIOS.library),
+    center: clampRatio(persisted.ratios?.center, DEFAULT_RATIOS.center),
+    ai: clampRatio(persisted.ratios?.ai, DEFAULT_RATIOS.ai),
   }));
   const [hidden, setHidden] = useState<Record<PaneKey, boolean>>(() => ({
     library: persisted.hidden?.library === true,
@@ -363,10 +167,7 @@ export function useLayout(roomPath: string) {
     return list.length > 0 ? list : ["center"];
   }, [isNarrow, focusPane, effHidden]);
 
-  const showSplitA =
-    visible.includes("library") &&
-    (visible.includes("center") || visible.includes("ai"));
-  const showSplitB = visible.includes("center") && visible.includes("ai");
+  const { showSplitA, showSplitB } = splitterVisibility(visible);
 
   const gridStyle = useMemo<CSSProperties>(() => {
     const track = (k: PaneKey) =>
@@ -635,22 +436,14 @@ export function useLayout(roomPath: string) {
   // ⌥⌘1–⌥⌘9, which is why Option is excluded below.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (
-        (e.metaKey || e.ctrlKey) &&
-        !e.altKey &&
-        !e.shiftKey &&
-        PANE_KEYS[e.key] !== undefined
-      ) {
+      const pane = paneShortcut(e);
+      if (pane) {
         e.preventDefault();
         e.stopPropagation();
-        togglePane(PANE_KEYS[e.key]);
+        togglePane(pane);
         return;
       }
-      if (e.key === "Escape" && focusPane) {
-        const t = e.target as HTMLElement | null;
-        const typing =
-          t != null && (t.tagName === "INPUT" || t.tagName === "TEXTAREA");
-        if (typing) return;
+      if (leavesFocus(e, focusPane)) {
         e.preventDefault();
         e.stopPropagation();
         setFocusPane(null);
@@ -670,13 +463,7 @@ export function useLayout(roomPath: string) {
   // "Sidebar", not "Library": this names the PANE, and what is in that pane
   // depends on the destination. The status bar cannot know which one, and
   // guessing Home's answer is what it used to do.
-  const paneName =
-    focusPane === "ai" ? "Assistant" : focusPane === "library" ? "Sidebar" : "Workspace";
-  const layoutLabel = isNarrow
-    ? paneName
-    : focusPane
-      ? `${paneName} focus`
-      : `${visible.length} pane${visible.length === 1 ? "" : "s"}`;
+  const layoutLabel = layoutStatusLabel(isNarrow, focusPane, visible.length);
 
   return {
     ratios,
@@ -718,17 +505,4 @@ export function useLayout(roomPath: string) {
     startDrag,
     keyResize,
   };
-}
-
-function clamp01(v: number | undefined, fallback: number): number {
-  return typeof v === "number" && Number.isFinite(v) && v > 0.05 && v < 0.95
-    ? v
-    : fallback;
-}
-
-/** Clamp into [lo, hi]. When the window is too narrow for both neighbours'
- * floors, `hi` can fall below `lo` — the minimum wins, so a pane never
- * collapses to nothing mid-drag. */
-function bound(v: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, v));
 }

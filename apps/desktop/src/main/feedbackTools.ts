@@ -260,32 +260,60 @@ function neverCancelled(): CancelFlag {
  * in the sidecar's `/feedback_draft`, exactly as in Rust.
  */
 export async function feedbackDraft(deps: FeedbackDraftDeps, text: string): Promise<FeedbackDraft> {
+  const trimmed = feedbackText(text);
+  const models = await installedFeedbackModels(deps);
+  const model = feedbackModel(deps.rooms, models);
+  const outcome = await postFeedbackDraft(deps, model, trimmed);
+  return feedbackOutcome(outcome, model);
+}
+
+function feedbackText(text: string): string {
   const trimmed = text.trim();
   if (trimmed === "") {
     throw new Error("Write a few words about what happened first.");
   }
+  return trimmed;
+}
 
+async function installedFeedbackModels(deps: FeedbackDraftDeps): Promise<string[]> {
   const listModels = deps.listModels ?? listModelsReal;
   let models: string[];
   try {
     models = await listModels();
   } catch {
-    throw new Error("The local AI (Ollama) isn't running — you can still write the issue yourself.");
+    unavailableFeedbackModels();
   }
+  return requireFeedbackModels(models);
+}
+
+function unavailableFeedbackModels(): never {
+  throw new Error("The local AI (Ollama) isn't running — you can still write the issue yourself.");
+}
+
+function requireFeedbackModels(models: string[]): string[] {
   if (models.length === 0) {
     throw new Error("No local AI model is installed — you can still write the issue yourself.");
   }
+  return models;
+}
 
-  const room: RoomHandle | null = deps.rooms.current();
-  let model = (room !== null ? modelSetting(room.db) : null) ?? bestLocalDefault(models);
-  if (!runsOnThisMac(model)) {
-    model = bestLocalDefault(models);
-  }
+function feedbackModel(rooms: RoomSource, models: readonly string[]): string {
+  const candidate = roomFeedbackModel(rooms) ?? bestLocalDefault(models);
+  return runsOnThisMac(candidate) ? candidate : bestLocalDefault(models);
+}
 
-  const body = { model, base_url: resolvedBaseUrl(), text: trimmed };
+function roomFeedbackModel(rooms: RoomSource): string | null {
+  const room: RoomHandle | null = rooms.current();
+  return room === null ? null : modelSetting(room.db);
+}
+
+function postFeedbackDraft(deps: FeedbackDraftDeps, model: string, text: string): Promise<SidecarPostOutcome> {
   const post = deps.post ?? sidecarJsonCancellable;
-  const outcome = await post("/feedback_draft", body, neverCancelled());
+  const body = { model, base_url: resolvedBaseUrl(), text };
+  return post("/feedback_draft", body, neverCancelled());
+}
 
+function feedbackOutcome(outcome: SidecarPostOutcome, model: string): FeedbackDraft {
   switch (outcome.kind) {
     case "value":
       return readDraft(outcome.value);

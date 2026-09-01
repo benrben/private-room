@@ -42,6 +42,7 @@ import {
   provenanceToJson,
   stageArtifact,
   type Provenance,
+  type Staged,
 } from "./db-host/artifacts.js";
 import type { FileMeta } from "./db-host/files.js";
 import { availableName, getFileMeta, setFileExtractedText } from "./db-host/files.js";
@@ -58,6 +59,109 @@ function extensionOf(name: string): string {
   const base = name.split(/[/\\]/).pop() ?? name;
   const idx = base.lastIndexOf(".");
   return idx <= 0 ? "" : base.slice(idx + 1).toLowerCase();
+}
+
+interface GeneratedArtifactRow {
+  id: string;
+  storage_kind: string;
+}
+
+interface WorkspaceArtifactWrite {
+  id: string;
+  versioned: boolean;
+}
+
+function cancelRequested(cancel: CancelFlag | null): boolean {
+  return cancel !== null && cancel.load();
+}
+
+function discardStagedBestEffort(db: Database.Database, stagedId: string): void {
+  try {
+    discardStaged(db, stagedId);
+  } catch {
+    // The sweep on the next room open is the backstop.
+  }
+}
+
+function throwStoppedBeforeSave(db: Database.Database, staged: Staged): never {
+  discardStagedBestEffort(db, staged.id);
+  throw new Error(`Stopped before "${staged.name}" was saved — nothing was written to the room.`);
+}
+
+function commitStagedOrDiscard(db: Database.Database, staged: Staged): Written {
+  try {
+    const [meta, versioned] = commitStaged(db, staged.id);
+    return { meta, versioned };
+  } catch (error) {
+    discardStagedBestEffort(db, staged.id);
+    throw error;
+  }
+}
+
+function existingGeneratedArtifact(db: Database.Database, name: string): GeneratedArtifactRow | undefined {
+  return db.prepare(
+    `SELECT id, storage_kind FROM files
+     WHERE source = 'generated' AND trashed_at IS NULL
+       AND (lower(artifact_key) = lower(?)
+            OR (artifact_key IS NULL AND lower(name) = lower(?)))
+     ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+  ).get(name, name) as GeneratedArtifactRow | undefined;
+}
+
+async function replaceGeneratedWorkspaceArtifact(
+  workspace: WorkspaceService,
+  existing: GeneratedArtifactRow,
+  bytes: Buffer,
+  text: string,
+): Promise<string> {
+  if (existing.storage_kind !== "workspace") {
+    await workspace.materializeLiveBlobFile(existing.id);
+  }
+  const current = workspace.db.prepare("SELECT content_sha256 FROM files WHERE id = ?")
+    .get(existing.id) as { content_sha256: string | null };
+  await workspace.snapshotVersion(existing.id, "AI regenerated");
+  await workspace.writeAtomic(existing.id, Readable.from([bytes]), current.content_sha256 ?? undefined);
+  setFileExtractedText(workspace.db, existing.id, text);
+  return existing.id;
+}
+
+async function createGeneratedWorkspaceArtifact(
+  workspace: WorkspaceService,
+  name: string,
+  bytes: Buffer,
+  text: string,
+): Promise<string> {
+  const free = availableName(workspace.db, name);
+  const entry = await workspace.createFile(free, Readable.from([bytes]), "generated");
+  setFileExtractedText(workspace.db, entry.fileId, text);
+  return entry.fileId;
+}
+
+async function writeWorkspaceArtifact(
+  workspace: WorkspaceService,
+  name: string,
+  bytes: Buffer,
+  text: string,
+): Promise<WorkspaceArtifactWrite> {
+  const existing = existingGeneratedArtifact(workspace.db, name);
+  if (existing !== undefined) {
+    return { id: await replaceGeneratedWorkspaceArtifact(workspace, existing, bytes, text), versioned: true };
+  }
+  return { id: await createGeneratedWorkspaceArtifact(workspace, name, bytes, text), versioned: false };
+}
+
+function finishWorkspaceArtifact(
+  db: Database.Database,
+  staged: Staged,
+  id: string,
+  mime: string,
+  provenance: string | null,
+): void {
+  db.transaction(() => {
+    db.prepare("UPDATE files SET mime_type = ?, provenance = ?, artifact_key = ? WHERE id = ?")
+      .run(mime, provenance, staged.name, id);
+    discardStaged(db, staged.id);
+  })();
 }
 
 /** What a committed artifact turned out to be. `versioned` is true when this
@@ -155,29 +259,8 @@ export class Artifact {
   commit(db: Database.Database): Written {
     const bytes = Buffer.from(this.content, "utf8");
     const staged = stageArtifact(db, this.name, this.mime, bytes, this.indexedText ?? this.content, this.prov);
-    if (this.cancel !== null && this.cancel.load()) {
-      // Discarding is best-effort — the sweep on the next room open is the
-      // backstop — but the REPORT must be exact: nothing was saved.
-      try {
-        discardStaged(db, staged.id);
-      } catch {
-        // best-effort, mirrors the Rust `let _ = db::discard_staged(..)`
-      }
-      throw new Error(
-        `Stopped before "${staged.name}" was saved — nothing was written to the room.`
-      );
-    }
-    try {
-      const [meta, versioned] = commitStaged(db, staged.id);
-      return { meta, versioned };
-    } catch (err) {
-      try {
-        discardStaged(db, staged.id);
-      } catch {
-        // best-effort, mirrors the Rust `let _ = db::discard_staged(..)`
-      }
-      throw err;
-    }
+    if (cancelRequested(this.cancel)) throwStoppedBeforeSave(db, staged);
+    return commitStagedOrDiscard(db, staged);
   }
 
   /**
@@ -191,57 +274,14 @@ export class Artifact {
     const bytes = Buffer.from(this.content, "utf8");
     const text = this.indexedText ?? this.content;
     const staged = stageArtifact(db, this.name, this.mime, bytes, text, this.prov);
-    if (this.cancel !== null && this.cancel.load()) {
-      try { discardStaged(db, staged.id); } catch { /* startup sweep is the backstop */ }
-      throw new Error(`Stopped before "${staged.name}" was saved — nothing was written to the room.`);
-    }
+    if (cancelRequested(this.cancel)) throwStoppedBeforeSave(db, staged);
     try {
       const provenance = provenanceToJson(this.prov);
-      const existing = db.prepare(
-        `SELECT id, storage_kind FROM files
-         WHERE source = 'generated' AND trashed_at IS NULL
-           AND (lower(artifact_key) = lower(?)
-                OR (artifact_key IS NULL AND lower(name) = lower(?)))
-         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
-      ).get(staged.name, staged.name) as { id: string; storage_kind: string } | undefined;
-
-      let id: string;
-      let versioned: boolean;
-      if (existing !== undefined && existing.storage_kind === "workspace") {
-        const current = db.prepare("SELECT content_sha256 FROM files WHERE id = ?")
-          .get(existing.id) as { content_sha256: string | null };
-        await workspace.snapshotVersion(existing.id, "AI regenerated");
-        await workspace.writeAtomic(existing.id, Readable.from([bytes]), current.content_sha256 ?? undefined);
-        setFileExtractedText(db, existing.id, text);
-        id = existing.id;
-        versioned = true;
-      } else if (existing !== undefined) {
-        // Heal output left by an older/missed writer, then version the stable
-        // id through the normal workspace path. Never fall back to committing
-        // current bytes into SQLCipher for a workspace room.
-        await workspace.materializeLiveBlobFile(existing.id);
-        const current = db.prepare("SELECT content_sha256 FROM files WHERE id = ?")
-          .get(existing.id) as { content_sha256: string | null };
-        await workspace.snapshotVersion(existing.id, "AI regenerated");
-        await workspace.writeAtomic(existing.id, Readable.from([bytes]), current.content_sha256 ?? undefined);
-        setFileExtractedText(db, existing.id, text);
-        id = existing.id;
-        versioned = true;
-      } else {
-        const free = availableName(db, staged.name);
-        const entry = await workspace.createFile(free, Readable.from([bytes]), "generated");
-        setFileExtractedText(db, entry.fileId, text);
-        id = entry.fileId;
-        versioned = false;
-      }
-      db.transaction(() => {
-        db.prepare("UPDATE files SET mime_type = ?, provenance = ?, artifact_key = ? WHERE id = ?")
-          .run(this.mime, provenance, staged.name, id);
-        discardStaged(db, staged.id);
-      })();
-      return { meta: getFileMeta(db, id), versioned };
+      const written = await writeWorkspaceArtifact(workspace, staged.name, bytes, text);
+      finishWorkspaceArtifact(db, staged, written.id, this.mime, provenance);
+      return { meta: getFileMeta(db, written.id), versioned: written.versioned };
     } catch (error) {
-      try { discardStaged(db, staged.id); } catch { /* startup sweep is the backstop */ }
+      discardStagedBestEffort(db, staged.id);
       throw error;
     }
   }

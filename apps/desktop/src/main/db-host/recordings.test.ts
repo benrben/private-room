@@ -15,6 +15,7 @@
 
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
+import { Readable } from "node:stream";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -29,13 +30,16 @@ import {
   updateFileContent,
 } from "./files.js";
 import { decodeWav, encodeWav } from "../recFormat.js";
+import type { WorkspaceService } from "../workspace/workspaceService.js";
 import {
   appendRecChunk,
   clearRecChunks,
   finalizeRecAudio,
+  finalizeRecAudioHybrid,
   getRecMeta,
   recordingsMissingRead,
   recoverRecChunks,
+  recoverRecChunksHybrid,
   setRecMeta,
 } from "./recordings.js";
 
@@ -154,6 +158,20 @@ describe("recoverRecChunks", () => {
     expect(chunkCount(db, id)).toBe(0);
   });
 
+  it("builds a WAV from checkpoints when the recording has no initial bytes", () => {
+    const db = freshRoom();
+    const id = addFile(db, "just-started.wav", "checkpointed transcript");
+    db.prepare("UPDATE files SET original_bytes = NULL WHERE id = ?").run(id);
+    appendRecChunk(db, id, new Float32Array([0.25, -0.25]));
+
+    expect(recoverRecChunks(db)).toBe(1);
+    const rescued = decodeWav(getFileBytes(db, id) as Buffer);
+    expect(rescued).toHaveLength(2);
+    expect(rescued[0]).toBeCloseTo(0.25, 3);
+    expect(rescued[1]).toBeCloseTo(-0.25, 3);
+    expect(getFileExtractedText(db, id)).toBe("checkpointed transcript");
+  });
+
   it("does not let a trashed recording take the crash rescue of the others down with it", () => {
     const db = freshRoom();
     const deletedId = addFile(db, "old call.wav", "(live recording)");
@@ -193,6 +211,87 @@ describe("recoverRecChunks", () => {
     expect(chunkCount(db, goodId)).toBe(0);
     // …and the damaged one keeps its tail for the next attempt.
     expect(chunkCount(db, damagedId)).toBe(1);
+  });
+});
+
+describe("recoverRecChunksHybrid", () => {
+  it("falls back to the encrypted database path when a recording is not workspace-backed", async () => {
+    const db = freshRoom();
+    const id = addFile(db, "database.wav", "placeholder");
+    appendRecChunk(db, id, new Float32Array([0.25]));
+    const wav = encodeWav(new Float32Array([0.5]));
+    const workspace = {
+      async readBuffer(): Promise<Buffer> {
+        throw new Error("the database fallback must not read the workspace");
+      },
+      async writeAtomic(): Promise<void> {
+        throw new Error("the database fallback must not write the workspace");
+      },
+    } as unknown as WorkspaceService;
+
+    await finalizeRecAudioHybrid(db, workspace, id, wav, "saved transcript");
+
+    expect(getFileBytes(db, id)?.equals(wav)).toBe(true);
+    expect(getFileExtractedText(db, id)).toBe("saved transcript");
+    expect(chunkCount(db, id)).toBe(0);
+    await expect(
+      finalizeRecAudioHybrid(db, workspace, "missing-recording", wav, null),
+    ).rejects.toThrow(/no longer in the room/);
+  });
+
+  it("rescues workspace and database recordings, skips trashed rows, and retains a failed workspace tail", async () => {
+    const db = freshRoom();
+    const workspaceId = addFile(db, "workspace.wav", "placeholder");
+    const failedWorkspaceId = addFile(db, "failed-workspace.wav", "placeholder");
+    const databaseId = addFile(db, "database.wav", "placeholder");
+    const trashedId = addFile(db, "trashed.wav", "placeholder");
+    const workspaceBase = encodeWav(new Float32Array([0.25]));
+    const databaseBase = encodeWav(new Float32Array([0.5]));
+    const workspaceBytes = new Map([[workspaceId, Buffer.from(workspaceBase)]]);
+    let workspaceFailure = true;
+
+    updateFileContent(db, databaseId, databaseBase, "database text");
+    for (const id of [workspaceId, failedWorkspaceId]) {
+      db.prepare("UPDATE files SET storage_kind = 'workspace', original_bytes = NULL WHERE id = ?").run(id);
+    }
+    appendRecChunk(db, workspaceId, new Float32Array([0.75]));
+    appendRecChunk(db, failedWorkspaceId, new Float32Array([0.1]));
+    appendRecChunk(db, databaseId, new Float32Array([1]));
+    appendRecChunk(db, trashedId, new Float32Array([0.2]));
+    trashFile(db, trashedId, { kind: "user" });
+
+    const workspace = {
+      async readBuffer(fileId: string): Promise<Buffer> {
+        if (fileId === failedWorkspaceId && workspaceFailure) {
+          throw new Error("workspace unavailable");
+        }
+        return workspaceBytes.get(fileId) ?? Buffer.alloc(0);
+      },
+      async writeAtomic(fileId: string, content: Readable): Promise<void> {
+        const chunks: Buffer[] = [];
+        for await (const chunk of content) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        workspaceBytes.set(fileId, Buffer.concat(chunks));
+      },
+    } as unknown as WorkspaceService;
+
+    await expect(recoverRecChunksHybrid(db, workspace)).rejects.toThrow(/1 of 4 interrupted recording/);
+
+    const rescuedWorkspace = decodeWav(workspaceBytes.get(workspaceId) as Buffer);
+    expect(rescuedWorkspace).toHaveLength(2);
+    expect(rescuedWorkspace[1]).toBeCloseTo(0.75, 3);
+    expect(decodeWav(getFileBytes(db, databaseId) as Buffer)[1]).toBeCloseTo(1, 3);
+    expect(chunkCount(db, workspaceId)).toBe(0);
+    expect(chunkCount(db, databaseId)).toBe(0);
+    expect(chunkCount(db, failedWorkspaceId)).toBe(1);
+    expect(chunkCount(db, trashedId)).toBe(1);
+
+    // Once its storage comes back, the retained tail is retried independently
+    // and the all-success path reports the recovered count.
+    workspaceFailure = false;
+    await expect(recoverRecChunksHybrid(db, workspace)).resolves.toBe(1);
+    expect(chunkCount(db, failedWorkspaceId)).toBe(0);
   });
 });
 

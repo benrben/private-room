@@ -1,0 +1,117 @@
+
+.sheet-notes > summary {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  min-height: 26px;
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  /* The UA's disclosure triangle is replaced by a drawn caret in the
+     markup, which can be rotated and which inherits the row's ink. */
+  list-style: none;
+}
+.sheet-notes > summary::-webkit-details-marker {
+  display: none;
+}
+.sheet-notes > summary:hover {
+  background: var(--hover);
+}
+.sheet-notes > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.sheet-notes-caret {
+  flex: 0 0 auto;
+  width: 0.9em;
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  transition: transform var(--dur-fast) var(--ease-pen);
+}
+.sheet-notes[open] .sheet-notes-caret {
+  transform: rotate(90deg);
+}
+.sheet-notes-label {
+  flex: 0 0 auto;
+  color: var(--text-strong);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+/* The glance: counts the sheet worked out. Sans, and a tier under the label
+   beside it, so it reads as data rather than as a second heading. */
+.sheet-notes-glance {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--faint);
+}
+
+.sheet-notes-fields {
+  margin: 0;
+  padding: var(--sp-1) var(--sp-2) var(--sp-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  /* A long list of notes must never push the grid off the pane. */
+  max-height: 32vh;
+  overflow-y: auto;
+}
+/* A notebook field: the key written in the margin, the note beside it. */
+.sheet-note {
+  display: grid;
+  grid-template-columns: 8.5rem minmax(0, 1fr);
+  gap: var(--sp-1) var(--sp-3);
+  align-items: baseline;
+}
+.sheet-note > dt {
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  text-align: right;
+}
+.sheet-note > dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--text);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+/* References, counts and ranges inside a note are technical data. */
+.sheet-note code {
+  font-family: var(--mono);
+  font-size: 0.94em;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-strong);
+}
+/* A narrow pane folds the field onto two lines rather than squeezing the
+   note into a 12-character column. */
+@container (max-width: 460px) {
+  .sheet-note {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .sheet-note > dt {
+    text-align: left;
+  }
+}
+
+/* The column-trim line stays OUTSIDE the notes panel: a wide report that
+   silently stops at column BH reads as "those columns aren't in the file",
+   so that sentence can never be behind a disclosure. */
+.sheet-view > .viewer-status:last-child {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sheet-notes-caret {
+    transition: none;
+  }
+}

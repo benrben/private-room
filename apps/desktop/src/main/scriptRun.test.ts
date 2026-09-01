@@ -35,6 +35,8 @@
  */
 
 import { randomUUID } from "node:crypto";
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -45,6 +47,8 @@ import { CancelFlag } from "./cancel.js";
 import { createRoom } from "./db-host/open.js";
 import { getFileBytes, insertFile } from "./db-host/files.js";
 import type { RoomHandle, RoomSource } from "./jobs.js";
+import { createRoomFile } from "./workspace/roomContent.js";
+import { createWorkspaceRoom } from "./workspace/roomLayout.js";
 import {
   DEFAULT_TIMEOUT_SECS,
   MAX_AUTO_MATERIALIZE,
@@ -60,9 +64,11 @@ import {
   type ScriptRunDeps,
   cachedPathPrefix,
   executeScriptInWorkspace,
+  exitedWithinForTests,
   guessMime,
   hasDeps,
   importOutputs,
+  importModifiedOutputsForTest,
   interpreterPolicy,
   isModifiedUsedFile,
   makeWorkspace,
@@ -74,6 +80,7 @@ import {
   python3Bin,
   referencedRoomFiles,
   resetBinCachesForTests,
+  removeScriptWorkspaceForTests,
   resolveInterpreter,
   resolveScriptFile,
   runScriptProcess,
@@ -83,6 +90,8 @@ import {
   scriptRunsRoot,
   setCachedPathPrefix,
   sweepScriptWorkspaces,
+  terminateGroupForTests,
+  killGroupForTests,
   uvBin,
 } from "./scriptRun.js";
 
@@ -256,6 +265,14 @@ describe("parseScriptManifest", () => {
     const m = parseScriptManifest("a.py", "# Room-Inputs: A.csv\n# ROOM-SHORTCUT: none\n");
     expect(m.inputs).toEqual(["A.csv"]);
     expect(m.shortcut).toBe("none");
+  });
+
+  it("preserves an explicit file shortcut", () => {
+    expect(parseScriptManifest("a.py", "# room-shortcut: file\n").shortcut).toBe("file");
+  });
+
+  it("ignores an invalid explicit shortcut and falls back from the manifest shape", () => {
+    expect(parseScriptManifest("a.py", "# room-shortcut: launch-everywhere\n").shortcut).toBe("none");
   });
 });
 
@@ -498,6 +515,41 @@ describe("makeWorkspace / sweepScriptWorkspaces", () => {
     expect(fs.existsSync(sentinel)).toBe(true);
     // Sweeping a cache dir with no script-runs/ at all is a harmless no-op.
     expect(() => sweepScriptWorkspaces(cache)).not.toThrow();
+  });
+
+  it("treats workspace deletion failures as best-effort cleanup", () => {
+    const refuse = (): never => { throw new Error("fabricated cleanup refusal"); };
+    const cache = tmpDir("fabricated-cleanup-failure");
+    expect(() => sweepScriptWorkspaces(cache, refuse)).not.toThrow();
+    expect(() => makeWorkspace(cache, "job", 1, refuse)).not.toThrow();
+    expect(() => removeScriptWorkspaceForTests(path.join(cache, "fabricated-cleanup-failure"), refuse)).not.toThrow();
+  });
+});
+
+describe("process escalation seams", () => {
+  it("observes the timer path when a child does not exit", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    Object.assign(child, { exitCode: null, signalCode: null });
+    await expect(exitedWithinForTests(child, 0)).resolves.toBe(false);
+  });
+
+  it("swallows a signal failure for an already-absent process group", () => {
+    expect(() => killGroupForTests(2_147_483_647, "SIGTERM")).not.toThrow();
+  });
+
+  it("escalates from TERM to KILL when the direct child does not exit", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    const signals: NodeJS.Signals[] = [];
+    let exitChecks = 0;
+    let goneChecks = 0;
+    await terminateGroupForTests(child, 4242, {
+      signal: (_pid, signal) => signals.push(signal),
+      exited: async () => { exitChecks += 1; return false; },
+      gone: async () => { goneChecks += 1; return true; },
+    });
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(exitChecks).toBe(2);
+    expect(goneChecks).toBe(1);
   });
 });
 
@@ -769,6 +821,41 @@ describe("importOutputs", () => {
     const { imported } = importOutputs(room.db, ws, manifestOut(["result.csv"]), [], "s.py", "c");
     expect(imported).toHaveLength(1);
     expect(getFileBytes(room.db, imported[0]!.id)?.toString()).toBe("arbitrary local file content");
+  });
+
+  it("handles an unreadable workspace and a vanished materialized file", () => {
+    const room = freshRoom();
+    const missingWorkspace = path.join(tmpDir("script-run-missing"), "gone");
+    const result = importOutputs(
+      room.db,
+      missingWorkspace,
+      manifestOut([]),
+      [{ name: "vanished.csv", sha: scriptFingerprint(Buffer.from("before")) }],
+      "s.py",
+      "c",
+    );
+    expect(result).toEqual({ imported: [], skipped: [] });
+  });
+
+  it("refuses an oversized modified materialized input before saving it back", () => {
+    const room = freshRoom();
+    const input = insertFile(room.db, "huge.bin", "application/octet-stream", Buffer.from("old"), null, "upload");
+    const oversized = Buffer.from("changed");
+    Object.defineProperty(oversized, "length", { value: 64 * 1024 * 1024 + 1 });
+    const result = importModifiedOutputsForTest(
+      room.db,
+      "/fabricated-workspace",
+      [{ name: "huge.bin", sha: scriptFingerprint(Buffer.from("old")) }],
+      [],
+      "c",
+      {
+        readMaterialized: () => oversized,
+        writeOutput: () => { throw new Error("must not save oversized bytes"); },
+      },
+    );
+    expect(result.imported).toEqual([]);
+    expect(result.skipped).toEqual(["huge.bin: over the 64MB import cap — not saved back"]);
+    expect(getFileBytes(room.db, input.id)).toEqual(Buffer.from("old"));
   });
 });
 
@@ -1334,6 +1421,58 @@ describe("the uv auto-heal retry loop (deterministic, fake executor)", () => {
       runScriptProcess(deps, "job-nouv", 0, room.path, file.id, scriptFingerprint(bytes), null, new CancelFlag())
     ).rejects.toThrow(/dependencies line/);
     expect(calls).toBe(1);
+  });
+
+  it("reports a nonzero exit code when the script produced no stderr", async () => {
+    const { room, fileId, sha } = healRoom("print('nothing on stderr')\n");
+    const deps = depsFor(room, tmpDir("script-run-cache"), {
+      execute: async () => ({ exitCode: 23, stdoutTail: "", stderrTail: "" }),
+    });
+    await expect(
+      runScriptProcess(deps, "job-no-stderr", 0, room.path, fileId, sha, null, new CancelFlag())
+    ).rejects.toThrow("The script exited with code 23.");
+  });
+});
+
+describe("runScriptProcess — workspace-folder output import", () => {
+  it("writes declared output bytes through the workspace room store", async () => {
+    const root = path.join(tmpDir("script-run-workspace"), "Workspace Room");
+    const created = createWorkspaceRoom(root, "correct horse battery staple", "Workspace Room");
+    openDbs.push(created.db);
+    const room = { db: created.db, path: created.descriptor.path };
+    const source = "// room-outputs: report.txt\nconsole.log('ok')\n";
+    const bytes = Buffer.from(source);
+    const file = await createRoomFile(
+      room,
+      "emit.js",
+      "text/javascript",
+      bytes,
+      source,
+      "upload",
+    );
+    const deps = depsFor(room, tmpDir("script-run-cache"), {
+      execute: async (ws) => {
+        fs.writeFileSync(path.join(ws, "report.txt"), "saved to workspace");
+        return OK;
+      },
+    });
+
+    const report = await runScriptProcess(
+      deps,
+      "job-workspace-import",
+      0,
+      room.path,
+      file.id,
+      scriptFingerprint(bytes),
+      null,
+      new CancelFlag(),
+    );
+
+    expect(report.imported.map((item) => item.name)).toContain("report.txt");
+    expect(fs.readFileSync(path.join(root, "report.txt"), "utf8")).toBe("saved to workspace");
+    expect(
+      room.db.prepare("SELECT storage_kind FROM files WHERE name = 'report.txt'").get(),
+    ).toEqual({ storage_kind: "workspace" });
   });
 });
 

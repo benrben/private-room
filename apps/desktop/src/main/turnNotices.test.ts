@@ -97,4 +97,8 @@ describe("claimsUnbackedAction", () => {
     const text = "I cannot see the screenshot.\nI've updated the file with the fix.";
     expect(claimsUnbackedAction(text, false, false)).toBe(true);
   });
+  it("continues after a negated matching claim to inspect a later line", () => {
+    const text = "I've updated nothing, not really.\nI've updated the file with the fix.";
+    expect(claimsUnbackedAction(text, false, false)).toBe(true);
+  });
 });

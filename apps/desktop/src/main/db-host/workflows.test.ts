@@ -137,6 +137,16 @@ describe("workflow CRUD + run/schedule cascade", () => {
     expect(listWorkflows(db).map((x) => x.id)).toEqual([a, b]);
     db.close();
   });
+
+  it("reads malformed legacy JSON as the documented safe defaults", () => {
+    const db = freshRoom();
+    const id = createWorkflow(db, "legacy", "", "", def(), "user", { scope: "file" });
+    db.prepare("UPDATE workflows SET definition = 'bad', binding = 'bad' WHERE id = ?").run(id);
+    const workflow = getWorkflow(db, id);
+    expect(workflow.definition).toBeNull();
+    expect(workflow.binding).toEqual({ scope: "general" });
+    db.close();
+  });
 });
 
 describe("schedules", () => {

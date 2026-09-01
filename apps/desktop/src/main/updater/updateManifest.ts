@@ -103,11 +103,18 @@ const ALL_DIGITS_RE = /^\d+$/;
 function compareIdentifier(a: string, b: string): number {
   const aNum = ALL_DIGITS_RE.test(a);
   const bNum = ALL_DIGITS_RE.test(b);
-  if (aNum && bNum) {
-    const an = Number(a);
-    const bn = Number(b);
-    return an === bn ? 0 : an < bn ? -1 : 1;
-  }
+  if (aNum && bNum) return compareNumericIdentifier(a, b);
+  return compareMixedOrTextIdentifier(a, b, aNum, bNum);
+}
+
+function compareNumericIdentifier(a: string, b: string): number {
+  const an = Number(a);
+  const bn = Number(b);
+  if (an === bn) return 0;
+  return an < bn ? -1 : 1;
+}
+
+function compareMixedOrTextIdentifier(a: string, b: string, aNum: boolean, bNum: boolean): number {
   // SemVer §11.4.3: numeric identifiers always have LOWER precedence than
   // alphanumeric ones.
   if (aNum !== bNum) return aNum ? -1 : 1;
@@ -117,22 +124,47 @@ function compareIdentifier(a: string, b: string): number {
 /** SemVer 2.0.0 precedence (§11). Build metadata is ignored entirely, matching
  * both the spec and the `semver` crate's `Ord`. */
 export function compareSemVer(a: SemVer, b: SemVer): number {
-  if (a.major !== b.major) return a.major < b.major ? -1 : 1;
-  if (a.minor !== b.minor) return a.minor < b.minor ? -1 : 1;
-  if (a.patch !== b.patch) return a.patch < b.patch ? -1 : 1;
+  const core = compareSemVerCore(a, b);
+  if (core !== 0) return core;
+  return comparePrerelease(a.prerelease, b.prerelease);
+}
+
+function compareSemVerCore(a: SemVer, b: SemVer): number {
+  const pairs: ReadonlyArray<readonly [number, number]> = [
+    [a.major, b.major],
+    [a.minor, b.minor],
+    [a.patch, b.patch],
+  ];
+  for (const [left, right] of pairs) {
+    if (left !== right) return left < right ? -1 : 1;
+  }
+  return 0;
+}
+
+function prereleaseAbsenceResult(a: string[], b: string[]): number {
   // §11.3: a prerelease has LOWER precedence than the same core version without.
-  if (a.prerelease.length === 0 && b.prerelease.length > 0) return 1;
-  if (a.prerelease.length > 0 && b.prerelease.length === 0) return -1;
-  const len = Math.max(a.prerelease.length, b.prerelease.length);
+  if (a.length === 0 && b.length > 0) return 1;
+  if (a.length > 0 && b.length === 0) return -1;
+  return 0;
+}
+
+function comparePrereleaseIdentifiers(a: string[], b: string[]): number {
+  const len = Math.max(a.length, b.length);
   for (let i = 0; i < len; i++) {
-    const ai = a.prerelease[i];
-    const bi = b.prerelease[i];
+    const ai = a[i];
+    const bi = b[i];
     if (ai === undefined) return -1; // fewer identifiers ⇒ lower precedence
     if (bi === undefined) return 1;
     const c = compareIdentifier(ai, bi);
     if (c !== 0) return c;
   }
   return 0;
+}
+
+function comparePrerelease(a: string[], b: string[]): number {
+  const absence = prereleaseAbsenceResult(a, b);
+  if (absence !== 0 || a.length === 0) return absence;
+  return comparePrereleaseIdentifiers(a, b);
 }
 
 /**
@@ -152,11 +184,16 @@ const RFC3339_RE =
   /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|([+-])(\d{2}):(\d{2}))$/;
 
 function daysInMonth(year: number, month: number): number {
-  if (month === 2) {
-    const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
-    return leap ? 29 : 28;
-  }
-  return month === 4 || month === 6 || month === 9 || month === 11 ? 30 : 31;
+  if (month === 2) return isLeapYear(year) ? 29 : 28;
+  return isThirtyDayMonth(month) ? 30 : 31;
+}
+
+function isLeapYear(year: number): boolean {
+  return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+}
+
+function isThirtyDayMonth(month: number): boolean {
+  return month === 4 || month === 6 || month === 9 || month === 11;
 }
 
 /**
@@ -175,21 +212,56 @@ function daysInMonth(year: number, month: number): number {
  * our own release script would never emit.
  */
 export function isValidRfc3339(s: string): boolean {
-  const m = RFC3339_RE.exec(s);
-  if (!m) return false;
-  const year = Number(m[1]);
-  const month = Number(m[2]);
-  const day = Number(m[3]);
-  const hour = Number(m[4]);
-  const minute = Number(m[5]);
-  const second = Number(m[6]);
-  if (month < 1 || month > 12) return false;
-  if (day < 1 || day > daysInMonth(year, month)) return false;
-  if (hour > 23 || minute > 59 || second > 60) return false;
-  if (m[7] !== undefined) {
-    if (Number(m[8]) > 23 || Number(m[9]) > 59) return false;
-  }
-  return true;
+  const parts = parseRfc3339Parts(s);
+  return parts !== null && hasValidRfc3339DateTime(parts) && hasValidRfc3339Offset(parts);
+}
+
+interface Rfc3339Parts {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+  offsetHour: number | null;
+  offsetMinute: number | null;
+}
+
+function parseRfc3339Parts(value: string): Rfc3339Parts | null {
+  const match = RFC3339_RE.exec(value);
+  if (match === null) return null;
+  return {
+    year: Number(match[1]),
+    month: Number(match[2]),
+    day: Number(match[3]),
+    hour: Number(match[4]),
+    minute: Number(match[5]),
+    second: Number(match[6]),
+    offsetHour: match[7] === undefined ? null : Number(match[8]),
+    offsetMinute: match[7] === undefined ? null : Number(match[9]),
+  };
+}
+
+function hasValidRfc3339DateTime(parts: Rfc3339Parts): boolean {
+  return hasValidRfc3339CalendarDate(parts) && hasValidRfc3339Clock(parts);
+}
+
+function hasValidRfc3339CalendarDate(parts: Rfc3339Parts): boolean {
+  if (parts.month < 1) return false;
+  if (parts.month > 12) return false;
+  if (parts.day < 1) return false;
+  return parts.day <= daysInMonth(parts.year, parts.month);
+}
+
+function hasValidRfc3339Clock(parts: Rfc3339Parts): boolean {
+  if (parts.hour > 23) return false;
+  if (parts.minute > 59) return false;
+  return parts.second <= 60;
+}
+
+function hasValidRfc3339Offset(parts: Rfc3339Parts): boolean {
+  if (parts.offsetHour === null || parts.offsetMinute === null) return true;
+  return parts.offsetHour <= 23 && parts.offsetMinute <= 59;
 }
 
 // ---------------------------------------------------------------- manifest
@@ -273,66 +345,97 @@ export function parseUpdateManifest(rawJson: string): UpdateManifest {
   return parseUpdateManifestValue(parsed);
 }
 
-/** {@link parseUpdateManifest} for an already-decoded JSON value. */
-export function parseUpdateManifestValue(parsed: unknown): UpdateManifest {
-  if (!isPlainObject(parsed)) {
+function manifestObject(value: unknown): Record<string, unknown> {
+  if (!isPlainObject(value)) {
     throw new ManifestParseError("manifest must be a JSON object");
   }
+  return value;
+}
 
-  const rawVersion = field(parsed, "version") ?? field(parsed, "name");
+function manifestVersion(value: Record<string, unknown>): string {
+  const rawVersion = field(value, "version") ?? field(value, "name");
   if (typeof rawVersion !== "string") {
     throw new ManifestParseError("manifest requires a string 'version' (or 'name') field");
   }
   const version = trimLeadingV(rawVersion);
-  parseSemVer(version); // validated eagerly — a bad version fails the manifest, not the comparison
+  parseSemVer(version);
+  return version;
+}
 
-  const rawNotes = field(parsed, "notes");
-  let notes: string | undefined;
-  if (!isAbsent(rawNotes)) {
-    if (typeof rawNotes !== "string") {
-      throw new ManifestParseError("manifest 'notes' must be a string");
-    }
-    notes = rawNotes;
+function manifestNotes(value: Record<string, unknown>): string | undefined {
+  const notes = field(value, "notes");
+  if (isAbsent(notes)) return undefined;
+  if (typeof notes !== "string") {
+    throw new ManifestParseError("manifest 'notes' must be a string");
   }
+  return notes;
+}
 
-  const rawPubDate = field(parsed, "pub_date");
-  let pubDate: string | undefined;
-  if (!isAbsent(rawPubDate)) {
-    if (typeof rawPubDate !== "string" || !isValidRfc3339(rawPubDate)) {
-      throw new ManifestParseError(
-        `manifest 'pub_date' must be RFC 3339 (e.g. "2026-08-21T21:42:18Z"), got ${JSON.stringify(rawPubDate)}`,
-      );
-    }
-    pubDate = rawPubDate;
+function manifestPublicationDate(value: Record<string, unknown>): string | undefined {
+  const pubDate = field(value, "pub_date");
+  if (isAbsent(pubDate)) return undefined;
+  if (typeof pubDate !== "string") {
+    throw new ManifestParseError(
+      `manifest 'pub_date' must be RFC 3339 (e.g. "2026-08-21T21:42:18Z"), got ${JSON.stringify(pubDate)}`,
+    );
   }
+  if (!isValidRfc3339(pubDate)) {
+    throw new ManifestParseError(
+      `manifest 'pub_date' must be RFC 3339 (e.g. "2026-08-21T21:42:18Z"), got ${JSON.stringify(pubDate)}`,
+    );
+  }
+  return pubDate;
+}
 
-  const rawTopUrl = field(parsed, "url");
-  const rawTopSignature = field(parsed, "signature");
-  if (!isAbsent(rawTopUrl)) requireUrl(rawTopUrl, "'url'");
-  if (!isAbsent(rawTopSignature) && typeof rawTopSignature !== "string") {
+function optionalTopLevelUrl(value: unknown): string | undefined {
+  if (isAbsent(value)) return undefined;
+  return requireUrl(value, "'url'");
+}
+
+function optionalTopLevelSignature(value: unknown): string | undefined {
+  if (isAbsent(value)) return undefined;
+  if (typeof value !== "string") {
     throw new ManifestParseError("manifest 'signature' must be a string");
   }
+  return value;
+}
 
-  const rawPlatforms = field(parsed, "platforms");
-  if (!isAbsent(rawPlatforms)) {
-    if (!isPlainObject(rawPlatforms)) {
-      throw new ManifestParseError("manifest 'platforms' must be an object");
-    }
-    // A Map, not a plain object: the keys come straight off the wire, and
-    // `platforms["__proto__"] = entry` on a `{}` would set the object's
-    // PROTOTYPE rather than an own property, while a lookup of `"constructor"`
-    // would resolve to a function instead of missing.
-    const platforms = new Map<string, ManifestPlatformEntry>();
-    for (const [key, value] of Object.entries(rawPlatforms)) {
-      platforms.set(key, parsePlatformEntry(value, key));
-    }
-    return { version, notes, pubDate, form: "static", platforms };
+interface TopLevelPlatformFields {
+  url: string | undefined;
+  signature: string | undefined;
+}
+
+function topLevelPlatformFields(value: Record<string, unknown>): TopLevelPlatformFields {
+  return {
+    url: optionalTopLevelUrl(field(value, "url")),
+    signature: optionalTopLevelSignature(field(value, "signature")),
+  };
+}
+
+function staticPlatforms(value: unknown): Map<string, ManifestPlatformEntry> | undefined {
+  if (isAbsent(value)) return undefined;
+  if (!isPlainObject(value)) {
+    throw new ManifestParseError("manifest 'platforms' must be an object");
   }
+  // Wire keys can include `__proto__` or `constructor`; a Map keeps both as
+  // ordinary own entries instead of following or changing a prototype.
+  const platforms = new Map<string, ManifestPlatformEntry>();
+  for (const [key, entry] of Object.entries(value)) {
+    platforms.set(key, parsePlatformEntry(entry, key));
+  }
+  return platforms;
+}
 
-  if (isAbsent(rawTopUrl)) {
+function dynamicManifest(
+  version: string,
+  notes: string | undefined,
+  pubDate: string | undefined,
+  fields: TopLevelPlatformFields,
+): UpdateManifest {
+  if (fields.url === undefined) {
     throw new ManifestParseError("the `url` field was not set on the updater response");
   }
-  if (isAbsent(rawTopSignature)) {
+  if (fields.signature === undefined) {
     throw new ManifestParseError("the `signature` field was not set on the updater response");
   }
   return {
@@ -340,8 +443,22 @@ export function parseUpdateManifestValue(parsed: unknown): UpdateManifest {
     notes,
     pubDate,
     form: "dynamic",
-    platform: { url: rawTopUrl as string, signature: rawTopSignature as string },
+    platform: { url: fields.url, signature: fields.signature },
   };
+}
+
+/** {@link parseUpdateManifest} for an already-decoded JSON value. */
+export function parseUpdateManifestValue(parsed: unknown): UpdateManifest {
+  const manifest = manifestObject(parsed);
+  const version = manifestVersion(manifest);
+  const notes = manifestNotes(manifest);
+  const pubDate = manifestPublicationDate(manifest);
+  const fields = topLevelPlatformFields(manifest);
+  const platforms = staticPlatforms(field(manifest, "platforms"));
+  if (platforms !== undefined) {
+    return { version, notes, pubDate, form: "static", platforms };
+  }
+  return dynamicManifest(version, notes, pubDate, fields);
 }
 
 // ------------------------------------------------------------- target keys

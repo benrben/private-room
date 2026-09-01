@@ -46,6 +46,22 @@ import {
 } from "./db-host/files.js";
 import { getSetting, setSetting } from "./db-host/settings.js";
 import type { RoomHandle, RoomSource } from "./jobs.js";
+
+// The production default reaches a real bundled sidecar. Keep every other
+// sidecar export real, but make its startup seam controllable for the one
+// regression that proves the default embedding path releases back to the pass.
+vi.mock("./sidecar.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./sidecar.js")>();
+  return { ...actual, ensureUp: vi.fn(actual.ensureUp) };
+});
+import { ensureUp } from "./sidecar.js";
+
+vi.mock("./workspace/roomContent.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./workspace/roomContent.js")>();
+  return { ...actual, readRoomFile: vi.fn(actual.readRoomFile) };
+});
+import { readRoomFile } from "./workspace/roomContent.js";
+
 import {
   type EmbedBackfillDeps,
   type EmbedFn,
@@ -356,6 +372,29 @@ describe("runEmbedBackfillPass", () => {
     db.close();
   });
 
+  it("uses the production sidecar default when an embedding seam is not supplied", async () => {
+    const db = freshRoom();
+    addFile(db, "default.txt", "text/plain", "the default sidecar route");
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ embeddings: [[1, 0, 0]] }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    vi.mocked(ensureUp).mockResolvedValue(`http://127.0.0.1:${port}`);
+
+    try {
+      const state = createEmbedBackfillState();
+      await expect(runEmbedBackfillPass({ rooms: fakeRooms(() => ({ db, path: ROOM })) }, state, 0))
+        .resolves.toEqual({ kind: "wrote", count: 1 });
+      expect(ensureUp).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.mocked(ensureUp).mockReset();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      db.close();
+    }
+  });
+
   it("skips a per-vector failure without counting it, and without aborting the batch", async () => {
     const db = freshRoom();
     addFile(db, "a.txt", "text/plain", "alpha content");
@@ -366,6 +405,26 @@ describe("runEmbedBackfillPass", () => {
       kind: "wrote",
       count: 1,
     });
+    expect(chunksMissingEmbedding(db, 10)).toHaveLength(1);
+    db.close();
+  });
+
+  it("continues when one embedding write is rejected by the database", async () => {
+    const db = freshRoom();
+    addFile(db, "a.txt", "text/plain", "alpha content");
+    addFile(db, "b.txt", "text/plain", "beta content");
+    const [first] = chunksMissingEmbedding(db, 10);
+    const firstId = first?.[0];
+    expect(firstId).toBeDefined();
+    db.exec(
+      `CREATE TRIGGER reject_first_embedding BEFORE UPDATE OF embedding ON chunks
+       WHEN OLD.id = '${firstId}' BEGIN SELECT RAISE(FAIL, 'simulated embedding write'); END;`,
+    );
+
+    const state = createEmbedBackfillState();
+    await expect(
+      runEmbedBackfillPass(deps(db, async (_model, texts) => texts.map(() => [1, 0, 0])), state, 0),
+    ).resolves.toEqual({ kind: "wrote", count: 1 });
     expect(chunksMissingEmbedding(db, 10)).toHaveLength(1);
     db.close();
   });
@@ -669,6 +728,76 @@ describe("runReextractBackfill", () => {
     db.close();
   });
 
+  it("skips a workspace entry whose normal file disappeared before the pass", async () => {
+    const { db, root, workspace } = freshWorkspace();
+    await workspace.createFile(
+      "gone.xlsx",
+      Readable.from([Buffer.from("normal file that disappears")]),
+      "upload",
+    );
+    rmSync(path.join(root, "gone.xlsx"));
+    const extractText = vi.fn(() => "must not receive missing bytes");
+
+    await runReextractBackfill({
+      rooms: fakeRooms(() => ({ db, path: root, workspace })),
+      roomEpoch: () => 0,
+      extractText,
+    });
+
+    expect(extractText).not.toHaveBeenCalled();
+    db.close();
+  });
+
+  it("skips a workspace entry whose reader has no bytes to extract", async () => {
+    const { db, root, workspace } = freshWorkspace();
+    const entry = await workspace.createFile(
+      "empty.xlsx",
+      Readable.from([Buffer.from("normal bytes")]),
+      "upload",
+    );
+    vi.mocked(readRoomFile).mockResolvedValueOnce({
+      name: "empty.xlsx",
+      mimeType: "application/vnd.ms-excel",
+      bytes: null,
+      extractedText: null,
+      storageKind: "workspace",
+    });
+    const extractText = vi.fn(() => "must not receive absent bytes");
+
+    try {
+      await runReextractBackfill({
+        rooms: fakeRooms(() => ({ db, path: root, workspace })),
+        roomEpoch: () => 0,
+        extractText,
+      });
+      expect(extractText).not.toHaveBeenCalled();
+      expect(getFileExtractedText(db, entry.fileId)).toBeNull();
+    } finally {
+      vi.mocked(readRoomFile).mockReset();
+      db.close();
+    }
+  });
+
+  it("treats an unreadable candidate query as an empty pass", async () => {
+    const db = freshRoom();
+    const unavailable = {
+      ...db,
+      prepare: () => {
+        throw new Error("simulated: files query unavailable");
+      },
+    } as unknown as Database.Database;
+    const extractText = vi.fn(() => "must not run");
+
+    await runReextractBackfill({
+      rooms: fakeRooms(() => ({ db: unavailable, path: ROOM })),
+      roomEpoch: () => 0,
+      extractText,
+    });
+
+    expect(extractText).not.toHaveBeenCalled();
+    db.close();
+  });
+
   it("discards workspace extraction when the normal file changes during extraction", async () => {
     const { db, root, workspace } = freshWorkspace();
     const entry = await workspace.createFile(
@@ -714,6 +843,27 @@ describe("runReextractBackfill", () => {
     });
     expect(getFileExtractedText(db, id)).toBe("42 43 44");
     expect(notify).toHaveBeenCalledTimes(1);
+    db.close();
+  });
+
+  it("continues after a failed extracted-text write without reporting a repair", async () => {
+    const db = freshRoom();
+    const id = addFile(db, "numbers.xlsx", "application/vnd.ms-excel", null);
+    db.exec(
+      `CREATE TRIGGER reject_extract BEFORE UPDATE OF extracted_text ON files
+       WHEN OLD.id = '${id}' BEGIN SELECT RAISE(FAIL, 'simulated text write'); END;`,
+    );
+    const notify = vi.fn();
+
+    await runReextractBackfill({
+      rooms: fakeRooms(() => ({ db, path: ROOM })),
+      roomEpoch: () => 0,
+      notifyFilesChanged: notify,
+      extractText: () => "recovered",
+    });
+
+    expect(getFileExtractedText(db, id)).toBeNull();
+    expect(notify).not.toHaveBeenCalled();
     db.close();
   });
 
@@ -957,6 +1107,46 @@ describe("runLegacyTextRepair", () => {
     expect(getFileMeta(db, id).aiSummary).toBeNull();
     expect(getSetting(db, RUST_REPAIR_STAMP)).toBe("1");
     expect(notify).toHaveBeenCalledTimes(1);
+    db.close();
+  });
+
+  it("continues from settings and candidate-query failures as an empty repair pass", async () => {
+    const db = freshRoom();
+    const unavailable = {
+      ...db,
+      prepare: () => {
+        throw new Error("simulated: room database unavailable");
+      },
+    } as unknown as Database.Database;
+    const extractText = vi.fn(() => "must not run");
+
+    await runLegacyTextRepair({
+      rooms: fakeRooms(() => ({ db: unavailable, path: ROOM })),
+      roomEpoch: () => 0,
+      extractText,
+    });
+
+    expect(extractText).not.toHaveBeenCalled();
+    db.close();
+  });
+
+  it("does not report a repair when reading and writing a candidate both fail", async () => {
+    const db = freshRoom();
+    addFile(db, "legacy.doc", "application/msword", "stale text");
+    const notify = vi.fn();
+
+    await runLegacyTextRepair(
+      repairDeps(db, {
+        notifyFilesChanged: notify,
+        extractText: () => {
+          db.exec("DROP TABLE files");
+          db.exec("DROP TABLE settings");
+          return "recovered text";
+        },
+      }),
+    );
+
+    expect(notify).not.toHaveBeenCalled();
     db.close();
   });
 

@@ -39,6 +39,7 @@ import {
   type JobQueueDeps,
   MAX_QUEUED,
   notImplementedRowStarter,
+  planString,
   podcastAudioRowStarter,
   pump,
   pumpOnOpen,
@@ -123,6 +124,14 @@ function deferredRender(): {
 }
 
 describe("tryReserve", () => {
+  it("reads only string fields from fabricated persisted job plans", () => {
+    expect(planString({ scriptFileId: "script-1", blank: "" }, "scriptFileId")).toBe("script-1");
+    expect(planString({ scriptFileId: "script-1", blank: "" }, "blank")).toBe("");
+    for (const plan of [null, [], "not a plan", 3, { scriptFileId: false }, {}]) {
+      expect(planString(plan, "scriptFileId")).toBeNull();
+    }
+  });
+
   it("reserve_is_single_slot", () => {
     const state = createJobQueueState();
     expect(tryReserve(state, "a")).toBe(true);
@@ -310,6 +319,19 @@ describe("submit / pump orchestration", () => {
     expect(getJob(db, id).status).toBe("error");
     expect(getJob(db, id).error).toBe(UNKNOWN_JOB_KIND);
     expect(deps.state.runningJob, "the slot is freed for the next job").toBeNull();
+    db.close();
+  });
+
+  it("releases the reserved slot when the submitted row cannot be read", async () => {
+    const db = freshRoom();
+    const { deps } = makeQueue(db);
+
+    await expect(submit(deps, "missing-job-row")).resolves.toBeUndefined();
+
+    expect(deps.state.runningJob, "the unreadable row cannot strand the queue").toBeNull();
+    expect(deps.cancelState.jobCancels.has("missing-job-row"), "no cancel flag was registered").toBe(
+      false,
+    );
     db.close();
   });
 

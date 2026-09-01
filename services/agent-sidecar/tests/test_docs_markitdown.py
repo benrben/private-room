@@ -27,6 +27,7 @@ import time
 
 import pytest
 
+from arcelle_sidecar.docs import markitdown
 from arcelle_sidecar.docs.markitdown import _run_markitdown, markitdown_extract
 
 _REAL_CANDIDATE_PATHS = ("/opt/homebrew/bin/markitdown", "/usr/local/bin/markitdown")
@@ -81,6 +82,18 @@ def test_run_markitdown_hang_is_killed_and_times_out(tmp_path):
     # the real 5s sleep finished -- finishing quickly proves it was killed,
     # not merely abandoned.
     assert elapsed < 3.0
+
+
+def test_run_markitdown_handles_an_already_exited_process_group(tmp_path, monkeypatch):
+    script = make_script(tmp_path / "short_hang.sh", "sleep 0.1")
+
+    def already_exited(*_args):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(markitdown.os, "killpg", already_exited)
+    result = _run_markitdown(script, str(tmp_path / "in.txt"), 0.0)
+    assert result.status == "timed_out"
+    assert result.text is None
 
 
 def test_run_markitdown_grandchild_holding_pipe_does_not_block_return(tmp_path):

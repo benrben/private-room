@@ -1,89 +1,41 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { closeWindow, confirm } from "./platform";
 import { Props, WorkArea, areaHoldsFile, isWorkArea } from "./workspace/types";
-import { useTabs, tabId, type Tab } from "./workspace/tabs";
+import { useTabs, type Tab } from "./workspace/tabs";
 import { useBrowserPages } from "./workspace/browserPages";
 import {
   newItemOf,
-  showsDocumentTabs,
   sidebarMenuLabel,
-  sidebarRegionLabel,
   type NewItemKind,
 } from "./workspace/destinations";
 import { libraryFiles } from "./workspace/fileVisibility";
-import TabStrip, { type TabTitleFacts } from "./shell/TabStrip";
-import { fileLabel } from "./workspace/composer";
-import { api, fileKindLabel, type ViewerKind } from "./api";
+import type { TabTitleFacts } from "./shell/TabStrip";
+import { api, fileKindLabel } from "./api";
 import { useWorkspaceState } from "./workspace/state";
 import { useWorkspaceActions, type WSActions } from "./workspace/actions";
 import { useWorkspaceEffects } from "./workspace/effects";
-import Overlays from "./workspace/Overlays";
 import TopBar from "./workspace/TopBar";
-import StudioModal from "./workspace/StudioModal";
-import CompareModal from "./workspace/CompareModal";
-import UnsavedEditsDialog from "./workspace/UnsavedEditsDialog";
-import AiActionModal from "./workspace/AiActionModal";
-import FeedbackModal from "./workspace/FeedbackModal";
-import SettingsModals from "./workspace/SettingsModals";
-import LibraryPane from "./workspace/Sidebar";
-import ViewerPane from "./workspace/ViewerPane";
-import AiPane from "./workspace/AiPane";
-import Toasts from "./workspace/Toasts";
 import { useLayout } from "./shell/useLayout";
 import { useNativeMenu } from "./shell/useNativeMenu";
-import ActivityRail from "./shell/ActivityRail";
-import CustomizeSidebar from "./shell/CustomizeSidebar";
-import Splitter from "./shell/Splitter";
 import StatusBar from "./shell/StatusBar";
-import ErrorBoundary from "./shell/ErrorBoundary";
 import { pendingApprovalCount, runningJobCount } from "./shell/activity";
 import { isCloudRoute } from "./workspace/markup";
-
-/** Which place the room was left in, so it reopens there. Sits beside
- * "workspace_tabs" (see workspace/tabs.ts) — same room, same lifetime, and
- * the two are read back together on the way in. */
-const AREA_SETTING = "workspace_area";
-
-/** Pages whose whole job is reading or capturing, where the AI column steps
- * aside on arrival so the document gets the width (see useLayout's
- * `setFocusedPage`). Long-form documents and recordings only: a spreadsheet, a
- * script or a note is something you work ON, usually with the assistant, and
- * closing its column would be taking a tool away mid-task. */
-const FOCUSED_KINDS = new Set<ViewerKind>([
-  "book",
-  "pdf",
-  "prose",
-  "email",
-  "worddoc",
-  "docx",
-  "slides",
-  "subtitle",
-  "recording",
-  "audio",
-  "video",
-]);
-
-/** The room workspace. A thin shell: state in useWorkspaceState, handlers in
- * useWorkspaceActions, backend-event wiring in useWorkspaceEffects — composed
- * into the full-window frame: top bar / activity rail / resizable three-pane
- * grid (Library | workspace | AI) / status bar. */
+import {
+  AREA_SETTING,
+  FOCUSED_KINDS,
+  WorkspaceModals,
+  WorkspacePanes,
+  WorkspaceReadOnlyBanner,
+  handleWorkspaceTabKeydown,
+  rememberedFileForArea,
+  restoreRememberedFile,
+  syncOpenFileTab,
+  workspaceArea,
+} from "./workspaceShell";
 export default function Workspace({ info, onLock, onRenamed }: Props) {
   const [registeringCopy, setRegisteringCopy] = useState(false);
   const s = useWorkspaceState(info);
   const actions = useWorkspaceActions(s, info, onLock);
-
-  /** Locking unmounts Monaco, and its buffer goes with it. The deliberate
-   * lock (the Lock button / ⌘L / the palette) asks first; the IDLE autolock
-   * deliberately does NOT — nobody is at the keyboard to answer, and a dialog
-   * that held the room open until someone came back would defeat the whole
-   * point of locking on idle. That is why the guard wraps the ACTION and
-   * `onLock` is handed on untouched (effects.ts calls it directly for the
-   * autolock).
-   *
-   * It has to sit in FRONT of `handleLock` rather than behind it: handleLock
-   * cancels the streaming answer and plays the seal sound before it locks, so
-   * asking afterwards meant "Cancel" left the room open with the answer
-   * already killed and a lock sound played for a lock that never happened. */
   const handleLock = useCallback(async () => {
     if (s.editModeRef.current && s.editorDirtyRef.current) {
       const go = await confirm(
@@ -95,19 +47,17 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     }
     await actions.handleLock();
   }, [s, actions]);
-
   const a: WSActions = { ...actions, handleLock };
   useWorkspaceEffects(s, a, info, onLock);
   // The PATH, not the name: the saved-layout key is a digest of it, so no room
   // name lands in plain browser storage and two same-named rooms in different
   // folders stop sharing (and overwriting) one layout.
   const layout = useLayout(info.path);
-
   // The "Customize sidebar" sheet. Local to the shell rather than in
   // `useWorkspaceState`: nothing outside this component raises it, and the
   // preferences it edits are their own device-wide store (shell/navPrefs).
   const [showCustomize, setShowCustomize] = useState(false);
-
+  const openCustomizeSidebar = useCallback(() => setShowCustomize(true), []);
   // ⌘Q raises NO window close request on macOS (the menu's Quit goes through
   // NSApplication terminate:, and tao only emits CloseRequested from
   // windowShouldClose:), so the guard above never sees it and the buffer went
@@ -157,27 +107,11 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     // Mount-once: reads refs only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
   // The rail's current area: full-pane flag views win, then the soft areas.
-  const area: WorkArea = s.showWorkflows
-    ? "workflows"
-    : s.showScripts
-      ? "scripts"
-      : s.showMap
-        ? "map"
-        : s.area;
-
-  /** The private browser's pages — their own typed, session-only state, listed
-   * by the Browser destination's contextual sidebar and nowhere else.
-   *
-   * `webOn` is what makes the browser exist at all; the second argument only
-   * changes how briskly the list reconciles with Rust. See
-   * workspace/browserPages.ts for why leaving the destination must not stop
-   * reconciling, and why none of this is ever written down. */
+  const area = workspaceArea(s);
   const pages = useBrowserPages(s.webOn, area === "browser", (message) =>
     s.pushToast("error", message),
   );
-
   // Keyed on the PATH, not the display name. The name is editable from the top
   // bar, and re-keying on it made a rename read as "a different room": the tab
   // list was re-read and the area restore ran again, closing whatever
@@ -191,9 +125,6 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
   // The tab list as of the latest render, for callbacks that run a tick later.
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
-
-  /** Put the app into the state a tab describes. The tab list is the source of
-   * truth; these flags are the machinery it drives. */
   const showArea = useCallback(
     (next: WorkArea) => {
       // Leaving a full-pane view is explicit; entering one uses its real
@@ -223,18 +154,7 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     },
     [a, s],
   );
-
-  /** Monaco holds ONE buffer — the tab that is showing. Anything that unmounts
-   * it takes the unsaved edit with it, so every such exit comes through here.
-   *
-   * This used to REFUSE, with a toast: "Save your edits first — or undo them —
-   * before switching tabs." That named a problem and offered no way out of it,
-   * and it only covered the tab strip; pressing Close on the viewer walked
-   * straight past and dropped the buffer with no warning at all. Now there is
-   * one question with three real answers, and `proceed` is the interrupted
-   * action, replayed. */
   const guardLeave = a.guardLeave;
-
   const activateTab = useCallback(
     (id: string) => {
       if (id === tabs.activeId) return;
@@ -242,14 +162,7 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     },
     [tabs, guardLeave],
   );
-
-  /** Files whose tab was closed, newest last — the ⇧⌘T stack.
-   *
-   * Files only, and deliberately: a private-browser page is not remembered
-   * anywhere, and a list of pages you could bring back is a history file
-   * wearing a different hat (the same reason page tabs are never persisted). */
   const reopenableRef = useRef<string[]>([]);
-
   const doCloseTab = useCallback(
     (id: string) => {
       const tab = tabsRef.current.tabs.find((t) => t.id === id);
@@ -272,7 +185,6 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     },
     [tabs, s],
   );
-
   const closeTab = useCallback(
     (id: string) => {
       if (id !== tabs.activeId) {
@@ -283,18 +195,6 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     },
     [tabs.activeId, doCloseTab, guardLeave],
   );
-
-  /** THE NEW-ITEM VERB OF THE CURRENT DESTINATION — what ⌘T and the sidebar
-   * header's button both call.
-   *
-   * ⌘T used to mean "new private browser page" from anywhere in the app,
-   * including the nine destinations with no browser on screen: pressing it in
-   * Skills navigated you out of Skills. It belongs to the destination now
-   * (see workspace/destinations.ts), and a destination with nothing to make
-   * simply does not claim the key.
-   *
-   * Every branch goes through `guardLeave`, because every one of them can
-   * unmount Monaco and take an unsaved buffer with it. */
   const newItem = useCallback(
     (kind: NewItemKind) => {
       const what =
@@ -328,25 +228,11 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     },
     [guardLeave, pages, a, s],
   );
-
-  /** ⌘T — whatever this destination makes, or nothing at all.
-   *
-   * The browser only exists while the room is allowed online, so an offline
-   * room's ⌘T must not try to open a page it cannot have. */
   const newItemHere = useCallback(() => {
     const kind = newItemOf(area);
     if (!kind || (kind === "page" && !s.webOn)) return;
     newItem(kind);
   }, [area, s.webOn, newItem]);
-
-  /** ⌘W — the active item of this destination, in the order a reader means it.
-   *
-   * The browser page on screen first, then the open document. With nothing to
-   * close the WINDOW closes, which is what ⌘W does on a Mac and what the
-   * predefined menu row this replaced always did — the difference is that it is
-   * now the last case rather than the only one, so ⌘W while reading a page can
-   * no longer quit Arcelle. Closing goes through the same unsaved-edits guard
-   * every other exit does. */
   const closeItemHere = useCallback(() => {
     if (area === "browser" && pages.activeId) {
       pages.close(pages.activeId);
@@ -362,7 +248,6 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     }
     void closeWindow();
   }, [area, pages, closeTab, guardLeave, s]);
-
   // Rail click = go there. Places used to earn a TAB as well, which is what
   // made the strip fill up with the same nine names the rail already lists;
   // the rail is now the only navigation and the strip holds documents (see
@@ -389,22 +274,7 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     newItem: newItemHere,
     closeItem: closeItemHere,
   });
-
-  /** THE LAST DOCUMENT EACH DESTINATION HAD OPEN.
-   *
-   * Selection is per destination, not global. Leaving Sketches for the browser
-   * and coming back must land on the same drawing; leaving Home for Sketches
-   * and coming back must land on the same document. One shared "open file"
-   * cannot express that — switching destinations clears it, which is right,
-   * and used to be the end of the story.
-   *
-   * A ref rather than state: nothing renders from it, and writing it during a
-   * switch must not schedule a second render in the middle of one. Not
-   * persisted, deliberately — `AREA_SETTING` and the tab list already restore
-   * a launch, and a per-destination map on disk would be a second, competing
-   * answer to the same question. */
   const lastFileRef = useRef<Partial<Record<WorkArea, string>>>({});
-
   const openArea = useCallback(
     (next: WorkArea) => {
       guardLeave("Opening this area", () => {
@@ -412,9 +282,7 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
         // destination actually held it. A document showing over a destination
         // that does not own it has already been moved Home by `showFileHere`
         // below, so this can never file a stray under the wrong place.
-        const leaving = s.openFileRef.current?.id ?? "";
-        lastFileRef.current[area] =
-          leaving && areaHoldsFile(area, leaving, s.files, s.scripts) ? leaving : "";
+        lastFileRef.current[area] = rememberedFileForArea(area, s);
         showArea(next);
         void api.setSetting(AREA_SETTING, next).catch(() => {
           /* a forgotten place is cosmetic; never disturb the room over it */
@@ -431,24 +299,11 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
         // the live file list, because a document deleted while you were
         // elsewhere must not reopen — and skipped for the browser, whose
         // selection is a live page and is restored by `useBrowserPages`.
-        const want = lastFileRef.current[next] ?? "";
-        if (want && s.files.some((f) => f.id === want)) void a.viewFile(want);
+        restoreRememberedFile(next, lastFileRef, s.files, a.viewFile);
       });
     },
     [showArea, guardLeave, tabs, area, s, a],
   );
-
-  /** Reopen the room in the place it was left.
-   *
-   * Runs once per room, and only AFTER the tab restore has finished — hence
-   * `tabs.restored`. showArea() closes the open file, so firing this while a
-   * file tab was still being restored would undo it.
-   *
-   * Two guards, both deliberate. A restored file tab wins: a document is a
-   * more specific place than the area behind it, and it is what the reader was
-   * actually looking at. And a saved value is only honoured if it is still a
-   * real area — the setting outlives the build that wrote it, so a renamed or
-   * retired area has to degrade to the default rather than wedge the room. */
   const areaRestoredFor = useRef("");
   useEffect(() => {
     if (!tabs.restored || areaRestoredFor.current === info.path) return;
@@ -463,7 +318,6 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
         /* opens at the default place, which is a fine outcome */
       });
   }, [tabs.restored, tabs.activeId, info.path, showArea]);
-
   // Every existing `setOpenFile` call site — citations, agent opens, the
   // library, Quick Actions, 21 of them — earns a tab for free by being watched
   // here instead of edited individually.
@@ -473,33 +327,11 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
   // the tab the user had just closed, and stole focus with it.
   const tabbedFileRef = useRef("");
   useEffect(() => {
-    if (!openFileId) {
-      tabbedFileRef.current = "";
-      return;
-    }
-    // The strip is HOME'S working set, so only what Home shows may earn a tab.
-    // A section-only sketch or creation appearing here would put it in Home by
-    // the back door — the one thing "section only" promises it will not do —
-    // and it is opened from its own destination's list anyway.
-    const meta = s.files.find((f) => f.id === openFileId);
-    if (meta && meta.libraryVisibility === "sectionOnly") {
-      tabbedFileRef.current = "";
-      return;
-    }
-    const name = meta?.name ?? "File";
-    if (tabbedFileRef.current === openFileId) {
-      // Same file, refreshed list: the only thing that can have changed is its
-      // name (a rename), so keep the strip honest without touching focus.
-      tabs.retitle(tabId("file", openFileId), fileLabel(name, s.files));
-      return;
-    }
-    tabbedFileRef.current = openFileId;
-    tabs.open("file", openFileId, fileLabel(name, s.files));
+    syncOpenFileTab({ files: s.files, openFileId, tabbedFileRef, tabs });
     // `tabs` is stable per render by identity of its callbacks; keying on the
     // file id is what makes this fire once per open rather than every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openFileId, s.files]);
-
   // ...and the other direction: showing a tab puts the app into its state.
   // Guarded by the id so this runs on a real switch, never on every render.
   useEffect(() => {
@@ -517,30 +349,6 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     showArea(tab.ref as WorkArea);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabs.active?.id]);
-
-  /** A DOCUMENT ALWAYS APPEARS IN THE DESTINATION THAT OWNS IT.
-   *
-   * An open file wins the centre pane — that is deliberate, so a citation or an
-   * agent open is never swallowed by whichever area page happens to be showing.
-   * The question this settles is which destination the reader is then IN.
-   *
-   * It used to be "the one on the rail, whatever the document is", with the
-   * sidebar and the breadcrumb quietly re-pointing at the file instead. That
-   * produced the exact failure the two-level IA is meant to make impossible: a
-   * .docx on screen, the rail marking Private browser, and the second column
-   * listing room files under a heading that belonged to neither. Now the app
-   * MOVES: a document its destination does not hold takes you Home, where that
-   * document lives, in one commit — rail, sidebar, workspace and breadcrumb all
-   * describing the same thing.
-   *
-   * Recordings, Scripts, Sketches and Creations hold their own kinds, so
-   * opening one of those from its own list keeps you exactly where you are.
-   *
-   * The `known` guard is what makes this safe to run on every open: a file
-   * created a moment ago (a new sketch, a fresh note) is opened before the
-   * file list has refreshed, and bouncing Home on the strength of a list that
-   * has not caught up would throw the reader out of the destination they were
-   * working in. */
   useEffect(() => {
     const open = s.openFile;
     if (!open) return;
@@ -553,7 +361,6 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     void api.setSetting(AREA_SETTING, "home").catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.openFile?.id, area, s.files, s.scripts]);
-
   // A full-pane view (Scripts, Workflows, Room Map) can be raised from outside
   // the rail — the "Scripts" action on a run toast, the ⌘K palette, a Home
   // row, the library's "New workflow" — and every one of those takes the pane
@@ -579,7 +386,6 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     tabsRef.current.activate("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.showScripts, s.showWorkflows, s.showMap]);
-
   // One-time housekeeping: a room saved before places stopped being tabs has
   // area tabs in `workspace_tabs`, and they arrive a tick after mount when the
   // setting is read back. Dropping them here rewrites the setting clean.
@@ -592,7 +398,6 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     tabs.unlist((t) => t.kind !== "area");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabs.tabs.length]);
-
   // A tab whose file was deleted has nothing to show — and neither has one
   // whose file has since been REMOVED from the Library, which is the same
   // question asked of Home's working set: the object is fine, Home is simply
@@ -621,60 +426,17 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     tabs.unlist((t) => t.kind !== "file" || shown.has(t.ref));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.files, info.path]);
-
   // Tab keys. Every switch goes through the same unsaved-edits guard the strip
   // itself uses — a shortcut that quietly threw away typing was the one hole.
   useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (!(e.metaKey || e.ctrlKey)) return;
-      // ⌥⌘1–⌥⌘9 pick a tab by position. Plain ⌘1/2/3 belong to the pane
-      // toggles (useLayout, and the rail says so out loud) — both handlers
-      // used to fire, so one press collapsed a pane AND jumped tabs. Read off
-      // `code`, because Option rewrites `key` into ¡™£ on macOS.
-      // ...and only where the strip is on screen. The document tabs are Home's
-      // (`showsDocumentTabs`, the same predicate the strip itself renders on),
-      // so in Sketch, Skills, Memory, Create or Connectors these keys used to
-      // open a Home document that was nowhere in sight and drag the rail back
-      // to Home with it — the failure the redesign fixed for ⌘T.
-      if (e.altKey) {
-        const digit = /^Digit([1-9])$/.exec(e.code);
-        if (!digit || !showsDocumentTabs(area)) return;
-        e.preventDefault();
-        guardLeave("Switching tabs", () => tabs.activateIndex(Number(digit[1]) - 1));
-        return;
-      }
-      // ⌘W and ⌘T are the NATIVE File menu's (src-tauri/src/menu.rs), which is
-      // the only owner that works while the private browser's native webview
-      // holds key focus. They are deliberately absent from this handler: two
-      // owners for one key equivalent means the press is handled twice.
-      // With Shift held the bracket keys report as "}" / "{" — checking only
-      // the unshifted characters meant these never fired at all.
-      if (e.shiftKey && (e.key === "]" || e.key === "}")) {
-        if (!showsDocumentTabs(area)) return;
-        e.preventDefault();
-        guardLeave("Switching tabs", () => tabs.step(1));
-        return;
-      }
-      if (e.shiftKey && (e.key === "[" || e.key === "{")) {
-        if (!showsDocumentTabs(area)) return;
-        e.preventDefault();
-        guardLeave("Switching tabs", () => tabs.step(-1));
-        return;
-      }
-      // ⇧⌘T — put back the file whose tab you just closed, the way every
-      // browser does it. Closing is meant to be cheap, and it only is when it
-      // is reversible; before this the only way back was to find the file in
-      // the library again. Deleted files are skipped rather than reported: the
-      // stack is a convenience, and a toast about a file the user removed on
-      // purpose would be noise.
-      if (e.key.toLowerCase() === "t" && e.shiftKey) {
-        e.preventDefault();
-        const live = new Set(s.files.map((f) => f.id));
-        let id = reopenableRef.current.pop();
-        while (id && !live.has(id)) id = reopenableRef.current.pop();
-        if (id) void a.viewFile(id);
-      }
-    }
+    const onKey = (event: KeyboardEvent) => handleWorkspaceTabKeydown(event, {
+      area,
+      files: s.files,
+      guardLeave,
+      reopenableRef,
+      tabs,
+      viewFile: a.viewFile,
+    });
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // `s.files` is in here because ⇧⌘T reads it — a stale list would reopen a
@@ -682,14 +444,12 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     // here because ⌘T and ⌘W are both scoped by it, and a stale area would run
     // the previous destination's verb.
   }, [tabs, closeTab, guardLeave, newItem, area, pages, s, a]);
-
   // A tab's glyph. None, now that the strip holds one KIND of thing: every
   // file tab used to carry the same generic sheet icon, which spent the row's
   // first 18px saying something the reader already knew and pushed the one
   // useful thing — the file's name — out of view. (The globe belonged to
   // browser pages, which have their own list now and their own icons in it.)
   const tabIcon = useCallback((_tab: Tab) => null, []);
-
   // B5: what a tab's model-written title (see shell/TabStrip.tsx) is
   // generated from — the file's saved name plus a short kind word, nothing
   // else. `null` opts the tab out of generation entirely rather than
@@ -710,18 +470,19 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
     },
     [s.files],
   );
-
   // One definition of "waiting" and "running" for the whole shell (see
   // shell/activity.ts) — the status bar and the Activity tab used to count
   // separately and disagree for a second after a recording stopped.
   const pendingApprovals = pendingApprovalCount(s);
   const runningJobs = runningJobCount(s);
-
   const showActivity = useCallback(() => {
     s.setAiTab("activity");
     layout.showPane("ai");
   }, [s, layout]);
-
+  const openPrivacySettings = useCallback(() => {
+    s.setSettingsSection("set-cloud-privacy");
+    s.setShowSettings(true);
+  }, [s]);
   // Reading and recording are one-column jobs, and the layout is told so it
   // can hand the width over once (useLayout's `setFocusedPage`). Derived here
   // rather than inside the layout because this is the only place that knows
@@ -733,11 +494,16 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
   useEffect(() => {
     setFocusedPage(focusedPage);
   }, [focusedPage, setFocusedPage]);
-
   return (
     <div className="workspace">
-      <Overlays s={s} a={a} layout={layout} />
-      <Toasts toasts={s.toasts} dismissToast={s.dismissToast} />
+      <WorkspaceModals
+        a={a}
+        info={info}
+        layout={layout}
+        s={s}
+        showCustomize={showCustomize}
+        setShowCustomize={setShowCustomize}
+      />
       <TopBar
         s={s}
         a={a}
@@ -752,136 +518,36 @@ export default function Workspace({ info, onLock, onRenamed }: Props) {
         approvals={pendingApprovals}
         running={runningJobs}
       />
-      {info.readOnly && (
-        <div className="workspace-readonly-banner" role="status">
-          <strong>Read-only room.</strong>{" "}
-          {info.duplicateRoomIdentity
-            ? "This folder is a raw copy with the same room identity as another workspace. Register it as a new copy before editing."
-            : "Another Arcelle process owns the writer lease. You can read the normal files here, but Arcelle will not save edits, run agents, index changes, or change private room data."}
-          {info.duplicateRoomIdentity && (
-            <button
-              type="button"
-              disabled={registeringCopy}
-              onClick={() => {
-                setRegisteringCopy(true);
-                void api.registerWorkspaceCopy()
-                  .then((next) => onRenamed?.(next))
-                  .catch((error) => s.pushToast("error", error instanceof Error ? error.message : String(error)))
-                  .finally(() => setRegisteringCopy(false));
-              }}
-            >
-              {registeringCopy ? "Registering…" : "Register as new copy"}
-            </button>
-          )}
-        </div>
-      )}
-
-      <StudioModal s={s} a={a} />
-      {/* Every exit that unmounts the editor asks this before it happens. */}
-      <UnsavedEditsDialog s={s} />
-      <CompareModal s={s} a={a} />
-      <AiActionModal s={s} a={a} />
-      {/* Mounted only while open: the draft fields are local state, so
-          unmounting is what clears them between issues (GH #3). */}
-      {s.showFeedback && <FeedbackModal s={s} />}
-      {/* A settings screen that throws must not take the room down with it. */}
-      <ErrorBoundary scope="Settings">
-        <SettingsModals s={s} a={a} info={info} layout={layout} />
-      </ErrorBoundary>
-      {/* Mounted only while open, like every other sheet here: the sidebar
-          preferences live in their own store, so there is no draft state to
-          preserve across a close. */}
-      {showCustomize && (
-        <ErrorBoundary scope="The sidebar settings">
-          <CustomizeSidebar onClose={() => setShowCustomize(false)} />
-        </ErrorBoundary>
-      )}
-
-      <main className="pr-main">
-        <ActivityRail
-          layout={layout}
-          area={area}
-          onArea={openArea}
-          onSettings={() => s.setShowSettings(true)}
-          onCustomize={() => setShowCustomize(true)}
-        />
-        <div
-          className={`pane-grid${layout.dragging ? " is-dragging" : ""}`}
-          ref={layout.gridRef}
-          style={layout.gridStyle}
-        >
-          {/* THE CONTEXTUAL SIDEBAR. Named after what is in it right now, not
-              after Home's Library — announcing "Library and sources" over a
-              list of private browser pages was a false statement made to
-              exactly the readers who cannot check it. `key` forces a fresh
-              subtree on a destination change, which is what makes a collapse,
-              a resize or a focus-mode expansion unable to reveal the previous
-              destination's rows for a frame. */}
-          <section
-            className={`pane pane-library${layout.visible.includes("library") ? "" : " is-hidden"}`}
-            aria-label={sidebarRegionLabel(area)}
-            aria-hidden={!layout.visible.includes("library")}
-          >
-            <ErrorBoundary scope="The sidebar">
-              <LibraryPane
-                key={area}
-                s={s}
-                a={a}
-                layout={layout}
-                area={area}
-                pages={pages}
-                onNewItem={newItem}
-              />
-            </ErrorBoundary>
-          </section>
-          <Splitter side="a" layout={layout} label="Resize the sidebar" />
-          <section
-            className={`pane pane-center${layout.visible.includes("center") ? "" : " is-hidden"}`}
-            aria-label="Workspace"
-            aria-hidden={!layout.visible.includes("center")}
-          >
-            {/* Home's document working set, and Home's alone. Every other
-                destination switches through its own contextual sidebar, and
-                reclaims this strip's height for the surface the reader
-                actually chose (see workspace/destinations.ts). */}
-            {showsDocumentTabs(area) && (
-              <TabStrip
-                tabs={{ ...tabs, activate: activateTab, close: closeTab }}
-                icons={tabIcon}
-                roomId={info.path}
-                titleFacts={tabTitleFacts}
-              />
-            )}
-            {/* The viewers have their own chunk boundary; this one covers the
-                rest of the centre pane — the browser, workflows, scripts and
-                the map — which had no net at all. */}
-            <ErrorBoundary scope="The workspace pane">
-              <ViewerPane s={s} a={a} info={info} layout={layout} area={area} />
-            </ErrorBoundary>
-          </section>
-          <Splitter side="b" layout={layout} label="Resize the AI pane" />
-          <section
-            className={`pane pane-ai${layout.visible.includes("ai") ? "" : " is-hidden"}`}
-            aria-label="AI chat, Studio, and activity"
-            aria-hidden={!layout.visible.includes("ai")}
-          >
-            <ErrorBoundary scope="The AI pane">
-              <AiPane s={s} a={a} info={info} layout={layout} area={area} />
-            </ErrorBoundary>
-          </section>
-        </div>
-      </main>
-
+      <WorkspaceReadOnlyBanner
+        info={info}
+        onRenamed={onRenamed}
+        pushToast={s.pushToast}
+        registeringCopy={registeringCopy}
+        setRegisteringCopy={setRegisteringCopy}
+      />
+      <WorkspacePanes
+        a={a}
+        activateTab={activateTab}
+        area={area}
+        closeTab={closeTab}
+        info={info}
+        layout={layout}
+        newItem={newItem}
+        openArea={openArea}
+        pages={pages}
+        s={s}
+        showCustomize={openCustomizeSidebar}
+        tabIcon={tabIcon}
+        tabTitleFacts={tabTitleFacts}
+        tabs={tabs}
+      />
       <StatusBar
         layout={layout}
         fileCount={s.files.length}
         cloud={isCloudRoute(s.model, s.ai)}
         engineLabel={a.engineLabelOf(s.model)}
         protectedOn={s.privacyOn}
-        onOpenPrivacy={() => {
-          s.setSettingsSection("set-cloud-privacy");
-          s.setShowSettings(true);
-        }}
+        onOpenPrivacy={openPrivacySettings}
         webOn={s.webOn}
         mcpToolCount={s.mcpTools.length}
         runningJobs={runningJobs}

@@ -1276,6 +1276,11 @@ describe("parseWorkflowBinding", () => {
     });
   });
 
+  it("rejects non-string file binding filters", () => {
+    expect(() => parseWorkflowBinding({ scope: "file", kinds: ["pdf", 7] })).toThrow(/kinds.*array of strings/);
+    expect(() => parseWorkflowBinding({ scope: "file", exts: "pdf" })).toThrow(/exts.*array of strings/);
+  });
+
   it("throws on an unknown scope", () => {
     expect(() => parseWorkflowBinding({ scope: "bogus" })).toThrow(/unknown scope/);
     expect(() => parseWorkflowBinding({})).toThrow(/unknown scope/);

@@ -139,298 +139,9 @@ import { clampBytes } from "./textClamp.js";
 import type { WorkspaceService } from "./workspace/workspaceService.js";
 import { createSealedPackage, importSealedPackage } from "./workspace/sealedPackage.js";
 import type { RoomDescriptor } from "./workspace/types.js";
+import { errMsg, workspaceVersionContent } from "./safetyVersionOperations.js";
+export { fileVersionsKept, listFileVersions, pinFileVersion, deleteFileVersion, getFileProvenance, contentText, versionContent, restoreVersionInto } from "./safetyVersionOperations.js";
 
-function errMsg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-// ============================================================================
-// File versions (ADD-2) — thin readers/writers over the db-host layer
-// ============================================================================
-
-/** How many unpinned versions a file keeps — so the History strip can SAY it.
- * Ported from `file_versions_kept`. */
-export function fileVersionsKept(): number {
-  return VERSIONS_KEPT;
-}
-
-/** ADD-2: a file's saved versions (newest first). Ported from
- * `list_file_versions`. */
-export function listFileVersions(db: Database.Database, id: string): FileVersion[] {
-  return dbListFileVersions(db, id);
-}
-
-/** Keep (or stop keeping) one saved version. Ported from
- * `pin_file_version`. */
-export function pinFileVersion(db: Database.Database, versionId: string, pinned: boolean): void {
-  dbSetVersionPinned(db, versionId, pinned);
-}
-
-/** Delete one saved version outright. Ported from `delete_file_version`. */
-export function deleteFileVersion(db: Database.Database, versionId: string): void {
-  dbDeleteFileVersion(db, versionId);
-}
-
-/** ART-1: what produced the file's CURRENT content, if the app recorded it.
- * Ported from `get_file_provenance`. */
-export function getFileProvenance(db: Database.Database, id: string): Provenance | null {
-  return fileProvenance(db, id);
-}
-
-// -------------------------------------------------------- version compare (Idea 11)
-
-/** Strict UTF-8 decode, matching Rust's `String::from_utf8(bytes).ok()` — NOT
- * `Buffer.prototype.toString("utf8")`, which is lossy (invalid sequences
- * become U+FFFD rather than failing). `TextDecoder`'s `fatal` mode rejects
- * exactly what Rust's strict validator rejects, so a legacy binary snapshot
- * (a JPEG, a PDF) answers `null` here rather than a string of replacement
- * boxes standing in for real content. */
-function utf8OrNull(bytes: Buffer): string | null {
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * The text a version saved BEFORE compound snapshots (its `text` column is
- * NULL) is re-derived with — Rust's
- * `extraction::extract_text(name, bytes).or_else(|| String::from_utf8(bytes).ok())`,
- * both arms, in that order. `version_content` and `restore_version_into`
- * share this chain in the Rust source precisely so a compare shows what a
- * restore would write; they share it here for the same reason.
- *
- * ORDER IS THE WHOLE POINT and dropping the first arm was not equivalent: a
- * legacy `.html` version fell through to the raw-UTF-8 arm and put MARKUP
- * (`<h1>Hi</h1>…`) into `extracted_text`, i.e. into the search index, where
- * Rust puts the stripped prose; a legacy `.txt` in a non-UTF-8 encoding
- * (cp1252, a latin-1 export) failed the strict decode outright and restored
- * with NO indexed text at all, where Rust's `decode_text_bytes` reads it.
- *
- * {@link extractText} is `editMatch.ts`'s port of that extractor, and it is
- * NARROWER than the Rust one by its own documented scope: text extensions,
- * `.docx` and `.html`/`.htm`. pdf/xlsx/pptx/legacy-Office/epub/rtf/iWork/
- * ipynb/eml/subtitle/svg/sketch each need their own extractor module that no
- * batch has ported yet, so a legacy version of one of THOSE still answers
- * `null` here rather than Rust's re-extracted prose. That is the real,
- * remaining gap — narrower than "the extractor is unported", which this
- * file's header used to claim and which was simply not true.
- */
-function rederiveVersionText(name: string, bytes: Buffer): string | null {
-  return extractText(name, bytes) ?? utf8OrNull(bytes);
-}
-
-/** Clip huge extracted text at a UTF-8 byte boundary for preview/compare
- * payloads. Ported from `clip_preview`, reusing `textClamp.ts`'s already-
- * ported `clampBytes` (cut-without-reserving, matching `clip_preview`'s own
- * "truncate then push_str the marker" order — unlike `clampBytesMarked`,
- * which reserves the marker's bytes INSIDE the ceiling). */
-function clipPreview(t: string): string {
-  if (Buffer.byteLength(t, "utf8") > 1_000_000) {
-    return `${clampBytes(t, 1_000_000)}\n\n… (truncated preview)`;
-  }
-  return t;
-}
-
-/** Ceiling past which a raw-text row degrades to a clipped read-only preview
- * (`PLAIN`, i.e. `Extracted`) instead of an editable Raw buffer. Ported from
- * `formats::MAX_RAW_TEXT_BYTES`. */
-const MAX_RAW_TEXT_BYTES = 10 * 1024 * 1024;
-
-type TextSource = "raw" | "extracted";
-
-/**
- * NARROW SLICE of `formats.rs`'s `FORMATS` table: only the `text`
- * (`TextSource`) and `max_bytes` columns `content_text`/`classify_file`
- * actually consult. `kind`/`editable`/`delivery` are NOT reproduced — nothing
- * in this file reads them, and reproducing them would be a second, drifting
- * copy of a registry this migration has not ported as its own module yet
- * (confirmed: no `classifyFile`/`FileView` export exists anywhere in this
- * tree). Same scope-line convention `editMatchExtraction.ts`'s own header
- * documents for its slice of `extraction.rs`: "a future `formats.rs` batch
- * extends this file" if more of the table is ever needed here.
- */
-const FORMAT_TEXT_SOURCE: ReadonlyMap<string, { text: TextSource; maxBytes: number | null }> = new Map([
-  ["pdf", { text: "extracted", maxBytes: null }],
-  ["docx", { text: "extracted", maxBytes: null }],
-  ["xlsx", { text: "extracted", maxBytes: null }],
-  ["xls", { text: "extracted", maxBytes: null }],
-  ["ods", { text: "extracted", maxBytes: null }],
-  ["pptx", { text: "extracted", maxBytes: null }],
-  ["ppt", { text: "extracted", maxBytes: null }],
-  ["doc", { text: "extracted", maxBytes: null }],
-  ["rtf", { text: "extracted", maxBytes: null }],
-  ["epub", { text: "extracted", maxBytes: null }],
-  ["zip", { text: "extracted", maxBytes: null }],
-  ["csv", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["tsv", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["md", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["markdown", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["html", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["htm", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["svg", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["sketch", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["ipynb", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["json", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["jsonl", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["ndjson", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["srt", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["vtt", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["eml", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["txt", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-  ["log", { text: "raw", maxBytes: MAX_RAW_TEXT_BYTES }],
-]);
-
-/** Ported from `classify_file(...).text` — extension wins over MIME (a raw
- * row past its ceiling degrades to `extracted`, an unregistered extension
- * falls through to image/code/plain, exactly as the Rust table does). */
-function classifyTextSource(name: string, mime: string, len: number): TextSource {
-  const ext = extensionOf(name);
-  const row = FORMAT_TEXT_SOURCE.get(ext);
-  if (row) {
-    if (row.maxBytes === null || len <= row.maxBytes) {
-      return row.text;
-    }
-    return "extracted"; // degrades to PLAIN
-  }
-  if (isImage(mime)) {
-    return "extracted"; // IMAGE
-  }
-  if (isTextExtension(ext) && len <= MAX_RAW_TEXT_BYTES) {
-    return "raw"; // CODE
-  }
-  return "extracted"; // PLAIN
-}
-
-/**
- * The text representation the viewer AND the Idea 11 compare view show for a
- * file's bytes — both shaped identically so the two diff panes can never
- * disagree about which representation they're comparing. Ported from
- * `commands::files::content_text`.
- */
-export function contentText(
-  name: string,
-  mime: string,
-  bytes: Buffer,
-  extracted: string | null
-): string | null {
-  const ext = extensionOf(name);
-  // Media (audio/video/recording): the transcript is the comparable text.
-  if (mediaKind(mime, ext) !== null) {
-    return extracted !== null ? clipPreview(extracted) : null;
-  }
-  const source = classifyTextSource(name, mime, bytes.length);
-  if (source === "raw") {
-    return clipPreview(decodeTextBytes(bytes));
-  }
-  return extracted !== null ? clipPreview(extracted) : null;
-}
-
-/**
- * Idea 11: the text of one saved version alongside the file's CURRENT text,
- * both shaped by `contentText` so the compare view diffs like-for-like. Pure
- * over a `Database` handle, matching `version_content`'s own Rust
- * signature. Throws when the version id is unknown ({@link getVersion}'s
- * `VERSION_NOT_AVAILABLE`) or when the owning file is gone/trashed
- * ({@link getFileFull}'s "no rows" — trashed files are excluded there the
- * same way `get_file_full` excludes them in Rust, which is what makes a
- * trashed file's compare view correctly refuse rather than diff a deleted
- * file's text).
- */
-export function versionContent(db: Database.Database, versionId: string): VersionContent {
-  const v = getVersion(db, versionId);
-  const [name, mimeRaw, currentBytesRaw, currentExtracted] = getFileFull(db, v.fileId);
-  const mime = mimeRaw ?? "";
-  // Versions saved before compound snapshots carry no text: re-derive it
-  // exactly as `restoreVersionInto` does, so the diff matches a restore.
-  const versionText = v.text !== null ? v.text : rederiveVersionText(name, v.bytes);
-  const currentBytes = currentBytesRaw ?? Buffer.alloc(0);
-  return {
-    fileName: name,
-    versionText: contentText(name, mime, v.bytes, versionText),
-    currentText: contentText(name, mime, currentBytes, currentExtracted),
-  };
-}
-
-async function workspaceVersionContent(
-  db: Database.Database,
-  workspace: WorkspaceService,
-  versionId: string,
-): Promise<VersionContent> {
-  const version = await workspace.versionSnapshot(versionId);
-  const file = db.prepare(
-    `SELECT name, mime_type, extracted_text FROM files
-     WHERE id = ? AND storage_kind = 'workspace' AND trashed_at IS NULL`,
-  ).get(version.fileId) as {
-    name: string;
-    mime_type: string | null;
-    extracted_text: string | null;
-  } | undefined;
-  if (file === undefined) throw new Error("That file is no longer in this room.");
-  const currentBytes = await workspace.readBuffer(version.fileId);
-  const versionText = version.text ?? rederiveVersionText(file.name, version.bytes);
-  return {
-    fileName: file.name,
-    versionText: contentText(file.name, file.mime_type ?? "", version.bytes, versionText),
-    currentText: contentText(file.name, file.mime_type ?? "", currentBytes, file.extracted_text),
-  };
-}
-
-/** The single write path for changing an existing file's bytes. Snapshots the
- * CURRENT bytes into version history tagged with `cause`, then overwrites —
- * ONE transaction, so a failed overwrite never cuts a version for content
- * that was never actually replaced. Ported from `commands::files::
- * store_file_bytes`. */
-function storeFileBytes(
-  db: Database.Database,
-  id: string,
-  bytes: Buffer,
-  text: string | null,
-  cause: string
-): void {
-  inTransaction(db, () => {
-    snapshotFileVersion(db, id, cause);
-    updateFileContent(db, id, bytes, text);
-  });
-}
-
-/**
- * The body of `restore_file_version`, over a plain `Database` handle — pure
- * for the same reason `versionContent` is. Restores bytes, extracted text,
- * ART-1 provenance and (for a Recording) transcript meta all in ONE
- * transaction — a half-restored recording would show words from one era
- * against speakers from another. Returns the id of the file that was
- * restored. Ported from `restore_version_into`.
- */
-export function restoreVersionInto(db: Database.Database, versionId: string): string {
-  const v = getVersion(db, versionId);
-  // A version row outlives a delete (trash is reversible), so a version id
-  // held by an open tab still resolves after the file is gone — but writing
-  // through it would put an old draft into a file the room isn't showing.
-  // `getFileName` hides trashed rows the same way Rust's does, so this guard
-  // costs nothing extra — and the name it returns doubles as the
-  // re-derivation input below, exactly as the Rust source notes.
-  let name: string;
-  try {
-    name = getFileName(db, v.fileId);
-  } catch {
-    throw new Error("That file is no longer in this room.");
-  }
-  // Versions saved before compound snapshots carry no text: re-derive it.
-  const text = v.text !== null ? v.text : rederiveVersionText(name, v.bytes);
-  // ART-1: whatever made THIS version made the file's content again, so the
-  // head's provenance moves back with the bytes. Read before the write.
-  const backTo = versionProvenanceJson(db, versionId);
-  inTransaction(db, () => {
-    storeFileBytes(db, v.fileId, v.bytes, text, "Restored");
-    setFileProvenance(db, v.fileId, backTo);
-    if (v.recMeta !== null) {
-      setRecMeta(db, v.fileId, v.recMeta);
-    }
-  });
-  return v.fileId;
-}
 
 // ============================================================================
 // The "came from the web" mark (quarantine)
@@ -519,17 +230,20 @@ function rustTrim(s: string): string {
  * folder the user picked: keep the last path component and neutralise
  * separators / NUL. Ported verbatim from `safe_export_name`. */
 export function safeExportName(name: string): string {
+  return exportableName(rustTrim(neutralizeExportName(lastExportPathPart(name))));
+}
+
+function lastExportPathPart(name: string): string {
   const parts = name.split(/[/\\]/);
-  const base = parts[parts.length - 1] ?? name;
-  let cleaned = "";
-  for (const c of base) {
-    cleaned += c === "/" || c === "\\" || c === "\0" ? "_" : c;
-  }
-  const trimmed = rustTrim(cleaned);
-  if (trimmed === "" || trimmed === "." || trimmed === "..") {
-    return "unnamed";
-  }
-  return trimmed;
+  return parts.at(-1) ?? name;
+}
+
+function neutralizeExportName(name: string): string {
+  return [...name].map((char) => (char === "/" || char === "\\" || char === "\0" ? "_" : char)).join("");
+}
+
+function exportableName(name: string): string {
+  return name === "" || name === "." || name === ".." ? "unnamed" : name;
 }
 
 /** Choose a destination name inside a folder that will not overwrite
@@ -595,32 +309,43 @@ async function exportWorkspaceFile(
  * `block_in_place`-wrapped `export_all` — see this file's module doc on why
  * `async` here is contract shape, not a real blocking fix). */
 export async function exportAll(db: Database.Database, destDir: string): Promise<number> {
+  assertExportDirectory(destDir);
+  return listFiles(db).reduce((written, file) => written + exportListedFile(db, destDir, file), 0);
+}
+
+function assertExportDirectory(destDir: string): void {
   if (!existsSync(destDir) || !statSync(destDir).isDirectory()) {
     throw new Error("Choose a folder to export into.");
   }
-  const files = listFiles(db);
-  let written = 0;
-  for (const f of files) {
-    const bytes = getFileBytes(db, f.id) ?? Buffer.alloc(0);
-    // Files written earlier this run land on disk, so the existence check
-    // also dedups same-named files against each other.
-    const name = uniqueExportName(safeExportName(f.name), (candidate) =>
-      existsSync(join(destDir, candidate))
-    );
-    const out = join(destDir, name);
-    try {
-      writeFileSync(out, bytes);
-    } catch (err) {
-      throw new Error(`Could not write "${name}": ${errMsg(err)}`);
-    }
-    // A room's downloads leave as downloads: exporting must not strip the
-    // mark macOS shows its Gatekeeper warning off.
-    if (fileOriginUrl(db, f.id) !== null) {
-      markAsDownloaded(out);
-    }
-    written += 1;
+}
+
+function exportDestination(destDir: string, fileName: string): { name: string; path: string } {
+  // Files written earlier this run land on disk, so the existence check also
+  // dedups same-named files against each other.
+  const name = uniqueExportName(safeExportName(fileName), (candidate) =>
+    existsSync(join(destDir, candidate))
+  );
+  return { name, path: join(destDir, name) };
+}
+
+function writeExportedFile(path: string, name: string, bytes: Buffer): void {
+  try {
+    writeFileSync(path, bytes);
+  } catch (err) {
+    throw new Error(`Could not write "${name}": ${errMsg(err)}`);
   }
-  return written;
+}
+
+function exportListedFile(
+  db: Database.Database,
+  destDir: string,
+  file: ReturnType<typeof listFiles>[number],
+): number {
+  const bytes = getFileBytes(db, file.id) ?? Buffer.alloc(0);
+  const destination = exportDestination(destDir, file.name);
+  writeExportedFile(destination.path, destination.name, bytes);
+  if (fileOriginUrl(db, file.id) !== null) markAsDownloaded(destination.path);
+  return 1;
 }
 
 async function exportAllWorkspace(
@@ -642,377 +367,8 @@ async function exportAllWorkspace(
   }
   return written;
 }
+export { changePasswordCore, changePassword, duplicateRoomCore, duplicateRoom, compactRoom, registerSafetyIpc } from "./safetyRoomOperations.js";
+export type { ChangePasswordPaths, EmitFn, SafetyOpenRoom, SafetyRoomSource, SafetyIpcDeps } from "./safetyRoomOperations.js";
 
-// ============================================================================
-// SEC-4: change password
-// ============================================================================
 
-/**
- * Rotate the room's password: verify `currentPassword` on a throwaway
- * connection, re-key the LIVE connection, keep Touch ID working if it was
- * enabled, re-wrap the recovery sidecar (if any) around the new password, and
- * re-key every whole-room checkpoint from the old password to the new.
- * Returns the fresh recovery code to show once, or `null` when the room has
- * no recovery. Ported from `change_password_core`.
- *
- * CALLER OWNS THE IN-MEMORY PASSWORD: Rust holds `room.password` inside the
- * same `AppState` lock this function's body ran under and updates it in
- * place. Nothing in this migration has that lock yet (see this file's module
- * doc), so — on a successful return — the CALLER is responsible for updating
- * whatever it holds as "the room's current password" to `newPassword` before
- * any subsequent operation (another `changePassword`, a `duplicateRoom`,
- * biometrics) needs it again. A future host-state batch that wires
- * {@link registerSafetyIpc} should pass an `onPasswordChanged` that does
- * exactly this.
- */
-export async function changePasswordCore(
-  db: Database.Database,
-  roomPath: string,
-  currentPassword: string,
-  newPassword: string,
-  paths: {
-    databasePath?: string;
-    biometricPath?: string;
-    recoveryPath?: string;
-    checkpointsPath?: string;
-  } = {},
-): Promise<string | null> {
-  const databasePath = paths.databasePath ?? roomPath;
-  const biometricPath = paths.biometricPath ?? roomPath;
-  const recoveryPath = paths.recoveryPath ?? roomPath;
-  const checkpointsPath = paths.checkpointsPath ?? roomPath;
-  verifyPassword(databasePath, currentPassword);
-  rekey(db, newPassword);
-  // ADD-11: keep Touch ID working after a password change. Chosen behavior:
-  // UPDATE the Keychain entry with the new password. If that somehow fails,
-  // delete the stale entry so Touch ID can never hand back the old password.
-  if (keychainHas(biometricPath)) {
-    try {
-      keychainStore(biometricPath, newPassword);
-    } catch {
-      try {
-        keychainDeleteEntry(biometricPath);
-      } catch {
-        // best-effort, matching Rust's own swallowed `let _ = ...delete(...)`
-      }
-    }
-  }
-  // Same policy for the recovery sidecar: re-wrap under the new password and
-  // hand back the fresh code; if re-wrapping fails, delete the stale sidecar
-  // so the unlock gate never offers a code that cannot work.
-  let newCode: string | null = null;
-  if (hasRecovery(recoveryPath)) {
-    try {
-      newCode = await writeRecovery(recoveryPath, newPassword);
-    } catch {
-      try {
-        await removeRecovery(recoveryPath);
-      } catch {
-        // best-effort
-      }
-      newCode = null;
-    }
-  }
-  // `vacuum_into` copies keep the key of the moment they were made, so a
-  // later rekey would strand every checkpoint. Re-key each one from the OLD
-  // password to the new. A failure is NOT fatal — the room itself is already
-  // re-keyed and refusing now would be worse — but it is reported, never
-  // swallowed into a false "all clean".
-  let stranded = 0;
-  for (const ck of checkpointCkPaths(checkpointsPath)) {
-    try {
-      rekeyCopy(ck, currentPassword, newPassword);
-    } catch {
-      stranded += 1;
-    }
-  }
-  if (stranded > 0) {
-    // The counter is deliberately content-free: a checkpoint path carries the
-    // room's own file name, which is the user's, and it never goes to a log.
-    console.error(`change_password: ${stranded} checkpoint(s) could not be re-keyed`);
-  }
-  return newCode;
-}
-
-/** Outer validation + dispatch matching the Rust `#[tauri::command] pub async
- * fn change_password` (the length floor and the rollback-busy refusal live
- * HERE, not in {@link changePasswordCore}, exactly as they do in Rust). The
- * rollback-busy check is a caller-supplied predicate rather than a direct
- * `RoomManagerState` import, matching `privacy.ts`'s own "each missing piece
- * of host state is a named dependency" convention — nothing in this
- * migration wires a rollback flag to this file yet. */
-export async function changePassword(
-  db: Database.Database,
-  roomPath: string,
-  currentPassword: string,
-  newPassword: string,
-  isRollingBack?: () => boolean,
-  paths?: Parameters<typeof changePasswordCore>[4],
-): Promise<string | null> {
-  if ([...newPassword].length < MIN_ROOM_PASSWORD_CHARS) {
-    throw new Error("Password must be at least 8 characters.");
-  }
-  if (isRollingBack?.()) {
-    throw new Error(ROLLBACK_BUSY);
-  }
-  return changePasswordCore(db, roomPath, currentPassword, newPassword, paths);
-}
-
-// ============================================================================
-// ADD-4: duplicate room
-// ============================================================================
-
-/** A full copy of the open room as it is now, optionally with its own new
- * password. The original is never touched. Ported from
- * `duplicate_room_core`. */
-export function duplicateRoomCore(
-  db: Database.Database,
-  roomPassword: string,
-  destPath: string,
-  newPassword: string | null
-): void {
-  vacuumInto(db, destPath);
-  if (newPassword !== null) {
-    try {
-      rekeyCopy(destPath, roomPassword, newPassword);
-    } catch (err) {
-      try {
-        unlinkSync(destPath);
-      } catch {
-        // best-effort cleanup, matching Rust's `let _ = std::fs::remove_file(...)`
-      }
-      throw err;
-    }
-  }
-}
-
-/** Outer validation matching `#[tauri::command] pub async fn duplicate_room`:
- * the new password's length floor and the destination-must-not-exist guard
- * both live here, ahead of the (potentially minutes-long) copy. */
-export async function duplicateRoom(
-  db: Database.Database,
-  roomPassword: string,
-  destPath: string,
-  newPassword: string | null
-): Promise<void> {
-  if (newPassword !== null && [...newPassword].length < MIN_ROOM_PASSWORD_CHARS) {
-    throw new Error("Password must be at least 8 characters.");
-  }
-  if (existsSync(destPath)) {
-    throw new Error("A file already exists at that location.");
-  }
-  duplicateRoomCore(db, roomPassword, destPath, newPassword);
-}
-
-async function duplicateWorkspaceRoom(
-  workspace: WorkspaceService,
-  roomId: string,
-  roomPassword: string,
-  destPath: string,
-  newPassword: string | null,
-): Promise<void> {
-  if (newPassword !== null && [...newPassword].length < MIN_ROOM_PASSWORD_CHARS) {
-    throw new Error("Password must be at least 8 characters.");
-  }
-  if (existsSync(destPath)) throw new Error("A file or folder already exists at that location.");
-  const packagePath = join(dirname(destPath), `.${basename(destPath)}.${randomUUID()}.duplicate.arcelle`);
-  try {
-    await createSealedPackage(
-      workspace,
-      roomId,
-      roomPassword,
-      packagePath,
-      roomPassword,
-      "duplicate",
-    );
-    await importSealedPackage(
-      packagePath,
-      roomPassword,
-      destPath,
-      newPassword ?? roomPassword,
-    );
-  } finally {
-    await rm(packagePath, { force: true }).catch(() => undefined);
-  }
-}
-
-// ============================================================================
-// SEC-7: compact room
-// ============================================================================
-
-/** Compact the open room on demand, reporting how much was reclaimed. Ported
- * from `compact_room_core`. */
-export async function compactRoom(db: Database.Database): Promise<string> {
-  const reclaimable = reclaimableBytes(db);
-  const mb = reclaimable / (1024 * 1024);
-  if (mb < 0.05) {
-    return "Nothing to recover.";
-  }
-  vacuum(db);
-  return `Recovered ${mb.toFixed(1)} MB.`;
-}
-
-// ============================================================================
-// IPC registration — NOT wired into any bootstrap file (rule 4)
-// ============================================================================
-
-/** `let _ = window.emit(...)` — a best-effort UI notification that must never
- * turn a successful call into a failed one. Same narrowest-possible contract
- * as `organizeTools.ts`'s own `EmitFn`. */
-export type EmitFn = (event: string, payload: unknown) => void;
-
-function emitSafely(emit: EmitFn | undefined, event: string, payload: unknown): void {
-  try {
-    emit?.(event, payload);
-  } catch {
-    // Swallowed deliberately, matching Rust's `let _ = window.emit(...)`.
-  }
-}
-
-/** The slice of room state every handler in this file needs: whichever room
- * is open RIGHT NOW. Deliberately its OWN shape (not `turnEngine.ts`'s
- * `OpenRoom`, which is `{db, path}` only) because `changePassword`/
- * `duplicateRoom` need the room's current password too — the same
- * `state.room.lock()` analogue `recIpc.ts`'s `RoomSource` documents, widened
- * by exactly the one field this file additionally needs. */
-export interface SafetyOpenRoom {
-  conn: Database.Database;
-  path: string;
-  password: string;
-  workspace?: WorkspaceService;
-  descriptor?: RoomDescriptor;
-  readOnly?: boolean;
-}
-
-export interface SafetyRoomSource {
-  currentRoom(): SafetyOpenRoom | null;
-}
-
-/** `AppState::with_room`'s own refusal, so an IPC call made between rooms
- * says what the shipped app says. */
-const NO_ROOM_OPEN = "No room is open.";
-
-/** The rollback-in-flight refusal text, ported from `commands.rs`'s
- * `ROLLBACK_BUSY` — restated as a literal (not imported from
- * `turnContext.ts`) so this file has no hard dependency on the room-manager
- * batch that owns the real rollback flag; a future wiring batch can swap this
- * for the shared constant without changing behavior, since the string is
- * identical either way. */
-const ROLLBACK_BUSY = "The room is rolling back — try again in a moment.";
-
-function openRoomOrThrow(room: SafetyRoomSource): SafetyOpenRoom {
-  const open = room.currentRoom();
-  if (open === null) {
-    throw new Error(NO_ROOM_OPEN);
-  }
-  return open;
-}
-
-/** Optional collaborators {@link registerSafetyIpc} needs beyond the open
- * room itself — each a named dependency, following `privacy.ts`'s convention,
- * rather than a wider `RoomManagerState`/`AppState` import this migration
- * does not have yet. */
-export interface SafetyIpcDeps {
-  /** Wave 3 (Idea 9)'s rollback-in-flight guard. Absent means "never busy". */
-  isRollingBack?: () => boolean;
-  /** `window.emit`, for `restore_file_version`'s two best-effort broadcasts. */
-  emit?: EmitFn;
-  /** Called after a successful `change_password` with the new password — see
-   * {@link changePasswordCore}'s own doc on why the caller, not this file,
-   * owns the in-memory room password. */
-  onPasswordChanged?: (newPassword: string) => void;
-}
-
-/** Register every `commands/safety.rs` channel on `ipcMain`. Channel names
- * are the Rust `#[tauri::command]` names `ipc-contract.ts` already declares,
- * so the renderer side needs no rename. */
-export function registerSafetyIpc(
-  ipcMain: Pick<IpcMain, "handle">,
-  room: SafetyRoomSource,
-  deps: SafetyIpcDeps = {}
-): void {
-  const handle = <A extends unknown[], R>(channel: string, fn: (...args: A) => R): void => {
-    ipcMain.handle(channel, (_event: IpcMainInvokeEvent, ...args: A) => fn(...args));
-  };
-
-  handle("list_file_versions", (args: { id: string }) =>
-    listFileVersions(openRoomOrThrow(room).conn, args.id)
-  );
-  handle("file_versions_kept", () => fileVersionsKept());
-  handle("pin_file_version", (args: { versionId: string; pinned: boolean }) =>
-    pinFileVersion(openRoomOrThrow(room).conn, args.versionId, args.pinned)
-  );
-  handle("delete_file_version", async (args: { versionId: string }) => {
-    const open = openRoomOrThrow(room);
-    if (open.workspace !== undefined) return open.workspace.deleteVersion(args.versionId);
-    deleteFileVersion(open.conn, args.versionId);
-  });
-  handle("get_file_provenance", (args: { id: string }) =>
-    getFileProvenance(openRoomOrThrow(room).conn, args.id)
-  );
-  handle("get_file_version", async (args: { versionId: string }) => {
-    const open = openRoomOrThrow(room);
-    return open.workspace === undefined
-      ? versionContent(open.conn, args.versionId)
-      : workspaceVersionContent(open.conn, open.workspace, args.versionId);
-  });
-  handle("restore_file_version", async (args: { versionId: string }) => {
-    const open = openRoomOrThrow(room);
-    const fileId = open.workspace === undefined
-      ? restoreVersionInto(open.conn, args.versionId)
-      : await open.workspace.restoreVersion(args.versionId);
-    emitSafely(deps.emit, "room-files-changed", undefined);
-    emitSafely(deps.emit, "file-updated", fileId);
-  });
-  handle("export_file", (args: { id: string; destPath: string }) => {
-    const open = openRoomOrThrow(room);
-    return open.workspace === undefined
-      ? exportFile(open.conn, args.id, args.destPath)
-      : exportWorkspaceFile(open.conn, open.workspace, args.id, args.destPath);
-  });
-  handle("export_all", (args: { destDir: string }) => {
-    const open = openRoomOrThrow(room);
-    return open.workspace === undefined
-      ? exportAll(open.conn, args.destDir)
-      : exportAllWorkspace(open.conn, open.workspace, args.destDir);
-  });
-  handle("change_password", async (args: { current: string; newPassword: string }) => {
-    const open = openRoomOrThrow(room);
-    if (open.readOnly === true) throw new Error("This workspace is read-only because another Arcelle process owns the writer lease.");
-    const databasePath = open.descriptor?.dbPath ?? open.path;
-    const code = await changePassword(
-      open.conn,
-      databasePath,
-      args.current,
-      args.newPassword,
-      deps.isRollingBack,
-      open.workspace === undefined ? undefined : {
-        databasePath,
-        biometricPath: open.path,
-        recoveryPath: databasePath,
-        checkpointsPath: open.path,
-      },
-    );
-    deps.onPasswordChanged?.(args.newPassword);
-    return code;
-  });
-  handle("duplicate_room", (args: { destPath: string; newPassword: string | null }) => {
-    const open = openRoomOrThrow(room);
-    if (open.readOnly === true) throw new Error("This workspace is read-only because another Arcelle process owns the writer lease.");
-    if (open.workspace === undefined || open.descriptor?.kind !== "workspace-folder") {
-      return duplicateRoom(open.conn, open.password, args.destPath, args.newPassword);
-    }
-    return duplicateWorkspaceRoom(
-      open.workspace,
-      open.descriptor.roomId,
-      open.password,
-      args.destPath,
-      args.newPassword,
-    );
-  });
-  handle("compact_room", () => {
-    const open = openRoomOrThrow(room);
-    if (open.readOnly === true) throw new Error("This workspace is read-only because another Arcelle process owns the writer lease.");
-    return compactRoom(open.conn);
-  });
-}
+export { exportAllWorkspace, exportWorkspaceFile, workspaceVersionContent };

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Readable } from "node:stream";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
-import type { RoomManagerDeps, RoomManagerState } from "./roomManager.js";
+import type { Room, RoomManagerDeps, RoomManagerState } from "./roomManager.js";
 import type { EventSender } from "./turn.js";
 import type { WindowContentView } from "./browser/webviewManager.js";
 import { Browser } from "./browser/browser.js";
@@ -52,6 +52,124 @@ export interface BrowserSurfaceHost {
   focusMainWindow(): void;
 }
 
+export interface BrowserImportDeps {
+  afterImport(): void;
+  availableName: typeof availableName;
+  createReadStream(path: string): Readable;
+  getFileMeta: typeof getFileMeta;
+  guessDownloadMime: typeof guessDownloadMime;
+  insertFileFromUrl: typeof insertFileFromUrl;
+  readBytes(path: string): Promise<Buffer>;
+  readText(path: string): Promise<string>;
+  safeFileName: typeof safeFileName;
+  setFileExtractedText: typeof setFileExtractedText;
+  textStream(text: string): Readable;
+}
+
+function browserImportDeps(afterImport: () => void): BrowserImportDeps {
+  return {
+    afterImport,
+    availableName,
+    createReadStream: (file) => fs.createReadStream(file),
+    getFileMeta,
+    guessDownloadMime,
+    insertFileFromUrl,
+    readBytes: (file) => fs.promises.readFile(file),
+    readText: (file) => fs.promises.readFile(file, "utf8"),
+    safeFileName,
+    setFileExtractedText,
+    textStream: (text) => Readable.from([Buffer.from(text, "utf8")]),
+  };
+}
+
+function openImportRoom(room: Room | null): Room {
+  if (!room) throw new Error("No room is open.");
+  return room;
+}
+
+function isTextMime(mime: string): boolean {
+  return mime.startsWith("text/");
+}
+
+function textFromBytes(mime: string, bytes: Buffer): string | null {
+  return isTextMime(mime) ? bytes.toString("utf8") : null;
+}
+
+async function insertLegacyBrowserDownload(
+  room: Room,
+  stagedPath: string,
+  finalName: string,
+  mime: string,
+  url: string,
+  deps: BrowserImportDeps,
+): Promise<FileMeta> {
+  const bytes = await deps.readBytes(stagedPath);
+  return deps.insertFileFromUrl(
+    room.conn,
+    finalName,
+    mime,
+    bytes,
+    textFromBytes(mime, bytes),
+    "web",
+    url,
+  );
+}
+
+async function workspaceDownloadText(
+  stagedPath: string,
+  mime: string,
+  deps: BrowserImportDeps,
+): Promise<string | null> {
+  return isTextMime(mime) ? deps.readText(stagedPath) : null;
+}
+
+function workspaceDownloadContent(
+  stagedPath: string,
+  text: string | null,
+  deps: BrowserImportDeps,
+): Readable {
+  return text === null ? deps.createReadStream(stagedPath) : deps.textStream(text);
+}
+
+async function insertWorkspaceBrowserDownload(
+  room: Room,
+  stagedPath: string,
+  finalName: string,
+  mime: string,
+  url: string,
+  deps: BrowserImportDeps,
+): Promise<FileMeta> {
+  const workspace = room.workspace;
+  if (workspace === undefined) throw new Error("Workspace is unavailable.");
+  const text = await workspaceDownloadText(stagedPath, mime, deps);
+  const entry = await workspace.createFile(
+    finalName,
+    workspaceDownloadContent(stagedPath, text, deps),
+    "web",
+  );
+  room.conn.prepare("UPDATE files SET mime_type = ?, origin_url = ? WHERE id = ?")
+    .run(mime, url, entry.fileId);
+  if (text !== null) deps.setFileExtractedText(room.conn, entry.fileId, text);
+  return deps.getFileMeta(room.conn, entry.fileId);
+}
+
+export async function importBytes(
+  room: Room | null,
+  stagedPath: string,
+  name: string,
+  url: string,
+  deps: BrowserImportDeps,
+): Promise<FileMeta> {
+  const open = openImportRoom(room);
+  const finalName = deps.availableName(open.conn, deps.safeFileName(name));
+  const mime = deps.guessDownloadMime(finalName);
+  const meta = open.workspace === undefined
+    ? await insertLegacyBrowserDownload(open, stagedPath, finalName, mime, url, deps)
+    : await insertWorkspaceBrowserDownload(open, stagedPath, finalName, mime, url, deps);
+  deps.afterImport();
+  return meta;
+}
+
 function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
 }
@@ -79,31 +197,8 @@ export function registerBrowserSurfaceIpc(
       void import("./privacy.js").then(({ schedulePrivacyScan }) => schedulePrivacyScan(deps.privacyScan!));
     }
   };
-
-  const importBytes = async (stagedPath: string, name: string, url: string): Promise<FileMeta> => {
-    const room = state.room;
-    if (!room) throw new Error("No room is open.");
-    const finalName = availableName(room.conn, safeFileName(name));
-    const mime = guessDownloadMime(finalName);
-    let meta: FileMeta;
-    if (room.workspace === undefined) {
-      const bytes = await fs.promises.readFile(stagedPath);
-      const text = mime.startsWith("text/") ? bytes.toString("utf8") : null;
-      meta = insertFileFromUrl(room.conn, finalName, mime, bytes, text, "web", url);
-    } else {
-      const text = mime.startsWith("text/") ? await fs.promises.readFile(stagedPath, "utf8") : null;
-      const content = text === null
-        ? fs.createReadStream(stagedPath)
-        : Readable.from([Buffer.from(text, "utf8")]);
-      const entry = await room.workspace.createFile(finalName, content, "web");
-      room.conn.prepare("UPDATE files SET mime_type = ?, origin_url = ? WHERE id = ?")
-        .run(mime, url, entry.fileId);
-      if (text !== null) setFileExtractedText(room.conn, entry.fileId, text);
-      meta = getFileMeta(room.conn, entry.fileId);
-    }
-    afterImport();
-    return meta;
-  };
+  const importDownload = (file: string, name: string, url: string) =>
+    importBytes(state.room, file, name, url, browserImportDeps(afterImport));
 
   const browser = new Browser({
     windowContentView: host.windowContentView,
@@ -118,7 +213,7 @@ export function registerBrowserSurfaceIpc(
     removeStagingDir: (dir) => fs.promises.rm(dir, { recursive: true, force: true }),
     importFinishedDownload: async (file, name, url) => {
       try {
-        return await importBytes(file, name, url);
+        return await importDownload(file, name, url);
       } finally {
         await fs.promises.rm(file, { force: true }).catch(() => {});
       }

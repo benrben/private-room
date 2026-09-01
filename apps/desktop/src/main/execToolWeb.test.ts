@@ -230,6 +230,25 @@ describe("web_search", () => {
     }
     expect(getFreshWebSearch(db, "central bank")).not.toBeNull();
   });
+
+  it("still returns live results when the best-effort search cache write fails", async () => {
+    const db = freshRoom();
+    turnWebAccessOn(db);
+    let finish!: (page: unknown) => void;
+    mockSearchWeb.mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+    const pending = execTool(
+      "web_search",
+      { query: "central bank" },
+      effects(),
+      deps({ db, maskOutboundWeb: () => null }),
+    );
+    await vi.waitFor(() => expect(mockSearchWeb).toHaveBeenCalledOnce());
+    db.close();
+    finish({ hits: [hit({ title: "Uncached result" })], merged: 1, tookMs: 1, cached: false, failed: [] });
+
+    const outcome = await pending;
+    expect(outcome.ok && outcome.text).toContain("Uncached result");
+  });
 });
 
 // --------------------------------------------------------------- fetch_page
@@ -330,6 +349,30 @@ describe("fetch_page", () => {
     });
     const plain = await execTool("fetch_page", { url: "https://plain.example/" }, effects(), d);
     expect(plain.ok && plain.text).not.toContain("(Redirected to");
+  });
+
+  it("still returns a fetched page when its best-effort cache write fails", async () => {
+    const db = freshRoom();
+    turnWebAccessOn(db);
+    let finish!: (page: unknown) => void;
+    mockFetchPage.mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+    const pending = execTool(
+      "fetch_page",
+      { url: "https://uncached.example/" },
+      effects(),
+      deps({ db, outboundUrlRefusal: () => null }),
+    );
+    await vi.waitFor(() => expect(mockFetchPage).toHaveBeenCalledOnce());
+    db.close();
+    finish({
+      title: "Uncached page",
+      text: "available despite cache failure",
+      finalUrl: "https://uncached.example/",
+      status: 200,
+    });
+
+    const outcome = await pending;
+    expect(outcome.ok && outcome.text).toContain("available despite cache failure");
   });
 
   it("a fetch error is a real tool failure, never fabricated text", async () => {

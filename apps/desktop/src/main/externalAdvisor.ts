@@ -182,199 +182,46 @@ export interface BuildCommandLineOptions {
  * The single quotes around the interpolated slugs are NOT what makes this
  * safe; {@link checkCliSlug} is. See its doc.
  */
-export function buildCommandLine(engine: CliEngine, opts: BuildCommandLineOptions): string {
-  const modelFlag = opts.submodel !== null ? ` --model '${opts.submodel}'` : "";
-  // Claude takes `--effort <level>`; Codex takes a config override.
-  // Antigravity's live catalog already exposes effort as model variants.
-  const effortFlag =
-    opts.effort === null || engine === "antigravity-cli"
-      ? ""
-      : engine === "claude-cli"
-        ? ` --effort '${opts.effort}'`
-        : ` -c 'model_reasoning_effort=${opts.effort}'`;
+function commandModelFlag(submodel: string | null): string {
+  return submodel === null ? "" : ` --model '${submodel}'`;
+}
 
-  if (engine === "claude-cli") {
-    const formatFlags = opts.streamJsonInput === true
-      ? "--input-format stream-json --output-format stream-json --verbose"
-      : "--output-format json";
-    if (opts.mcpConfigPath !== undefined && opts.mcpConfigPath !== null) {
-      return (
-        `claude -p ${formatFlags} --mcp-config '${opts.mcpConfigPath}' ` +
-        `--strict-mcp-config --allowedTools 'mcp__room__*'${modelFlag}${effortFlag}`
-      );
-    }
-    return `claude -p ${formatFlags}${modelFlag}${effortFlag}`;
+function commandEffortFlag(engine: CliEngine, effort: string | null): string {
+  if (effort === null || engine === "antigravity-cli") return "";
+  if (engine === "claude-cli") return ` --effort '${effort}'`;
+  return ` -c 'model_reasoning_effort=${effort}'`;
+}
+
+function claudeFormatFlags(streamJsonInput: boolean | undefined): string {
+  return streamJsonInput === true
+    ? "--input-format stream-json --output-format stream-json --verbose"
+    : "--output-format json";
+}
+
+function claudeCommand(opts: BuildCommandLineOptions, modelFlag: string, effortFlag: string): string {
+  const formatFlags = claudeFormatFlags(opts.streamJsonInput);
+  if (opts.mcpConfigPath !== undefined && opts.mcpConfigPath !== null) {
+    return (
+      `claude -p ${formatFlags} --mcp-config '${opts.mcpConfigPath}' ` +
+      `--strict-mcp-config --allowedTools 'mcp__room__*'${modelFlag}${effortFlag}`
+    );
   }
+  return `claude -p ${formatFlags}${modelFlag}${effortFlag}`;
+}
+
+export function buildCommandLine(engine: CliEngine, opts: BuildCommandLineOptions): string {
+  const modelFlag = commandModelFlag(opts.submodel);
+  const effortFlag = commandEffortFlag(engine, opts.effort);
+  if (engine === "claude-cli") return claudeCommand(opts, modelFlag, effortFlag);
   if (engine === "antigravity-cli") {
     return `agy --sandbox --mode plan --input-format stream-json --output-format stream-json --print-timeout 5m${modelFlag}`;
   }
   return `codex exec --json${CODEX_ARCELLE_FLAGS}${opts.codexMcpFlags ?? ""}${modelFlag}${effortFlag} -`;
 }
+import { ExternalUsage, parseAntigravityJsonStream, parseClaudeJsonResult, parseCodexJsonStream } from "./externalAdvisorParsing.js";
+export { parseClaudeJsonResult, parseCodexJsonStream, parseAntigravityJsonStream } from "./externalAdvisorParsing.js";
+export type { ExternalUsage } from "./externalAdvisorParsing.js";
 
-// ---------------------------------------------------------------- usage/parsers
-
-/**
- * `ExternalUsage` (external.rs lines 926-930) — real usage for one
- * external-CLI turn, when the CLI's own JSON envelope parsed. `inputTokens`
- * is the round's real PROMPT/context token count (Claude: `input_tokens +
- * cache_creation_input_tokens + cache_read_input_tokens`, all three count
- * toward context; Codex: `input_tokens`, already inclusive of any cached
- * subset).
- */
-export interface ExternalUsage {
-  inputTokens: number | null;
-  outputTokens: number | null;
-}
-
-const NO_USAGE: ExternalUsage = { inputTokens: null, outputTokens: null };
-
-function asRecord(v: unknown): Record<string, unknown> | null {
-  return typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
-}
-
-/** `serde_json::Value::as_u64` — a JSON number that is a non-negative integer,
- * and nothing else. A float or a negative reads as absent, exactly as it does
- * in Rust, rather than as a fractional token count. */
-function u64Field(obj: Record<string, unknown> | null, key: string): number | null {
-  if (obj === null) return null;
-  const v = obj[key];
-  return typeof v === "number" && Number.isInteger(v) && v >= 0 ? v : null;
-}
-
-/**
- * `parse_claude_json_result` (external.rs lines 940-964) — `claude -p
- * --output-format json`'s single JSON result object. Falls back to treating
- * the whole stdout as plain answer text (no usage) if the envelope doesn't
- * parse as expected.
- *
- * A present-but-unreadable `usage` still reports a total (`0`), matching
- * Rust's `usage_obj.map(...)`: the difference between "the CLI reported no
- * usage field at all" (`null`) and "it reported one we could not read" (`0`)
- * is preserved rather than flattened.
- *
- * NOTE: `modelUsage[*].contextWindow` also rides this envelope — the real
- * window, per model. The CHAT path reads it in the sidecar's twin of this
- * parser (`external_llm.parse_claude_json_result`); nothing here consumes it.
- */
-export function parseClaudeJsonResult(stdout: Buffer | string): { text: string; usage: ExternalUsage } {
-  const raw = typeof stdout === "string" ? stdout : stdout.toString("utf8");
-  const fallbackText = (): string => raw.trim();
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    // Image-bearing Claude requests require stream-JSON input, which in turn
-    // requires stream-JSON OUTPUT. Read the terminal result object out of the
-    // NDJSON stream while ignoring shell banners and intermediate events.
-    parsed = null;
-    for (const line of raw.split("\n")) {
-      if (line.trim() === "") continue;
-      try {
-        const event = JSON.parse(line) as unknown;
-        const obj = asRecord(event);
-        if (obj?.type === "result") parsed = event;
-      } catch {
-        // Interactive shell startup output is not part of Claude's envelope.
-      }
-    }
-    if (parsed === null) return { text: fallbackText(), usage: NO_USAGE };
-  }
-  const obj = asRecord(parsed);
-  if (obj === null) {
-    return { text: fallbackText(), usage: NO_USAGE };
-  }
-  const text = typeof obj.result === "string" ? obj.result : fallbackText();
-
-  if (!Object.prototype.hasOwnProperty.call(obj, "usage")) {
-    return { text, usage: NO_USAGE };
-  }
-  const usageObj = asRecord(obj.usage);
-  const inputTokens =
-    (u64Field(usageObj, "input_tokens") ?? 0) +
-    (u64Field(usageObj, "cache_creation_input_tokens") ?? 0) +
-    (u64Field(usageObj, "cache_read_input_tokens") ?? 0);
-  return { text, usage: { inputTokens, outputTokens: u64Field(usageObj, "output_tokens") } };
-}
-
-/**
- * `parse_codex_json_stream` (external.rs lines 974-1013) — `codex exec
- * --json`'s JSONL event stream. The answer rides the LAST
- * `item.completed`/`agent_message` event; usage rides the final
- * `turn.completed` event, and a `turn.completed` carrying no `usage` object
- * leaves whatever an earlier one reported intact. Falls back to the raw
- * stdout as plain text only if NOT ONE line parsed as JSON (a genuine
- * schema-drift case) — an answer that's merely empty is trusted as-is.
- */
-export function parseCodexJsonStream(stdout: Buffer | string): { text: string; usage: ExternalUsage } {
-  const raw = typeof stdout === "string" ? stdout : stdout.toString("utf8");
-  let text = "";
-  let inputTokens: number | null = null;
-  let outputTokens: number | null = null;
-  let parsedAny = false;
-
-  for (const line of raw.split("\n")) {
-    if (line.length === 0) {
-      continue;
-    }
-    let ev: unknown;
-    try {
-      ev = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    parsedAny = true;
-    const obj = asRecord(ev);
-    if (obj === null) {
-      continue;
-    }
-    if (obj.type === "item.completed") {
-      const item = asRecord(obj.item);
-      if (item !== null && item.type === "agent_message" && typeof item.text === "string") {
-        text = item.text;
-      }
-    } else if (obj.type === "turn.completed") {
-      const usage = asRecord(obj.usage);
-      if (usage !== null) {
-        inputTokens = u64Field(usage, "input_tokens");
-        outputTokens = u64Field(usage, "output_tokens");
-      }
-    }
-  }
-  if (!parsedAny) {
-    text = raw.trim();
-  }
-  return { text, usage: { inputTokens, outputTokens } };
-}
-
-/** Antigravity CLI's `--output-format stream-json` JSONL stream. The terminal
- * result carries the final response and aggregate token stats. */
-export function parseAntigravityJsonStream(stdout: Buffer | string): { text: string; usage: ExternalUsage } {
-  const raw = typeof stdout === "string" ? stdout : stdout.toString("utf8");
-  let text = "";
-  let inputTokens: number | null = null;
-  let outputTokens: number | null = null;
-  let parsedAny = false;
-  for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
-    let event: unknown;
-    try { event = JSON.parse(line); } catch { continue; }
-    parsedAny = true;
-    const obj = asRecord(event);
-    if (obj?.event === "step_update") {
-      const update = asRecord(obj.step_update);
-      if (update?.step_type === "agent_response" && typeof update.text_delta === "string") text += update.text_delta;
-    } else if (obj?.event === "result") {
-      const result = asRecord(obj.result);
-      if (typeof result?.response === "string") text = result.response;
-      const usage = asRecord(result?.usage);
-      inputTokens = u64Field(usage, "input_tokens");
-      outputTokens = u64Field(usage, "output_tokens");
-    }
-  }
-  if (!parsedAny) text = raw.trim();
-  return { text, usage: { inputTokens, outputTokens } };
-}
 
 // -------------------------------------------------------- reconciliation seams
 
@@ -393,7 +240,7 @@ export interface AdvisorPrivacyPolicy {
 
 /** A compile-time check that the seam above is the real `Redactor`'s shape
  * and not a look-alike that has drifted from it. */
-const REDACTOR_FITS: (r: Redactor) => AdvisorPrivacyPolicy = (r) => r;
+const REDACTOR_FITS: Redactor extends AdvisorPrivacyPolicy ? true : never = true;
 void REDACTOR_FITS;
 
 /** `commands::active_policy()` — the room's currently active redactor, or
@@ -540,7 +387,6 @@ function runCli(a: RunCliArgs): Promise<CliRunOutcome> {
     child.stderr?.on("data", (c: Buffer | string) => stderrChunks.push(asBuffer(c)));
 
     let settled = false;
-    let spawnError: string | null = null;
     let watcher: ReturnType<typeof setInterval> | undefined;
     const stopWatcher = (): void => {
       if (watcher !== undefined) {
@@ -555,7 +401,6 @@ function runCli(a: RunCliArgs): Promise<CliRunOutcome> {
     // bare exit code, is correct under either ordering and cannot hang if
     // only one of the two ever fires.
     child.on("error", (err) => {
-      spawnError = err.message;
       if (settled) return;
       settled = true;
       stopWatcher();
@@ -565,10 +410,6 @@ function runCli(a: RunCliArgs): Promise<CliRunOutcome> {
       if (settled) return;
       settled = true;
       stopWatcher();
-      if (spawnError !== null) {
-        resolve({ ok: false, error: `Could not start ${a.engineName}: ${spawnError}` });
-        return;
-      }
       resolve({
         ok: true,
         result: { code, stdout: Buffer.concat(stdoutChunks), stderr: Buffer.concat(stderrChunks) },
@@ -677,283 +518,8 @@ export function claudeImageUserEvent(prompt: string, images: readonly string[]):
     },
   })}\n`;
 }
+export { runExternalCli, runAdvisorCli, makeRunAdvisorCli, realRunAdvisorCli } from "./externalAdvisorRun.js";
+export type { RunExternalOptions, ExternalRunResult } from "./externalAdvisorRun.js";
 
-export interface RunExternalOptions {
-  /** ADD-7: the Stop flag. Polled every 100ms; the child is killed the moment
-   * it reads true. */
-  cancel?: CancelFlagLike;
-  /** ADD-20: hands the CLI the room's tools over a scoped localhost MCP
-   * bridge. See the module doc for why no call site supplies one yet. */
-  bridge?: AdvisorBridge;
-  /** PRIV-1: overrides the `privacy.ts` lookup this otherwise does for
-   * itself. Called once per turn — see the module doc for why this is a thunk
-   * rather than a policy value. */
-  activePolicy?: ActiveAdvisorPolicy;
-  /** PRIV-1: "send real details this once" — skips the privacy door for this
-   * one turn even when {@link activePolicy} would otherwise engage it. */
-  privacyBypass?: boolean;
-  /** Test seam: the shell that runs the built command line. Defaults to the
-   * real `zsh -ilc`; see the module doc for why tests swap it. */
-  shell?: { command: string; args: readonly string[] };
-  /** Test seam: env for the spawned shell. Defaults to `process.env`. */
-  env?: NodeJS.ProcessEnv;
-  /** Test seam: replaces the real `child_process.spawn`. */
-  spawnFn?: AdvisorSpawnFn;
-}
 
-export interface ExternalRunResult {
-  text: string;
-  usage: ExternalUsage | null;
-}
-
-/**
- * Run one prompt through a cloud CLI (Claude Code / Codex / Antigravity) — the real port of
- * `run_external` (external.rs lines 643-892). The content leaves the machine
- * via the user's own account.
- *
- * Claude receives attached images as base64 content blocks on stream-JSON
- * stdin, including when its file tools are disabled. Other CLI adapters retain
- * their private temporary-file flow, cleaned on every exit path rather than
- * just the happy one ({@link cleanupScratchDir}).
- *
- * `engineRaw` is either a bare engine id (`"claude-cli"`/`"codex-cli"`) or a
- * composite one carrying the model and/or reasoning effort the Cloud picker
- * chose (`"codex-cli::gpt-5.6-sol::high"`).
- *
- * Rejects (never resolves with a fabricated answer) on: an unknown engine, an
- * unsafe model/effort slug, a spawn failure, or a non-zero exit — exactly
- * `run_external`'s own `Err` cases. `execTool.ts`'s `execConsultAdvisor`
- * already turns a rejection into "the advisor could not be reached" for the
- * user; this function's job stops at reporting the failure honestly.
- */
-export async function runExternalCli(
-  engineRaw: string,
-  messages: readonly SidecarChatMessage[],
-  options: RunExternalOptions = {}
-): Promise<ExternalRunResult> {
-  const [engine, submodelRaw, effortRaw] = splitExternalModel(engineRaw);
-
-  // PRIV-1: the door, inside the leaf — EVERY caller of this function ships
-  // content to a cloud CLI, so the policy engages here regardless of which
-  // feature composed the messages. Protected strings become placeholders,
-  // attached images stay on the Mac (pixels can't be redacted), and the reply
-  // is restored below before anyone sees it.
-  const lookUpPolicy = options.activePolicy ?? defaultActivePolicy;
-  const policy = options.privacyBypass ? null : (lookUpPolicy() ?? null);
-  const report = emptyPrivacyReport();
-  const guarded: readonly SidecarChatMessage[] =
-    policy === null
-      ? messages
-      : messages.map((m) => {
-          const redacted: SidecarChatMessage = { ...m, content: policy.redact(m.content, report) };
-          if (m.images !== undefined) {
-            report.imagesBlocked += m.images.length;
-            delete redacted.images;
-          }
-          return redacted;
-        });
-
-  const tmpDir = path.join(os.tmpdir(), `arcelle-cli-${randomUUID()}`);
-  try {
-    const claudeImages: string[] = [];
-    const imagePaths: string[] = [];
-    for (const m of guarded) {
-      if (m.images === undefined) continue;
-      for (const b64 of m.images.slice(0, MAX_IMAGES_PER_MESSAGE)) {
-        const bytes = decodeBase64Strict(b64);
-        if (bytes === null) continue;
-        if (engine === "claude-cli") {
-          claudeImages.push(b64);
-          continue;
-        }
-        if (imagePaths.length === 0) {
-          await mkdir(tmpDir, { recursive: true });
-        }
-        const p = path.join(tmpDir, `attachment-${imagePaths.length + 1}.png`);
-        try {
-          await writeFile(p, bytes);
-          imagePaths.push(p);
-        } catch {
-          // Best-effort, matching Rust's `if std::fs::write(...).is_ok()`: a
-          // failed write is skipped rather than aborting the turn.
-        }
-      }
-    }
-
-    let prompt = "";
-    for (const m of guarded) {
-      if (m.role === "system") {
-        prompt += `Instructions:\n${m.content}\n\n`;
-      } else if (m.role === "user") {
-        prompt += `User: ${m.content}\n\n`;
-      } else if (m.role === "assistant") {
-        prompt += `Assistant: ${m.content}\n\n`;
-      }
-      // "tool" and anything else is skipped, matching Rust's `_ => {}`.
-    }
-    if (claudeImages.length > 0) {
-      prompt +=
-        `${claudeImages.length} image(s) are attached to this request as image content blocks. ` +
-        "Inspect those pixels before answering.\n\n";
-    } else if (imagePaths.length > 0) {
-      prompt +=
-        `The user attached ${imagePaths.length} image(s), saved for you at:\n${imagePaths.join("\n")}\n` +
-        "Open and view them before answering.\n\n";
-    }
-    if (options.bridge !== undefined) {
-      prompt +=
-        "You are connected to the user's Arcelle through the MCP " +
-        'server named "room". Use its tools to list, search, open, edit, ' +
-        "create, or annotate the room's files whenever the question " +
-        "involves files — do not guess file contents from memory.\n\n";
-    }
-    prompt += "Respond to the last user message. Reply with the answer only.";
-
-    // ADD-20 / engine parity: hand the bridge to BOTH CLIs. Claude takes a
-    // JSON `--mcp-config` file (written into the temp work dir, removed with
-    // it); Codex takes per-invocation `-c mcp_servers.room.*` overrides with
-    // the bearer token passed through a child-process env var.
-    let mcpConfigPath: string | null = null;
-    let codexMcpFlags = "";
-    let codexBridgeToken: string | null = null;
-    if (options.bridge !== undefined) {
-      if (engine === "claude-cli") {
-        await mkdir(tmpDir, { recursive: true });
-        mcpConfigPath = path.join(tmpDir, "mcp-room.json");
-        await writeFile(mcpConfigPath, options.bridge.mcpConfigJson());
-      } else if (engine === "codex-cli") {
-        codexMcpFlags =
-          ` -c 'mcp_servers.room.url="${options.bridge.mcpUrl()}"' ` +
-          "-c 'mcp_servers.room.bearer_token_env_var=\"PR_ROOM_MCP_TOKEN\"'";
-        codexBridgeToken = options.bridge.token;
-      }
-    }
-
-    // Nothing between `set_setting` and here looked at the characters — this
-    // is the ONE place the value becomes a shell word. See checkCliSlug.
-    const submodel = checkCliSlug(submodelRaw, "model");
-    const effort = checkCliSlug(effortRaw, "reasoning effort");
-
-    if (engine !== "claude-cli" && engine !== "codex-cli" && engine !== "antigravity-cli") {
-      throw new Error("Unknown engine");
-    }
-    const cmdline = buildCommandLine(engine, {
-      submodel,
-      effort,
-      mcpConfigPath,
-      codexMcpFlags,
-      streamJsonInput: engine === "claude-cli" && claudeImages.length > 0,
-    });
-
-    const workDir = imagePaths.length === 0 ? os.tmpdir() : tmpDir;
-    const shell = options.shell ?? DEFAULT_SHELL;
-    const env: NodeJS.ProcessEnv = { ...(options.env ?? process.env) };
-    // The bridge token rides an env var (never argv, which `ps` can read).
-    if (codexBridgeToken !== null) {
-      env.PR_ROOM_MCP_TOKEN = codexBridgeToken;
-    }
-
-    const runOnce = () => runCli({
-      spawnFn: options.spawnFn ?? realAdvisorSpawn,
-      command: shell.command,
-      args: [...shell.args, cmdline],
-      cwd: workDir,
-      env,
-      stdinText: engine === "antigravity-cli"
-        ? `${JSON.stringify({ event: "user", message: { role: "user", content: prompt } })}\n`
-        : engine === "claude-cli" && claudeImages.length > 0
-          ? claudeImageUserEvent(prompt, claudeImages)
-          : prompt,
-      engineName: engine,
-      cancel: options.cancel,
-    });
-    let run = await runOnce();
-    if (!run.ok) {
-      throw new Error(run.error);
-    }
-    if (run.result.code !== 0) {
-      const snippet = Array.from(run.result.stderr.toString("utf8")).slice(0, STDERR_SNIPPET_CHARS).join("");
-      throw new Error(`${engine} failed: ${snippet}`);
-    }
-
-    let parsed = engine === "claude-cli"
-      ? parseClaudeJsonResult(run.result.stdout)
-      : engine === "antigravity-cli"
-        ? parseAntigravityJsonStream(run.result.stdout)
-        : parseCodexJsonStream(run.result.stdout);
-
-    // Antigravity occasionally exits 0 after emitting only initialization or
-    // tool-stream events. That is an adapter failure, not an empty answer.
-    // Retry the provider process once, then surface bounded raw diagnostics
-    // instead of letting the caller turn an empty string into "no output".
-    if (engine === "antigravity-cli" && parsed.text.trim() === "") {
-      const first = run.result;
-      run = await runOnce();
-      if (!run.ok) throw new Error(run.error);
-      if (run.result.code !== 0) {
-        const snippet = Array.from(run.result.stderr.toString("utf8")).slice(0, STDERR_SNIPPET_CHARS).join("");
-        throw new Error(`${engine} failed: ${snippet}`);
-      }
-      parsed = parseAntigravityJsonStream(run.result.stdout);
-      if (parsed.text.trim() === "") {
-        const diagnostics = (label: string, value: Buffer): string => {
-          const snippet = Array.from(value.toString("utf8")).slice(0, STDERR_SNIPPET_CHARS).join("").trim();
-          return `${label}=${snippet === "" ? "(empty)" : snippet}`;
-        };
-        throw new Error(
-          `${engine} failed after one bounded retry: exit=${String(run.result.code)}; `
-          + `${diagnostics("stdout", run.result.stdout)}; ${diagnostics("stderr", run.result.stderr)}; `
-          + `first_stdout_bytes=${first.stdout.length}; first_stderr_bytes=${first.stderr.length}`,
-        );
-      }
-    }
-
-    // PRIV-1: put the real values back into the reply — the cloud only ever
-    // saw the placeholders; the user reads a normal answer. Usage numbers
-    // carry no room content, so they ride through untouched.
-    return {
-      text: policy === null ? parsed.text : policy.restore(parsed.text),
-      usage: parsed.usage,
-    };
-  } finally {
-    // Decrypted content must not linger on disk, however this function
-    // returns — including on every throw above.
-    await cleanupScratchDir(tmpDir);
-  }
-}
-
-// -------------------------------------------------------- the runAdvisorCli seam
-
-/**
- * The exact shape `execTool.ts`'s `ExecToolDeps.runAdvisorCli` declares:
- * `(engine, question) => Promise<string>`. Builds the one-message prompt
- * `consult_advisor`'s own Rust arm builds (agent.rs line 4643:
- * `vec![ollama::ChatMessage::new("user", question)]`) and discards usage —
- * agent.rs's own comment on that call says why: "a nested sub-call inside one
- * turn, already captured as ordinary tool-result char length under the outer
- * turn's 'tools' category".
- */
-export async function runAdvisorCli(
-  engine: CliEngine,
-  question: string,
-  options: RunExternalOptions = {}
-): Promise<string> {
-  const { text } = await runExternalCli(engine, [{ role: "user", content: question }], options);
-  return text;
-}
-
-/** The `(engine, question) => Promise<string>` seam, bound to a fixed set of
- * {@link RunExternalOptions} — how a host that HAS a live privacy thunk, room
- * bridge or cancel flag hands them to every advisor call it wires up. */
-export function makeRunAdvisorCli(
-  options: RunExternalOptions = {}
-): (engine: CliEngine, question: string) => Promise<string> {
-  return (engine, question) => runAdvisorCli(engine, question, options);
-}
-
-/**
- * Ready-made seam with no bridge, cancel flag or privacy thunk — the honest
- * default given none of those live instances exist yet in this migration (see
- * the module doc). This is what `execTool.ts`'s `withRealAdvisorCli` installs.
- */
-export const realRunAdvisorCli: (engine: CliEngine, question: string) => Promise<string> = makeRunAdvisorCli();
+export { CliRunOutcome, CliRunResult, DEFAULT_SHELL, MAX_IMAGES_PER_MESSAGE, RunCliArgs, STDERR_SNIPPET_CHARS, cleanupScratchDir, decodeBase64Strict, defaultActivePolicy, realAdvisorSpawn, runCli };

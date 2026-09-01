@@ -343,4 +343,8 @@ describe("htmlToMarkdown", () => {
   it("collapses every run of whitespace to one space, as HTML does", () => {
     expect(htmlToMarkdown("<p>a\n\t  b   c</p>")).toBe("a b c\n");
   });
+
+  it("keeps an explicit line break as a word boundary", () => {
+    expect(htmlToMarkdown("<p>first<br>second</p>")).toBe("first second\n");
+  });
 });

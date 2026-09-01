@@ -10,13 +10,17 @@ import { RoomToolDispatcher, WEB_LANES_ALL } from "./bridgeDispatcher.js";
 import { createFolder, moveFileToFolder } from "./db-host/folders.js";
 import { insertFile } from "./db-host/files.js";
 import { createRoom } from "./db-host/open.js";
+import { setSetting } from "./db-host/settings.js";
 import { createToolEffects } from "./execTool.js";
 import {
   INTERACTIVE_VISUAL_INDEX_BUDGET_MS,
+  liveMcpRoutes,
   playableVideoMime,
   requestLiveMediaFrame,
 } from "./liveAppServices.js";
 import { createMediaStreams, type MediaStreams } from "./mediaTools.js";
+import { MCP_TOOL_PREFS_KEY } from "./mcpConfig.js";
+import type { McpManager } from "./mcpClient.js";
 import { createRoomManagerState, type RoomManagerState } from "./roomManager.js";
 import type { EventSender } from "./turn.js";
 import { VIDEO_VISUAL_INDEX_PROFILE_ID } from "./videoVisualIndex.js";
@@ -111,6 +115,83 @@ describe("playableVideoMime", () => {
   it("does not relabel an unsupported arbitrary file as video", () => {
     expect(playableVideoMime("notes.bin", "application/octet-stream")).toBeNull();
     expect(playableVideoMime("notes.txt", "text/plain")).toBeNull();
+  });
+});
+
+describe("liveMcpRoutes", () => {
+  it("preserves route ordering, reserved-name disambiguation, schemas, and annotations using only manager fakes", () => {
+    const manager = {
+      servers: [
+        {
+          name: "offline",
+          status: "failed",
+          client: {},
+          remote: false,
+          tools: [{ name: "ignored", description: "ignored", schema: {}, annotations: null }],
+        },
+        {
+          name: "missing",
+          status: "connected",
+          client: null,
+          remote: false,
+          tools: [{ name: "ignored", description: "ignored", schema: {}, annotations: null }],
+        },
+        {
+          name: "list",
+          status: "connected",
+          client: {},
+          remote: true,
+          tools: [
+            {
+              name: "room files",
+              description: "a".repeat(2_001),
+              schema: ["not an object"],
+              annotations: { title: "Visible files" },
+            },
+            { name: "room files", description: "second", schema: { type: "string" }, annotations: null },
+          ],
+        },
+      ],
+    } as unknown as McpManager;
+
+    const routes = liveMcpRoutes(createRoomManagerState(), manager);
+
+    expect(routes.map((route) => route.catalogName)).toEqual(["list_room_files_2", "list_room_files_3"]);
+    expect(routes).toMatchObject([{
+      toolName: "room files",
+      serverName: "list",
+      remote: true,
+      spec: {
+        type: "function",
+        function: {
+          name: "list_room_files_2",
+          description: `${"a".repeat(1_997)}…`,
+          parameters: { type: "object", properties: {} },
+          annotations: { title: "Visible files" },
+        },
+      },
+    }, {
+      spec: { function: { name: "list_room_files_3", description: "second", parameters: { type: "string" } } },
+    }]);
+  });
+
+  it("honors the open room's persisted disabled-tool preference", () => {
+    const { state } = fixtureRoom();
+    setSetting(db!, MCP_TOOL_PREFS_KEY, JSON.stringify({ files: ["hidden"] }));
+    const manager = {
+      servers: [{
+        name: "files",
+        status: "connected",
+        client: {},
+        remote: false,
+        tools: [
+          { name: "hidden", description: "not exposed", schema: {}, annotations: null },
+          { name: "shown", description: "exposed", schema: {}, annotations: null },
+        ],
+      }],
+    } as unknown as McpManager;
+
+    expect(liveMcpRoutes(state, manager).map((route) => route.toolName)).toEqual(["shown"]);
   });
 });
 

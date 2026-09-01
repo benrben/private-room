@@ -42,6 +42,16 @@ const WORKLET_URL = "/rec-worklet.js";
  * responsive, large enough not to flood the main thread. */
 const FALLBACK_BUFFER = 4096;
 
+const MIC_ACCESS_ERRORS = new Map<string, string>([
+  ["NotFoundError", "No microphone found — plug one in or check your input device."],
+  ["OverconstrainedError", "No microphone found — plug one in or check your input device."],
+  ["NotReadableError", "The microphone is busy in another app — close it and try again."],
+  ["AbortError", "The microphone is busy in another app — close it and try again."],
+]);
+
+const MIC_BLOCKED_ERROR =
+  "Microphone blocked — allow Arcelle in System Settings → Privacy & Security → Microphone, then reopen the app.";
+
 function floatsToBase64(chunks: Float32Array[], length: number): string {
   const all = new Float32Array(length);
   let at = 0;
@@ -243,6 +253,11 @@ function scriptProcessorTap(
   };
 }
 
+function micAccessError(error: unknown): Error {
+  const name = (error as { name?: string })?.name || "";
+  return new Error(MIC_ACCESS_ERRORS.get(name) ?? MIC_BLOCKED_ERROR);
+}
+
 /** Open the microphone. MUST be the first thing awaited in the click handler
  * that starts (or resumes) a recording: WebKit only grants capture while the
  * gesture's activation is still alive, so asking after an IPC round-trip
@@ -254,14 +269,7 @@ export async function acquireMic(): Promise<MediaStream> {
       audio: micConstraints(),
     });
   } catch (e) {
-    const name = (e as { name?: string })?.name || "";
-    throw new Error(
-      name === "NotFoundError" || name === "OverconstrainedError"
-        ? "No microphone found — plug one in or check your input device."
-        : name === "NotReadableError" || name === "AbortError"
-          ? "The microphone is busy in another app — close it and try again."
-          : "Microphone blocked — allow Arcelle in System Settings → Privacy & Security → Microphone, then reopen the app.",
-    );
+    throw micAccessError(e);
   }
 }
 

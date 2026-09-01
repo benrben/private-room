@@ -37,6 +37,97 @@ function rowRef(row: ObjectRow): ContentObjectRef {
   return { id: row.id, sha256: row.sha256, sizeBytes: row.size_bytes };
 }
 
+interface RestoreDetails {
+  ciphertextEnd: number;
+  headerBytes: number;
+  nonce: Buffer;
+  objectPath: string;
+  tag: Buffer;
+}
+
+async function readObjectHeader(objectPath: string, objectSize: number, headerBytes: number): Promise<{
+  header: Buffer;
+  tag: Buffer;
+}> {
+  const source = await open(objectPath, "r");
+  const header = Buffer.alloc(headerBytes);
+  const tag = Buffer.alloc(TAG_BYTES);
+  try {
+    await source.read(header, 0, header.length, 0);
+    await source.read(tag, 0, tag.length, objectSize - TAG_BYTES);
+  } finally {
+    await source.close();
+  }
+  return { header, tag };
+}
+
+async function inspectObjectForRestore(privateRoot: string, row: ObjectRow): Promise<RestoreDetails> {
+  const objectPath = path.join(privateRoot, ...row.relative_object_path.split("/"));
+  const objectStat = await stat(objectPath);
+  const headerBytes = MAGIC.length + NONCE_BYTES;
+  if (objectStat.size < headerBytes + TAG_BYTES) throw new Error("The saved content object is damaged.");
+  const { header, tag } = await readObjectHeader(objectPath, objectStat.size, headerBytes);
+  if (!header.subarray(0, MAGIC.length).equals(MAGIC)) throw new Error("The saved content object is damaged.");
+  const nonce = header.subarray(MAGIC.length);
+  if (!nonce.equals(row.nonce)) throw new Error("The saved content object nonce does not match its record.");
+  return { ciphertextEnd: objectStat.size - TAG_BYTES - 1, headerBytes, nonce, objectPath, tag };
+}
+
+function restoreObserver(): { observe: Transform; verify: (row: ObjectRow) => void } {
+  const hash = createHash("sha256");
+  let sizeBytes = 0;
+  const observe = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      hash.update(chunk);
+      sizeBytes += chunk.length;
+      callback(null, chunk);
+    },
+  });
+  return {
+    observe,
+    verify(row) {
+      if (hash.digest("hex") !== row.sha256 || sizeBytes !== row.size_bytes) {
+        throw new Error("The saved content object failed its integrity check.");
+      }
+    },
+  };
+}
+
+async function syncFile(pathname: string): Promise<void> {
+  const finished = await open(pathname, "r+");
+  try {
+    await finished.sync();
+  } finally {
+    await finished.close();
+  }
+}
+
+async function restoreVerifiedObject(
+  row: ObjectRow,
+  details: RestoreDetails,
+  key: Buffer,
+  tempPath: string,
+  destinationPath: string,
+): Promise<void> {
+  const decipher = createDecipheriv("aes-256-gcm", key, details.nonce);
+  decipher.setAuthTag(details.tag);
+  const observed = restoreObserver();
+  try {
+    await pipeline(
+      createReadStream(details.objectPath, { start: details.headerBytes, end: details.ciphertextEnd }),
+      decipher,
+      observed.observe,
+      createWriteStream(tempPath, { flags: "wx", mode: 0o600 }),
+    );
+    observed.verify(row);
+    await syncFile(tempPath);
+    await rename(tempPath, destinationPath);
+  } catch (error) {
+    await rm(tempPath, { force: true });
+    throw error;
+  }
+}
+
 /** Immutable, authenticated and streaming private history storage. */
 export class ContentObjectStore {
   private readonly objectsRoot: string;
@@ -112,54 +203,11 @@ export class ContentObjectStore {
       .prepare("SELECT id, sha256, size_bytes, nonce, relative_object_path FROM content_objects WHERE id = ?")
       .get(objectId) as ObjectRow | undefined;
     if (row === undefined) throw new Error("The saved content object no longer exists.");
-    const objectPath = path.join(this.privateRoot, ...row.relative_object_path.split("/"));
     await mkdir(path.dirname(destinationPath), { recursive: true });
     const tempPath = `${destinationPath}.${randomUUID()}.partial`;
-    const objectStat = await stat(objectPath);
-    const headerBytes = MAGIC.length + NONCE_BYTES;
-    if (objectStat.size < headerBytes + TAG_BYTES) throw new Error("The saved content object is damaged.");
-    const source = await open(objectPath, "r");
-    const header = Buffer.alloc(headerBytes);
-    const tag = Buffer.alloc(TAG_BYTES);
-    try {
-      await source.read(header, 0, header.length, 0);
-      await source.read(tag, 0, tag.length, objectStat.size - TAG_BYTES);
-    } finally {
-      await source.close();
-    }
-    if (!header.subarray(0, MAGIC.length).equals(MAGIC)) throw new Error("The saved content object is damaged.");
-    const nonce = header.subarray(MAGIC.length);
-    if (!nonce.equals(row.nonce)) throw new Error("The saved content object nonce does not match its record.");
-    const decipher = createDecipheriv("aes-256-gcm", objectKey(this.db), nonce);
-    decipher.setAuthTag(tag);
-    const hash = createHash("sha256");
-    let sizeBytes = 0;
-    const observe = new Transform({
-      transform(chunk: Buffer, _encoding, callback) {
-        hash.update(chunk);
-        sizeBytes += chunk.length;
-        callback(null, chunk);
-      },
-    });
-    try {
-      await pipeline(
-        createReadStream(objectPath, { start: headerBytes, end: objectStat.size - TAG_BYTES - 1 }),
-        decipher,
-        observe,
-        createWriteStream(tempPath, { flags: "wx", mode: 0o600 }),
-      );
-      const digest = hash.digest("hex");
-      if (digest !== row.sha256 || sizeBytes !== row.size_bytes) {
-        throw new Error("The saved content object failed its integrity check.");
-      }
-      const finished = await open(tempPath, "r+");
-      try { await finished.sync(); } finally { await finished.close(); }
-      await rename(tempPath, destinationPath);
-      return rowRef(row);
-    } catch (error) {
-      await rm(tempPath, { force: true });
-      throw error;
-    }
+    const details = await inspectObjectForRestore(this.privateRoot, row);
+    await restoreVerifiedObject(row, details, objectKey(this.db), tempPath, destinationPath);
+    return rowRef(row);
   }
 
   /** Open a verified plaintext stream without exposing the object key or path. */

@@ -165,6 +165,7 @@ describe("chunksMissingEmbedding / setChunkEmbedding / chunksByRowids", () => {
     const hydrated = chunksByRowids(db, rowids);
     expect(hydrated.length).toBe(1);
     expect(hydrated[0]?.[2]).toContain("holiday party");
+    expect(chunksByRowids(db, [])).toEqual([]);
 
     db.close();
   });

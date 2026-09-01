@@ -42,6 +42,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -80,11 +81,37 @@ vi.mock("./db-host/checkpoints.js", async (importOriginal) => {
   return { ...actual, performSwap: vi.fn(actual.performSwap) };
 });
 
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, renameSync: vi.fn(actual.renameSync) };
+});
+
+vi.mock("./roomManager.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./roomManager.js")>();
+  return {
+    ...actual,
+    drainInflight: vi.fn(actual.drainInflight),
+    openRoomImpl: vi.fn(actual.openRoomImpl),
+  };
+});
+
+vi.mock("./workspace/sealedPackage.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./workspace/sealedPackage.js")>();
+  return {
+    ...actual,
+    createSealedPackage: vi.fn(actual.createSealedPackage),
+    importSealedPackage: vi.fn(actual.importSealedPackage),
+    inspectSealedPackage: vi.fn(actual.inspectSealedPackage),
+  };
+});
+
 import { getFileFull, insertFile, updateFileContent } from "./db-host/files.js";
 import { createRoom as dbCreateRoom, openRoom as dbOpenRoom } from "./db-host/open.js";
 import {
   createRoom,
   createRoomManagerState,
+  drainInflight,
+  openRoomImpl,
   spawnRoomServerIfEnabledNotImplemented,
   teardownOpenRoom,
   rescanWorkspaceRoom,
@@ -104,7 +131,11 @@ import {
   rollbackRoomCheckpoint,
   strandedCheckpointNames,
 } from "./roomCheckpoints.js";
-import { inspectSealedPackage } from "./workspace/sealedPackage.js";
+import {
+  createSealedPackage,
+  importSealedPackage,
+  inspectSealedPackage,
+} from "./workspace/sealedPackage.js";
 import type { WorkspaceOperationProgressEvent } from "../shared/workspaceProgress.js";
 
 const PASSWORD = "correct horse battery staple";
@@ -182,6 +213,26 @@ function openRoomState(
   return { state, deps: baseDeps(dir, overrides), dir, roomPath };
 }
 
+function openWorkspaceState(tag: string): {
+  state: RoomManagerState;
+  deps: RoomManagerDeps;
+  dir: string;
+  roomPath: string;
+} {
+  const dir = freshDir();
+  const roomPath = path.join(dir, tag);
+  const state = createRoomManagerState();
+  const deps = baseDeps(dir);
+  createRoom(state, deps, roomPath, PASSWORD, tag, "workspace-folder");
+  return { state, deps, dir, roomPath };
+}
+
+function closeWorkspaceState(state: RoomManagerState, deps: RoomManagerDeps): void {
+  if (state.room !== null) {
+    teardownOpenRoom(state, deps);
+  }
+}
+
 describe("workspace-folder checkpoints", () => {
   it("packages normal files and restores through a verified sibling while keeping a backup", async () => {
     const dir = freshDir();
@@ -236,6 +287,181 @@ describe("workspace-folder checkpoints", () => {
       expect(listRoomCheckpoints(state).entries.some((entry) => entry.auto)).toBe(true);
     } finally {
       teardownOpenRoom(state, deps);
+    }
+  }, 20_000);
+
+  it("refuses a rollback if the open workspace no longer has a workspace descriptor", async () => {
+    const { state, deps } = openWorkspaceState("Descriptor mismatch");
+    const room = state.room!;
+    const descriptor = room.descriptor!;
+    try {
+      Reflect.set(room, "descriptor", { ...descriptor, kind: "room-file" });
+      await expect(rollbackRoomCheckpoint(state, deps, randomUUID(), FAST)).rejects.toThrow(
+        "This room is not a workspace folder."
+      );
+    } finally {
+      Reflect.set(room, "descriptor", descriptor);
+      closeWorkspaceState(state, deps);
+    }
+  });
+
+  it("refuses a workspace checkpoint whose sealed identity belongs to another room", async () => {
+    const { state, deps, roomPath } = openWorkspaceState("Foreign checkpoint");
+    try {
+      const saved = await createRoomCheckpoint(state, "target");
+      const actual = inspectSealedPackage(
+        checkpointFilePath(checkpointsDir(roomPath), saved.id),
+        PASSWORD
+      );
+      vi.mocked(inspectSealedPackage).mockReturnValueOnce({ ...actual, roomId: "another-workspace" });
+
+      await expect(rollbackRoomCheckpoint(state, deps, saved.id, FAST)).rejects.toThrow(
+        "That checkpoint does not belong to this workspace."
+      );
+    } finally {
+      closeWorkspaceState(state, deps);
+    }
+  }, 20_000);
+
+  it("keeps a workspace open when its pre-rollback safety copy cannot be packaged", async () => {
+    const { state, deps } = openWorkspaceState("Safety copy failure");
+    try {
+      const saved = await createRoomCheckpoint(state, "target");
+      vi.mocked(createSealedPackage).mockRejectedValueOnce(new Error("package disk full"));
+
+      await expect(rollbackRoomCheckpoint(state, deps, saved.id, FAST)).rejects.toThrow(
+        "Could not take a safety copy before rolling back: package disk full"
+      );
+      expect(state.room).not.toBeNull();
+    } finally {
+      closeWorkspaceState(state, deps);
+    }
+  }, 20_000);
+
+  it("keeps a workspace open when its verified restore cannot be prepared", async () => {
+    const { state, deps } = openWorkspaceState("Restore preparation failure");
+    try {
+      const saved = await createRoomCheckpoint(state, "target");
+      vi.mocked(importSealedPackage).mockRejectedValueOnce(new Error("corrupt package"));
+
+      await expect(rollbackRoomCheckpoint(state, deps, saved.id, FAST)).rejects.toThrow(
+        "Could not prepare the checkpoint restore: corrupt package"
+      );
+      expect(state.room).not.toBeNull();
+    } finally {
+      closeWorkspaceState(state, deps);
+    }
+  }, 20_000);
+
+  it("reopens the original workspace when installing the restore cannot start", async () => {
+    const { state, deps, roomPath } = openWorkspaceState("Install first rename failure");
+    const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
+    try {
+      const saved = await createRoomCheckpoint(state, "target");
+      vi.mocked(renameSync).mockImplementation((source, destination) => {
+        if (source === roomPath) throw new Error("original rename blocked");
+        actualFs.renameSync(source, destination);
+      });
+
+      await expect(rollbackRoomCheckpoint(state, deps, saved.id, FAST)).rejects.toThrow(
+        "Could not replace the workspace with its checkpoint: original rename blocked. The original workspace was reopened."
+      );
+      expect(state.room?.path).toBe(roomPath);
+    } finally {
+      closeWorkspaceState(state, deps);
+    }
+  }, 20_000);
+
+  it("puts the original workspace back when the restored workspace cannot reopen", async () => {
+    const { state, deps, roomPath } = openWorkspaceState("Restore reopen failure");
+    const actualRoomManager = await vi.importActual<typeof import("./roomManager.js")>("./roomManager.js");
+    try {
+      const saved = await createRoomCheckpoint(state, "target");
+      vi.mocked(openRoomImpl)
+        .mockImplementationOnce(() => { throw new Error("restored workspace would not open"); })
+        .mockImplementation(actualRoomManager.openRoomImpl);
+
+      await expect(rollbackRoomCheckpoint(state, deps, saved.id, FAST)).rejects.toThrow(
+        "The checkpoint was prepared but could not be opened: restored workspace would not open. The original workspace was restored."
+      );
+      expect(state.room?.path).toBe(roomPath);
+    } finally {
+      closeWorkspaceState(state, deps);
+    }
+  }, 20_000);
+
+  it("puts the moved workspace back when the second install rename fails", async () => {
+    const { state, deps, roomPath } = openWorkspaceState("Install second rename failure");
+    const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
+    try {
+      const saved = await createRoomCheckpoint(state, "target");
+      vi.mocked(renameSync).mockImplementation((source, destination) => {
+        if (destination === roomPath && source !== roomPath && !String(source).endsWith(".backup")) {
+          throw new Error("restore rename blocked");
+        }
+        actualFs.renameSync(source, destination);
+      });
+
+      await expect(rollbackRoomCheckpoint(state, deps, saved.id, FAST)).rejects.toThrow(
+        "Could not replace the workspace with its checkpoint: restore rename blocked. The original workspace was reopened."
+      );
+      expect(state.room?.path).toBe(roomPath);
+    } finally {
+      closeWorkspaceState(state, deps);
+    }
+  }, 20_000);
+
+  it("reports the backup path if a failed workspace install cannot recover", async () => {
+    const { state, deps, roomPath } = openWorkspaceState("Install recovery failure");
+    const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
+    try {
+      const saved = await createRoomCheckpoint(state, "target");
+      vi.mocked(renameSync).mockImplementation((source, destination) => {
+        if (destination === roomPath && source !== roomPath) {
+          throw new Error("restore and recovery rename blocked");
+        }
+        actualFs.renameSync(source, destination);
+      });
+
+      await expect(rollbackRoomCheckpoint(state, deps, saved.id, FAST)).rejects.toThrow(
+        /Could not replace the workspace with its checkpoint: restore and recovery rename blocked\. The original workspace is at .+\.backup, but reopening failed:/
+      );
+      expect(state.room).toBeNull();
+    } finally {
+      closeWorkspaceState(state, deps);
+    }
+  }, 20_000);
+
+  it("reports when both the restored workspace and its automatic recovery cannot reopen", async () => {
+    const { state, deps } = openWorkspaceState("Double reopen failure");
+    try {
+      const saved = await createRoomCheckpoint(state, "target");
+      vi.mocked(openRoomImpl)
+        .mockImplementationOnce(() => { throw new Error("restored workspace would not open"); })
+        .mockImplementationOnce(() => { throw new Error("original workspace would not open"); });
+
+      await expect(rollbackRoomCheckpoint(state, deps, saved.id, FAST)).rejects.toThrow(
+        /The checkpoint could not be opened \(restored workspace would not open\), and automatic recovery also failed \(original workspace would not open\)\./
+      );
+      expect(state.room).toBeNull();
+    } finally {
+      closeWorkspaceState(state, deps);
+    }
+  }, 20_000);
+
+  it("does not report a completed workspace restore as failed when its listener throws", async () => {
+    const { state, deps } = openWorkspaceState("Workspace emit failure");
+    try {
+      const saved = await createRoomCheckpoint(state, "target");
+      const emit = vi.fn((event: string) => {
+        if (event === "room-rolled-back") throw new Error("renderer went away");
+      });
+
+      await expect(rollbackRoomCheckpoint(state, { ...deps, emit }, saved.id, FAST)).resolves.toMatchObject({
+        path: state.room!.path,
+      });
+    } finally {
+      closeWorkspaceState(state, deps);
     }
   }, 20_000);
 });
@@ -557,6 +783,17 @@ describe("rollbackRoomCheckpoint", () => {
     expect(state.room?.conn).toBe(originalConn);
   });
 
+  it("rechecks the cancellation registries even when the drain reports success", async () => {
+    const { state, deps } = openRoomState("rollback-registry-recheck");
+    const meta = await createRoomCheckpoint(state, "target");
+    state.cancel.cancels.set("late-writer", new CancelFlag());
+    vi.mocked(drainInflight).mockResolvedValueOnce({ asksDrained: true, jobsDrained: true });
+
+    await expect(rollbackRoomCheckpoint(state, deps, meta.id, FAST)).rejects.toThrow(DRAIN_NOT_CLEAN);
+    expect(state.room).not.toBeNull();
+    expect(state.rollingBack).toBe(false);
+  });
+
   it("verifies the checkpoint's password BEFORE tearing anything down", async () => {
     const { state, deps, roomPath } = openRoomState("rollback-stranded");
     await createRoomCheckpoint(state, "Healthy"); // establishes the dir for real
@@ -654,6 +891,20 @@ describe("rollbackRoomCheckpoint", () => {
     expect(state.rollingBack).toBe(false);
   });
 
+  it("reports a successful swap whose replacement cannot be reopened", async () => {
+    const { state, deps, roomPath } = openRoomState("rollback-reopen-fail");
+    const meta = await createRoomCheckpoint(state, "target");
+    vi.mocked(performSwap).mockImplementationOnce((targetPath) => {
+      writeFileSync(targetPath, "not a room database", "utf8");
+    });
+
+    await expect(rollbackRoomCheckpoint(state, deps, meta.id, FAST)).rejects.toThrow(
+      /Rolled back, but reopening the room failed: .+\. Unlock it again from the start screen\./
+    );
+    expect(state.room).toBeNull();
+    expect(existsSync(roomPath)).toBe(true);
+  });
+
   it(
     "restores the room to the checkpointed state byte for byte, end to end, over a REOPENED connection",
     async () => {
@@ -745,7 +996,7 @@ describe("rollbackRoomCheckpoint", () => {
     expect(emit).toHaveBeenCalledWith("room-rolled-back", info);
     expect(state.rollingBack).toBe(false);
     strayConns.push(state.room!.conn);
-  });
+  }, 15_000);
 
   // --------------------------------------------------------------------------
   // Data-safety boundary: nothing that is not a real payload may ever reach

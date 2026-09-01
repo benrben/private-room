@@ -39,6 +39,11 @@ describe("one_unprotected_page_makes_the_whole_browser_unprotected", () => {
     expect(protectionSeverity(unknown)).toBeGreaterThan(protectionSeverity(active));
   });
 
+  it("does not accidentally classify an unknown future wire tag as safe", () => {
+    const future = { state: "future-protection-state" };
+    expect(protectionSeverity(future as never)).toBe(future);
+  });
+
   it("keeps the FIRST page's reason on a tie, so it belongs to the page that hit trouble earliest", () => {
     expect(
       worstProtection([failed, { state: "failed", reason: "second" }]),

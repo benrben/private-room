@@ -227,6 +227,30 @@ export function parsePublicKeyFile(fileText: string): ParsedPublicKey {
   };
 }
 
+/** Map minisign's two accepted signature algorithm tags to their hash mode. */
+function signaturePrehashedMode(algorithm: string): boolean {
+  if (algorithm === ALG_PREHASHED) return true;
+  if (algorithm === ALG_LEGACY) {
+    // Legacy signatures are accepted because the plugin calls
+    // `public_key.verify(data, &signature, true)` — `allow_legacy = true`
+    // (`updater.rs:1461`). Refusing them would be stricter than the client this
+    // must interoperate with.
+    return false;
+  }
+  throw new MinisignError(
+    "unsupported_algorithm",
+    `unsupported signature algorithm ${JSON.stringify(algorithm)}`,
+  );
+}
+
+function signatureFields(inner: Buffer): Pick<ParsedSignature, "keyId" | "prehashed" | "signature"> {
+  return {
+    keyId: Buffer.from(inner.subarray(2, 10)),
+    prehashed: signaturePrehashedMode(inner.subarray(0, 2).toString("latin1")),
+    signature: Buffer.from(inner.subarray(10, 74)),
+  };
+}
+
 /**
  * Parse a minisign SIGNATURE FILE — the 4-line untrusted comment / base64
  * signature / `trusted comment: …` / base64 global signature format — from its
@@ -242,23 +266,6 @@ export function parseSignatureFile(fileText: string): ParsedSignature {
     throw new MinisignError(
       "malformed_signature",
       `signature inner bytes must be 74 (alg 2 + keyId 8 + sig 64), got ${inner.length}`,
-    );
-  }
-
-  const alg = inner.subarray(0, 2).toString("latin1");
-  let prehashed: boolean;
-  if (alg === ALG_PREHASHED) {
-    prehashed = true;
-  } else if (alg === ALG_LEGACY) {
-    // Legacy signatures are accepted because the plugin calls
-    // `public_key.verify(data, &signature, true)` — `allow_legacy = true`
-    // (`updater.rs:1461`). Refusing them would be stricter than the client this
-    // must interoperate with.
-    prehashed = false;
-  } else {
-    throw new MinisignError(
-      "unsupported_algorithm",
-      `unsupported signature algorithm ${JSON.stringify(alg)}`,
     );
   }
 
@@ -279,21 +286,13 @@ export function parseSignatureFile(fileText: string): ParsedSignature {
   }
 
   return {
-    keyId: Buffer.from(inner.subarray(2, 10)),
-    prehashed,
-    signature: Buffer.from(inner.subarray(10, 74)),
+    ...signatureFields(inner),
     trustedComment: trustedCommentLine.slice(TRUSTED_COMMENT_PREFIX.length),
     globalSignature: Buffer.from(globalSignature),
   };
 }
 
 function edPublicKeyFromRaw(raw: Buffer): KeyObject {
-  if (raw.length !== 32) {
-    throw new MinisignError(
-      "malformed_public_key",
-      `raw Ed25519 key must be 32 bytes, got ${raw.length}`,
-    );
-  }
   return createPublicKey({
     key: Buffer.concat([SPKI_ED25519_PREFIX, raw]),
     format: "der",

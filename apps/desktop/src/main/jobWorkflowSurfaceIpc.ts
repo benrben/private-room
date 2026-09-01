@@ -58,6 +58,101 @@ function scheduleArg(value: unknown): ScheduleArg {
   };
 }
 
+type WorkflowDatabase = Parameters<typeof createWorkflow>[0];
+
+interface ParsedWorkflowUpdate {
+  binding: ReturnType<typeof parseBinding>;
+  definition: unknown;
+  parsedDefinition: ReturnType<typeof parseDef>;
+}
+
+function asDefaultString(value: unknown, fallback: string): string {
+  return String(value ?? fallback);
+}
+
+function newWorkflowName(value: unknown): string {
+  return asDefaultString(value, "New workflow").trim() || "New workflow";
+}
+
+function newWorkflowEmoji(value: unknown): string {
+  return asDefaultString(value, "✨") || "✨";
+}
+
+function throwWorkflowErrors(errors: string[]): void {
+  if (errors.length) throw new Error(errors.join("; "));
+}
+
+function applyRequestedSchedule(
+  db: WorkflowDatabase,
+  id: string,
+  definition: ReturnType<typeof parseDef>,
+  rawSchedule: unknown,
+): void {
+  if (rawSchedule === undefined) return;
+  const schedule = scheduleArg(rawSchedule);
+  applySchedule(db, id, definition, schedule.kind, schedule.param, schedule.enabled, schedule.catchUp);
+}
+
+async function saveWorkflowFromRaw(
+  db: WorkflowDatabase,
+  raw: unknown,
+  changed: () => void,
+): Promise<string> {
+  const values = object(raw);
+  const definition = parseDef(values.definition);
+  const binding = parseBinding(values.binding);
+  const errors = await validateWorkflowInner(db, definition, binding);
+  throwWorkflowErrors(errors);
+  const id = createWorkflow(
+    db,
+    newWorkflowName(values.name),
+    asDefaultString(values.description, ""),
+    newWorkflowEmoji(values.emoji),
+    values.definition,
+    asDefaultString(values.createdBy, "user"),
+    binding,
+  );
+  applyRequestedSchedule(db, id, definition, values.schedule);
+  changed();
+  return id;
+}
+
+function parsedWorkflowUpdate(
+  values: Record<string, unknown>,
+  existing: ReturnType<typeof getWorkflow>,
+): ParsedWorkflowUpdate {
+  const definition = values.definition ?? existing.definition;
+  const binding = values.binding ?? existing.binding;
+  return { definition, binding: parseBinding(binding), parsedDefinition: parseDef(definition) };
+}
+
+function updatedWorkflowString(value: unknown, existing: string): string {
+  return typeof value === "string" ? value : existing;
+}
+
+async function updateWorkflowFromRaw(
+  db: WorkflowDatabase,
+  raw: unknown,
+  changed: () => void,
+): Promise<void> {
+  const values = object(raw);
+  const id = String(values.id ?? "");
+  const existing = getWorkflow(db, id);
+  const update = parsedWorkflowUpdate(values, existing);
+  const errors = await validateWorkflowInner(db, update.parsedDefinition, update.binding);
+  throwWorkflowErrors(errors);
+  updateWorkflow(
+    db, id,
+    updatedWorkflowString(values.name, existing.name),
+    updatedWorkflowString(values.description, existing.description),
+    updatedWorkflowString(values.emoji, existing.emoji),
+    update.definition, update.binding,
+  );
+  setWorkflowStatus(db, id, "draft");
+  applyRequestedSchedule(db, id, update.parsedDefinition, values.schedule);
+  changed();
+}
+
 export function createWorkflowRunDeps(
   state: RoomManagerState,
   deps: RoomManagerDeps,
@@ -147,54 +242,10 @@ export function registerJobWorkflowSurfaceIpc(
     const a = object(raw);
     return validateWorkflowInner(room().conn, parseDef(a.definition), parseBinding(a.binding));
   });
-  ipcMain.handle("save_workflow", async (_e: IpcMainInvokeEvent, raw: unknown) => {
-    const a = object(raw);
-    const db = room().conn;
-    const def = parseDef(a.definition);
-    const binding = parseBinding(a.binding);
-    const errors = await validateWorkflowInner(db, def, binding);
-    if (errors.length) throw new Error(errors.join("; "));
-    const id = createWorkflow(
-      db,
-      String(a.name ?? "New workflow").trim() || "New workflow",
-      String(a.description ?? ""),
-      String(a.emoji ?? "✨") || "✨",
-      a.definition,
-      String(a.createdBy ?? "user"),
-      binding,
-    );
-    if (a.schedule !== undefined) {
-      const s = scheduleArg(a.schedule);
-      applySchedule(db, id, def, s.kind, s.param, s.enabled, s.catchUp);
-    }
-    changed();
-    return id;
-  });
-  ipcMain.handle("update_workflow", async (_e: IpcMainInvokeEvent, raw: unknown) => {
-    const a = object(raw);
-    const db = room().conn;
-    const id = String(a.id ?? "");
-    const old = getWorkflow(db, id);
-    const definition = a.definition ?? old.definition;
-    const binding = a.binding ?? old.binding;
-    const def = parseDef(definition);
-    const parsedBinding = parseBinding(binding);
-    const errors = await validateWorkflowInner(db, def, parsedBinding);
-    if (errors.length) throw new Error(errors.join("; "));
-    updateWorkflow(
-      db, id,
-      typeof a.name === "string" ? a.name : old.name,
-      typeof a.description === "string" ? a.description : old.description,
-      typeof a.emoji === "string" ? a.emoji : old.emoji,
-      definition, parsedBinding,
-    );
-    setWorkflowStatus(db, id, "draft");
-    if (a.schedule !== undefined) {
-      const s = scheduleArg(a.schedule);
-      applySchedule(db, id, def, s.kind, s.param, s.enabled, s.catchUp);
-    }
-    changed();
-  });
+  ipcMain.handle("save_workflow", (_e: IpcMainInvokeEvent, raw: unknown) =>
+    saveWorkflowFromRaw(room().conn, raw, changed));
+  ipcMain.handle("update_workflow", (_e: IpcMainInvokeEvent, raw: unknown) =>
+    updateWorkflowFromRaw(room().conn, raw, changed));
   ipcMain.handle("delete_workflow", (_e: IpcMainInvokeEvent, raw: unknown) => {
     deleteWorkflowCmd(room().conn, String(object(raw).id ?? ""), state.cancel);
     changed();

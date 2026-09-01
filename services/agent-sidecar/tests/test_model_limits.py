@@ -64,7 +64,27 @@ async def test_native_context_length_returns_none_for_an_unlisted_model(
     model_limits._CACHE.clear()
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"models": []})
+        return httpx.Response(
+            200,
+            json={"models": [{"model": "other:1b", "details": {"context_length": 2048}}]},
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_with(handler))
+    length = await model_limits.native_context_length("mystery:1b", "http://127.0.0.1:11434")
+    assert length is None
+
+
+async def test_native_context_length_rejects_an_invalid_matching_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model entry without a positive integer window stays unknown."""
+    model_limits._CACHE.clear()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"models": [{"model": "mystery:1b", "details": {"context_length": 0}}]},
+        )
 
     monkeypatch.setattr(httpx, "AsyncClient", _client_with(handler))
     length = await model_limits.native_context_length("mystery:1b", "http://127.0.0.1:11434")

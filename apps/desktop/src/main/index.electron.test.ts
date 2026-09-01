@@ -202,13 +202,17 @@ function signedUpdaterFixture() {
  *
  * `browserLive.worker.cjs` and `mcpFixtureStdioServer.mjs` are deliberately
  * NOT here: both are referenced only from `.test.ts` files, which this build
- * excludes. `page.js` IS here — `webviewManager.ts` hands `PAGE_SCRIPT_PATH`
- * to `session.registerPreloadScript`, so it is real runtime surface the
+ * excludes. The `page*.js` fragments ARE here — `webviewManager.ts` hands
+ * `PAGE_SCRIPT_PATHS` to `session.registerPreloadScript`, so they are real runtime surface the
  * moment the browser lane is wired.
  */
 const RUNTIME_ASSETS: readonly (readonly string[])[] = [
   ["src", "main", "bootStub.html"],
   ["src", "main", "db-host", "schema.sql"],
+  ["src", "main", "browser", "pageCore.js"],
+  ["src", "main", "browser", "pageSnapshot.js"],
+  ["src", "main", "browser", "pageRead.js"],
+  ["src", "main", "browser", "pageActions.js"],
   ["src", "main", "browser", "page.js"],
 ];
 

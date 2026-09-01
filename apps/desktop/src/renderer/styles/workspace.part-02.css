@@ -1,0 +1,476 @@
+
+
+/* ----- masthead ----- */
+
+.rh-masthead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-6);
+  padding-bottom: var(--sp-4);
+  margin-bottom: var(--sp-6);
+  /* The masthead rule, drawn the way .nb-rule draws one — a stroke that
+     thins at both ends rather than a flat border — but as a background so it
+     costs no element and gives a screen reader nothing extra to walk past. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line) 2%,
+    var(--line) 97%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1.5px;
+  background-position: left bottom;
+}
+.rh-masthead-main {
+  min-width: 0;
+}
+.rh-title {
+  margin: 0 0 var(--sp-3);
+  color: var(--text-strong);
+  font-size: var(--fs-page);
+  font-family: var(--display);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.08;
+  /* The title shares its line with the dated stamp, so at 44px it usually
+     takes two lines; balancing them stops the second line being one orphaned
+     word. Purely cosmetic and simply ignored by an engine that does not have
+     it — there is no layout that depends on it landing. */
+  text-wrap: balance;
+}
+/* .nb-subtitle brings the hand and the yellow swipe under it. The measure is
+   capped well short of the column so the swipe stays visibly narrower than
+   the masthead rule beneath it — two horizontal marks the same width read as
+   one mistake. */
+.rh-subtitle {
+  margin: 0;
+  max-width: 60ch;
+}
+
+/* ----- the dated annotation, upper right ----- */
+
+.rh-stamp {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--sp-1);
+  text-align: right;
+  padding-top: 6px;
+}
+/* The masthead date, in the sans. It steps down from the hand's 24px to the
+   card rung: the same nominal size in Figtree reads a tier LARGER than it did
+   in Kalam, and the 44px title beside it is what carries the masthead anyway.
+   At --fs-card, --muted still clears comfortably. */
+.rh-stamp-date {
+  font-size: var(--fs-card);
+  line-height: 1.15;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.rh-stamp-counts {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--faint);
+  white-space: nowrap;
+}
+.rh-stamp-state {
+  white-space: nowrap;
+}
+
+/* ----- sections ----- */
+
+.rh-section {
+  position: relative;
+  margin: 0 0 var(--sp-8);
+}
+.rh-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding-bottom: var(--sp-2);
+  margin-bottom: var(--sp-3);
+  /* Same drawn-rule idiom as the masthead, one weight quieter. */
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--line-soft) 2%,
+    var(--line-soft) 96%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: left bottom;
+}
+/* The section label was 11px, under the 12px floor the type scale sets as the
+   smallest size allowed anywhere. Letterspacing carries the emphasis instead. */
+.rh-section-head h2 {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.rh-section-note {
+  margin-left: auto;
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--faint);
+}
+
+/* ----- attention strips -----
+   A marker stroke down the page rather than a filled alert box: a 3px edge in
+   the meaning's ink, and a wash of the same hue across the paper behind it.
+
+   The edge is drawn in --mk-ink and not with .nb-edge's --mk fill, because a
+   3px stroke is meaningful non-text and owes 3:1 — a marker fill measures
+   ~1.7:1 on ivory. Ink on the washed strip measures 4.5:1 (light yellow, the
+   worst pair) to 8.1:1 (dark red), well clear of that floor. */
+
+.rh-attn-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.rh-attn {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-sm);
+  /* Both marker properties carry the library's own fallback idiom, so a strip
+     that somehow arrives without a .nb-sem-* class still draws as "pending"
+     rather than losing its edge and its wash to an invalid value. */
+  box-shadow: inset 3px 0 0 var(--mk-ink, var(--sem-pending));
+  background-image: linear-gradient(
+    97deg,
+    color-mix(in srgb, var(--mk, var(--sem-pending-fill)) 20%, transparent) 0%,
+    color-mix(in srgb, var(--mk, var(--sem-pending-fill)) 10%, transparent) 62%,
+    color-mix(in srgb, var(--mk, var(--sem-pending-fill)) 15%, transparent) 100%
+  );
+}
+.rh-attn-tag {
+  white-space: nowrap;
+}
+.rh-attn-text {
+  min-width: 0;
+  color: var(--text);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+}
+/* The CTA is drawn in the strip's own ink. That is not only for looks:
+   .nb-btn's --rule-strong edge is 3.005:1 on bare paper, and the strip's wash
+   darkens the ground just enough to take it to 2.81:1 — under the 3:1 a
+   control boundary owes. --mk-ink measures 4.08:1 (light red) to 5.08:1 (dark
+   yellow) against the same wash in all six theme/hue combinations. The LABEL
+   stays --text, so the button never reads as coloured text. */
+.rh-attn-cta {
+  white-space: nowrap;
+  border-color: var(--mk-ink, var(--sem-pending));
+}
+/* base.css paints an accent ghost behind any hovered button. On a coloured
+   strip that sits under the marker swash .nb-btn wipes in and turns both to
+   mud, so this CTA keeps its own ground and lets the swash be the one mark. */
+.rh-attn-cta:hover:not(:disabled) {
+  background-color: transparent;
+}
+
+/* ----- ruled timeline -----
+   Files and chats interleave by time, with anything still running filed above
+   them. The dashed thread is .nb-connect; each row's own icon (.rh-tl-ico)
+   is what says what kind of entry it is, so the thread stays a plain rule
+   rather than growing a second, unlabelled glyph of its own.
+
+   The thread deliberately runs a little past the last row: the room's history
+   does continue below what Home shows, and a stroke that stops dead would say
+   otherwise. */
+
+.rh-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 26px;
+  --nb-connect-at: 8px;
+}
+.rh-tl-row {
+  position: relative;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: 52px;
+  padding: var(--sp-2) var(--sp-3);
+  text-align: left;
+  color: inherit;
+  background-color: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  transition: background-color var(--dur-fast) var(--ease-pen);
+}
+.rh-tl-row:hover {
+  background-color: var(--hover);
+}
+.rh-tl-ico {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  color: var(--muted);
+}
+.rh-tl-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+/* Recent work was 13px and outranked by nothing. At --fs-card it is the
+   largest thing on the page after the masthead, which is the priority the
+   briefing is supposed to have. */
+.rh-tl-title {
+  color: var(--text-strong);
+  font-size: var(--fs-card);
+  font-weight: 500;
+  line-height: 1.3;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.rh-tl-kind {
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.rh-tl-when {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--faint);
+  white-space: nowrap;
+}
+.rh-tl-state {
+  white-space: nowrap;
+}
+/* The empty state is a direction, which is one of the few places the hand is
+   allowed to give an instruction. .nb-annot brings the curved arrow with it,
+   in flow, so it can never land on top of anything. */
+.rh-empty {
+  margin: 0;
+  padding: var(--sp-2) 0 var(--sp-2) 26px;
+}
+
+/* ----- major actions -----
+   Wide notebook cards. .nb-card gives the drawn border and .nb-frame-set on
+   the grid rotates four radius signatures across them, so a run of four does
+   not look stamped from one die. */
+
+.rh-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(248px, 1fr));
+  gap: var(--sp-4);
+}
+.rh-card {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  /* Three rows with the last one elastic, so the area label sits on the
+     bottom edge of every card however tall the row makes them. */
+  grid-template-rows: auto auto 1fr;
+  gap: var(--sp-1) var(--sp-3);
+  text-align: left;
+  color: inherit;
+}
+.rh-card-ico {
+  grid-row: 1;
+  grid-column: 1;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  color: var(--muted);
+  transition: color var(--dur-fast) var(--ease-pen);
+}
+.rh-card:hover .rh-card-ico,
+.rh-card:focus-visible .rh-card-ico {
+  color: var(--accent);
+}
+.rh-card-title {
+  grid-column: 2;
+  color: var(--text-strong);
+  font-size: var(--fs-card);
+  font-weight: 600;
+  line-height: 1.25;
+}
+.rh-card-copy {
+  grid-column: 2;
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+.rh-card-area {
+  grid-column: 2;
+  align-self: end;
+  padding-top: var(--sp-3);
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+/* ----- the fold: everything the rail already reaches ----- */
+
+.rh-more-rule {
+  margin: var(--sp-6) 0 var(--sp-4);
+}
+.rh-more {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.rh-chip {
+  /* .nb-chip-btn's 24px floor is the minimum; these get 28px because they are
+     the only way to reach five areas from this page. */
+  min-height: 28px;
+  padding: var(--sp-1) var(--sp-3);
+}
+.rh-chip-ico {
+  display: inline-flex;
+  align-items: center;
+  color: var(--muted);
+}
+.rh-chip-count {
+  margin-left: 2px;
+}
+/* An unavailable chip (Room Map, with nothing to map) must not light up under
+   the pointer: .nb-chip-btn:hover matches it too, and a control that reacts to
+   the mouse while refusing the click is a lie.
+
+   aria-disabled, not :disabled — the chip stays focusable and hoverable so the
+   reason it cannot be used is reachable. It keeps full text contrast for the
+   same reason: greying out the one control whose explanation the reader needs
+   is the wrong half to dim. The pencil border and the visible note carry the
+   state instead. */
+.rh-chip.is-unavailable {
+  border-style: dashed;
+  border-color: var(--rule);
+}
+.rh-chip.is-unavailable:hover,
+.rh-chip.is-unavailable:active {
+  color: var(--text);
+  border-color: var(--rule);
+  background: transparent;
+  transform: none;
+  cursor: default;
+}
+/* The reason, in the reader's own margin voice, sitting with its chip. */
+.rh-chip-why {
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+  color: var(--ink-2);
+  align-self: center;
+}
+
+/* Text for assistive technology only. Not `display: none`, which would take it
+   out of the accessibility tree along with the pixels. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* ----- marginalia -----
+   Decoration: aria-hidden in the markup, inert here, fixed content, and gone
+   entirely below the width at which the column actually has a margin. It is
+   drawn OUTSIDE the column, so if the gutter were ever narrower than the note
+   it would overlap the cards or push a horizontal scrollbar onto the page —
+   hence display:none as the default and the query as the exception, never the
+   other way round. */
+
+.rh-margin {
+  display: none;
+}
+.rh-margin-note {
+  font-family: var(--hand);
+  font-size: var(--fs-hand);
+  line-height: var(--lh-hand);
+  color: var(--faint);
+  text-align: right;
+}
+/* Pinned to the same ink as the note beside it: .nb-arrow-curve's own default
+   happens to resolve to this token today, and a sketch whose two halves drift
+   apart in a later edit is worse than one line of redundancy. */
+.rh-margin-arrow {
+  color: var(--faint);
+}
+
+/* 1100px container = a 760px column with 170px of gutter each side, and the
+   note needs 124 + 16. The container's inline size is its CONTENT box, so a
+   visible scrollbar is already out of that number. */
+@container rh-home (min-width: 1100px) {
+  .rh-margin {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 2px;
+    position: absolute;
+    top: 44px;
+    right: calc(100% + var(--sp-4));
+    width: 124px;
+    pointer-events: none;
+  }
+}
+
+/* ----- narrow column -----
+   Below this the wide strips and rows stop fitting: the CTA and the
+   handwritten date each drop to their own line rather than crushing the text
+   they sit beside. */
+@container rh-home (max-width: 520px) {
+  .rh-masthead {
+    flex-direction: column;
+    gap: var(--sp-4);
+  }
+  .rh-stamp {
+    align-items: flex-start;
+    text-align: left;
+    padding-top: 0;
+  }
+  .rh-attn {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .rh-attn-cta {
+    grid-column: 1 / -1;
+    justify-self: start;
+  }
+  .rh-tl-row {
+    grid-template-columns: 22px minmax(0, 1fr);
+  }
+  .rh-tl-when,
+  .rh-tl-state {
+    grid-column: 2;
+  }
+}
+
+/* The suggestion tray keeps its own styling (misc-moonshot.css); it only
+   needs to be pushed clear of the last section. */
+.rh-tray {
+  margin-top: var(--sp-8);
+}
+
+/* The lift, press and swash transitions this page borrows are already covered
+   by paper.css's reduced-motion block; these two are its own. */
+@media (prefers-reduced-motion: reduce) {
+  .rh-tl-row,
+  .rh-card-ico {
+    transition: none;
+  }
+}

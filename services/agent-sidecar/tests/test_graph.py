@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 from unittest import mock
@@ -49,6 +51,7 @@ from arcelle_sidecar.graph import (
     WorkerOutcome,
     _Delegator,
     _ToolPass,
+    _fallback_answer,
     call_model,
     parse_plan,
     plan_waves,
@@ -100,6 +103,136 @@ def test_routers() -> None:
     assert route_after_tools({"cancelled": False, "round": 9, "max_rounds": 9}) == "synthesize"  # type: ignore[arg-type]
 
 
+def test_selected_tools_preserve_advisor_unlock_and_connector_boundaries() -> None:
+    def spec(name: str) -> dict[str, dict[str, str]]:
+        return {"function": {"name": name}}
+
+    served = [
+        spec("consult_advisor"),
+        spec("open_file"),
+        spec("view_screenshot"),
+        spec("search_mcp_tools"),
+        spec("third_party_tool"),
+    ]
+
+    plain = graph._select_tools(
+        served, agent_id="files.read", unlocked=set(), advisors=False, plan_multi=True
+    )
+    assert {tool["function"]["name"] for tool in plain} == {"open_file", "third_party_tool"}
+
+    unlocked = graph._select_tools(
+        served, agent_id="files.read", unlocked={"app_ui"}, advisors=True
+    )
+    assert {tool["function"]["name"] for tool in unlocked} == {
+        "consult_advisor",
+        "open_file",
+        "view_screenshot",
+        "third_party_tool",
+    }
+
+    held = graph._held_plan_tools(True, set())
+    assert "search_mcp_tools" in held
+    assert not graph._tool_is_visible(
+        spec("search_mcp_tools"), set(), held, {"search_mcp_tools"}, advisors=False
+    )
+
+
+def _stream_deps_factory(emit: Callable[[Event], Awaitable[None]]) -> Deps:
+    return Deps(
+        chat=FakeChatModel([]),  # type: ignore[arg-type]
+        emit=emit,
+        cancel=CancelToken(),
+        mcp=FakeMCP(),  # type: ignore[arg-type]
+    )
+
+
+async def _streamed_events(req: Any) -> list[Event]:
+    return [event async for event in graph.stream_events(req, _stream_deps_factory)]
+
+
+async def test_stream_events_preserves_fake_run_event_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_run(_req: Any, deps: Deps) -> str:
+        await deps.emit({"t": "step", "v": "fake started"})
+        await deps.emit({"t": "final", "v": "fake finished"})
+        return "fake finished"
+
+    monkeypatch.setattr(graph, "run_agent", fake_run)
+
+    assert await _streamed_events(make_request()) == [
+        {"t": "step", "v": "fake started"},
+        {"t": "final", "v": "fake finished"},
+    ]
+
+
+async def test_stream_events_keeps_deep_fallback_and_read_only_notice_ordered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = ModuleType("arcelle_sidecar.deep_harness")
+    selected: list[dict[str, Any]] = []
+
+    async def select(req: Any) -> SimpleNamespace:
+        selected.append({"question": req.question})
+        return SimpleNamespace(use_deep_agent=False, reason="fake fallback", small_model=False)
+
+    async def fake_run(_req: Any, deps: Deps) -> str:
+        await deps.emit({"t": "final", "v": "classic fallback"})
+        return "classic fallback"
+
+    harness.select_deep_harness = select  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "arcelle_sidecar.deep_harness", harness)
+    monkeypatch.setattr(graph, "run_agent", fake_run)
+    fallback = make_request()
+    fallback.harness = "deep"
+
+    assert await _streamed_events(fallback) == [
+        {"t": "step", "v": "Using deterministic Arcelle harness: fake fallback"},
+        {"t": "final", "v": "classic fallback"},
+    ]
+    assert selected == [{"question": fallback.question}]
+
+    async def select_deep(_req: Any) -> SimpleNamespace:
+        return SimpleNamespace(use_deep_agent=True, reason="", small_model=True)
+
+    async def fake_deep(question: str, deps: Deps, **kwargs: Any) -> None:
+        assert question == "write a note"
+        assert kwargs["write_enabled"] is False
+        await deps.emit({"t": "final", "v": "deep fake finished"})
+
+    harness.select_deep_harness = select_deep  # type: ignore[attr-defined]
+    harness.run_deep_agent = fake_deep  # type: ignore[attr-defined]
+    deep = make_request("write a note", routing=WRITE_ON)
+    deep.harness = "deep"
+
+    assert await _streamed_events(deep) == [
+        {
+            "t": "step",
+            "v": "Deep Harness is read-only because no completed rollback baseline authorized this run.",
+        },
+        {"t": "final", "v": "deep fake finished"},
+    ]
+
+
+async def test_stream_events_reports_fake_run_failure_and_torn_down_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failing_run(_req: Any, _deps: Deps) -> str:
+        raise RuntimeError()
+
+    monkeypatch.setattr(graph, "run_agent", failing_run)
+    assert await _streamed_events(make_request()) == [
+        {"t": "error", "v": "RuntimeError"},
+    ]
+
+    queue: asyncio.Queue[Event | None] = asyncio.Queue()
+    await graph._emit_torn_down_run(queue)
+    assert await queue.get() == {
+        "t": "error",
+        "v": "the run was torn down before it produced an answer",
+    }
+
+
 # --------------------------------------------------------------------------- #
 # the ask reaches the model (question vs. messages)
 # --------------------------------------------------------------------------- #
@@ -146,6 +279,21 @@ async def test_hard_no_tools_policy_never_lists_or_offers_tools() -> None:
         for event in out.events
     )
     assert out.chat.seen_messages[0][0]["content"] == "Answer without tools or sources."
+
+
+async def test_an_empty_bridge_catalog_reports_missing_specialists() -> None:
+    """A wiring failure is a host event, not a model claim about the room."""
+    mcp = FakeMCP(tools=[])
+    out = await drive(make_request(), FakeChatModel([Round(content="No tools are available.")]), mcp)
+
+    assert mcp.list_calls == 1
+    assert out.of("step") == [
+        {
+            "t": "step",
+            "v": "No specialists available — the room tool bridge served 0 tools this run",
+        }
+    ]
+    assert out.of("step_status") == [{"t": "step_status", "ok": False}]
 
 
 async def test_question_is_not_duplicated_when_history_already_has_the_user_turn() -> None:
@@ -1897,6 +2045,22 @@ async def test_the_usage_bar_counts_the_ephemeral_notes_it_actually_sent() -> No
 # --------------------------------------------------------------------------- #
 
 
+def test_fallback_answer_keeps_reports_cancellation_artifacts_and_failed_work_distinct() -> None:
+    reports = {"reports": [("Files", "Report from the Files agent: FOUND: rent is 1200")]}
+    assert _fallback_answer(reports, cancelled=False) == (
+        "I could not compose an answer, but here is what came back:\n\n"
+        "**Files** — FOUND: rent is 1200"
+    )
+    assert _fallback_answer(reports, cancelled=True) == (
+        "Stopped. Here is what had already come back:\n\n"
+        "**Files** — FOUND: rent is 1200"
+    )
+    assert _fallback_answer({}, cancelled=True) == ""
+    assert _fallback_answer({"referents": ["create_file: notes.md"]}, cancelled=False) == "Done."
+    assert _fallback_answer({"progress": ["ask_web_agent"]}, cancelled=False) == NOTHING_USABLE_TEXT
+    assert _fallback_answer({}, cancelled=False) == NOTHING_TEXT
+
+
 async def test_a_turn_that_produced_nothing_does_not_claim_it_is_done() -> None:
     """`Done.` used to be the net for EVERY blank answer, chosen without
     looking at whether anything had happened. Nothing ran, nothing changed and
@@ -2376,6 +2540,29 @@ def test_parse_plan_salvages_what_a_small_model_actually_emits() -> None:
     # Unusable input yields nothing rather than a half-formed task.
     assert parse_plan(None) == []
     assert parse_plan([{"agent": "file"}]) == []
+
+
+def test_parse_plan_fails_open_without_promoting_invalid_values_to_tasks() -> None:
+    assert parse_plan("not valid JSON") == []
+    assert parse_plan({"agent": "web"}) == []
+    assert parse_plan(("not", "a", "list")) == []
+    assert parse_plan([0, "", "  ", {"instruction": "valid", "depends_on": "0"}]) == [
+        {"agent": "", "instruction": "valid", "depends_on": []}
+    ]
+    assert parse_plan(
+        [
+            {
+                "instruction": "keep valid dependency indices",
+                "depends_on": [0, True, "01", "-2", "-0", 1.0, "1.0", "+3", None],
+            }
+        ]
+    ) == [
+        {
+            "agent": "",
+            "instruction": "keep valid dependency indices",
+            "depends_on": [0, 1, -2, 0],
+        }
+    ]
 
 
 async def test_ask_agents_runs_independent_tasks_in_one_parallel_wave() -> None:
@@ -3657,6 +3844,114 @@ def _pass(
 
 def _tool_texts(p: _ToolPass) -> list[str]:
     return [str(m.get("content")) for m in p.messages if m.get("role") == "tool"]
+
+
+async def test_child_outcome_returns_the_already_launched_fake_task_result() -> None:
+    expected = WorkerOutcome("fabricated file report", True, False, ["create_file: notes.md"])
+
+    async def completed_child() -> WorkerOutcome:
+        return expected
+
+    call = ToolCall(name="ask_file_agent", arguments={"instruction": "read notes"}, id="child-1")
+    tool_pass = _pass()
+    tool_pass.delegator.tasks[call.id] = asyncio.create_task(completed_child())
+
+    assert await tool_pass._child_outcome(call, "read notes") == expected
+
+
+async def test_child_outcome_runs_a_fabricated_inline_fallback_when_no_task_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    expected = WorkerOutcome("fabricated fallback report", True, False, ["open_file: notes.md"])
+
+    def fake_resolve_worker(
+        name: str, instruction: str, *, served_names: set[str], web_enabled: bool
+    ) -> str:
+        captured.update(
+            resolve_name=name,
+            resolve_instruction=instruction,
+            served_names=served_names,
+            web_enabled=web_enabled,
+        )
+        return "files.read"
+
+    async def fake_run_worker(
+        state: Any,
+        config: Any,
+        worker_id: str,
+        instruction: str,
+        referents: list[str],
+        node_key: str,
+    ) -> WorkerOutcome:
+        captured.update(
+            state=state,
+            config=config,
+            worker_id=worker_id,
+            instruction=instruction,
+            referents=referents,
+            node_key=node_key,
+        )
+        return expected
+
+    monkeypatch.setattr(graph, "resolve_worker", fake_resolve_worker)
+    monkeypatch.setattr(graph, "_run_worker", fake_run_worker)
+    call = ToolCall(name="ask_file_agent", arguments={"instruction": "read notes"}, id="child-2")
+    tool_pass = _pass()
+    tool_pass.delegator.referents_at_launch.append("open_file: lease.pdf")
+
+    assert await tool_pass._child_outcome(call, "read notes") == expected
+    assert captured["resolve_name"] == "ask_file_agent"
+    assert captured["resolve_instruction"] == "read notes"
+    assert captured["web_enabled"] is True
+    assert captured["worker_id"] == "files.read"
+    assert captured["instruction"] == "read notes"
+    assert captured["referents"] == ["open_file: lease.pdf"]
+    assert captured["node_key"] == "files.read#0"
+    assert tool_pass.delegator.pipeline == [
+        {
+            "agent": "files.read",
+            "instruction": "read notes",
+            "status": "done",
+            "batch": 0,
+            "key": "files.read#0",
+        }
+    ]
+
+
+async def test_child_outcome_turns_a_fabricated_child_exception_into_a_failure_report() -> None:
+    async def crashing_child() -> WorkerOutcome:
+        raise asyncio.TimeoutError()
+
+    call = ToolCall(name="ask_web_agent", arguments={"instruction": "check rates"}, id="child-3")
+    tool_pass = _pass()
+    tool_pass.delegator.launched_label[call.id] = "Web specialist"
+    tool_pass.delegator.tasks[call.id] = asyncio.create_task(crashing_child())
+
+    outcome = await tool_pass._child_outcome(call, "check rates")
+
+    assert outcome == WorkerOutcome(
+        "The Web specialist could not finish: TimeoutError", False, False, []
+    )
+
+
+async def test_child_outcome_reraises_cancellation_after_draining_fake_siblings() -> None:
+    async def waiting_child() -> WorkerOutcome:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    call = ToolCall(name="ask_file_agent", arguments={"instruction": "read notes"}, id="child-4")
+    tool_pass = _pass()
+    target = asyncio.create_task(waiting_child())
+    sibling = asyncio.create_task(waiting_child())
+    tool_pass.delegator.tasks.update({call.id: target, "sibling": sibling})
+    target.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await tool_pass._child_outcome(call, "read notes")
+
+    assert target.cancelled()
+    assert sibling.done() and sibling.cancelled()
 
 
 async def test_the_pass_answers_a_duplicate_from_the_memo_without_re_running_it() -> None:

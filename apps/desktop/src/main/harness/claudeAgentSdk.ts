@@ -1,5 +1,4 @@
 import { spawnSync } from "node:child_process";
-import { realpathSync } from "node:fs";
 import path from "node:path";
 import {
   query,
@@ -15,7 +14,10 @@ import { AsyncEventQueue } from "./eventQueue.js";
 import { claudeAgentDefinitions } from "./agentManifest.js";
 import { safeProviderFailure } from "./failureSafety.js";
 import { nativeCliExecutable, nativeHarnessModel } from "./nativeCli.js";
-import type { NativeRoomMcpExposure, NativeRoomMcpFactory } from "./nativeRoomMcp.js";
+import type {
+  NativeRoomMcpExposure,
+  NativeRoomMcpFactory,
+} from "./nativeRoomMcp.js";
 import {
   spawnWithNativeWorkspaceSandbox,
   terminateNativeProcessTree,
@@ -29,56 +31,254 @@ import type {
   HarnessRun,
   HarnessRuntime,
 } from "./types.js";
+import { canonicalPath, mutatingTool, preToolDecision } from "./claudeToolPolicy.js";
 
-const FILE_TOOLS = new Set(["Read", "Write", "Edit", "Glob", "Grep", "NotebookEdit"]);
-const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit"]);
-const SAFE_TOOL_FAILURE = "Claude tool failed. Provider diagnostics were omitted to protect room data.";
-const SAFE_TOOL_DENIAL = "Claude tool was denied by the Arcelle permission policy.";
+const SAFE_TOOL_FAILURE =
+  "Claude tool failed. Provider diagnostics were omitted to protect room data.";
+const SAFE_TOOL_DENIAL =
+  "Claude tool was denied by the Arcelle permission policy.";
 const SAFE_TOOL_INCOMPLETE = "Claude tool ended without a completion result.";
-const NETWORK_COMMAND = /(^|[;&|()\s])(curl|wget|nc|ncat|ssh|scp|sftp|ftp|telnet)\b/i;
-const EXECUTABLE_CHANGE = /(^|[;&|()\s])chmod\s+(?:-[^\s]+\s+)*[^\n]*(?:\+x|[157][0-7]{2})/i;
 const WORKSPACE_TOOL_GUIDANCE =
   "Use native Read, Write, Edit, Glob, Grep, and NotebookEdit for normal room files. " +
   "For move, rename, or delete operations, you must use the Arcelle Room MCP tools because Claude has no native tool for those operations. " +
   "Bash is unavailable in this runtime.";
 
-function within(root: string, candidate: string): boolean {
-  const absolute = path.resolve(root, candidate);
-  const relative = path.relative(path.resolve(root), absolute);
-  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
-}
-
-function canonicalPath(candidate: string): string {
-  try { return realpathSync(candidate); }
-  catch { return path.resolve(candidate); }
-}
-
-function requestedPath(input: Record<string, unknown>): string | null {
-  for (const key of ["file_path", "path", "notebook_path"]) {
-    if (typeof input[key] === "string") return input[key] as string;
-  }
-  return null;
-}
-
-function privateOrOutside(root: string, candidate: string): boolean {
-  const absolute = path.resolve(root, candidate);
-  const privateRoot = path.join(path.resolve(root), ".arcelle");
-  return absolute === privateRoot || absolute.startsWith(`${privateRoot}${path.sep}`) || !within(root, absolute);
-}
-
-function mutatingTool(toolName: string): boolean {
-  return WRITE_TOOLS.has(toolName)
-    || /(?:^|__)(?:workspace_(?:write|edit|move|rename|delete)|trash_files|organize_files|save_generated_file)$/i.test(toolName);
-}
-
 function streamText(message: SDKMessage): string | null {
-  if (message.type !== "stream_event" || message.event.type !== "content_block_delta") return null;
+  if (
+    message.type !== "stream_event" ||
+    message.event.type !== "content_block_delta"
+  )
+    return null;
   const delta = message.event.delta as { type?: string; text?: string };
-  return delta.type === "text_delta" && typeof delta.text === "string" ? delta.text : null;
+  return delta.type === "text_delta" && typeof delta.text === "string"
+    ? delta.text
+    : null;
 }
 
 interface PendingApproval {
   resolve(decision: ApprovalDecision): void;
+}
+
+type ClaudeToolTracker = {
+  events: AsyncEventQueue<HarnessEvent>;
+  runId: string;
+  started: Map<string, string>;
+  settled: Set<string>;
+  hadMutatingFailure: boolean;
+};
+
+type ClaudeStreamState = {
+  context: HarnessContext;
+  events: AsyncEventQueue<HarnessEvent>;
+  subagents: Map<string, string>;
+  tools: ClaudeToolTracker;
+  receivedResult: boolean;
+  providerSucceeded: boolean;
+};
+
+type ClaudeAssistantMessage = Extract<SDKMessage, { type: "assistant" }>;
+type ClaudeContentBlock = ClaudeAssistantMessage["message"]["content"][number];
+type ClaudeResultMessage = Extract<SDKMessage, { type: "result" }>;
+
+function startTrackedTool(
+  tracker: ClaudeToolTracker,
+  toolId: string,
+  tool: string,
+): void {
+  if (tracker.settled.has(toolId) || tracker.started.has(toolId)) return;
+  tracker.started.set(toolId, tool);
+  tracker.events.push({
+    type: "tool_started",
+    runId: tracker.runId,
+    tool,
+    toolId,
+  });
+}
+
+function settleTrackedTool(
+  tracker: ClaudeToolTracker,
+  toolId: string,
+  tool: string,
+  error?: string,
+): void {
+  if (tracker.settled.has(toolId)) return;
+  startTrackedTool(tracker, toolId, tool);
+  tracker.settled.add(toolId);
+  tracker.started.delete(toolId);
+  if (error !== undefined && mutatingTool(tool))
+    tracker.hadMutatingFailure = true;
+  tracker.events.push({
+    type: "tool_completed",
+    runId: tracker.runId,
+    tool,
+    toolId,
+    error,
+  });
+}
+
+function parentToolUseId(message: SDKMessage): string | null {
+  const value = (message as unknown as { parent_tool_use_id?: string | null })
+    .parent_tool_use_id;
+  return value ?? null;
+}
+
+function emitStreamText(message: SDKMessage, state: ClaudeStreamState): void {
+  const delta = streamText(message);
+  if (delta === null) return;
+  const parentId = parentToolUseId(message);
+  state.events.push({
+    type: "text_delta",
+    runId: state.context.runId,
+    text: delta,
+    agentId: parentId === null ? undefined : state.subagents.get(parentId),
+  });
+}
+
+function emitCoordinatorStart(
+  message: SDKMessage,
+  state: ClaudeStreamState,
+): void {
+  if (message.type !== "system" || message.subtype !== "init") return;
+  state.events.push({
+    type: "agent_started",
+    runId: state.context.runId,
+    agentId: "coordinator",
+    label: "Claude",
+  });
+}
+
+function isSubagentTool(name: string): boolean {
+  return name === "Agent" || name === "Task";
+}
+
+function subagentId(input: Record<string, unknown>, fallback: string): string {
+  if (typeof input.subagent_type === "string") return input.subagent_type;
+  if (typeof input.agent === "string") return input.agent;
+  return fallback;
+}
+
+function recordAssistantBlock(
+  block: ClaudeContentBlock,
+  state: ClaudeStreamState,
+): void {
+  if (block.type !== "tool_use") return;
+  const input = block.input as Record<string, unknown>;
+  if (isSubagentTool(block.name)) {
+    const agentId = subagentId(input, block.id);
+    state.subagents.set(block.id, agentId);
+    state.events.push({
+      type: "agent_started",
+      runId: state.context.runId,
+      agentId,
+      label: agentId,
+    });
+  }
+  startTrackedTool(state.tools, block.id, block.name);
+}
+
+function recordAssistantTools(
+  message: SDKMessage,
+  state: ClaudeStreamState,
+): void {
+  if (message.type !== "assistant") return;
+  for (const block of message.message.content)
+    recordAssistantBlock(block, state);
+}
+
+function resultUsage(message: ClaudeResultMessage) {
+  return message.subtype === "success" ? message.usage : undefined;
+}
+
+function recordResult(message: SDKMessage, state: ClaudeStreamState): void {
+  if (message.type !== "result") return;
+  state.receivedResult = true;
+  state.providerSucceeded = message.subtype === "success" && !message.is_error;
+  for (const denial of message.permission_denials ?? []) {
+    settleTrackedTool(
+      state.tools,
+      denial.tool_use_id,
+      denial.tool_name,
+      SAFE_TOOL_DENIAL,
+    );
+  }
+  const usage = resultUsage(message);
+  state.events.push({
+    type: "usage_updated",
+    runId: state.context.runId,
+    inputTokens: usage?.input_tokens,
+    outputTokens: usage?.output_tokens,
+    costUsd: message.total_cost_usd,
+  });
+}
+
+function recordSdkMessage(message: SDKMessage, state: ClaudeStreamState): void {
+  emitStreamText(message, state);
+  emitCoordinatorStart(message, state);
+  recordAssistantTools(message, state);
+  recordResult(message, state);
+}
+
+function settleUnfinishedTools(tracker: ClaudeToolTracker): void {
+  for (const [toolId, tool] of tracker.started) {
+    settleTrackedTool(tracker, toolId, tool, SAFE_TOOL_INCOMPLETE);
+  }
+}
+
+function runSucceeded(state: ClaudeStreamState): boolean {
+  return (
+    state.receivedResult &&
+    state.providerSucceeded &&
+    !state.tools.hadMutatingFailure
+  );
+}
+
+function emitRunTerminal(state: ClaudeStreamState): void {
+  if (!runSucceeded(state)) {
+    state.events.push({
+      type: "run_failed",
+      runId: state.context.runId,
+      error: "Claude Agent SDK run failed.",
+    });
+    return;
+  }
+  state.events.push({
+    type: "agent_completed",
+    runId: state.context.runId,
+    agentId: "coordinator",
+  });
+  state.events.push({
+    type: "run_completed",
+    runId: state.context.runId,
+    status: "completed",
+  });
+}
+
+function cancelPendingApprovals(pending: Map<string, PendingApproval>): void {
+  for (const approval of pending.values()) approval.resolve("cancel");
+  pending.clear();
+}
+
+async function streamClaudeEvents(
+  sdkQuery: ReturnType<typeof query>,
+  state: ClaudeStreamState,
+  pending: Map<string, PendingApproval>,
+  roomMcp: NativeRoomMcpExposure | undefined,
+): Promise<void> {
+  try {
+    for await (const message of sdkQuery) recordSdkMessage(message, state);
+    settleUnfinishedTools(state.tools);
+    emitRunTerminal(state);
+  } catch {
+    state.events.push({
+      type: "run_failed",
+      runId: state.context.runId,
+      error: safeProviderFailure("claude"),
+    });
+  } finally {
+    cancelPendingApprovals(pending);
+    await roomMcp?.stop();
+    state.events.end();
+  }
 }
 
 export class ClaudeAgentSdkRuntime implements HarnessRuntime {
@@ -101,19 +301,31 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
     return result.status === 0;
   }
 
-  async verifyExposure(workspacePath: string, runtimePath: string, writeEnabled: boolean): Promise<boolean> {
-    return verifyNativeHarnessExecutable({
-      workspacePath,
-      runtimePath,
-      executable: this.executable,
-      provider: "claude",
-      writeEnabled,
-    }, ["--version"]);
+  async verifyExposure(
+    workspacePath: string,
+    runtimePath: string,
+    writeEnabled: boolean,
+  ): Promise<boolean> {
+    return verifyNativeHarnessExecutable(
+      {
+        workspacePath,
+        runtimePath,
+        executable: this.executable,
+        provider: "claude",
+        writeEnabled,
+      },
+      ["--version"],
+    );
   }
 
-  async startTurn(context: HarnessContext, input: HarnessInput): Promise<HarnessRun> {
+  async startTurn(
+    context: HarnessContext,
+    input: HarnessInput,
+  ): Promise<HarnessRun> {
     if (!context.exposureVerified) {
-      throw new Error("Claude native harness refused an unverified workspace exposure.");
+      throw new Error(
+        "Claude native harness refused an unverified workspace exposure.",
+      );
     }
     const events = new AsyncEventQueue<HarnessEvent>();
     // macOS exposes /var as a symlink to /private/var. Claude resolves its cwd
@@ -124,24 +336,14 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
     const pending = new Map<string, PendingApproval>();
     const spawned = new Set<SpawnedProcess>();
     const subagents = new Map<string, string>();
-    const startedTools = new Map<string, string>();
-    const settledTools = new Set<string>();
-    let hadMutatingToolFailure = false;
+    const tools: ClaudeToolTracker = {
+      events,
+      runId: context.runId,
+      started: new Map<string, string>(),
+      settled: new Set<string>(),
+      hadMutatingFailure: false,
+    };
     const roomMcp = await this.roomMcpFactory?.(context);
-
-    const startTool = (toolId: string, tool: string): void => {
-      if (settledTools.has(toolId) || startedTools.has(toolId)) return;
-      startedTools.set(toolId, tool);
-      events.push({ type: "tool_started", runId: context.runId, tool, toolId });
-    };
-    const settleTool = (toolId: string, tool: string, error?: string): void => {
-      if (settledTools.has(toolId)) return;
-      startTool(toolId, tool);
-      settledTools.add(toolId);
-      startedTools.delete(toolId);
-      if (error !== undefined && mutatingTool(tool)) hadMutatingToolFailure = true;
-      events.push({ type: "tool_completed", runId: context.runId, tool, toolId, error });
-    };
 
     const canUseTool: CanUseTool = async (toolName, toolInput, options) => {
       const requestId = options.requestId || options.toolUseID;
@@ -150,91 +352,62 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
         runId: context.runId,
         requestId,
         tool: toolName,
-        detail: options.title ?? options.description ?? `Claude wants to use ${toolName}.`,
+        detail:
+          options.title ??
+          options.description ??
+          `Claude wants to use ${toolName}.`,
       });
       const decision = await new Promise<ApprovalDecision>((resolve) => {
         const onAbort = () => resolve("cancel");
         options.signal.addEventListener("abort", onAbort, { once: true });
-        pending.set(requestId, { resolve: (value) => {
-          options.signal.removeEventListener("abort", onAbort);
-          resolve(value);
-        } });
+        pending.set(requestId, {
+          resolve: (value) => {
+            options.signal.removeEventListener("abort", onAbort);
+            resolve(value);
+          },
+        });
       });
       pending.delete(requestId);
       return decision === "allow-once" || decision === "allow-run"
-        ? { behavior: "allow", updatedInput: toolInput, toolUseID: options.toolUseID }
-        : { behavior: "deny", message: "Arcelle did not approve this operation.", interrupt: decision === "cancel" };
+        ? {
+            behavior: "allow",
+            updatedInput: toolInput,
+            toolUseID: options.toolUseID,
+          }
+        : {
+            behavior: "deny",
+            message: "Arcelle did not approve this operation.",
+            interrupt: decision === "cancel",
+          };
     };
 
     const preTool: HookCallback = async (hookInput) => {
       const pre = hookInput as PreToolUseHookInput;
       const toolInput = (pre.tool_input ?? {}) as Record<string, unknown>;
-      const candidate = requestedPath(toolInput);
-      if (candidate !== null && privateOrOutside(workspacePath, candidate)) {
-        return {
-          hookSpecificOutput: {
-            hookEventName: "PreToolUse",
-            permissionDecision: "deny",
-            permissionDecisionReason: "Arcelle only exposes normal files inside this room.",
-          },
-        };
-      }
-      if (WRITE_TOOLS.has(pre.tool_name) && !context.writeEnabled) {
-        return {
-          hookSpecificOutput: {
-            hookEventName: "PreToolUse",
-            permissionDecision: "deny",
-            permissionDecisionReason: "This run is read-only.",
-          },
-        };
-      }
-      if (pre.tool_name === "Bash") {
-        const command = String(toolInput.command ?? "");
-        if (NETWORK_COMMAND.test(command)) {
-          return {
-            hookSpecificOutput: {
-              hookEventName: "PreToolUse",
-              permissionDecision: "deny",
-              permissionDecisionReason: "Shell network access is disabled; use Arcelle browser tools.",
-            },
-          };
-        }
-        if (EXECUTABLE_CHANGE.test(command)) {
-          return {
-            hookSpecificOutput: {
-              hookEventName: "PreToolUse",
-              permissionDecision: "deny",
-              permissionDecisionReason: "Agents cannot make room files executable.",
-            },
-          };
-        }
-        return {
-          hookSpecificOutput: {
-            hookEventName: "PreToolUse",
-            permissionDecision: "ask",
-            permissionDecisionReason: "Shell commands require approval.",
-          },
-        };
-      }
-      if (FILE_TOOLS.has(pre.tool_name)) {
-        return {
-          hookSpecificOutput: {
-            hookEventName: "PreToolUse",
-            permissionDecision: "allow",
-            permissionDecisionReason: "The operation stays inside the verified room exposure.",
-          },
-        };
-      }
-      return {};
+      return preToolDecision(
+        pre.tool_name,
+        toolInput,
+        workspacePath,
+        context.writeEnabled,
+      );
     };
 
     const postTool: HookCallback = async (hookInput, toolUseId) => {
-      const inputRecord = hookInput as unknown as { tool_name?: string; tool_use_id?: string };
+      const inputRecord = hookInput as unknown as {
+        tool_name?: string;
+        tool_use_id?: string;
+      };
       const settledId = toolUseId ?? inputRecord.tool_use_id;
-      if (settledId !== undefined) settleTool(settledId, inputRecord.tool_name ?? "tool");
-      const subagent = settledId === undefined ? undefined : subagents.get(settledId);
+      if (settledId !== undefined)
+        settleTrackedTool(tools, settledId, inputRecord.tool_name ?? "tool");
+      const subagent =
+        settledId === undefined ? undefined : subagents.get(settledId);
       if (subagent !== undefined) {
-        events.push({ type: "agent_completed", runId: context.runId, agentId: subagent });
+        events.push({
+          type: "agent_completed",
+          runId: context.runId,
+          agentId: subagent,
+        });
         subagents.delete(settledId!);
       }
       return {};
@@ -242,7 +415,12 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
 
     const postToolFailure: HookCallback = async (hookInput, toolUseId) => {
       const failure = hookInput as PostToolUseFailureHookInput;
-      settleTool(toolUseId ?? failure.tool_use_id, failure.tool_name, SAFE_TOOL_FAILURE);
+      settleTrackedTool(
+        tools,
+        toolUseId ?? failure.tool_use_id,
+        failure.tool_name,
+        SAFE_TOOL_FAILURE,
+      );
       return {};
     };
 
@@ -270,64 +448,76 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
         context.systemPrompt,
         WORKSPACE_TOOL_GUIDANCE,
         roomMcp?.instructions,
-      ].filter((value): value is string => typeof value === "string" && value.length > 0).join("\n\n");
+      ]
+        .filter(
+          (value): value is string =>
+            typeof value === "string" && value.length > 0,
+        )
+        .join("\n\n");
       sdkQuery = query({
         prompt: input.text,
         options: {
-        abortController,
-        // The SDK resolves its optional CLI relative to sdk.mjs. Inside an
-        // Electron asar that virtual path is readable by Node but cannot be
-        // executed by spawn(2). Use the executable that Arcelle already
-        // capability-probed (normally the installed Claude Code CLI), so the
-        // packaged app starts the same verified binary as the sandbox test.
-        pathToClaudeCodeExecutable: this.executable,
-        cwd: workspacePath,
-        model: nativeHarnessModel(context.model),
-        systemPrompt: { type: "preset", preset: "claude_code", append: systemAppend },
-        tools: { type: "preset", preset: "claude_code" },
-        agents: claudeAgentDefinitions(),
-        mcpServers: roomMcp === undefined ? undefined : {
-          room: claudeRoomMcpConfiguration(roomMcp),
-        },
-        strictMcpConfig: roomMcp !== undefined,
-        // Claude Code's Bash tool starts its own macOS sandbox. Arcelle has
-        // already placed the CLI inside a stricter Seatbelt profile, and the
-        // nested sandbox is not compatible with that verified exposure.
-        disallowedTools: ["Bash", "WebFetch", "WebSearch"],
-        permissionMode: "default",
-        sandbox: {
-          enabled: true,
-          failIfUnavailable: true,
-          autoAllowBashIfSandboxed: false,
-          allowUnsandboxedCommands: false,
-          filesystem: {
-            allowManagedReadPathsOnly: true,
-            allowRead: [workspacePath],
-            allowWrite: context.writeEnabled ? [workspacePath] : [],
-            denyRead: [path.join(workspacePath, ".arcelle")],
-            denyWrite: [path.join(workspacePath, ".arcelle")],
+          abortController,
+          // The SDK resolves its optional CLI relative to sdk.mjs. Inside an
+          // Electron asar that virtual path is readable by Node but cannot be
+          // executed by spawn(2). Use the executable that Arcelle already
+          // capability-probed (normally the installed Claude Code CLI), so the
+          // packaged app starts the same verified binary as the sandbox test.
+          pathToClaudeCodeExecutable: this.executable,
+          cwd: workspacePath,
+          model: nativeHarnessModel(context.model),
+          systemPrompt: {
+            type: "preset",
+            preset: "claude_code",
+            append: systemAppend,
           },
-          network: {
-            strictAllowlist: true,
-            // The per-run Arcelle MCP bridge is the only network endpoint
-            // exposed to the native Claude process. Seatbelt still blocks
-            // filesystem escape and the bridge requires a fresh bearer token.
-            allowedDomains: roomMcp === undefined ? [] : ["127.0.0.1"],
-            allowLocalBinding: false,
-            allowAllUnixSockets: false,
+          tools: { type: "preset", preset: "claude_code" },
+          agents: claudeAgentDefinitions(),
+          mcpServers:
+            roomMcp === undefined
+              ? undefined
+              : {
+                  room: claudeRoomMcpConfiguration(roomMcp),
+                },
+          strictMcpConfig: roomMcp !== undefined,
+          // Claude Code's Bash tool starts its own macOS sandbox. Arcelle has
+          // already placed the CLI inside a stricter Seatbelt profile, and the
+          // nested sandbox is not compatible with that verified exposure.
+          disallowedTools: ["Bash", "WebFetch", "WebSearch"],
+          permissionMode: "default",
+          sandbox: {
+            enabled: true,
+            failIfUnavailable: true,
+            autoAllowBashIfSandboxed: false,
+            allowUnsandboxedCommands: false,
+            filesystem: {
+              allowManagedReadPathsOnly: true,
+              allowRead: [workspacePath],
+              allowWrite: context.writeEnabled ? [workspacePath] : [],
+              denyRead: [path.join(workspacePath, ".arcelle")],
+              denyWrite: [path.join(workspacePath, ".arcelle")],
+            },
+            network: {
+              strictAllowlist: true,
+              // The per-run Arcelle MCP bridge is the only network endpoint
+              // exposed to the native Claude process. Seatbelt still blocks
+              // filesystem escape and the bridge requires a fresh bearer token.
+              allowedDomains: roomMcp === undefined ? [] : ["127.0.0.1"],
+              allowLocalBinding: false,
+              allowAllUnixSockets: false,
+            },
           },
-        },
-        canUseTool,
-        includePartialMessages: true,
-        forwardSubagentText: true,
-        includeHookEvents: true,
-        settingSources: [],
-        hooks: {
-          PreToolUse: [{ hooks: [preTool] }],
-          PostToolUse: [{ hooks: [postTool] }],
-          PostToolUseFailure: [{ hooks: [postToolFailure] }],
-        },
-        spawnClaudeCodeProcess: spawnSandboxed,
+          canUseTool,
+          includePartialMessages: true,
+          forwardSubagentText: true,
+          includeHookEvents: true,
+          settingSources: [],
+          hooks: {
+            PreToolUse: [{ hooks: [preTool] }],
+            PostToolUse: [{ hooks: [postTool] }],
+            PostToolUseFailure: [{ hooks: [postToolFailure] }],
+          },
+          spawnClaudeCodeProcess: spawnSandboxed,
         },
       });
     } catch (error) {
@@ -335,76 +525,24 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
       throw error;
     }
 
-    void (async () => {
-      events.push({ type: "run_started", runId: context.runId, harness: this.name });
-      let receivedResult = false;
-      let providerSucceeded = false;
-      try {
-        for await (const message of sdkQuery) {
-          const delta = streamText(message);
-          if (delta !== null) {
-            const parentToolUseId = (message as unknown as { parent_tool_use_id?: string | null }).parent_tool_use_id;
-            events.push({
-              type: "text_delta",
-              runId: context.runId,
-              text: delta,
-              agentId: parentToolUseId == null ? undefined : subagents.get(parentToolUseId),
-            });
-          }
-          if (message.type === "system" && message.subtype === "init") {
-            events.push({ type: "agent_started", runId: context.runId, agentId: "coordinator", label: "Claude" });
-          }
-          if (message.type === "assistant") {
-            for (const block of message.message.content) {
-              if (block.type === "tool_use") {
-                const toolInput = block.input as Record<string, unknown>;
-                if (block.name === "Agent" || block.name === "Task") {
-                  const agentId = typeof toolInput.subagent_type === "string"
-                    ? toolInput.subagent_type
-                    : typeof toolInput.agent === "string"
-                      ? toolInput.agent
-                      : block.id;
-                  subagents.set(block.id, agentId);
-                  events.push({ type: "agent_started", runId: context.runId, agentId, label: agentId });
-                }
-                startTool(block.id, block.name);
-              }
-            }
-          }
-          if (message.type === "result") {
-            receivedResult = true;
-            providerSucceeded = message.subtype === "success" && !message.is_error;
-            for (const denial of message.permission_denials ?? []) {
-              settleTool(denial.tool_use_id, denial.tool_name, SAFE_TOOL_DENIAL);
-            }
-            const usage = message.subtype === "success" ? message.usage : undefined;
-            events.push({
-              type: "usage_updated",
-              runId: context.runId,
-              inputTokens: usage?.input_tokens,
-              outputTokens: usage?.output_tokens,
-              costUsd: message.total_cost_usd,
-            });
-          }
-        }
-        for (const [toolId, tool] of startedTools) {
-          settleTool(toolId, tool, SAFE_TOOL_INCOMPLETE);
-        }
-        if (!receivedResult || !providerSucceeded || hadMutatingToolFailure) {
-          events.push({ type: "run_failed", runId: context.runId, error: "Claude Agent SDK run failed." });
-        } else {
-          events.push({ type: "agent_completed", runId: context.runId, agentId: "coordinator" });
-          events.push({ type: "run_completed", runId: context.runId, status: "completed" });
-        }
-      } catch (error) {
-        events.push({ type: "run_failed", runId: context.runId, error: safeProviderFailure("claude") });
-      } finally {
-        for (const approval of pending.values()) approval.resolve("cancel");
-        pending.clear();
-        await roomMcp?.stop();
-        events.end();
-      }
-    })();
+    events.push({
+      type: "run_started",
+      runId: context.runId,
+      harness: this.name,
+    });
+    void streamClaudeEvents(
+      sdkQuery,
+      {
+        context,
+        events,
+        subagents,
+        tools,
+        receivedResult: false,
+        providerSucceeded: false,
+      },
+      pending,
+      roomMcp,
+    );
 
     return {
       events,
@@ -417,7 +555,8 @@ export class ClaudeAgentSdkRuntime implements HarnessRuntime {
       },
       approve: async (requestId, decision) => {
         const approval = pending.get(requestId);
-        if (approval === undefined) throw new Error("That approval request is no longer active.");
+        if (approval === undefined)
+          throw new Error("That approval request is no longer active.");
         approval.resolve(decision);
       },
     };

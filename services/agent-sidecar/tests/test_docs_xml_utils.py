@@ -99,6 +99,13 @@ def test_read_zip_entry_none_for_missing_entry_or_non_zip() -> None:
     assert xu.read_zip_entry_capped(b"not a zip", "word/document.xml", 64) is None
 
 
+def test_read_zip_entry_refuses_non_utf8_content() -> None:
+    data = io.BytesIO()
+    with zipfile.ZipFile(data, "w") as archive:
+        archive.writestr("word/document.xml", b"\xff\xfe")
+    assert xu.read_zip_entry_capped(data.getvalue(), "word/document.xml", 64) is None
+
+
 def test_read_zip_entry_default_cap_reads_a_real_entry() -> None:
     data = fake_office_zip("word/document.xml", "<w:p>hi</w:p>")
     assert xu.read_zip_entry(data, "word/document.xml") == "<w:p>hi</w:p>"
@@ -199,6 +206,12 @@ def test_strip_tags_ignores_gt_inside_quoted_attribute() -> None:
 
 def test_strip_tags_decodes_entities_after_stripping() -> None:
     assert xu.strip_tags("<p>a &amp; b</p>") == " a & b "
+
+
+def test_ascii_case_comparison_never_folds_non_ascii_characters() -> None:
+    assert xu._ascii_ci_eq("AMP", "amp") is True
+    assert xu._ascii_ci_eq("é", "É") is False
+    assert xu._ascii_ci_eq("amp", "amps") is False
 
 
 # --------------------------------------------------------- xml_paras_to_text
@@ -305,6 +318,12 @@ def test_decode_minus_sign_in_numeric_ref_is_rejected() -> None:
     # Unlike '+', a leading '-' has no valid u32 meaning and must not parse.
     assert xu.decode_basic_entities("&#-5;") == "&#-5;"
     assert xu.decode_basic_entities("&#x-5;") == "&#x-5;"
+
+
+def test_parse_u32_rejects_empty_and_overflowing_numbers() -> None:
+    assert xu._parse_u32("", 10) is None
+    assert xu._parse_u32("+FFFFFFFF", 16) == 0xFFFFFFFF
+    assert xu._parse_u32("100000000", 16) is None
 
 
 def test_decode_multibyte_filler_around_embedded_ampersand_round_trips() -> None:

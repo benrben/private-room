@@ -14,11 +14,32 @@
       "note": "The CLI extracts legacy sealed-room blobs. It does not open a workspace folder."
     },
     {
-      "path": "apps/desktop/src/main/db-host/files.ts",
+      "path": "apps/desktop/src/main/db-host/filesContent.ts",
       "access": ["read", "write"],
       "category": "legacy-blob-store",
       "workspaceCurrentBytesAllowed": false,
-      "note": "These are the legacy blob primitives used by BlobContentStore. Higher layers must choose the room content abstraction before calling them."
+      "note": "The legacy content getters and updater read or write blob bytes only after rejecting workspace databases."
+    },
+    {
+      "path": "apps/desktop/src/main/db-host/filesCreateList.ts",
+      "access": ["read", "write"],
+      "category": "legacy-blob-store",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "Legacy inserts and byte-deduplication use this column only after the shared workspace-database guard refuses workspace storage."
+    },
+    {
+      "path": "apps/desktop/src/main/db-host/filesModel.ts",
+      "access": ["documentation-reference"],
+      "category": "legacy-blob-store",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "The shared fail-closed guard documents that files.original_bytes belongs only to legacy blob rooms."
+    },
+    {
+      "path": "apps/desktop/src/main/db-host/filesSearch.ts",
+      "access": ["read"],
+      "category": "legacy-blob-store",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "Legacy search and byte inventory queries read the blob column; workspace callers route through WorkspaceService instead."
     },
     {
       "path": "apps/desktop/src/main/db-host/recordings.ts",
@@ -42,14 +63,7 @@
       "note": "Legacy blob version snapshots read this column. WorkspaceService uses encrypted content objects instead."
     },
     {
-      "path": "apps/desktop/src/main/mediaTranscribeJob.ts",
-      "access": ["documentation-reference"],
-      "category": "hybrid-transcription-abstraction",
-      "workspaceCurrentBytesAllowed": false,
-      "note": "The re-transcription history path documents that legacy rooms snapshot their blob while workspace rooms use encrypted content objects; it never reads or writes the legacy column directly."
-    },
-    {
-      "path": "apps/desktop/src/main/recBridge.ts",
+      "path": "apps/desktop/src/main/recBridgeEdits.ts",
       "access": ["documentation-reference"],
       "category": "hybrid-recording-abstraction",
       "workspaceCurrentBytesAllowed": false,
@@ -61,6 +75,13 @@
       "category": "legacy-conversion-boundary",
       "workspaceCurrentBytesAllowed": false,
       "note": "Conversion streams source blobs, verifies them, and clears the column only in the new workspace copy."
+    },
+    {
+      "path": "apps/desktop/src/main/workspace/conversionPlan.ts",
+      "access": ["read"],
+      "category": "legacy-conversion-boundary",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "Conversion planning checks whether each legacy source blob exists before scheduling a workspace copy; it never reads workspace current bytes from this column."
     },
     {
       "path": "apps/desktop/src/main/workspace/roomContent.ts",
@@ -84,11 +105,25 @@
       "note": "This aggregate reports bytes still owned by the legacy blob store."
     },
     {
-      "path": "apps/desktop/src/main/workspace/workspaceService.ts",
+      "path": "apps/desktop/src/main/workspace/workspaceServiceBase.ts",
+      "access": ["read", "clear"],
+      "category": "workspace-projection",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "Legacy repair streams old blob bytes into a normal file and then clears the column as it adopts the row into workspace storage."
+    },
+    {
+      "path": "apps/desktop/src/main/workspace/workspaceServiceMutations.ts",
       "access": ["write-null"],
       "category": "workspace-projection",
       "workspaceCurrentBytesAllowed": false,
-      "note": "All workspace inserts write NULL. Current bytes are written only to normal files."
+      "note": "Workspace file creation and object publication insert NULL; current bytes are written only to normal files."
+    },
+    {
+      "path": "apps/desktop/src/main/workspace/workspaceServiceReconcile.ts",
+      "access": ["write-null"],
+      "category": "workspace-projection",
+      "workspaceCurrentBytesAllowed": false,
+      "note": "Filesystem reconciliation registers normal files with NULL legacy bytes and never copies their current content into the database."
     }
   ],
   "knownIndirectBlobAssumptions": []

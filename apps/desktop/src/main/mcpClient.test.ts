@@ -15,6 +15,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import * as path from "node:path";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -25,12 +26,14 @@ import {
   flattenCallResult,
   isRemoteTransport,
   loginShellPath,
+  lineReaderEofSequenceForTests,
   MAX_TOOL_IMAGES,
   MAX_TOOL_IMAGE_B64,
   McpManager,
   parseHttpMessage,
   parseMcpConfig,
   pushStderrLine,
+  resetLoginShellPathCacheForTests,
   sanitizeToolName,
   STDERR_TAIL_MAX,
   type ServerConfig,
@@ -343,7 +346,16 @@ describe("parseHttpMessage", () => {
     // An SSE body that never declares its content type is still recognised.
     expect(parseHttpMessage("", sse, 7)).toBeDefined();
     expect(parseHttpMessage("application/json", "not json", 1)).toBeUndefined();
+    const sseAfterJunk =
+      `event: message\ndata: definitely-not-json\n\n` +
+      `event: message\ndata: {"jsonrpc":"2.0","id":7,"result":{"ok":2}}\n\n`;
+    expect((parseHttpMessage("text/event-stream", sseAfterJunk, 7) as { result: { ok: number } }).result.ok).toBe(2);
   });
+});
+
+it("returns EOF immediately on reads after a stream has ended", async () => {
+  const stream = new PassThrough();
+  await expect(lineReaderEofSequenceForTests(stream, () => stream.end())).resolves.toEqual([null, null]);
 });
 
 it("resolves a login-shell PATH once and reuses it", async () => {
@@ -352,6 +364,8 @@ it("resolves a login-shell PATH once and reuses it", async () => {
   expect(first).toContain("/usr/local/bin");
   // The OnceLock equivalent: the second call is the same cached string.
   expect(await loginShellPath()).toBe(first);
+  resetLoginShellPathCacheForTests();
+  expect(await loginShellPath()).toContain("/usr/local/bin");
 });
 
 // ---------------------------------------------------------- real stdio wire
@@ -369,7 +383,7 @@ describe("stdio transport (real child process)", () => {
     // via `cursor`.
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual(
-      ["boom", "die_with_stderr", "echo", "hang", "junk_then_ok", "loud_stderr", "null_error", "picture", "ping_me"].sort()
+      ["boom", "die_with_stderr", "echo", "hang", "junk_then_ok", "loud_stderr", "null_error", "picture", "ping_me", "unknown_error", "unsupported_request"].sort()
     );
     const boom = tools.find((t) => t.name === "boom")!;
     expect(boom.annotations).toEqual({ readOnlyHint: true, destructiveHint: false });
@@ -406,6 +420,18 @@ describe("stdio transport (real child process)", () => {
     expect(out.text).toBe("answered after pong");
   });
 
+  it("refuses an unsupported server request and continues the original call", async () => {
+    const { client } = await connectMcpClient(stdioConfig());
+    clientsToClose.push(client);
+    expect((await client.callTool("unsupported_request", {})).text).toBe("client refused unsupported request");
+  });
+
+  it("reports a malformed JSON-RPC error without assuming it has a message", async () => {
+    const { client } = await connectMcpClient(stdioConfig());
+    clientsToClose.push(client);
+    await expect(client.callTool("unknown_error", {})).rejects.toThrow("tools/call failed: unknown error");
+  });
+
   it("a normal reply still arrives after the server chatters on stderr", async () => {
     const { client } = await connectMcpClient(stdioConfig());
     clientsToClose.push(client);
@@ -426,6 +452,16 @@ describe("stdio transport (real child process)", () => {
     const { client } = await connectMcpClient(stdioConfig(), { callTimeoutMs: 200 });
     clientsToClose.push(client);
     await expect(client.callTool("hang", {})).rejects.toThrow("Server timed out on tools/call.");
+  });
+
+  it("rejects an already-expired per-call deadline", async () => {
+    const { client } = await connectMcpClient(stdioConfig(), { callTimeoutMs: 0 });
+    clientsToClose.push(client);
+    await expect(client.callTool("hang", {})).rejects.toThrow("Server timed out on tools/call.");
+  });
+
+  it("reports EOF when the child has already closed stdout", async () => {
+    await expect(connectMcpClient(stdioConfig(["--exit-immediately"]))).rejects.toThrow(/Server (exited|timed out)/);
   });
 
   it("reports the server's stderr tail when it exits without answering", async () => {
@@ -564,6 +600,20 @@ function closeServer(server: Server): Promise<void> {
   return new Promise((resolve) => server.close(() => resolve()));
 }
 
+function startHttpFailureFixture(): Promise<{ url: string; server: Server }> {
+  return new Promise((resolve) => {
+    const server = createServer((_req, res) => {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+      res.end("upstream connector failure");
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address !== null ? address.port : 0;
+      resolve({ url: `http://127.0.0.1:${port}/mcp`, server });
+    });
+  });
+}
+
 describe("http transport (real loopback server)", () => {
   it("connects over plain JSON responses and round-trips a call", async () => {
     const { url, server } = await startHttpFixture();
@@ -574,6 +624,7 @@ describe("http transport (real loopback server)", () => {
       const out = await client.callTool("remote_echo", { q: "hi" });
       expect(JSON.parse(out.text)).toEqual({ q: "hi" });
       await expect(client.callTool("remote_boom", {})).rejects.toThrow("remote kaboom");
+      expect(() => client.close()).not.toThrow();
     } finally {
       await closeServer(server);
     }
@@ -631,6 +682,17 @@ describe("http transport (real loopback server)", () => {
         disabled: false,
       });
       expect((await client.callTool("remote_echo", { ok: true })).text).toContain("ok");
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("reports a non-auth HTTP failure with the response snippet", async () => {
+    const { url, server } = await startHttpFailureFixture();
+    try {
+      await expect(connectMcpClient({ transport: { kind: "http", url, headers: {} }, disabled: false })).rejects.toThrow(
+        "initialize: remote server returned HTTP 502 upstream connector failure"
+      );
     } finally {
       await closeServer(server);
     }

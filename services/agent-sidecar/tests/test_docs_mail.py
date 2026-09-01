@@ -11,7 +11,47 @@ Mirrors the Rust `#[cfg(test)]` mail cases verbatim:
 
 from __future__ import annotations
 
-from arcelle_sidecar.docs.mail import extract_eml
+from arcelle_sidecar.docs.mail import _MAX_DERIVED_CHARS, _push_capped, extract_eml
+
+
+def test_push_capped_appends_text_and_updates_the_byte_total_in_place() -> None:
+    out = ["kept"]
+    total_len = [len("kept".encode("utf-8"))]
+
+    _push_capped(out, " next", total_len)
+
+    assert out == ["kept", " next"]
+    assert total_len == [len("kept next".encode("utf-8"))]
+
+
+def test_push_capped_appends_an_entry_that_exactly_reaches_the_cap() -> None:
+    out: list[str] = []
+    total_len = [_MAX_DERIVED_CHARS - len("é".encode("utf-8"))]
+
+    _push_capped(out, "é", total_len)
+
+    assert out == ["é"]
+    assert total_len == [_MAX_DERIVED_CHARS]
+
+
+def test_push_capped_trims_before_a_multibyte_continuation_byte() -> None:
+    out: list[str] = []
+    total_len = [_MAX_DERIVED_CHARS - 2]
+
+    _push_capped(out, "aé", total_len)
+
+    assert out == ["a"]
+    assert total_len == [_MAX_DERIVED_CHARS - 1]
+
+
+def test_push_capped_preserves_output_and_total_when_the_cap_is_exhausted() -> None:
+    out = ["already indexed"]
+    total_len = [_MAX_DERIVED_CHARS]
+
+    _push_capped(out, "must not be added", total_len)
+
+    assert out == ["already indexed"]
+    assert total_len == [_MAX_DERIVED_CHARS]
 
 
 def test_a_plain_message_keeps_its_headers_and_body() -> None:
@@ -117,3 +157,101 @@ def test_nested_multipart_html_fallback_wins_over_a_later_plain_sibling() -> Non
         f"the later plain sibling was reached, diverging from the Rust "
         f"source's immediate-return-on-nested-result behavior: {text!r}"
     )
+
+
+def test_multipart_skips_empty_nested_and_unknown_parts_before_html_fallback() -> None:
+    """An empty nested part does not prevent the outer fallback search.
+
+    The parser must also retain the *first* HTML fallback after ignoring an
+    unknown attachment and a later HTML alternative.
+    """
+    eml = (
+        'Content-Type: multipart/mixed; boundary="outer"\r\n\r\n'
+        "--outer\r\n"
+        'Content-Type: multipart/alternative; boundary="inner"\r\n\r\n'
+        "--inner\r\n"
+        "Content-Type: application/octet-stream\r\n\r\n"
+        "unreadable nested attachment\r\n"
+        "--inner--\r\n"
+        "--outer\r\n"
+        "Content-Type: application/octet-stream\r\n\r\n"
+        "unreadable outer attachment\r\n"
+        "--outer\r\n"
+        "Content-Type: text/html\r\n\r\n"
+        "<p>first readable fallback</p>\r\n"
+        "--outer\r\n"
+        "Content-Type: text/html\r\n\r\n"
+        "<p>later fallback</p>\r\n"
+        "--outer--\r\n"
+    )
+    text = extract_eml(eml)
+    assert text is not None
+    assert "first readable fallback" in text, text
+    assert "later fallback" not in text, text
+
+
+def test_multipart_repeated_close_markers_are_trimmed_before_reading_part() -> None:
+    """Rust's `trim_start_matches("--")` removes every leading marker pair."""
+    eml = (
+        'Content-Type: multipart/mixed; boundary="edge"\n\n'
+        "--edge----Content-Type: text/plain\n\nrepeated marker body\n"
+        "--edge--\n"
+    )
+    text = extract_eml(eml)
+    assert text is not None
+    assert "repeated marker body" in text, text
+
+
+def test_unquoted_multipart_boundary_stops_at_the_first_separator() -> None:
+    eml = (
+        "Content-Type: multipart/mixed; boundary=outer remaining; charset=utf-8\n\n"
+        "--outer\nContent-Type: text/plain\n\nparsed unquoted boundary\n--outer--\n"
+    )
+    text = extract_eml(eml)
+    assert text is not None
+    assert "parsed unquoted boundary" in text, text
+
+
+def test_multipart_without_a_usable_boundary_keeps_its_body_unparsed() -> None:
+    for content_type in ("multipart/mixed", "multipart/mixed; boundary=;"):
+        text = extract_eml(f"Content-Type: {content_type}\n\nraw multipart body")
+        assert text is not None
+        assert "raw multipart body" in text, text
+
+
+def test_quoted_printable_keeps_malformed_escapes_and_hard_breaks() -> None:
+    eml = (
+        "Content-Type: text/plain\nContent-Transfer-Encoding: quoted-printable\n\n"
+        "keep=ZQ\ntruncated=Q\n"
+    )
+    text = extract_eml(eml)
+    assert text is not None
+    assert "keep=ZQ\ntruncated=Q" in text, text
+
+
+def test_quoted_printable_preserves_a_final_bare_carriage_return() -> None:
+    """Rust's `lines()` does not treat a final bare CR as a terminator."""
+    eml = (
+        "Content-Type: text/plain\nContent-Transfer-Encoding: quoted-printable\n\n"
+        "body ending in bare CR\r"
+    )
+    text = extract_eml(eml)
+    assert text is not None
+    assert text.endswith("body ending in bare CR\r"), repr(text)
+
+
+def test_unclosed_mime_word_retains_rusts_duplicated_prefix() -> None:
+    """The source port intentionally preserves its odd malformed-word output."""
+    text = extract_eml("Subject: hello =?utf-8?B?abc\n\n")
+    assert text is not None
+    assert "Subject: hello hello =?utf-8?B?abc" in text, text
+
+
+def test_malformed_and_unknown_mime_words_remain_readable_text() -> None:
+    incomplete = extract_eml("Subject: =?not-an-encoded-word?=\n\n")
+    assert incomplete is not None
+    assert "Subject: not-an-encoded-word" in incomplete, incomplete
+
+    unknown = extract_eml("Subject: =?utf-8?X?literal?=\n\n")
+    assert unknown is not None
+    assert "Subject: utf-8?X?literal" in unknown, unknown

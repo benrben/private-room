@@ -5,12 +5,94 @@ import Settings from "../Settings";
 import { WSState } from "./state";
 import { WSActions } from "./actions";
 import { LayoutApi } from "../shell/useLayout";
+import {
+  fmtSize,
+  importModeCopy,
+  isYoutubeUrl,
+  submitButtonLabel,
+} from "./settingsLinkHelpers";
 
-/** ADD-26: is this a YouTube page URL? Checked against the URL with its
- * scheme stripped, so "https://youtu.be/…" matches too. */
-function isYoutubeUrl(url: string): boolean {
-  const bare = url.trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
-  return /(^|\.)((youtube(-nocookie)?\.com)|youtu\.be)\//i.test(bare);
+function isSettingsBusy(s: WSState) {
+  return (
+    s.jobs.some((job) => job.status === "running" || job.status === "queued") ||
+    s.recLive !== null ||
+    s.asking
+  );
+}
+
+function SettingsDialog({ s, a, layout }: {
+  s: WSState;
+  a: WSActions;
+  layout: LayoutApi;
+}) {
+  if (!s.showSettings) return null;
+  return (
+    <Settings
+      ai={s.ai}
+      model={s.model}
+      onModelChange={a.changeModel}
+      onModelsChanged={a.refreshAi}
+      busy={isSettingsBusy(s)}
+      initialSection={s.settingsSection}
+      onApplyPreset={layout.applyPreset}
+      onClose={() => {
+        s.setShowSettings(false);
+        s.setSettingsSection(null);
+        a.refreshWebAccess();
+        a.refreshAutolock();
+        a.refreshPrivacy();
+        a.refreshMemAutoSave();
+      }}
+    />
+  );
+}
+
+function McpApprovalDialog({ s, a, info }: {
+  s: WSState;
+  a: WSActions;
+  info: RoomInfo;
+}) {
+  const pending = info.pendingMcp;
+  if (!pending || s.mcpDialogDismissed) return null;
+  return (
+    <div className="settings-backdrop mcp-approve-backdrop">
+      <div className="settings mcp-approve">
+        <div className="settings-head">
+          <span className="badge-label">
+            <LockIcon size={14} /> This room wants to start programs
+          </span>
+        </div>
+        <div className="settings-body">
+          <p className="mcp-approve-lead">
+            Opening <strong>{info.name}</strong> wants to run these programs on
+            this Mac to give the AI extra tools. Only allow this if you trust
+            whoever made the room.
+          </p>
+          <div className="mcp-approve-list">
+            {pending.servers.map((server) => (
+              <div key={server.name} className="mcp-approve-server">
+                <div className="mcp-approve-name">{server.name}</div>
+                <code className="mcp-approve-cmd">{server.command}</code>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="settings-actions mcp-approve-actions">
+          <button className="subtle" onClick={a.keepMcpOff} disabled={s.approvingMcp}>
+            Keep off
+          </button>
+          <button className="primary" onClick={a.approveMcp} disabled={s.approvingMcp}>
+            {s.approvingMcp ? "Starting…" : "Allow"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AddLinkWhenOpen({ s, a }: { s: WSState; a: WSActions }) {
+  if (!s.showAddLink) return null;
+  return <AddLinkModal s={s} a={a} />;
 }
 
 /** Room settings, the SEC-1 MCP start-approval dialog, and the ADD-12 add-link
@@ -26,97 +108,265 @@ export default function SettingsModals({
   info: RoomInfo;
   layout: LayoutApi;
 }) {
-  return (
-    <>
-      {s.showSettings && (
-        <Settings
-          ai={s.ai}
-          model={s.model}
-          onModelChange={a.changeModel}
-          onModelsChanged={a.refreshAi}
-          // Idea 9: CheckpointsSection can't reach WSState, so compute the
-          // rollback-disable gate here (same signals as the Summarize button).
-          busy={
-            s.jobs.some(
-              (j) => j.status === "running" || j.status === "queued",
-            ) ||
-            s.recLive !== null ||
-            s.asking
-          }
-          initialSection={s.settingsSection}
-          // Settings → Interface offers the same three presets the toolbar's
-          // Layout menu does, applied to the room sitting behind this modal.
-          onApplyPreset={layout.applyPreset}
-          onClose={() => {
-            s.setShowSettings(false);
-            s.setSettingsSection(null);
-            a.refreshWebAccess();
-            a.refreshAutolock();
-            a.refreshPrivacy();
-            // Wave 1b (idea 5): the Behavior checkbox only writes the DB —
-            // re-read it so auto-save flips without reopening the room.
-            a.refreshMemAutoSave();
-          }}
-        />
-      )}
-
-      {info.pendingMcp && !s.mcpDialogDismissed && (
-        <div className="settings-backdrop mcp-approve-backdrop">
-          <div className="settings mcp-approve">
-            <div className="settings-head">
-              <span className="badge-label">
-                <LockIcon size={14} /> This room wants to start programs
-              </span>
-            </div>
-            <div className="settings-body">
-              <p className="mcp-approve-lead">
-                Opening <strong>{info.name}</strong> wants to run these programs
-                on this Mac to give the AI extra tools. Only allow this if you
-                trust whoever made the room.
-              </p>
-              <div className="mcp-approve-list">
-                {info.pendingMcp.servers.map((srv) => (
-                  <div key={srv.name} className="mcp-approve-server">
-                    <div className="mcp-approve-name">{srv.name}</div>
-                    <code className="mcp-approve-cmd">{srv.command}</code>
-                  </div>
-                ))}
-              </div>
-            </div>
-            <div className="settings-actions mcp-approve-actions">
-              <button
-                className="subtle"
-                onClick={a.keepMcpOff}
-                disabled={s.approvingMcp}
-              >
-                Keep off
-              </button>
-              <button
-                className="primary"
-                onClick={a.approveMcp}
-                disabled={s.approvingMcp}
-              >
-                {s.approvingMcp ? "Starting…" : "Allow"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {s.showAddLink && <AddLinkModal s={s} a={a} />}
-    </>
-  );
+  return <><SettingsDialog s={s} a={a} layout={layout} /><McpApprovalDialog s={s} a={a} info={info} /><AddLinkWhenOpen s={s} a={a} /></>;
 }
 
 /** The ADD-12 add-link modal, plus the ADD-26 "also save the video" path for
  * YouTube links. Mounted only while open, so the checkbox/progress state
  * resets each time. */
-/** A byte estimate the way a person sizes a download. */
-function fmtSize(bytes: number): string {
-  const gib = 1024 ** 3;
-  return bytes >= gib
-    ? `${(bytes / gib).toFixed(1)} GB`
-    : `${Math.round(bytes / 1024 ** 2)} MB`;
+function AddLinkHeader({ isYoutube, onClose }: {
+  isYoutube: boolean;
+  onClose: () => void;
+}) {
+  return (
+    <div className="settings-head">
+      <span className="badge-label">
+        <LinkIcon size={14} /> {isYoutube ? "Import YouTube video" : "Add a web link"}
+      </span>
+      <button
+        className="subtle btn-ic"
+        title="Close"
+        aria-label="Close"
+        onClick={onClose}
+      >
+        <CloseIcon size={12} />
+      </button>
+    </div>
+  );
+}
+
+function LinkPrivacyHint({ isYoutube, saveVideo }: {
+  isYoutube: boolean;
+  saveVideo: boolean;
+}) {
+  const message = isYoutube
+    ? "This sends the public video link to YouTube to fetch it — your room files stay on this Mac."
+    : saveVideo
+      ? "This sends the public link to the site to fetch its video — your room files stay on this Mac."
+      : "This fetches one page from the internet — your room files stay on this Mac.";
+  return <p className="settings-hint">{message}</p>;
+}
+
+function LinkAddressInput({ value, onChange, onSubmit, onClose }: {
+  value: string;
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <input
+      className="add-link-input"
+      autoFocus
+      dir="auto"
+      placeholder="https://example.com/article"
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") onSubmit();
+        if (event.key === "Escape") onClose();
+      }}
+    />
+  );
+}
+
+function ImportModePicker({ isYoutube, saveVideo, importing, onSelect }: {
+  isYoutube: boolean;
+  saveVideo: boolean;
+  importing: boolean;
+  onSelect: (saveVideo: boolean) => void;
+}) {
+  const copy = importModeCopy(isYoutube);
+  return (
+    <div className="yt-mode" role="radiogroup" aria-label="What to import">
+      <button
+        className={`yt-mode-opt${!saveVideo ? " active" : ""}`}
+        role="radio"
+        aria-checked={!saveVideo}
+        disabled={importing}
+        onClick={() => onSelect(false)}
+      >
+        <span className="yt-mode-name">{copy.pageName}</span>
+        <span className="yt-mode-sub">{copy.pageDetail}</span>
+      </button>
+      <button
+        className={`yt-mode-opt${saveVideo ? " active" : ""}`}
+        role="radio"
+        aria-checked={saveVideo}
+        disabled={importing}
+        onClick={() => onSelect(true)}
+      >
+        <span className="yt-mode-name">{copy.videoName}</span>
+        <span className="yt-mode-sub">{copy.videoDetail}</span>
+      </button>
+    </div>
+  );
+}
+
+function QualitySize({ bytes }: { bytes: number | null }) {
+  if (bytes === null) return null;
+  return <span className="yt-quality-size"> · ~{fmtSize(bytes)}</span>;
+}
+
+function BestQualityOption({ importing, downloading, qualities, maxHeight, onSelect }: {
+  importing: boolean;
+  downloading: boolean;
+  qualities: MediaQualityOption[];
+  maxHeight: number | null;
+  onSelect: () => void;
+}) {
+  const bestDoesNotFit = qualities.length > 0 && !qualities[0].fits;
+  return (
+    <button
+      className={`yt-quality-opt${maxHeight === null ? " active" : ""}`}
+      role="radio"
+      aria-checked={maxHeight === null}
+      disabled={importing || downloading || bestDoesNotFit}
+      title={bestDoesNotFit ? "The best quality is too big for a room file" : undefined}
+      onClick={onSelect}
+    >
+      Best
+    </button>
+  );
+}
+
+function VideoQualityOption({ quality, importing, downloading, maxHeight, onSelect }: {
+  quality: MediaQualityOption;
+  importing: boolean;
+  downloading: boolean;
+  maxHeight: number | null;
+  onSelect: (height: number) => void;
+}) {
+  return (
+    <button
+      className={`yt-quality-opt${maxHeight === quality.height ? " active" : ""}`}
+      role="radio"
+      aria-checked={maxHeight === quality.height}
+      disabled={importing || downloading || !quality.fits}
+      title={quality.fits ? undefined : "Too big for a room file"}
+      onClick={() => onSelect(quality.height)}
+    >
+      {quality.height}p
+      <QualitySize bytes={quality.approxBytes} />
+    </button>
+  );
+}
+
+function QualityOptions({ importing, downloading, qualities, maxHeight, onSelect }: {
+  importing: boolean;
+  downloading: boolean;
+  qualities: MediaQualityOption[];
+  maxHeight: number | null;
+  onSelect: (height: number | null) => void;
+}) {
+  return (
+    <>
+      <BestQualityOption
+        importing={importing}
+        downloading={downloading}
+        qualities={qualities}
+        maxHeight={maxHeight}
+        onSelect={() => onSelect(null)}
+      />
+      {qualities.map((quality) => (
+        <VideoQualityOption
+          key={quality.height}
+          quality={quality}
+          importing={importing}
+          downloading={downloading}
+          maxHeight={maxHeight}
+          onSelect={onSelect}
+        />
+      ))}
+    </>
+  );
+}
+
+function VideoQualityPicker({ visible, probing, importing, downloading, qualities, maxHeight, onSelect }: {
+  visible: boolean;
+  probing: boolean;
+  importing: boolean;
+  downloading: boolean;
+  qualities: MediaQualityOption[] | null;
+  maxHeight: number | null;
+  onSelect: (height: number | null) => void;
+}) {
+  if (!visible) return null;
+  return (
+    <div className="yt-quality" role="radiogroup" aria-label="Video quality">
+      {probing ? (
+        <span className="yt-quality-hint">
+          Checking which qualities this video offers…
+        </span>
+      ) : (
+        <QualityOptions
+          importing={importing}
+          downloading={downloading}
+          qualities={qualities ?? []}
+          maxHeight={maxHeight}
+          onSelect={onSelect}
+        />
+      )}
+    </div>
+  );
+}
+
+function DownloadProgress({ downloading, progress, onCancel }: {
+  downloading: boolean;
+  progress: { status: string; percent: number | null } | null;
+  onCancel: () => void;
+}) {
+  if (!downloading) return null;
+  return (
+    <span className="banner-pull">
+      <span className="banner-pull-label">
+        Downloading <strong>video</strong>… you can close this — it keeps going
+        and lands in the room.
+        <button className="subtle" onClick={onCancel}>Stop download</button>
+      </span>
+      <span
+        className="pull-bar"
+        role="progressbar"
+        aria-label="Download progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={progress?.percent ?? undefined}
+      >
+        <span
+          className="pull-bar-fill"
+          style={{ width: `${progress?.percent ?? 0}%` }}
+        />
+      </span>
+      <span className="banner-pull-status">
+        {progress?.status ?? "Starting"}
+        {progress?.percent != null && ` — ${progress.percent.toFixed(0)}%`}
+      </span>
+    </span>
+  );
+}
+
+function AddLinkActions({ importing, downloading, linkUrl, isYoutube, saveVideo, onClose, onSubmit }: {
+  importing: boolean;
+  downloading: boolean;
+  linkUrl: string;
+  isYoutube: boolean;
+  saveVideo: boolean;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  return (
+    <div className="settings-actions">
+      <button className="subtle" onClick={onClose}>
+        {importing ? "Close" : "Cancel"}
+      </button>
+      <button
+        className="primary"
+        onClick={onSubmit}
+        disabled={importing || !linkUrl.trim()}
+      >
+        {submitButtonLabel({ downloading, importing, isYoutube, saveVideo })}
+      </button>
+    </div>
+  );
 }
 
 function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
@@ -290,207 +540,51 @@ function AddLinkModal({ s, a }: { s: WSState; a: WSActions }) {
     <div
       className="settings-backdrop"
       onMouseDown={(e) => {
-        // Closing is ALWAYS allowed. A video download runs for minutes, and
-        // with every dismissal switched off the whole app was held hostage by
-        // a download started by mistake. The fetch keeps going in the
-        // background and still reports itself with a toast.
         if (e.target === e.currentTarget) s.setShowAddLink(false);
       }}
     >
       <div className="settings add-link-modal">
-        <div className="settings-head">
-          <span className="badge-label">
-            {/* The sheet renames itself the moment a YouTube URL is
-                recognized — the mental model must never change mid-form. */}
-            <LinkIcon size={14} />{" "}
-            {isYoutube ? "Import YouTube video" : "Add a web link"}
-          </span>
-          <button
-            className="subtle btn-ic"
-            title="Close"
-            // An icon-only control needs a name of its own. `title` alone is a
-            // last-resort fallback in the accessible-name calculation and is
-            // not surfaced at all to a keyboard user who cannot hover it.
-            aria-label="Close"
-            onClick={() => s.setShowAddLink(false)}
-          >
-            <CloseIcon size={12} />
-          </button>
-        </div>
+        <AddLinkHeader
+          isYoutube={isYoutube}
+          onClose={() => s.setShowAddLink(false)}
+        />
         <div className="settings-body">
-          <p className="settings-hint">
-            {/* The boundary sentence lives here, in the action surface —
-                what leaves the Mac and what doesn't, before the click. */}
-            {isYoutube
-              ? "This sends the public video link to YouTube to fetch it — your room files stay on this Mac."
-              : saveVideo
-                ? "This sends the public link to the site to fetch its video — your room files stay on this Mac."
-                : "This fetches one page from the internet — your room files stay on this Mac."}
-          </p>
-          <input
-            className="add-link-input"
-            autoFocus
-            dir="auto"
-            placeholder="https://example.com/article"
+          <LinkPrivacyHint isYoutube={isYoutube} saveVideo={saveVideo} />
+          <LinkAddressInput
             value={s.linkUrl}
-            onChange={(e) => s.setLinkUrl(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") submit();
-              if (e.key === "Escape") s.setShowAddLink(false);
-            }}
+            onChange={s.setLinkUrl}
+            onSubmit={submit}
+            onClose={() => s.setShowAddLink(false)}
           />
-          {/* BROWSE-2: the video option is offered for every URL — yt-dlp
-              covers most video sites, and an unsupported one fails honestly. */}
-          <div
-            className="yt-mode"
-            role="radiogroup"
-            aria-label="What to import"
-          >
-            <button
-              className={`yt-mode-opt${!saveVideo ? " active" : ""}`}
-              role="radio"
-              aria-checked={!saveVideo}
-              disabled={s.importingLink}
-              onClick={() => setSaveVideo(false)}
-            >
-              <span className="yt-mode-name">
-                {isYoutube ? "Transcript only" : "Page text"}
-              </span>
-              <span className="yt-mode-sub">
-                {isYoutube ? "captions, small and fast" : "readable copy, small and fast"}
-              </span>
-            </button>
-            <button
-              className={`yt-mode-opt${saveVideo ? " active" : ""}`}
-              role="radio"
-              aria-checked={saveVideo}
-              disabled={s.importingLink}
-              onClick={() => setSaveVideo(true)}
-            >
-              <span className="yt-mode-name">
-                {isYoutube ? "Video + transcript" : "Video from this page"}
-              </span>
-              <span className="yt-mode-sub">
-                {isYoutube ? "larger, plays offline forever" : "works on most video sites"}
-              </span>
-            </button>
-          </div>
-          {/* The quality row: only what THIS video actually offers, probed
-              live — never a hardcoded ladder. Sizes are the site's own
-              estimates; a quality too big for a room file says so instead
-              of failing after the download. */}
-          {saveVideo && (probing || (qualities?.length ?? 0) > 0) && (
-            <div className="yt-quality" role="radiogroup" aria-label="Video quality">
-              {probing ? (
-                <span className="yt-quality-hint">
-                  Checking which qualities this video offers…
-                </span>
-              ) : (
-                <>
-                  <button
-                    className={`yt-quality-opt${maxHeight === null ? " active" : ""}`}
-                    role="radio"
-                    aria-checked={maxHeight === null}
-                    disabled={
-                      s.importingLink ||
-                      downloading ||
-                      (qualities!.length > 0 && !qualities![0].fits)
-                    }
-                    title={
-                      qualities!.length > 0 && !qualities![0].fits
-                        ? "The best quality is too big for a room file"
-                        : undefined
-                    }
-                    onClick={() => setMaxHeight(null)}
-                  >
-                    Best
-                  </button>
-                  {qualities!.map((q) => (
-                    <button
-                      key={q.height}
-                      className={`yt-quality-opt${maxHeight === q.height ? " active" : ""}`}
-                      role="radio"
-                      aria-checked={maxHeight === q.height}
-                      disabled={s.importingLink || downloading || !q.fits}
-                      title={q.fits ? undefined : "Too big for a room file"}
-                      onClick={() => setMaxHeight(q.height)}
-                    >
-                      {q.height}p
-                      {q.approxBytes != null && (
-                        <span className="yt-quality-size">
-                          {" "}
-                          · ~{fmtSize(q.approxBytes)}
-                        </span>
-                      )}
-                    </button>
-                  ))}
-                </>
-              )}
-            </div>
-          )}
-          {downloading && (
-            <span className="banner-pull">
-              <span className="banner-pull-label">
-                Downloading <strong>video</strong>… you can close this — it
-                keeps going and lands in the room.
-                {/* …or actually abandon it. Closing only hides a download that
-                    can run for the whole budget, so a video started by mistake
-                    used to need a force-quit. */}
-                <button
-                  className="subtle"
-                  onClick={() => void api.cancelMediaDownload().catch(() => {})}
-                >
-                  Stop download
-                </button>
-              </span>
-              {/* A bar whose only state was a CSS width. Given the real ARIA
-                  role it becomes a progress report the room can read out — and
-                  `aria-valuenow` is deliberately omitted while yt-dlp has not
-                  reported a percentage yet, which is how ARIA spells
-                  "indeterminate". Claiming 0% would be a number we do not
-                  have. */}
-              <span
-                className="pull-bar"
-                role="progressbar"
-                aria-label="Download progress"
-                aria-valuemin={0}
-                aria-valuemax={100}
-                aria-valuenow={ytProgress?.percent ?? undefined}
-              >
-                <span
-                  className="pull-bar-fill"
-                  style={{ width: `${ytProgress?.percent ?? 0}%` }}
-                />
-              </span>
-              <span className="banner-pull-status">
-                {ytProgress?.status ?? "Starting"}
-                {ytProgress?.percent != null &&
-                  ` — ${ytProgress.percent.toFixed(0)}%`}
-              </span>
-            </span>
-          )}
-          <div className="settings-actions">
-            <button className="subtle" onClick={() => s.setShowAddLink(false)}>
-              {s.importingLink ? "Close" : "Cancel"}
-            </button>
-            <button
-              className="primary"
-              onClick={submit}
-              disabled={s.importingLink || !s.linkUrl.trim()}
-            >
-              {downloading
-                ? "Downloading…"
-                : s.importingLink
-                  ? "Fetching…"
-                  : isYoutube
-                    ? saveVideo
-                      ? "Import video"
-                      : "Import transcript"
-                    : saveVideo
-                      ? "Download video"
-                      : "Save page"}
-            </button>
-          </div>
+          <ImportModePicker
+            isYoutube={isYoutube}
+            saveVideo={saveVideo}
+            importing={s.importingLink}
+            onSelect={setSaveVideo}
+          />
+          <VideoQualityPicker
+            visible={saveVideo && (probing || (qualities?.length ?? 0) > 0)}
+            probing={probing}
+            importing={s.importingLink}
+            downloading={downloading}
+            qualities={qualities}
+            maxHeight={maxHeight}
+            onSelect={setMaxHeight}
+          />
+          <DownloadProgress
+            downloading={downloading}
+            progress={ytProgress}
+            onCancel={() => void api.cancelMediaDownload().catch(() => {})}
+          />
+          <AddLinkActions
+            importing={s.importingLink}
+            downloading={downloading}
+            linkUrl={s.linkUrl}
+            isYoutube={isYoutube}
+            saveVideo={saveVideo}
+            onClose={() => s.setShowAddLink(false)}
+            onSubmit={submit}
+          />
         </div>
       </div>
     </div>

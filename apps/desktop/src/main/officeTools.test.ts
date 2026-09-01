@@ -28,6 +28,7 @@ import {
   registerOfficeIpc,
   slideCountOf,
   slidePreview,
+  slidePreviewInRoom,
   type RoomSource,
   type SlideCache,
   type SlideCacheEntry,
@@ -109,6 +110,14 @@ describe("slideCountOf", () => {
   it("a legacy binary .ppt counts as zero rather than crashing — slidePreview is what turns 0 into 1", () => {
     expect(slideCountOf(OLE_MAGIC)).toBe(0);
     expect(Math.max(slideCountOf(OLE_MAGIC), 1)).toBe(1);
+  });
+
+  it("treats a missing or truncated slide-list opening tag as no listed slides", () => {
+    expect(slideCountOf(fakeOfficeZip("ppt/presentation.xml", "<p:presentation/>"))).toBe(0);
+    expect(slideCountOf(fakeOfficeZip(
+      "ppt/presentation.xml",
+      "<p:presentation><p:sldIdLst",
+    ))).toBe(0);
   });
 });
 
@@ -529,6 +538,26 @@ describe("slidePreview", () => {
     await expect(slidePreview(db, "no-such-id", -1, createSlideCache())).rejects.toThrow(
       "non-negative integer"
     );
+  });
+});
+
+describe("slidePreviewInRoom", () => {
+  it("uses the same index validation and room-backed rendering path", async () => {
+    freshRoom();
+    const file = insertFile(db, "deck.pptx", PPTX_MIME, fakeDeck(2), null, "library");
+    const render = vi.fn<PreviewRenderFn>(() => Promise.resolve(Buffer.from([4])));
+    const open = { db, path: roomPath };
+
+    await expect(slidePreviewInRoom(open, file.id, -1, createSlideCache(), render)).rejects.toThrow(
+      "non-negative integer"
+    );
+    expect(render).not.toHaveBeenCalled();
+
+    await expect(slidePreviewInRoom(open, file.id, 1, createSlideCache(), render)).resolves.toEqual({
+      pngB64: Buffer.from([4]).toString("base64"),
+      slides: 2,
+    });
+    expect(idOrder(Buffer.from(render.mock.calls[0]![1]))).toEqual(["rId2", "rId1"]);
   });
 });
 

@@ -57,6 +57,13 @@ import { APPROVE_SCRIPT_BYTES_NOT_IMPLEMENTED } from "./scriptConsent.js";
 import { STOPPED } from "./scriptRun.js";
 import { DELETE_DECLINED } from "./mcpConfig.js";
 import { SKILL_AGENT_IDS } from "./toolSpecs.js";
+
+vi.mock("./workflowCompose.js", () => ({
+  generateTextAnyEngine: vi.fn(),
+  withRealOllamaGenerate: vi.fn((deps) => deps),
+}));
+
+import { generateTextAnyEngine, withRealOllamaGenerate } from "./workflowCompose.js";
 import {
   agentDeleteSkill,
   agentRunSkillScript,
@@ -78,6 +85,9 @@ import {
   isTextPath,
   listSkillsCmd,
   loadSkillSources,
+  MAX_IMPORT_BYTES,
+  MAX_RESOURCE_BYTES,
+  MAX_RESOURCES,
   normalizeSkillPath,
   parseSkillMd,
   registerSkillsIpc,
@@ -109,6 +119,7 @@ const tmpDirs: string[] = [];
 afterEach(() => {
   resetLiveSkillRunsForTests();
   vi.restoreAllMocks();
+  vi.clearAllMocks();
   for (const dir of tmpDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -480,15 +491,41 @@ describe("loadSkillSources / instructionsWithSourceLinks / skillComposePrompt", 
 });
 
 describe("composeSkill", () => {
+  const validSkill = (overrides: Record<string, unknown> = {}): string =>
+    JSON.stringify({
+      name: "composed-skill",
+      description: "Builds a skill when asked.",
+      instructions: "Follow the bundled guide.",
+      resources: [],
+      ...overrides,
+    });
+
+  const composeRaw = (db: Database.Database, raw: string): Promise<string> =>
+    composeSkill(db, "Build something", null, {
+      listModels: async () => ["local"],
+      generate: async () => raw,
+    });
+
   it("refuses an empty request before touching the room", async () => {
     const db = freshRoom();
     await expect(composeSkill(db, "   ", null)).rejects.toThrow("Describe the skill you want.");
     db.close();
   });
 
+  it("refuses composition while a room restore is in progress before listing models", async () => {
+    const db = freshRoom();
+    const listModels = vi.fn(async () => ["local"]);
+    await expect(composeSkill(db, "Build something", null, { listModels, isRollingBack: () => true })).rejects.toThrow(
+      "A room restore is in progress. Try again when it finishes."
+    );
+    expect(listModels).not.toHaveBeenCalled();
+    db.close();
+  });
+
   it("generates, validates, and saves a disabled draft with bundled sources", async () => {
     const db = freshRoom();
     const source = insertFile(db, "evidence.txt", "text/plain", Buffer.from("facts"), "facts", "import");
+    const emit = vi.fn();
     const id = await composeSkill(db, "Build something", [source.id], {
       listModels: async () => ["local"],
       generate: async () => JSON.stringify({
@@ -497,9 +534,11 @@ describe("composeSkill", () => {
         instructions: "Use the bundled evidence.",
         resources: [{ path: "references/guide.md", content: "Guide" }],
       }),
+      emit,
     });
     const skill = findSkillDb(db, id)!;
     expect(skill.enabled).toBe(false);
+    expect(emit).toHaveBeenCalledWith("skills-changed", undefined);
     expect(listSkillResourcesDb(db, id).map((resource) => resource.path)).toEqual([
       "references/guide.md",
       "references/source-files/evidence-txt.md",
@@ -509,6 +548,97 @@ describe("composeSkill", () => {
       listModels: async () => ["local"],
       generate: async () => "{}",
     })).rejects.toThrow(/no readable text yet/);
+    db.close();
+  });
+
+  it("uses the production generator when no injected generator is provided", async () => {
+    const db = freshRoom();
+    vi.mocked(generateTextAnyEngine).mockResolvedValue(validSkill({ name: "default-generator" }));
+    const id = await composeSkill(db, "Build something", null, { listModels: async () => ["local"] });
+    expect(findSkillDb(db, id)?.name).toBe("default-generator");
+    expect(withRealOllamaGenerate).toHaveBeenCalledWith({});
+    expect(generateTextAnyEngine).toHaveBeenCalledTimes(1);
+    db.close();
+  });
+
+  it("reports malformed model JSON, non-objects, and missing required fields", async () => {
+    const db = freshRoom();
+    await expect(composeRaw(db, "not JSON")).rejects.toThrow("The model did not return a valid skill:");
+    await expect(composeRaw(db, "[]")).rejects.toThrow("The model did not return a skill object.");
+    await expect(composeRaw(db, JSON.stringify({ name: "only-name" }))).rejects.toThrow(
+      "The composed skill is missing name, description, or instructions."
+    );
+    db.close();
+  });
+
+  it("validates the generated resource collection and each resource shape", async () => {
+    const db = freshRoom();
+    await expect(composeRaw(db, validSkill({ resources: "not-an-array" }))).rejects.toThrow(
+      "The composed skill's resources must be an array."
+    );
+    await expect(composeRaw(db, validSkill({ resources: [null] }))).rejects.toThrow(
+      "Each composed skill resource needs a path and text content."
+    );
+    await expect(composeRaw(db, validSkill({ resources: [{ path: "references/a.md" }] }))).rejects.toThrow(
+      "Each composed skill resource needs a path and text content."
+    );
+    db.close();
+  });
+
+  it("enforces generated resource count, per-resource size, and total size", async () => {
+    const db = freshRoom();
+    const entry = { path: "references/a.md", content: "x" };
+    await expect(composeRaw(db, validSkill({ resources: Array.from({ length: MAX_RESOURCES + 1 }, () => entry) }))).rejects.toThrow(
+      `A skill may contain at most ${MAX_RESOURCES} resources.`
+    );
+
+    vi.spyOn(Buffer, "from").mockReturnValue({ length: MAX_RESOURCE_BYTES + 1 } as Buffer);
+    await expect(composeRaw(db, validSkill({ resources: [{ path: "references/large.md", content: "large" }] }))).rejects.toThrow(
+      "references/large.md is too large."
+    );
+    vi.restoreAllMocks();
+
+    vi.spyOn(Buffer, "from").mockReturnValue({ length: MAX_RESOURCE_BYTES } as Buffer);
+    const totalEntries = Array.from({ length: 5 }, (_, index) => ({ path: `references/${index}.md`, content: "sized" }));
+    await expect(composeRaw(db, validSkill({ resources: totalEntries }))).rejects.toThrow(
+      "The composed skill's resources are too large."
+    );
+    expect(MAX_RESOURCE_BYTES * totalEntries.length).toBeGreaterThan(MAX_IMPORT_BYTES);
+    db.close();
+  });
+
+  it("rejects resource paths that cannot coexist in one portable skill folder", async () => {
+    const db = freshRoom();
+    await expect(composeRaw(db, validSkill({
+      resources: [
+        { path: "references", content: "file" },
+        { path: "references/guide.md", content: "nested" },
+      ],
+    }))).rejects.toThrow(/file and a folder/);
+    db.close();
+  });
+
+  it("refuses a generated name that already belongs to a skill", async () => {
+    const db = freshRoom();
+    createSkillDb(db, "already-exists", "Existing", "Body", false, "user", "");
+    await expect(composeRaw(db, validSkill({ name: "already-exists" }))).rejects.toThrow(
+      'A skill named "already-exists" already exists.'
+    );
+    db.close();
+  });
+
+  it("removes a half-written skill when storing a generated resource fails", async () => {
+    const db = freshRoom();
+    const prepare = db.prepare.bind(db);
+    vi.spyOn(db, "prepare").mockImplementation((sql) => {
+      if (sql.includes("INSERT INTO skill_resources")) throw new Error("resource write failed");
+      return prepare(sql);
+    });
+    await expect(composeRaw(db, validSkill({
+      name: "write-failure",
+      resources: [{ path: "references/guide.md", content: "Guide" }],
+    }))).rejects.toThrow("resource write failed");
+    expect(findSkillDb(db, "write-failure")).toBeNull();
     db.close();
   });
 });
@@ -1150,15 +1280,36 @@ describe("registerSkillsIpc", () => {
     const bundle = (await call("get_skill", { id })) as { skill: { name: string } };
     expect(bundle.skill.name).toBe("review");
 
+    await call("update_skill", {
+      id,
+      name: "review-updated",
+      description: "updated",
+      instructions: "Updated body",
+      agent: "files.read",
+    });
+    expect(((await call("get_skill", { id })) as { skill: { name: string } }).skill.name).toBe("review-updated");
+
     await call("save_skill_resource", { skillId: id, path: "references/n.md", text: "hi" });
     expect(((await call("get_skill_resource", { skillId: id, path: "references/n.md" })) as { text: string }).text).toBe(
       "hi"
     );
+    await call("delete_skill_resource", { skillId: id, path: "references/n.md" });
+    await expect(call("get_skill_resource", { skillId: id, path: "references/n.md" })).rejects.toThrow(
+      "has no file",
+    );
+
+    const importedRoot = freshDir("skill-ipc-import-");
+    writeFileSync(
+      path.join(importedRoot, "SKILL.md"),
+      "---\nname: ipc-imported\ndescription: Imported\n---\n\nImported body\n",
+    );
+    const importedId = await call("import_skill_folder", { path: importedRoot, replace: false });
+    expect(findSkillDb(db, importedId as string)?.name).toBe("ipc-imported");
 
     await call("set_skill_enabled", { id, enabled: true });
     expect(((await call("get_skill", { id })) as { skill: { enabled: boolean } }).skill.enabled).toBe(true);
 
-    expect((await call("list_skills")) as Array<{ name: string }>).toHaveLength(1);
+    expect((await call("list_skills")) as Array<{ name: string }>).toHaveLength(2);
     expect(await call("skill_agent_ids")).toEqual([...SKILL_AGENT_IDS]);
 
     const dest = freshDir("skill-ipc-export-");

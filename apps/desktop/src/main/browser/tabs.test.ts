@@ -228,6 +228,15 @@ describe("two_sittings_in_the_same_second_are_still_two", () => {
   });
 });
 
+describe("TabRegistry ids", () => {
+  it("returns every page id in tab order", () => {
+    const registry = new TabRegistry();
+    registry.addPage(page("first"));
+    registry.addPage(page("second"));
+    expect(registry.ids()).toEqual(["first", "second"]);
+  });
+});
+
 describe("nowIso", () => {
   it("matches browser.rs's now_iso shape: %Y-%m-%dT%H:%M:%S", () => {
     expect(nowIso(new Date(2026, 0, 2, 3, 4, 5))).toBe("2026-01-02T03:04:05");

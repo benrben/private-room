@@ -3,16 +3,13 @@ import { api, FileTarget } from "../api";
 import { fileToBase64 } from "./composer";
 import {
   acquireMic,
-  attachMicTap,
   createPcmTap,
   micConstraints,
-  noteLiveStt,
-  stopMicTap,
 } from "./liveRec";
-import { closeRecordingTransport, startRecordingTransport } from "./recordingTransport";
 import { WSState } from "./state";
 import { base64ToBytes } from "../viewers/util";
 import { connectDictSession, type DictSession } from "./dictSession";
+import { makeLiveRecordingActions } from "./recordingLiveActions";
 
 /** Below this RMS (PCM samples in [-1, 1]) counts as silence for hands-free
  * auto-send — comfortably above the mic's noise floor (echoCancellation /
@@ -101,37 +98,56 @@ export function makeRecordingActions(
     owner: string,
     onDone: (blob: Blob, ext: string) => Promise<void>,
   ) {
-    if (s.dictState === "busy" || s.dictState === "preparing") return;
-    if (s.dictState === "recording") {
-      if (s.dictOwner === owner) s.recorderRef.current?.stop();
-      return;
-    }
+    if (shouldSkipRecordingStart(owner)) return;
     // Own the state BEFORE asking for the microphone: the permission dialog
     // or a slow device can take seconds, and the capture dock must already be
     // saying "Preparing microphone…" instead of the click doing nothing.
     s.setDictOwner(owner);
     s.setDictState("preparing");
-    let stream: MediaStream;
+    const stream = await recordingMic();
+    if (!stream) return;
+    startBatchRecording(stream, owner, onDone);
+  }
+
+  function shouldSkipRecordingStart(owner: string): boolean {
+    if (s.dictState === "busy" || s.dictState === "preparing") return true;
+    if (s.dictState !== "recording") return false;
+    if (s.dictOwner === owner) s.recorderRef.current?.stop();
+    return true;
+  }
+
+  async function recordingMic(): Promise<MediaStream | null> {
     try {
       // Same constraints as a recording: `audio: true` lets WebKit turn on
       // voice processing (and its gain riding) by default, which other apps on
       // the same microphone hear as their volume dropping (GH #4).
-      stream = await navigator.mediaDevices.getUserMedia({
+      return await navigator.mediaDevices.getUserMedia({
         audio: micConstraints(),
       });
     } catch (e) {
       s.setDictState("idle");
       s.setDictOwner(null);
-      const name = (e as { name?: string })?.name || "";
-      const msg =
-        name === "NotFoundError" || name === "OverconstrainedError"
-          ? "No microphone found — plug one in or check your input device."
-          : name === "NotReadableError" || name === "AbortError"
-            ? "The microphone is busy in another app — close it and try again."
-            : "Microphone blocked — allow Arcelle in System Settings → Privacy & Security → Microphone, then reopen the app.";
-      s.pushToast("error", msg);
-      return;
+      s.pushToast("error", recordingMicMessage(e));
+      return null;
     }
+  }
+
+  function recordingMicMessage(error: unknown): string {
+    const name = (error as { name?: string })?.name || "";
+    if (name === "NotFoundError" || name === "OverconstrainedError") {
+      return "No microphone found — plug one in or check your input device.";
+    }
+    if (name === "NotReadableError" || name === "AbortError") {
+      return "The microphone is busy in another app — close it and try again.";
+    }
+    return "Microphone blocked — allow Arcelle in System Settings → Privacy & Security → Microphone, then reopen the app.";
+  }
+
+  function startBatchRecording(
+    stream: MediaStream,
+    owner: string,
+    onDone: (blob: Blob, ext: string) => Promise<void>,
+  ) {
     const mime = MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4" : "";
     const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
     s.dictChunksRef.current = [];
@@ -190,95 +206,161 @@ export function makeRecordingActions(
     // capture dock must already be saying "Preparing microphone…".
     s.setDictOwner(owner);
     s.setDictState("preparing");
-    void (async () => {
-      const fail = (msg: string) => {
-        s.setDictState("idle");
-        s.setDictOwner(null);
-        s.pushToast("error", msg);
-      };
-      let mic: MediaStream;
-      try {
-        mic = await acquireMic();
-      } catch (e) {
-        fail(e instanceof Error ? e.message : String(e));
+    void launchDictation(owner, sink, onPartial);
+  }
+
+  async function launchDictation(
+    owner: string,
+    sink: (text: string) => void | Promise<void>,
+    onPartial?: (text: string) => void,
+  ) {
+    const mic = await dictationMic();
+    if (!mic) return;
+    const resources = await dictationResources(mic, owner, onPartial);
+    if (!resources) return;
+    s.setDictState("recording");
+    s.dictStreamRef.current = () => stopDictation(resources, sink, onPartial);
+  }
+
+  async function dictationMic(): Promise<MediaStream | null> {
+    try {
+      return await acquireMic();
+    } catch (e) {
+      failDictation(e instanceof Error ? e.message : String(e));
+      return null;
+    }
+  }
+
+  interface DictationResources {
+    mic: MediaStream;
+    session: DictSession;
+    tapDown: () => Promise<void>;
+  }
+
+  async function dictationResources(
+    mic: MediaStream,
+    owner: string,
+    onPartial?: (text: string) => void,
+  ): Promise<DictationResources | null> {
+    let session: DictSession | null = null;
+    try {
+      const info = await api.dictStart(); // model check + authenticated WS URL
+      session = await connectDictSession(info, (text) => {
+        s.setDictPartial(text);
+        onPartial?.(text);
+      });
+      const push = (rate: number, b64: string) => session!.push(rate, b64);
+      // Hands-free: once you've said something, going quiet for a beat
+      // ends your turn and sends it — the same "stop and send" the mic
+      // button/capture dock already do, just triggered by silence instead
+      // of a click. Scoped to the composer (never journal/file/note/memory
+      // dictation, where a mid-thought pause must not auto-cut you off).
+      const autoSend = owner === "composer" && s.handsFree;
+      const tapDown = await createPcmTap(
+        mic,
+        autoSend ? withSilenceGate(push, () => s.dictStreamRef.current?.()) : push,
+      );
+      return { mic, session, tapDown };
+    } catch (e) {
+      mic.getTracks().forEach((t) => t.stop());
+      session?.cancel();
+      reportDictationSetupFailure(e);
+      return null;
+    }
+  }
+
+  function reportDictationSetupFailure(error: unknown) {
+    if (isMissingSttModel(error)) {
+      s.setDictState("idle");
+      s.setDictOwner(null);
+      showMissingSttModelToast();
+      return;
+    }
+    failDictation(`Dictation failed: ${error}`);
+  }
+
+  function isMissingSttModel(error: unknown): boolean {
+    return String(error).includes("STT_MODEL_MISSING");
+  }
+
+  function showMissingSttModelToast() {
+    s.pushToast(
+      "error",
+      "Download the voice model first, in Settings → Model → Dictation.",
+      { label: "Open Settings", run: () => s.setShowSettings(true) },
+    );
+  }
+
+  function failDictation(message: string) {
+    s.setDictState("idle");
+    s.setDictOwner(null);
+    s.pushToast("error", message);
+  }
+
+  function stopDictation(
+    resources: DictationResources,
+    sink: (text: string) => void | Promise<void>,
+    onPartial?: (text: string) => void,
+  ) {
+    s.dictStreamRef.current = null;
+    s.setDictState("busy");
+    void finishDictation(resources, sink, onPartial);
+  }
+
+  async function finishDictation(
+    { mic, session, tapDown }: DictationResources,
+    sink: (text: string) => void | Promise<void>,
+    onPartial?: (text: string) => void,
+  ) {
+    try {
+      // Teardown AWAITS the final flush, so the socket's Stop message is
+      // ordered after the last samples and the closing word is not clipped.
+      await tapDown();
+      mic.getTracks().forEach((t) => t.stop());
+      const raw = (await session.stop()).trim();
+      if (!raw) {
+        onPartial?.(""); // wipe any painted partials
+        s.pushToast("info", "No speech detected.");
         return;
       }
-      let session: DictSession | null = null;
-      let tapDown: (() => Promise<void>) | null = null;
-      try {
-        const info = await api.dictStart(); // model check + authenticated WS URL
-        session = await connectDictSession(info, (text) => {
-          s.setDictPartial(text);
-          onPartial?.(text);
-        });
-        const push = (rate: number, b64: string) => session!.push(rate, b64);
-        // Hands-free: once you've said something, going quiet for a beat
-        // ends your turn and sends it — the same "stop and send" the mic
-        // button/capture dock already do, just triggered by silence instead
-        // of a click. Scoped to the composer (never journal/file/note/memory
-        // dictation, where a mid-thought pause must not auto-cut you off).
-        const autoSend = owner === "composer" && s.handsFree;
-        tapDown = await createPcmTap(
-          mic,
-          autoSend ? withSilenceGate(push, () => s.dictStreamRef.current?.()) : push,
-        );
-      } catch (e) {
-        mic.getTracks().forEach((t) => t.stop());
-        session?.cancel();
-        if (String(e).includes("STT_MODEL_MISSING")) {
-          s.setDictState("idle");
-          s.setDictOwner(null);
-          s.pushToast(
-            "error",
-            "Download the voice model first, in Settings → Model → Dictation.",
-            { label: "Open Settings", run: () => s.setShowSettings(true) },
-          );
-        } else {
-          fail(`Dictation failed: ${e}`);
-        }
-        return;
-      }
-      s.setDictState("recording");
-      s.dictStreamRef.current = () => {
-        s.dictStreamRef.current = null;
-        s.setDictState("busy");
-        void (async () => {
-          try {
-            // Teardown AWAITS the final flush, so the socket's Stop message is
-            // ordered after the last samples and the closing word is not clipped.
-            await tapDown!();
-            mic.getTracks().forEach((t) => t.stop());
-            const raw = (await session!.stop()).trim();
-            if (!raw) {
-              onPartial?.(""); // wipe any painted partials
-              s.pushToast("info", "No speech detected.");
-              return;
-            }
-            let text = raw;
-            try {
-              const [translate, mode] = await Promise.all([
-                api.getSetting("dict_translate"),
-                api.getSetting("dict_mode"),
-              ]);
-              if (translate === "on" || (mode && mode !== "off")) {
-                text =
-                  (await api.shapeText(raw, translate === "on", mode || "off")).trim() || raw;
-              }
-            } catch (e) {
-              s.pushToast("info", `Kept the exact transcript — ${e}`);
-            }
-            await sink(text);
-          } catch (e) {
-            onPartial?.("");
-            s.pushToast("error", `Dictation failed: ${e}`);
-          } finally {
-            s.setDictPartial("");
-            s.setDictState("idle");
-            s.setDictOwner(null);
-          }
-        })();
-      };
-    })();
+      await sink(await shapedDictation(raw));
+    } catch (e) {
+      onPartial?.("");
+      s.pushToast("error", `Dictation failed: ${e}`);
+    } finally {
+      s.setDictPartial("");
+      s.setDictState("idle");
+      s.setDictOwner(null);
+    }
+  }
+
+  async function shapedDictation(raw: string): Promise<string> {
+    try {
+      const [translate, mode] = await Promise.all([
+        api.getSetting("dict_translate"),
+        api.getSetting("dict_mode"),
+      ]);
+      if (!shouldShapeDictation(translate, mode)) return raw;
+      return shapedTranscript(raw, translate, mode);
+    } catch (e) {
+      s.pushToast("info", `Kept the exact transcript — ${e}`);
+      return raw;
+    }
+  }
+
+  function shouldShapeDictation(
+    translate: string | null,
+    mode: string | null,
+  ): boolean {
+    return translate === "on" || Boolean(mode && mode !== "off");
+  }
+
+  async function shapedTranscript(
+    raw: string,
+    translate: string | null,
+    mode: string | null,
+  ): Promise<string> {
+    return (await api.shapeText(raw, translate === "on", mode || "off")).trim() || raw;
   }
 
   function micState(owner: string) {
@@ -351,179 +433,6 @@ export function makeRecordingActions(
       await viewFile(id);
       s.pushToast("success", "Added your words to the file.");
     });
-  }
-
-  // ---- ADD-27: the live Recording file ----------------------------------
-  // The session is workspace-wide (it must survive switching files), so its
-  // lifecycle lives here, not in the view: backend engine via rec_* commands
-  // + the module-level mic tap (liveRec.ts).
-
-  async function startLiveRecording(
-    fileId?: string,
-    opts?: { systemAudio?: boolean; liveTranslate?: string | null },
-  ) {
-    if (s.recLive) {
-      s.pushToast("info", "A recording is already running.");
-      await viewFile(s.recLive.fileId);
-      return;
-    }
-    // Open the microphone BEFORE anything else: WebKit grants capture only
-    // while the click that triggered this is still "active", and rec_start
-    // below costs several IPC round-trips. Asking afterwards fails with
-    // NotAllowedError even though permission was granted long ago.
-    const withSystem = opts?.systemAudio ?? true;
-    let mic: MediaStream | null = null;
-    // Held, not announced: what a dead microphone COSTS depends on whether the
-    // Mac's audio lane actually comes up, and no lane exists until rec_start
-    // has run. Announcing it here promised a recording that a denied Screen
-    // Recording permission (or a failed start) never made.
-    let micError: string | null = null;
-    try {
-      mic = await acquireMic();
-    } catch (e) {
-      micError = e instanceof Error ? e.message : String(e);
-    }
-    let res;
-    try {
-      res = await api.recStart({
-        fileId: fileId ?? null,
-        systemAudio: withSystem,
-        liveTranslate: opts?.liveTranslate ?? null,
-      });
-    } catch (e) {
-      mic?.getTracks().forEach((t) => t.stop());
-      if (String(e).includes("STT_MODEL_MISSING")) {
-        s.pushToast(
-          "error",
-          "Download the voice model first, in Settings → Model → Dictation.",
-          { label: "Open Settings", run: () => s.setShowSettings(true) },
-        );
-      } else {
-        s.pushToast("error", String(e));
-      }
-      return;
-    }
-    // Past this line the engine IS recording. Nothing below may report itself
-    // as a failure to start, and nothing below may tear the microphone down.
-    // The engine always starts with live transcription ON — sync the
-    // session-scoped UI mirror (a previous session may have turned it off).
-    startRecordingTransport(res.sessionUrl, res.fileId);
-    noteLiveStt(true);
-    s.setRecLive({ fileId: res.fileId, status: "recording" });
-    if (micError) {
-      // The meeting-audio tap is brought up on a helper thread and takes
-      // SECONDS to land (recording.rs `sys_tap_starting`); its lane reads
-      // "off" until then. So "on" is not yet a fact here and its absence
-      // proves nothing — only a lane that has already errored, or one that
-      // was never asked for, means nothing at all is being captured.
-      // `resumeLiveRecording` asks the same question of a session whose lanes
-      // are long since settled, which is why it can read the lane directly.
-      const live = await api.recLiveStatus().catch(() => null);
-      const nothingCaptured = !withSystem || live?.sys?.[0] === "error";
-      // The remedy belongs only to the case it actually fixes. With the box
-      // ticked there is nothing left to tick: the lane was asked for and did
-      // not come up (in practice the Screen Recording permission), which
-      // RecordingView's own banner names, with the settings button beside it.
-      const remedy = withSystem
-        ? ""
-        : ' Stop, then start again with "Include the Mac\'s audio" ticked.';
-      s.pushToast(
-        "error",
-        nothingCaptured
-          ? `${micError} — and the Mac's audio is not being recorded, so nothing at all is being captured.${remedy}`
-          : `${micError} (the Mac's audio keeps recording)`,
-      );
-    }
-    if (mic) {
-      try {
-        await attachMicTap(mic);
-      } catch (e) {
-        mic.getTracks().forEach((t) => t.stop());
-        s.pushToast(
-          "error",
-          `The recording started, but your microphone could not be attached, so your voice is not being captured: ${e}`,
-        );
-      }
-    }
-    try {
-      s.setFiles(await api.listFiles());
-      await viewFile(res.fileId);
-    } catch (e) {
-      s.pushToast("error", `The recording started, but the room could not be refreshed: ${e}`);
-    }
-  }
-
-  async function pauseLiveRecording() {
-    stopMicTap();
-    try {
-      await api.recPause();
-    } catch (e) {
-      s.pushToast("error", String(e));
-    }
-  }
-
-  async function resumeLiveRecording() {
-    // Same rule as start: the microphone first, while the click still counts.
-    let mic: MediaStream | null = null;
-    try {
-      mic = await acquireMic();
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      // Ask the live session whether the Mac's audio lane is actually on
-      // ("on" | "error" | "off") rather than assuming it — with it off, a dead
-      // microphone means nothing is being captured at all.
-      const live = await api.recLiveStatus().catch(() => null);
-      s.pushToast(
-        "error",
-        live?.sys?.[0] === "on"
-          ? `${msg} (the Mac's audio keeps recording)`
-          : `${msg} — and the Mac's audio is not being recorded, so nothing at all is being captured.`,
-      );
-    }
-    try {
-      await api.recResume();
-      if (mic) await attachMicTap(mic);
-    } catch (e) {
-      mic?.getTracks().forEach((t) => t.stop());
-      s.pushToast("error", String(e instanceof Error ? e.message : e));
-    }
-  }
-
-  async function stopLiveRecording() {
-    stopMicTap();
-    const fileId = s.recLive?.fileId;
-    s.setRecLive((r) => (r ? { ...r, status: "saving" } : r));
-    try {
-      // What was actually written decides the sentence: live transcription can
-      // be switched off mid-session, and a session where nobody spoke has no
-      // segments either. Claiming a transcript that isn't in the file is the
-      // one thing this receipt must not do.
-      const meta = await api.recStop();
-      // The receipt carries a direct way to the output — success must never
-      // require hunting the sidebar for a new row.
-      s.pushToast(
-        "success",
-        meta.segments.length > 0
-          ? "Recording saved — transcript included."
-          : "Recording saved. No transcript was written — use Re-transcribe to build one.",
-        fileId ? { label: "Open", run: () => void viewFile(fileId) } : undefined,
-      );
-    } catch (e) {
-      s.pushToast("error", String(e));
-    } finally {
-      closeRecordingTransport();
-    }
-    s.setRecLive(null);
-    try {
-      s.setFiles(await api.listFiles());
-      // Refresh the open view so the player gets the freshly written audio.
-      if (fileId && s.openFileRef.current?.id === fileId) await viewFile(fileId);
-    } catch (e) {
-      // Every caller runs this as `void stopLiveRecording()`, so an escaping
-      // rejection here would be an unhandled one — with a success toast already
-      // on screen and a sidebar that never gained the row.
-      s.pushToast("error", `The recording was saved, but the room could not be refreshed: ${e}`);
-    }
   }
 
   /** Abandon the running model download. `pull_model` registers its cancel flag
@@ -622,6 +531,17 @@ export function makeRecordingActions(
       }
     }, 1500);
   }
+
+  const {
+    startLiveRecording,
+    pauseLiveRecording,
+    resumeLiveRecording,
+    stopLiveRecording,
+  } = makeLiveRecordingActions(s, {
+    viewFile,
+    isMissingSttModel,
+    showMissingSttModelToast,
+  });
 
   return {
     refreshAi, beginRecording, dictateTo, micState, recordVoiceNote,

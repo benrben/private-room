@@ -10,8 +10,9 @@ import type { ChildProcess } from "node:child_process";
 // two concurrent ensureUp() calls without needing a real Python interpreter
 // on the machine running the suite. Every OTHER test in this file reaches
 // spawnAndWait() only through the "nothing configured -> launchCommand()
-// returns null" failure path, which returns before ever calling spawn(), so
-// this mock is inert for them.
+// returns null" failure path, except for the lifecycle tests that explicitly
+// exercise a child startup failure below. Those tests supply their own fake
+// ChildProcess, so this mock is inert everywhere else.
 vi.mock("node:child_process", () => ({ spawn: vi.fn() }));
 
 import { spawn } from "node:child_process";
@@ -23,6 +24,7 @@ import {
   baseUrlIfRunning,
   busy,
   ensureUp,
+  forgetRoomMemory,
   inflightCount,
   parsePortLine,
   previousStderrLogPath,
@@ -173,6 +175,30 @@ describe("probeOnce against a real TCP listener", () => {
     const verdict2: Probe = await probeOnce(url, 300);
     expect(verdict2).toBe("gone");
   }, 10_000);
+
+  it("treats HTTP and JSON failures as busy but a refused fetch as gone", async () => {
+    // These are deliberately direct fetch outcomes rather than another
+    // listening-server fixture: the lifecycle contract is about how each
+    // transport result is classified. Keeping the three outcomes together
+    // makes a future probe split prove that it did not turn an alive but
+    // unready sidecar into a restartable "gone" sidecar.
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("not ready", { status: 503 }))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockRejectedValue(new SyntaxError("bad health JSON")),
+      })
+      .mockRejectedValueOnce(Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await expect(probeOnce("http://sidecar.test", 50)).resolves.toBe("busy");
+      await expect(probeOnce("http://sidecar.test", 50)).resolves.toBe("busy");
+      await expect(probeOnce("http://sidecar.test", 50)).resolves.toBe("gone");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe("stderr log paths", () => {
@@ -200,6 +226,7 @@ describe("spawnAndWait failure shape", () => {
     } else {
       process.env.ARCELLE_SIDECAR_DIR = savedDir;
     }
+    vi.mocked(spawn).mockReset();
   });
 
   it("an unavailable error keeps the reason it used to drop", async () => {
@@ -221,6 +248,82 @@ describe("spawnAndWait failure shape", () => {
     await expect(spawnAndWait(50)).rejects.toThrow(
       /^SIDECAR_UNAVAILABLE: no sidecar to launch — no bundled binary in Resources\/ and no ARCELLE_SIDECAR_PYTHON pointing at a Python with the package$/,
     );
+  });
+
+  it("reports a child spawn error promptly instead of waiting for the port handshake", async () => {
+    process.env.ARCELLE_SIDECAR_PYTHON = process.execPath;
+    delete process.env.ARCELLE_SIDECAR_DIR;
+    const emitted = new EventEmitter();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const child = emitted as unknown as ChildProcess;
+    Object.assign(child, { stdout, stderr, pid: undefined });
+    vi.mocked(spawn).mockReturnValueOnce(child);
+
+    queueMicrotask(() => {
+      emitted.emit("error", new Error("interpreter missing"));
+      stdout.end();
+      stderr.end();
+    });
+
+    await expect(spawnAndWait(1_000)).rejects.toThrow(
+      /^SIDECAR_UNAVAILABLE: could not start the sidecar: interpreter missing$/,
+    );
+  });
+
+  it("cleans up when the child has no capturable stdout", async () => {
+    process.env.ARCELLE_SIDECAR_PYTHON = process.execPath;
+    delete process.env.ARCELLE_SIDECAR_DIR;
+    const child = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(child, { stdout: null, stderr: null, pid: undefined });
+    vi.mocked(spawn).mockReturnValueOnce(child);
+
+    await expect(spawnAndWait(50)).rejects.toThrow(
+      /^SIDECAR_UNAVAILABLE: the sidecar's stdout could not be captured$/,
+    );
+  });
+
+  it("cleans up and explains a child that closes stdout before its port line", async () => {
+    process.env.ARCELLE_SIDECAR_PYTHON = process.execPath;
+    delete process.env.ARCELLE_SIDECAR_DIR;
+    const stdout = new PassThrough();
+    const child = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(child, { stdout, stderr: null, pid: undefined });
+    vi.mocked(spawn).mockReturnValueOnce(child);
+    queueMicrotask(() => stdout.end());
+
+    await expect(spawnAndWait(50)).rejects.toThrow(
+      /^SIDECAR_UNAVAILABLE: the sidecar printed no SIDECAR_PORT line within 0s \(see .+\)$/,
+    );
+  });
+
+  it("cleans up a port that never becomes healthy", async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(503).end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("expected an AddressInfo from the test HTTP server");
+    }
+    process.env.ARCELLE_SIDECAR_PYTHON = process.execPath;
+    delete process.env.ARCELLE_SIDECAR_DIR;
+    const stdout = new PassThrough();
+    const child = new EventEmitter() as unknown as ChildProcess;
+    Object.assign(child, { stdout, stderr: null, pid: undefined });
+    vi.mocked(spawn).mockReturnValueOnce(child);
+    queueMicrotask(() => {
+      stdout.write(`SIDECAR_PORT=${address.port}\n`);
+      stdout.end();
+    });
+
+    try {
+      await expect(spawnAndWait(10)).rejects.toThrow(
+        /^SIDECAR_UNAVAILABLE: the sidecar announced port \d+ but never passed \/health within 0s \(see .+\)$/,
+      );
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });
 
@@ -380,6 +483,38 @@ describe("baseUrlIfRunning", () => {
     const spawnCallsAfterEnsure = vi.mocked(spawn).mock.calls.length;
     expect(baseUrlIfRunning()).toBe(fakeUrl);
     expect(vi.mocked(spawn).mock.calls.length).toBe(spawnCallsAfterEnsure);
+
+    const originalFetch = globalThis.fetch;
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      globalThis.fetch = vi.fn()
+        .mockResolvedValueOnce(new Response("refused", { status: 503 }))
+        .mockRejectedValueOnce(new Error("fabricated network failure"))
+        .mockRejectedValueOnce("fabricated non-error failure") as unknown as typeof fetch;
+      forgetRoomMemory();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      forgetRoomMemory();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      forgetRoomMemory();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(globalThis.fetch).toHaveBeenCalledWith(`${fakeUrl}/forget`, expect.objectContaining({
+        method: "POST",
+        body: "{}",
+        signal: expect.any(AbortSignal),
+      }));
+      expect(error).toHaveBeenCalledWith("[sidecar] /forget refused (status 503)");
+      expect(error).toHaveBeenCalledWith(
+        "[sidecar] /forget did not reach the AI service:",
+        "fabricated network failure",
+      );
+      expect(error).toHaveBeenCalledWith(
+        "[sidecar] /forget did not reach the AI service:",
+        "fabricated non-error failure",
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      error.mockRestore();
+    }
 
     stopIfOurs();
     expect(baseUrlIfRunning()).toBeNull();

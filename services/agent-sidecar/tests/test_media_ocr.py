@@ -147,6 +147,78 @@ def test_wanted_language_prefixes_exact_order() -> None:
     ]
 
 
+def test_recognition_uses_priority_languages_and_only_nonblank_best_lines(monkeypatch) -> None:
+    """The request path remains testable without loading macOS Vision."""
+    class Candidate:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        def string(self) -> str:
+            return self.text
+
+    class Observation:
+        def __init__(self, text: str | None) -> None:
+            self.text = text
+
+        def topCandidates_(self, _count: int) -> list[Candidate]:
+            return [] if self.text is None else [Candidate(self.text)]
+
+    class Request:
+        def __init__(self) -> None:
+            self.languages: list[str] | None = None
+            self.level: object | None = None
+            self.correction = False
+            self.automatic = False
+
+        def setRecognitionLevel_(self, level: object) -> None:
+            self.level = level
+
+        def setUsesLanguageCorrection_(self, enabled: bool) -> None:
+            self.correction = enabled
+
+        def setAutomaticallyDetectsLanguage_(self, enabled: bool) -> None:
+            self.automatic = enabled
+
+        def supportedRecognitionLanguagesAndReturnError_(self, _error: object) -> tuple[list[str], None]:
+            return ["fr-CA", "en-US", "en-US", "ar-SA", "ignored-X"], None
+
+        def setRecognitionLanguages_(self, languages: list[str]) -> None:
+            self.languages = languages
+
+        def results(self) -> list[Observation]:
+            return [Observation("first"), Observation(" "), Observation(None), Observation("second")]
+
+    request = Request()
+
+    class Recognizer:
+        @staticmethod
+        def new() -> Request:
+            return request
+
+    class FakeVision:
+        VNRecognizeTextRequest = Recognizer
+        VNRequestTextRecognitionLevelAccurate = "accurate"
+
+    class Handler:
+        def performRequests_error_(self, requests: list[Request], _error: object) -> tuple[bool, None]:
+            assert requests == [request]
+            return True, None
+
+    monkeypatch.setattr(ocr, "Vision", FakeVision)
+    assert ocr.run_recognition(Handler()) == "first\nsecond"
+    assert request.level == "accurate"
+    assert request.correction and request.automatic
+    assert request.languages == ["en-US", "fr-CA", "ar-SA"]
+
+
+def test_available_languages_fails_closed_when_vision_refuses() -> None:
+    class FailingRequest:
+        def supportedRecognitionLanguagesAndReturnError_(self, _error: object) -> tuple[None, None]:
+            raise RuntimeError("Vision unavailable")
+
+    assert ocr._available_languages(FailingRequest()) == []
+
+
 # ------------------------------------------------------------- (4) real Vision OCR
 
 

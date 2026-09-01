@@ -43,7 +43,12 @@ export interface Geometry {
 }
 
 /** A monitor's own rectangle, in the same coordinate space: [x, y, width, height]. */
-export type Screen = readonly [x: number, y: number, width: number, height: number];
+export type Screen = readonly [
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+];
 
 /** The minimums from the window config (`minWidth`/`minHeight`). A remembered
  * size below them is a corrupt or hand-edited file, not a user preference. */
@@ -83,7 +88,10 @@ function isValidU32(n: number): boolean {
  * or close, and the app looks like it failed to launch. Refusing to restore
  * is always recoverable; restoring off-screen is not.
  */
-export function geometryIsUsable(g: Geometry, screens: readonly Screen[]): boolean {
+export function geometryIsUsable(
+  g: Geometry,
+  screens: readonly Screen[],
+): boolean {
   if (g.width < MIN_W || g.height < MIN_H) {
     return false;
   }
@@ -136,33 +144,49 @@ const GEOMETRY_SCHEMA_VERSION = 1;
  * `null`, never throws: a bad file must read as "nothing saved", not crash
  * the caller.
  */
-export function parseGeometry(raw: string): Geometry | null {
+function parseJsonRecord(raw: string): Record<string, unknown> | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
     return null;
   }
-  if (typeof parsed !== "object" || parsed === null) {
-    return null;
-  }
-  const { v, x, y, width, height } = parsed as Record<string, unknown>;
-  if (v !== GEOMETRY_SCHEMA_VERSION) {
-    return null;
-  }
+  return typeof parsed === "object" && parsed !== null
+    ? (parsed as Record<string, unknown>)
+    : null;
+}
+
+function geometryNumbers(value: Record<string, unknown>): Geometry | null {
+  const { x, y, width, height } = value;
   if (
     typeof x !== "number" ||
     typeof y !== "number" ||
     typeof width !== "number" ||
-    typeof height !== "number" ||
-    !isValidI32(x) ||
-    !isValidI32(y) ||
-    !isValidU32(width) ||
-    !isValidU32(height)
+    typeof height !== "number"
   ) {
     return null;
   }
   return { x, y, width, height };
+}
+
+function validGeometryRange(geometry: Geometry): boolean {
+  return (
+    isValidI32(geometry.x) &&
+    isValidI32(geometry.y) &&
+    isValidU32(geometry.width) &&
+    isValidU32(geometry.height)
+  );
+}
+
+function geometryFromRecord(value: Record<string, unknown>): Geometry | null {
+  if (value.v !== GEOMETRY_SCHEMA_VERSION) return null;
+  const geometry = geometryNumbers(value);
+  return geometry !== null && validGeometryRange(geometry) ? geometry : null;
+}
+
+export function parseGeometry(raw: string): Geometry | null {
+  const value = parseJsonRecord(raw);
+  return value === null ? null : geometryFromRecord(value);
 }
 
 /**
@@ -210,7 +234,12 @@ export class GeometryStore {
     if (position === null || size === null) {
       return;
     }
-    this.lastSeen = { x: position.x, y: position.y, width: size.width, height: size.height };
+    this.lastSeen = {
+      x: position.x,
+      y: position.y,
+      width: size.width,
+      height: size.height,
+    };
   }
 
   /**

@@ -1,0 +1,500 @@
+
+/* `.tab-dot` used to flag the Activity tab: one 6px dot in two hues, which
+   made colour the only carrier. AiPane.tsx now renders a `.nb-circled` count
+   for waiting approvals and a dot for busy, styled in aiPane.css, so the two
+   rules that lived here matched nothing and are gone. */
+
+/* Context strip: what the AI will answer from, before anything is sent. */
+.context-strip {
+  min-height: 34px;
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line-soft);
+  font-size: var(--fs-micro);
+  min-width: 0;
+  /* A status readout, not content the user wrote (P0-3). */
+  user-select: none;
+}
+.context-strip .context-label {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.context-strip .context-count {
+  color: var(--accent-2);
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: inherit;
+  cursor: pointer;
+}
+.context-strip .context-count:hover {
+  text-decoration: underline;
+}
+/* The scope control. Reads as the same word the button above is — it stands in
+   the same sentence — so it borrows the accent and gives up the platform's
+   field chrome; the caret the browser still draws is what says it opens. */
+.context-strip .context-scope {
+  color: var(--accent-2);
+  background: none;
+  border: 0;
+  padding: 0;
+  max-width: 22ch;
+  font: inherit;
+  cursor: pointer;
+}
+/* What the chosen scope COSTS, beside what it is. Amber, like every other
+   surface that says room content is leaving this Mac (.local-mini.warn). */
+.context-strip .context-leaves {
+  color: var(--amber);
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.local-mini {
+  margin-left: auto;
+  color: var(--green);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.local-mini.warn {
+  color: var(--amber);
+}
+.local-mini.danger {
+  color: var(--danger);
+}
+
+/* ----- status bar ----- */
+
+/* The quietest surface in the app: one hairline above it, no cell borders, no
+   fills, everything in the faint ink. What it does NOT do is shrink — 10px
+   type was under the 12px floor, and "light" is a matter of contrast and
+   clutter, not of size. */
+.pr-statusbar {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  background: transparent;
+  border-top: 1px solid var(--line-soft);
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  min-width: 0;
+  /* Readouts, not content (P0-3): nothing in the status strip is text a
+     person typed or would copy. */
+  user-select: none;
+}
+.status-seal {
+  height: 24px;
+  display: grid;
+  place-items: center;
+  color: var(--sem-done);
+}
+.status-left,
+.status-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  padding: 0 10px;
+  overflow: hidden;
+}
+.status-right {
+  justify-content: flex-end;
+}
+/* 24px tall because half of these are buttons and the spec's minimum target
+   is 24 — a readout you can read but not hit is a worse bargain than a bar
+   that is three pixels taller. */
+.status-item {
+  display: flex;
+  align-items: center;
+  min-height: 24px;
+  gap: 5px;
+  white-space: nowrap;
+  background: none;
+  border: 0;
+  border-radius: 3px 2px 4px 2px / 2px 4px 2px 3px;
+  color: inherit;
+  padding: 0 3px;
+  font-size: inherit;
+}
+.status-item.good {
+  color: var(--green);
+}
+.status-item.warn {
+  color: var(--amber);
+}
+.status-item.danger {
+  color: var(--danger);
+}
+/* The trust chip is the room's primary safety readout — the one thing down
+   here allowed to be heavier than faint — and "Raw cloud" carries a marker
+   wash so the one dangerous state actually catches the eye. */
+.status-trust {
+  font-weight: 600;
+  cursor: pointer;
+}
+.status-trust.danger {
+  padding: 0 7px;
+  background: color-mix(in srgb, var(--mk-red) 22%, transparent);
+}
+button.status-item:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+button.status-trust.danger:hover {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--mk-red) 34%, transparent);
+}
+/* The circled approval count in the bar sits on a 12px line, so it comes down
+   from .nb-circled's 18px to match the text it is set in. */
+.pr-statusbar .nb-circled {
+  min-width: 16px;
+  height: 16px;
+  font-size: var(--fs-micro);
+}
+/* Running work: the dot is an accompaniment to "3 jobs running", never the
+   message. Linked blue, not the accent — the pen is this app's SELECTION
+   colour, and three surfaces were drawing the same fact three ways (the rail
+   in yellow, Room Home's stamp in blue, this in pink). Blue is what the token
+   map reserves for "active", and it is now what all three use. */
+.status-item .status-dot.busy {
+  background: var(--sem-linked);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--mk-blue) 22%, transparent);
+}
+
+/* ----- library pane internals ----- */
+
+.source-tools {
+  padding: 9px 10px 6px;
+  flex: 0 0 auto;
+}
+/* The list order, under the filter box: quiet until you look for it, because
+   the default order is right for most rooms. */
+.file-sort {
+  margin-top: 6px;
+}
+.file-sort select {
+  width: 100%;
+  height: 26px;
+  padding: 0 6px;
+  font-size: var(--fs-micro);
+  color: var(--muted);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+}
+.file-sort select:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+  outline: none;
+}
+.search-field {
+  width: 100%;
+  height: 31px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 var(--sp-2);
+  color: var(--muted);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+}
+.search-field:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.search-field input {
+  width: 100%;
+  min-width: 0;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  outline: 0;
+  font-size: var(--fs-micro);
+  padding: 0;
+}
+.search-field input::placeholder {
+  color: var(--faint);
+}
+.search-field .side-search-clear {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 4px 2px 5px 3px / 3px 5px 2px 4px;
+  color: var(--faint);
+}
+.search-field .side-search-clear:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+
+.library-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 2px 7px 40px;
+}
+.group-heading {
+  height: 24px;
+  padding: 0 6px;
+  margin-top: 9px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  font-weight: 500;
+  letter-spacing: 0.075em;
+  text-transform: uppercase;
+}
+.group-heading .group-action {
+  margin-left: auto;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  border-radius: 4px 2px 5px 3px / 3px 5px 2px 4px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+}
+.group-heading .group-action:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.source-footer {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 38px;
+  padding: 0 9px;
+  display: flex;
+  align-items: center;
+  background: linear-gradient(180deg, transparent, var(--panel) 28%);
+  z-index: 2;
+}
+.add-source-button {
+  width: 100%;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  font-size: var(--fs-micro);
+  padding: 0;
+}
+.add-source-button:hover {
+  border-color: var(--accent);
+  background: var(--hover);
+}
+
+/* AI-sources rows (checkbox = included in answers). */
+.source-row {
+  min-width: 0;
+  min-height: 33px;
+  display: grid;
+  grid-template-columns: 21px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 5px;
+  border-radius: var(--radius-xs);
+  color: var(--muted);
+}
+.source-row:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.source-row.is-current {
+  background: var(--selected);
+  color: var(--text-strong);
+}
+.source-row input[type="checkbox"] {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  border: 1px solid var(--faint);
+  border-radius: 3px 2px 4px 2px / 2px 4px 2px 3px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  cursor: pointer;
+}
+.source-row input[type="checkbox"]::before {
+  content: "";
+  width: 7px;
+  height: 4px;
+  border-left: 1.7px solid var(--accent-ink);
+  border-bottom: 1.7px solid var(--accent-ink);
+  transform: translateY(-1px) rotate(-45deg) scale(0);
+}
+.source-row input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.source-row input[type="checkbox"]:checked::before {
+  transform: translateY(-1px) rotate(-45deg) scale(1);
+}
+.source-open {
+  min-width: 0;
+  width: 100%;
+  padding: 2px 3px;
+  text-align: left;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 3px 2px 4px 2px / 2px 4px 2px 3px;
+}
+.source-line {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.source-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-meta);
+}
+.source-meta {
+  padding-left: 23px;
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Area navigation list (Workflows / Recordings / Scripts / Memory lenses). */
+.area-nav-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px 7px 40px;
+}
+.area-nav-intro {
+  margin: 4px 7px 12px;
+  color: var(--muted);
+  font-size: var(--fs-micro);
+  line-height: 1.5;
+}
+/* Name the AI's source scope explicitly, so "nothing checked" reads as a chosen
+   mode ("Whole room") rather than an accidental empty selection. */
+.sources-scope {
+  margin: 6px 7px 10px;
+}
+.sources-scope .area-nav-intro {
+  margin: 6px 0 0;
+}
+.scope-tag {
+  display: inline-block;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  padding: 2px var(--sp-2);
+  border-radius: 999px;
+}
+.scope-tag.auto {
+  color: var(--amber);
+  background: color-mix(in srgb, var(--mk-yellow) 22%, transparent);
+}
+.scope-tag.selected {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+.area-nav-row {
+  width: 100%;
+  min-height: 42px;
+  padding: 6px 7px;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-xs);
+  text-align: left;
+}
+.area-nav-row:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+/* Rows that only report a number — the Find scopes, the Memory group counts.
+   The markup has said `is-static` since those lenses were written, but nothing
+   ever styled it, so a `<div>` with no handler still lit up under the pointer
+   and promised a click it does not have. */
+.area-nav-row.is-static {
+  cursor: default;
+}
+.area-nav-row.is-static:hover {
+  color: var(--muted);
+  background: transparent;
+}
+.area-nav-row.is-current {
+  color: var(--text-strong);
+  background: var(--selected);
+}
+.area-nav-main {
+  min-width: 0;
+}
+.area-nav-title {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: var(--fs-meta);
+}
+.area-nav-copy {
+  display: block;
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.area-nav-state {
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  white-space: nowrap;
+}
+/* --faint is solved against --hover, the lightest ground in the dark theme
+   (tokens.css). --selected is a translucent wash that lands lighter still, so
+   the secondary line inside the one row a reader looks at longest was the
+   least legible text in the sidebar. It steps up a tier there. */
+.area-nav-row.is-current .area-nav-copy,
+.area-nav-row.is-current .area-nav-state,
+.source-row.is-current .source-meta {
+  color: var(--muted);
+}
+
+/* ----- the private browser's pages, in the contextual sidebar ----- */
+
+/* A page row is an `area-nav-row` that can be selected and closed. The close
+   control appears on hover AND on focus — a control only reachable with a
+   pointer is not a control everyone has, and the row's own Backspace/Delete is
+   the other half of that promise (see PagesNav). */
+.page-row {
+  cursor: default;
+}

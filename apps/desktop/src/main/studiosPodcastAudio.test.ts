@@ -34,6 +34,7 @@
 
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
+import { writeFile as writeFileAsync } from "node:fs/promises";
 import * as http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -64,6 +65,11 @@ vi.mock("./sidecar.js", async (importOriginal) => {
   return { ...actual, ensureUp: vi.fn(actual.ensureUp) };
 });
 
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, writeFile: vi.fn(actual.writeFile) };
+});
+
 import { ensureUp } from "./sidecar.js";
 import {
   encodeEpisode,
@@ -81,6 +87,7 @@ import {
   setPodcastCast,
   SPEECH_OFFLINE_MESSAGE,
   speakableText,
+  storePodcastAudioOutput,
   timedTranscript,
   type StudioStepSink,
 } from "./studiosPodcastAudio.js";
@@ -154,6 +161,15 @@ describe("nextTakeName", () => {
     expect(nextTakeName(db, "Ep", "m4a")).toBe("Ep - episode 3.m4a");
     // A different script is unaffected — the name is per title.
     expect(nextTakeName(db, "Other", "m4a")).toBe("Other - episode.m4a");
+  });
+
+  it("falls back to a UUID suffix after every bounded episode name is occupied", () => {
+    const db = freshRoom();
+    for (let number = 1; number <= 99; number += 1) {
+      const suffix = number === 1 ? "" : ` ${number}`;
+      insertFile(db, `Overflow - episode${suffix}.m4a`, "audio/mp4", Buffer.from([0]), null, "generated");
+    }
+    expect(nextTakeName(db, "Overflow", "m4a")).toMatch(/^Overflow - episode [0-9a-f]{8}\.m4a$/);
   });
 });
 
@@ -268,6 +284,42 @@ describe("encodeEpisode", () => {
     // audio player — a file the viewer cannot open is not an episode.
     expect(mediaKind(mime, ext)).toBe("audio");
   }, 15_000);
+
+  it("falls back to the original bytes when afconvert rejects malformed WAV data", async () => {
+    const wav = Buffer.from("not a wav");
+    await expect(encodeEpisode(wav)).resolves.toEqual({ bytes: wav, mime: "audio/wav", ext: "wav" });
+  });
+
+  it("cleans up and preserves a write failure before invoking afconvert", async () => {
+    const actualWrite = vi.mocked(writeFileAsync).getMockImplementation();
+    expect(actualWrite).toBeDefined();
+    vi.mocked(writeFileAsync).mockRejectedValueOnce(new Error("disk full"));
+    try {
+      await expect(encodeEpisode(Buffer.from("wav"))).rejects.toThrow("disk full");
+    } finally {
+      vi.mocked(writeFileAsync).mockImplementation(actualWrite!);
+    }
+  });
+});
+
+describe("storePodcastAudioOutput", () => {
+  it("uses the workspace backend, then keeps its DB metadata in sync", async () => {
+    const db = freshRoom();
+    const output = insertFile(db, "episode.bin", "application/octet-stream", Buffer.from("old"), null, "generated");
+    const createFile = vi.fn(async () => ({ fileId: output.id }));
+    const room = {
+      db,
+      path: "room-a",
+      workspace: { createFile },
+    } as unknown as RoomHandle;
+
+    const result = await storePodcastAudioOutput(room, "episode.m4a", "audio/mp4", Buffer.from("audio"), "the transcript");
+
+    expect(result.id).toBe(output.id);
+    expect(createFile).toHaveBeenCalledOnce();
+    expect(db.prepare("SELECT mime_type, extracted_text FROM files WHERE id = ?").get(output.id))
+      .toEqual({ mime_type: "audio/mp4", extracted_text: "the transcript" });
+  });
 });
 
 // ==================================================== safeScopeName
@@ -359,6 +411,56 @@ describe("previewPodcastVoice", () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+
+  it("trims optional voice knobs and omits blank ones from the speech body", async () => {
+    const db = freshRoom();
+    setSetting(db, "web_provider", "duckduckgo");
+    let bodySeen: unknown = null;
+    const server = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk: Buffer) => (body += chunk.toString()));
+      req.on("end", () => {
+        bodySeen = JSON.parse(body);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ audio_b64: "YXVkaW8=" }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    vi.mocked(ensureUp).mockResolvedValue(`http://127.0.0.1:${(server.address() as { port: number }).port}`);
+    try {
+      await expect(previewPodcastVoice(db, "hello", " voice ", " +10% ", "   ")).resolves.toBe("YXVkaW8=");
+      expect(bodySeen).toEqual({ text: "hello", voice: "voice", rate: "+10%" });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("surfaces sidecar errors and refuses a successful envelope without audio", async () => {
+    const db = freshRoom();
+    setSetting(db, "web_provider", "duckduckgo");
+    let request = 0;
+    const server = http.createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        request += 1;
+        res.writeHead(request === 1 ? 502 : 200, { "content-type": "application/json" });
+        res.end(request === 1
+          ? JSON.stringify({ code: "TTS_UNAVAILABLE", error: "voice service offline" })
+          : request === 2
+            ? JSON.stringify({ ok: true })
+            : "null");
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    vi.mocked(ensureUp).mockResolvedValue(`http://127.0.0.1:${(server.address() as { port: number }).port}`);
+    try {
+      await expect(previewPodcastVoice(db, "hello")).rejects.toThrow("voice service offline");
+      await expect(previewPodcastVoice(db, "hello")).rejects.toThrow("neural voice returned no audio");
+      await expect(previewPodcastVoice(db, "hello")).rejects.toThrow("neural voice returned no audio");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
 });
 
 // ==================================================== getPodcast / setPodcastCast
@@ -418,6 +520,22 @@ describe("getPodcast / setPodcastCast", () => {
     expect(updated.turns.map((t) => t.speaker)).toEqual(["Ada Lovelace", "Bo"]);
     expect(updated.audioFileId).toBe(audio.id);
   });
+
+  it("reports when a database trigger removes the script during its recast", () => {
+    const db = freshRoom();
+    const file = insertFile(db, "ep.html", "text/html", Buffer.from("<p>x</p>"), null, "generated");
+    const turns = [turn("Ada", "Hi.")];
+    savePodcast(db, file.id, "Ep", turns, castFromTurns(turns, ["v1"]));
+    db.exec(`
+      CREATE TRIGGER vanish_podcast_after_recast
+      AFTER UPDATE ON podcasts
+      BEGIN
+        DELETE FROM podcasts WHERE file_id = NEW.file_id;
+      END;
+    `);
+
+    expect(() => setPodcastCast(db, file.id, [host("Ada Lovelace")])).toThrow("the script vanished");
+  });
 });
 
 // ==================================================== renderPodcastAudio
@@ -474,6 +592,26 @@ describe("renderPodcastAudio", () => {
     savePodcast(db, file.id, title, turns, castFromTurns(turns, ["v1", "v2"]));
     return file.id;
   }
+
+  it("refuses when no room is open before reading a script", async () => {
+    const { rooms } = fakeRooms(null);
+    await expect(renderPodcastAudio(rooms, "missing", new CancelFlag(), "room-a")).rejects.toThrow("No room is open.");
+  });
+
+  it("keeps the per-turn privacy lookup on the currently open room", async () => {
+    const db = freshRoom();
+    setSetting(db, "web_provider", "duckduckgo");
+    const fileId = makeScript(db, "Ep", [turn("Ada", "Hi.")]);
+    let reads = 0;
+    const rooms: RoomSource = {
+      current: () => {
+        reads += 1;
+        return reads === 1 ? { db, path: "room-a" } : null;
+      },
+    };
+    await expect(renderPodcastAudio(rooms, fileId, new CancelFlag(), "room-a")).rejects.toThrow("No room is open.");
+    expect(ensureUp).not.toHaveBeenCalled();
+  });
 
   it("records an episode end to end: privacy door, synthesis, encoding, transcript, save, and link", async () => {
     const db = freshRoom();
@@ -618,6 +756,25 @@ describe("renderPodcastAudio", () => {
       }
     );
   });
+
+  it("refuses missing or malformed podcast audio before encoding or saving", async () => {
+    const db = freshRoom();
+    setSetting(db, "web_provider", "duckduckgo");
+    const fileId = makeScript(db, "Ep", [turn("Ada", "Hi.")]);
+    const { rooms } = fakeRooms({ db, path: "room-a" });
+
+    await withServer(
+      () => ({ status: 200, json: { offsets_ms: [0] } }),
+      async () => expect(renderPodcastAudio(rooms, fileId, new CancelFlag(), "room-a"))
+        .rejects.toThrow("the voice service returned no audio")
+    );
+    await withServer(
+      () => ({ status: 200, json: { audio_b64: "not base64!", offsets_ms: [0] } }),
+      async () => expect(renderPodcastAudio(rooms, fileId, new CancelFlag(), "room-a"))
+        .rejects.toThrow("the voice service returned unreadable audio: invalid base64")
+    );
+    expect(dbGetPodcast(db, fileId)?.audioFileId).toBeNull();
+  });
 });
 
 // ==================================================== IPC wiring
@@ -635,8 +792,9 @@ function fakeIpcMain() {
 }
 
 describe("registerStudiosPodcastAudioIpc", () => {
-  it("registers get_podcast, set_podcast_cast and preview_podcast_voice", () => {
+  it("registers and dispatches get_podcast, set_podcast_cast and preview_podcast_voice", async () => {
     const db = freshRoom();
+    setSetting(db, "web_provider", "off");
     const file = insertFile(db, "ep.html", "text/html", Buffer.from("<p>x</p>"), null, "generated");
     const turns = [turn("Ada", "Hi.")];
     savePodcast(db, file.id, "Ep", turns, castFromTurns(turns, []));
@@ -650,6 +808,17 @@ describe("registerStudiosPodcastAudioIpc", () => {
     );
     const result = ipcMain.handlers.get("get_podcast")?.({}, { fileId: file.id }) as ReturnType<typeof getPodcast>;
     expect(result?.title).toBe("Ep");
+    const recast = ipcMain.handlers.get("set_podcast_cast")?.({}, {
+      fileId: file.id,
+      cast: [host("Ada Lovelace")],
+    }) as ReturnType<typeof setPodcastCast>;
+    expect(recast.cast[0]?.name).toBe("Ada Lovelace");
+    await expect(Promise.resolve(ipcMain.handlers.get("preview_podcast_voice")?.({}, {
+      text: "hello",
+      voice: "",
+      rate: "",
+      pitch: "",
+    }))).rejects.toThrow(SPEECH_OFFLINE_MESSAGE);
   });
 
   it("throws 'No room is open.' when nothing is open", () => {

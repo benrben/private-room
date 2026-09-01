@@ -277,6 +277,21 @@ class _HubRequestHandler(BaseHTTPRequestHandler):
         got = self.headers.get("Authorization", "")
         return hmac.compare_digest(got, f"Bearer {self.hub.token}")
 
+    def _content_length(self) -> int | None:
+        """Parse the declared request size, with no ambiguous fallback."""
+        try:
+            return int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+
+    def _json_body(self, length: int) -> dict[str, Any] | None:
+        """Read exactly the declared body and accept JSON objects only."""
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, OSError):
+            return None
+        return body if isinstance(body, dict) else None
+
     def _read_body(self) -> dict[str, Any] | None:
         """This request's JSON-RPC envelope, or ``None`` once 4xx is answered.
 
@@ -291,9 +306,8 @@ class _HubRequestHandler(BaseHTTPRequestHandler):
         a run of confusing 400s until the connection dies. A body we did read
         leaves the connection reusable, malformed or not.
         """
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
+        length = self._content_length()
+        if length is None:
             # An unparseable Content-Length means we cannot tell where this
             # body ends, so we cannot skip past it either.
             self.close_connection = True
@@ -303,12 +317,8 @@ class _HubRequestHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._send(413)
             return None
-        try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except (ValueError, OSError):
-            self._send(400)
-            return None
-        if not isinstance(body, dict):
+        body = self._json_body(length)
+        if body is None:
             # A JSON array or scalar is not a JSON-RPC envelope. Answering
             # 400 is what the parse above always meant: before, `.get` on a
             # list raised inside the handler thread and the client got a

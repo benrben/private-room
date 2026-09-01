@@ -9,7 +9,7 @@
  * this port's own addition rather than a mirror of an existing fixture.
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -38,6 +38,8 @@ import {
   MCP_CONFIG_KEY,
   mcpFingerprint,
   mcpGate,
+  mcpAutoApproveFile,
+  mcpOutboundUnmaskFile,
   mergeBearer,
   parseConnectorFlag,
   parseConnectorPower,
@@ -67,6 +69,40 @@ import {
 } from "./mcpConfig.js";
 
 const asObject = (v: unknown): Record<string, unknown> => v as Record<string, unknown>;
+
+describe("connector configuration error boundaries", () => {
+  it("refuses malformed JSON before changing a connector", () => {
+    expect(() => mergeBearer("not-json", "server", "token")).toThrow(/isn't valid JSON/);
+    expect(() => setServerDisabled("not-json", "server", true)).toThrow(/isn't valid JSON/);
+    expect(() => removeServerFromConfig("not-json", "server")).toThrow(/isn't valid JSON/);
+  });
+
+  it("keeps the auto-approval and outbound-unmask preferences in separate files", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "arcelle-mcp-flags-"));
+    expect(mcpAutoApproveFile(dir)).toBe(path.join(dir, "mcp_auto_approve.json"));
+    expect(mcpOutboundUnmaskFile(dir)).toBe(path.join(dir, "mcp_outbound_unmask.json"));
+    expect(readMcpFlag(path.join(dir, "missing.json"))).toBe(false);
+    const unreadable = path.join(dir, "unreadable.json");
+    mkdirSync(unreadable);
+    expect(readMcpFlag(unreadable)).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reports a surviving grant when its powers file cannot be rewritten", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "arcelle-mcp-grant-failure-"));
+    const powers = path.join(dir, "mcp_connector_powers.json");
+    writeFileSync(powers, JSON.stringify({ github: { autoApprove: true } }));
+    chmodSync(powers, 0o400);
+    try {
+      expect(() => forgetConnectorGrants(dir, new Set(["github"]), "github")).toThrow(
+        /permissions saved for that name could not be cleared/,
+      );
+    } finally {
+      chmodSync(powers, 0o600);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 // -------------------------------------------------- agent-initiated deletion
 
@@ -151,6 +187,8 @@ it("the_upgrade_from_the_global_switches_grants_nothing_new", () => {
   // a global OFF read as a grant anywhere.
   expect(Object.keys(parseConnectorPowers("{}")).length).toBe(0);
   expect(Object.keys(parseConnectorPowers("garbage")).length).toBe(0);
+  expect(Object.keys(parseConnectorPowers("[]")).length).toBe(0);
+  expect(Object.keys(parseConnectorPowers(`{"broken":null}`))).toEqual([]);
   for (const global of [false, true]) {
     expect(effectivePower(global, undefined)).toBe(global);
   }
@@ -322,6 +360,28 @@ it("a_retargeted_or_dropped_connector_gives_up_its_sign_in", () => {
   expect(resignedServers("not json", a)).toEqual([]);
 });
 
+it("same destination compares nested JSON structurally, not by object key order", () => {
+  const old = {
+    command: "runner",
+    args: ["--options", { retry: 2, headers: { accept: "text/plain", trace: false } }],
+  };
+  const reordered = {
+    command: "runner",
+    args: ["--options", { headers: { trace: false, accept: "text/plain" }, retry: 2 }],
+  };
+  expect(sameDestination(old, reordered)).toBe(true);
+  expect(sameDestination(old, { ...reordered, args: ["--options", { retry: 3 }] })).toBe(false);
+  expect(sameDestination(old, { ...reordered, args: { retry: 2 } })).toBe(false);
+  expect(sameDestination({ command: "runner", args: ["a"] }, { command: "runner", args: ["a", "b"] })).toBe(false);
+  expect(sameDestination({ command: "runner", args: [{ one: 1 }] }, { command: "runner", args: [{ two: 1 }] })).toBe(
+    false
+  );
+  expect(sameDestination({ command: "runner", args: [{ one: 1 }] }, { command: "runner", args: [{ one: 2 }] })).toBe(
+    false
+  );
+  expect(sameDestination({ command: "runner", args: [{ one: 1 }] }, { command: "runner", args: [1] })).toBe(false);
+});
+
 it("mcp_fingerprint_is_stable_and_config_sensitive", () => {
   const a = `{"mcpServers":{"web":{"command":"uvx","args":["ddg"]}}}`;
   expect(mcpFingerprint(a)).toBe(mcpFingerprint(a));
@@ -489,8 +549,21 @@ it("tool_prefs_toggle_off_and_back_on", () => {
   // never an error and never a crash on `.filter` of a non-array.
   expect(Object.keys(parseToolPrefs("not json")).length).toBe(0);
   expect(Object.keys(parseToolPrefs(`{"srv":5}`)).length).toBe(0);
+  expect(Object.keys(parseToolPrefs("[]")).length).toBe(0);
   expect(() => setToolPref(`{"srv":5}`, "srv", "t", false)).not.toThrow();
   expect(parseToolPrefs(setToolPref(`{"srv":5}`, "srv", "t", false))["srv"]!.has("t")).toBe(true);
+});
+
+it("tool preference updates keep unrelated duplicates and sort only server keys", () => {
+  // A tolerant read must not silently normalize the persisted value while
+  // changing one tool: only the requested tool is removed and re-appended.
+  const raw = `{"z":["keep","keep","target"],"a":["other"]}`;
+  expect(setToolPref(raw, "z", "target", false)).toBe(
+    `{"a":["other"],"z":["keep","keep","target"]}`
+  );
+  expect(setToolPref(raw, "z", "target", true)).toBe(`{"a":["other"],"z":["keep","keep"]}`);
+  expect(setToolPref("not json", "new", "tool", false)).toBe(`{"new":["tool"]}`);
+  expect(setToolPref("[]", "new", "tool", false)).toBe(`{"new":["tool"]}`);
 });
 
 // ---------------------------------------------------------------- redaction
@@ -574,6 +647,19 @@ it("command_line_masking_knows_a_key_from_an_ordinary_argument", () => {
   expect(looksLikeSecret("/tmp/notes.db")).toBe(false);
 });
 
+it("command line masking preserves the exact credential-flag and equals forms", () => {
+  expect(redactCliArgs(["--api-key=short", "--token", "still-not-a-secret", "--mode=fast"])).toEqual([
+    "--api-key=[redacted]",
+    "--token",
+    "[redacted]",
+    "--mode=fast",
+  ]);
+  // A blank equals value is not a secret in its own right, and a credential
+  // flag with no following value stays visible rather than inventing one.
+  expect(redactCliArgs(["--api-key=", "--token"])).toEqual(["--api-key=", "--token"]);
+  expect(looksLikeSecret("abcdefghijklmnopqrstuvwxyz")).toBe(false);
+});
+
 it("saving_a_connector_read_through_the_mask_keeps_the_real_key", () => {
   // The model reads a connector (masked), edits something harmless, and saves
   // it back. The placeholder must NOT land in the stored config, and the
@@ -616,6 +702,49 @@ it("a_reshuffled_args_list_still_restores_the_right_key", () => {
   restoreRedactedArgs(two, swapped);
   expect((swapped["args"] as unknown[])[1]).toBe(token);
   expect((swapped["args"] as unknown[])[3]).toBe(key);
+});
+
+it("redacted restoration falls back to the matching original position", () => {
+  // These are flag-masked rather than secret-shaped.  Neither placeholder has
+  // a matching preceding argument, so the stable-index tie-break must retain
+  // the original values rather than consuming whichever value is first.
+  const old = { command: "runner", args: ["--token", "first", "--token", "second"] };
+  const incoming: Record<string, unknown> = {
+    command: "runner",
+    args: ["--inserted", "[redacted]", "--different", "[redacted]"],
+  };
+  restoreRedactedArgs(old, incoming);
+  expect(incoming["args"]).toEqual(["--inserted", "first", "--different", "second"]);
+});
+
+it("redacted restoration leaves unsupported values alone and uses each final tie-break", () => {
+  // Non-array config is ignored, as are non-string entries supplied by another
+  // config writer.  These cases must not cause a partial rewrite.
+  const untouched: Record<string, unknown> = { args: [123, "[redacted]"] };
+  restoreRedactedArgs({}, untouched);
+  restoreRedactedArgs({ args: [] }, {});
+  restoreRedactedArgs({ args: ["--token", "secret"] }, untouched);
+  expect(untouched["args"]).toEqual([123, "secret"]);
+
+  // Multiple candidates at index zero have no preceding argument to pair with,
+  // so the original first candidate wins.
+  const noPrevious: Record<string, unknown> = { args: ["[redacted]"] };
+  restoreRedactedArgs({ args: ["--token", "first", "--token", "second"] }, noPrevious);
+  expect(noPrevious["args"]).toEqual(["first"]);
+
+  // Bare secrets can occupy index zero.  A non-matching preceding value makes
+  // the preceding-argument search skip it, then the same index selects index 1.
+  const sameIndex: Record<string, unknown> = { args: ["--other", "[redacted]"] };
+  restoreRedactedArgs({ args: ["ghp_1a2b3c4d5e6f7g8h9i0j", "xoxb-1a2b3c4d5e6f7g8h9i0j"] }, sameIndex);
+  expect(sameIndex["args"]).toEqual(["--other", "xoxb-1a2b3c4d5e6f7g8h9i0j"]);
+
+  // With neither a paired predecessor nor a matching incoming index, use the
+  // first unused stored value, exactly as the original order requires.
+  const firstCandidate: Record<string, unknown> = {
+    args: ["a", "b", "c", "d", "e", "f", "[redacted]"],
+  };
+  restoreRedactedArgs({ args: ["--token", "first", "--token", "second"] }, firstCandidate);
+  expect((firstCandidate["args"] as unknown[])[6]).toBe("first");
 });
 
 it("a_placeholder_that_matches_nothing_stops_the_save", () => {
@@ -972,6 +1101,17 @@ describe("agent_* integration (real room DB)", () => {
     expect(msg).not.toContain("cleared for the same reason");
     expect(forgetConnectorGrants).not.toHaveBeenCalled();
     expect(loadTokens(db, "gh")).not.toBeNull();
+  });
+
+  it("agentSaveMcp does not claim grants were cleared when the grant store left them intact", () => {
+    const db = freshRoom();
+    agentSaveMcp(db, { name: "gh", config: { type: "http", url: "https://a.test/mcp" } });
+    const msg = agentSaveMcp(
+      db,
+      { name: "gh", config: { type: "http", url: "https://b.test/mcp" } },
+      { forgetConnectorGrants: () => ({ cleared: false }) }
+    );
+    expect(msg).not.toContain("cleared for the same reason");
   });
 
   it("agentSaveMcp reports (without throwing) when the grants file could not be rewritten", () => {

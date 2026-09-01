@@ -30,6 +30,8 @@ the exact same position the caller's walk is at).
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 # ------------------------------------------------------------------ cp1252
 
 # Windows-1252 -- the code page `\ansi` RTF means by default, and the one
@@ -142,13 +144,17 @@ def _parse_i64(num: str) -> int | None:
     position, not just first) fails to parse here exactly as
     `"12-34".parse::<i64>()` errors in Rust.
     """
-    if not num:
-        return None
-    digits = num[1:] if num[0] == "-" else num
-    if not digits or not digits.isdigit():
+    digits = _signed_digits(num)
+    if digits is None or not digits.isdigit():
         return None
     n = int(num)
     return n if _I64_MIN <= n <= _I64_MAX else None
+
+
+def _signed_digits(num: str) -> str | None:
+    if not num:
+        return None
+    return num[1:] if num[0] == "-" else num
 
 
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -166,12 +172,18 @@ def _parse_hex_byte(s: str) -> int | None:
     whitespace, and would even hand back a *negative* int for `"-8"`
     (crashing the caller's `chr()`).
     """
-    if not s or s == "+":
+    digits = _unsigned_hex_digits(s)
+    if digits is None:
         return None
-    digits = s[1:] if s[0] == "+" else s
-    if not digits or any(c not in _HEX_DIGITS for c in digits):
+    if any(c not in _HEX_DIGITS for c in digits):
         return None
     return int(digits, 16)
+
+
+def _unsigned_hex_digits(s: str) -> str | None:
+    if not s or s == "+":
+        return None
+    return s[1:] if s[0] == "+" else s
 
 
 def _rtf_u_char(cp: int) -> str | None:
@@ -200,183 +212,206 @@ def _skip_rtf_fallback(cur: _Cursor, count: int) -> None:
     however many are still owed, leaving the brace itself for the caller.
     """
     for _ in range(count):
-        p = cur.peek()
-        if p == "\\":
-            cur.next()
-            q = cur.peek()
-            if q is None:
-                return
-            if q == "'":
-                cur.next()  # the quote
-                cur.next()  # hex digit 1 (may be None at EOF; harmless)
-                cur.next()  # hex digit 2
-            elif not _is_ascii_alpha(q):
-                cur.next()
-            else:
-                # A whole control word: name, then digits/'-', then one
-                # optional delimiter space.
-                while True:
-                    r = cur.peek()
-                    if r is not None and _is_ascii_alpha(r):
-                        cur.next()
-                    else:
-                        break
-                while True:
-                    r = cur.peek()
-                    if r is not None and (_is_ascii_digit(r) or r == "-"):
-                        cur.next()
-                    else:
-                        break
-                if cur.peek() == " ":
-                    cur.next()
-        elif p is None or p in ("{", "}"):
+        if _fallback_ends_here(cur):
             return
-        else:
-            cur.next()
+        _skip_one_fallback_character(cur)
+
+
+def _fallback_ends_here(cur: _Cursor) -> bool:
+    p = cur.peek()
+    return p is None or p in ("{", "}")
+
+
+def _skip_one_fallback_character(cur: _Cursor) -> None:
+    if cur.peek() != "\\":
+        cur.next()
+        return
+    cur.next()
+    _skip_fallback_escape(cur)
+
+
+def _skip_fallback_escape(cur: _Cursor) -> None:
+    q = cur.peek()
+    if q is None:
+        return
+    if q == "'":
+        _skip_fallback_hex_escape(cur)
+        return
+    if _is_ascii_alpha(q):
+        _skip_fallback_control_word(cur)
+        return
+    cur.next()
+
+
+def _skip_fallback_hex_escape(cur: _Cursor) -> None:
+    cur.next()  # the quote
+    cur.next()  # hex digit 1 (may be None at EOF; harmless)
+    cur.next()  # hex digit 2
+
+
+def _skip_fallback_control_word(cur: _Cursor) -> None:
+    _consume_while(cur, _is_ascii_alpha)
+    _consume_while(cur, _is_control_parameter_character)
+    if cur.peek() == " ":
+        cur.next()
+
+
+def _is_control_parameter_character(c: str) -> bool:
+    return _is_ascii_digit(c) or c == "-"
+
+
+def _consume_while(cur: _Cursor, accepts: Callable[[str], bool]) -> None:
+    while (c := cur.peek()) is not None and accepts(c):
+        cur.next()
+
+
+class _RtfExtractor:
+    """The stateful walk behind :func:`extract_rtf`."""
+
+    def __init__(self, rtf: str) -> None:
+        self.cur = _Cursor(rtf)
+        self.out: list[str] = []
+        self.depth = 0
+        self.skipping: int | None = None
+        self.codepage = 1252
+        self.uc = 1
+
+    def extract(self) -> str | None:
+        while (c := self.cur.next()) is not None:
+            self._consume(c)
+        result = "".join(self.out)
+        return result if result.strip() else None
+
+    def _consume(self, c: str) -> None:
+        if c == "{":
+            self.depth += 1
+            return
+        if c == "}":
+            self._close_group()
+            return
+        if c == "\\":
+            self._consume_escape()
+            return
+        self._consume_literal(c)
+
+    def _consume_literal(self, c: str) -> None:
+        if c in ("\r", "\n"):
+            return
+        if self.skipping is None:
+            self.out.append(c)
+
+    def _close_group(self) -> None:
+        if self.skipping == self.depth:
+            self.skipping = None
+        self.depth = max(self.depth - 1, 0)
+
+    def _consume_escape(self) -> None:
+        nxt = self.cur.peek()
+        if nxt is None:
+            return
+        if nxt == "'":
+            self._consume_hex_escape()
+            return
+        if not _is_ascii_alpha(nxt):
+            self._consume_symbol_escape(nxt)
+            return
+        word, num = self._read_control_word()
+        self._consume_control_word(word, num)
+
+    def _consume_hex_escape(self) -> None:
+        self.cur.next()
+        b = _parse_hex_byte(self._read_hex_characters())
+        if b is None or self.skipping is not None:
+            return
+        self.out.append(self._decode_hex_byte(b))
+
+    def _read_hex_characters(self) -> str:
+        chars: list[str] = []
+        for _ in range(2):
+            char = self.cur.next()
+            if char is None:
+                break
+            chars.append(char)
+        return "".join(chars)
+
+    def _decode_hex_byte(self, b: int) -> str:
+        if b < 0x80:
+            return chr(b)
+        if self.codepage != 1252:
+            return " "
+        decoded = _cp1252_char(b)
+        return decoded if decoded is not None else " "
+
+    def _consume_symbol_escape(self, nxt: str) -> None:
+        self.cur.next()
+        if self.skipping is not None:
+            return
+        if nxt in ("\\", "{", "}"):
+            self.out.append(nxt)
+
+    def _read_control_word(self) -> tuple[str, str]:
+        word = _read_while(self.cur, _is_ascii_alpha)
+        num = _read_while(self.cur, _is_control_parameter_character)
+        if self.cur.peek() == " ":
+            self.cur.next()
+        return word, num
+
+    def _consume_control_word(self, word: str, num: str) -> None:
+        if self._consume_encoding_setting(word, num):
+            return
+        if self._consume_unicode_escape(word, num):
+            return
+        self._consume_text_control_word(word)
+
+    def _consume_encoding_setting(self, word: str, num: str) -> bool:
+        if word == "ansicpg":
+            parsed = _parse_unsigned(num, _U32_MAX)
+            self.codepage = parsed if parsed is not None else 1252
+            return True
+        if word == "uc":
+            parsed = _parse_unsigned(num, _USIZE_MAX)
+            self.uc = min(parsed if parsed is not None else 1, 16)
+            return True
+        return False
+
+    def _consume_unicode_escape(self, word: str, num: str) -> bool:
+        if word != "u":
+            return False
+        _skip_rtf_fallback(self.cur, self.uc)
+        if self.skipping is None:
+            self._append_unicode_character(num)
+        return True
+
+    def _append_unicode_character(self, num: str) -> None:
+        n = _parse_i64(num)
+        if n is None:
+            return
+        cp = n + 65536 if n < 0 else n
+        char = _rtf_u_char(cp)
+        if char is not None:
+            self.out.append(char)
+
+    def _consume_text_control_word(self, word: str) -> None:
+        if self.skipping is not None:
+            return
+        if word in _SKIP_GROUPS:
+            self.skipping = self.depth
+            return
+        if word in _BREAK_WORDS:
+            self.out.append("\n")
+            return
+        if word == "tab":
+            self.out.append(" ")
+
+
+def _read_while(cur: _Cursor, accepts: Callable[[str], bool]) -> str:
+    chars: list[str] = []
+    while (char := cur.peek()) is not None and accepts(char):
+        cur.next()
+        chars.append(char)
+    return "".join(chars)
 
 
 def extract_rtf(rtf: str) -> str | None:
-    """Plain text out of an RTF document, or `None` if the result is blank
-    (whitespace-only or empty) once every control structure is stripped.
-    """
-    cur = _Cursor(rtf)
-    out: list[str] = []
-    depth = 0
-    # Depth of the group currently being skipped, if any. `None` means "not
-    # currently inside a skipped group".
-    skipping: int | None = None
-    # `\ansicpg N` -- the code page `\'xx` bytes are written in. Absent
-    # means the `\ansi` default, 1252. Anything else is left as a space
-    # rather than guessed at: the wrong letters would be worse in the
-    # index than a gap.
-    codepage = 1252
-    # `\ucN` -- how many characters of ANSI fallback follow each `\uN`
-    # escape for readers that can't do Unicode. Default 1 per the spec.
-    uc = 1
-
-    while True:
-        c = cur.next()
-        if c is None:
-            break
-
-        if c == "{":
-            depth += 1
-            continue
-
-        if c == "}":
-            # Only OUR OWN depth being closed clears the skip flag -- a
-            # nested group closing (while already skipping a shallower
-            # one) must not accidentally un-skip early.
-            if skipping == depth:
-                skipping = None
-            depth = max(depth - 1, 0)
-            continue
-
-        if c == "\\":
-            nxt = cur.peek()
-            if nxt is None:
-                # A lone trailing backslash with nothing after it.
-                break
-
-            if nxt == "'":
-                cur.next()
-                hex_chars: list[str] = []
-                for _ in range(2):
-                    h = cur.next()
-                    if h is None:
-                        break
-                    hex_chars.append(h)
-                b = _parse_hex_byte("".join(hex_chars))
-                if b is not None and skipping is None:
-                    if b < 0x80:
-                        decoded: str | None = chr(b)
-                    elif codepage == 1252:
-                        decoded = _cp1252_char(b)
-                    else:
-                        decoded = None
-                    # A space still keeps the word boundary for a code
-                    # page we can't decode.
-                    out.append(decoded if decoded is not None else " ")
-                continue
-
-            if not _is_ascii_alpha(nxt):
-                # An escaped literal: \\ \{ \} and friends -- only those
-                # three specific characters are ever emitted.
-                cur.next()
-                if skipping is None and nxt in ("\\", "{", "}"):
-                    out.append(nxt)
-                continue
-
-            word_chars: list[str] = []
-            while True:
-                p = cur.peek()
-                if p is not None and _is_ascii_alpha(p):
-                    cur.next()
-                    word_chars.append(p)
-                else:
-                    break
-            word = "".join(word_chars)
-
-            # A numeric parameter, then one optional space delimiter.
-            num_chars: list[str] = []
-            while True:
-                p = cur.peek()
-                if p is not None and (_is_ascii_digit(p) or p == "-"):
-                    cur.next()
-                    num_chars.append(p)
-                else:
-                    break
-            num = "".join(num_chars)
-            if cur.peek() == " ":
-                cur.next()
-
-            if word == "ansicpg":
-                parsed = _parse_unsigned(num, _U32_MAX)
-                codepage = parsed if parsed is not None else 1252
-                continue
-
-            if word == "uc":
-                # Clamped: real documents use 0, 1 or 2, and a crafted
-                # oversized count would otherwise swallow the rest of a
-                # group.
-                parsed = _parse_unsigned(num, _USIZE_MAX)
-                uc = min(parsed if parsed is not None else 1, 16)
-                continue
-
-            if word == "u":
-                # The fallback characters are swallowed whether or not we
-                # are inside a skipped group -- they are not text.
-                _skip_rtf_fallback(cur, uc)
-                if skipping is None:
-                    n = _parse_i64(num)
-                    if n is not None:
-                        # A negative parameter is the code unit written as
-                        # a signed 16-bit integer.
-                        cp = n + 65536 if n < 0 else n
-                        ch = _rtf_u_char(cp)
-                        if ch is not None:
-                            out.append(ch)
-                continue
-
-            if skipping is not None:
-                continue
-            if word in _SKIP_GROUPS:
-                skipping = depth
-            elif word in _BREAK_WORDS:
-                out.append("\n")
-            elif word == "tab":
-                out.append(" ")
-            # Every other unrecognized control word: no output, no state
-            # change.
-            continue
-
-        if c in ("\r", "\n"):
-            # A literal line ending in the raw RTF source itself is always
-            # dropped, regardless of skip state.
-            continue
-
-        if skipping is None:
-            out.append(c)
-
-    result = "".join(out)
-    return result if result.strip() else None
+    """Plain text out of an RTF document, or `None` if it has no prose."""
+    return _RtfExtractor(rtf).extract()

@@ -192,28 +192,33 @@ function nextAtTime(after: Date, time: ClockTime, dow: number | null): Date | nu
  * branch rather than only the ones that happen to parse.
  */
 export function nextRunAfter(kind: string, param: string, after: Date): Date | null {
-  const next = ((): Date | null => {
-    switch (kind) {
-      case "interval": {
-        const mins = parseDigits(param, true);
-        if (mins === null || mins <= 0) {
-          return null;
-        }
-        return new Date(after.getTime() + mins * 60_000);
-      }
-      case "daily": {
-        const t = parseHhMm(param);
-        return t === null ? null : nextAtTime(after, t, null);
-      }
-      case "weekly": {
-        const parsed = parseDowHhMm(param);
-        return parsed === null ? null : nextAtTime(after, parsed.time, parsed.dow);
-      }
-      default:
-        return null;
-    }
-  })();
+  const next = nextRunCandidate(kind, param, after);
   return next !== null && Number.isNaN(next.getTime()) ? null : next;
+}
+
+function nextRunCandidate(kind: string, param: string, after: Date): Date | null {
+  switch (kind) {
+    case "interval": return nextInterval(param, after);
+    case "daily": return nextDaily(param, after);
+    case "weekly": return nextWeekly(param, after);
+    default: return null;
+  }
+}
+
+function nextInterval(param: string, after: Date): Date | null {
+  const minutes = parseDigits(param, true);
+  if (minutes === null || minutes <= 0) return null;
+  return new Date(after.getTime() + minutes * 60_000);
+}
+
+function nextDaily(param: string, after: Date): Date | null {
+  const time = parseHhMm(param);
+  return time === null ? null : nextAtTime(after, time, null);
+}
+
+function nextWeekly(param: string, after: Date): Date | null {
+  const parsed = parseDowHhMm(param);
+  return parsed === null ? null : nextAtTime(after, parsed.time, parsed.dow);
 }
 
 /** The next run time as a stored UTC string, computed from NOW. */
@@ -327,6 +332,39 @@ function skipMissedRun(deps: SchedulerDeps, sched: Schedule): void {
   }
 }
 
+async function startScheduledRun(
+  deps: SchedulerDeps,
+  workflow: Workflow,
+  trigger: string,
+): Promise<string | null> {
+  try {
+    return await deps.startWorkflowRun(workflow.id, trigger, null);
+  } catch {
+    // A failed start (a broken def, or the unbuilt-engine stub) still advances
+    // the schedule so the loop doesn't hammer it every tick.
+    return null;
+  }
+}
+
+function persistScheduledRun(
+  db: Parameters<typeof markScheduleRun>[0],
+  sched: Schedule,
+  jobId: string | null,
+  nextRunAt: string | null,
+): void {
+  try {
+    if (jobId !== null && jobId !== "") {
+      markScheduleRun(db, sched.id, jobId, nextRunAt);
+    } else {
+      // An empty id means the run was skipped (already in flight, or the queue
+      // is full) — advance the schedule without recording a phantom run.
+      setScheduleNextRun(db, sched.id, nextRunAt);
+    }
+  } catch {
+    // best-effort, as above.
+  }
+}
+
 /** Start one scheduled run and advance the schedule's next run. */
 async function fire(
   deps: SchedulerDeps,
@@ -338,29 +376,24 @@ async function fire(
     return; // Rust's `let Some(window) = main_window(app) else { return }`.
   }
   const next = nextRunFromNow(sched.kind, sched.param);
-  let jobId: string | null;
-  try {
-    jobId = await deps.startWorkflowRun(wf.id, trigger, null);
-  } catch {
-    // A failed start (a broken def, or the unbuilt-engine stub) still advances
-    // the schedule so the loop doesn't hammer it every tick.
-    jobId = null;
-  }
+  const jobId = await startScheduledRun(deps, wf, trigger);
   const room = deps.rooms.current();
   if (room === null) {
     return; // the room closed while starting the run; nothing left to write.
   }
+  persistScheduledRun(room.db, sched, jobId, next);
+}
+
+function loadDueSchedules(db: Parameters<typeof dueSchedules>[0], now: string): Array<[Schedule, Workflow]> {
   try {
-    if (jobId !== null && jobId !== "") {
-      markScheduleRun(room.db, sched.id, jobId, next);
-    } else {
-      // An empty id means the run was skipped (already in flight, or the queue
-      // is full) — advance the schedule without recording a phantom run.
-      setScheduleNextRun(room.db, sched.id, next);
-    }
+    return dueSchedules(db, now);
   } catch {
-    // best-effort, as above.
+    return [];
   }
+}
+
+function missedWithoutCatchUp(sched: Schedule, watchingSince: string): boolean {
+  return !sched.catchUp && isMissed(sched.nextRunAt, watchingSince);
 }
 
 /** Read the currently-due schedules (a fresh read, no held lock) and fire each.
@@ -375,12 +408,7 @@ export async function tick(
   if (room === null) {
     return;
   }
-  let due: Array<[Schedule, Workflow]>;
-  try {
-    due = dueSchedules(room.db, utcNowString());
-  } catch {
-    due = [];
-  }
+  const due = loadDueSchedules(room.db, utcNowString());
   for (const [sched, wf] of due) {
     if (state.generation !== generation) {
       return;
@@ -388,7 +416,7 @@ export async function tick(
     // A slot missed while the workflow was a draft is governed by "Catch up at
     // unlock" exactly as one missed while the app was closed is — otherwise
     // activating a workflow starts a full pass within 30 s.
-    if (!sched.catchUp && isMissed(sched.nextRunAt, watchingSince)) {
+    if (missedWithoutCatchUp(sched, watchingSince)) {
       skipMissedRun(deps, sched);
       continue;
     }

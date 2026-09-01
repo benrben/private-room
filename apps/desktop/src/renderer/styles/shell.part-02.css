@@ -1,0 +1,493 @@
+
+@media (prefers-reduced-motion: reduce) {
+  .rail-button {
+    transition: none;
+  }
+}
+
+/* ----- expanded rail — icon and full label on one row (the default) ----- */
+.activity-rail.is-expanded {
+  align-items: stretch;
+  padding: 8px 9px;
+}
+.activity-rail.is-expanded .rail-button {
+  width: 100%;
+  min-height: 34px;
+  flex-direction: row;
+  justify-content: flex-start;
+  gap: 11px;
+  padding: 6px 10px;
+}
+.activity-rail.is-expanded .rail-label {
+  font-size: var(--fs-meta);
+  text-align: left;
+  -webkit-line-clamp: 1;
+  white-space: nowrap;
+  word-break: normal;
+  text-overflow: ellipsis;
+}
+.activity-rail.is-expanded .rail-divider {
+  width: 100%;
+  margin: 1px 0 6px;
+}
+.activity-rail.is-expanded .rail-group-label {
+  display: block;
+  width: 100%;
+  margin: 10px 2px 1px;
+  color: var(--faint);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+/* The pressed/current spine sits just inside the wider padding. */
+.activity-rail.is-expanded .rail-button::before {
+  left: -4px;
+}
+/* The expander itself reads as chrome, not as another destination. */
+.rail-expander {
+  color: var(--faint);
+}
+.rail-expander:hover {
+  color: var(--text);
+}
+/* ----- More tools -----
+   The disclosure that holds every destination the reader has not pinned. It
+   is chrome, not a place, so it never takes the pen: no accent wash, no
+   spine, and the caret is the only thing that changes when it opens. A row
+   that looked like the destinations above it would put us straight back into
+   the wall of equivalent-looking icons this redesign exists to undo. */
+.rail-more {
+  color: var(--faint);
+}
+.rail-more:hover,
+.rail-more[aria-expanded="true"] {
+  color: var(--text);
+}
+.rail-chev {
+  margin-left: auto;
+  flex-shrink: 0;
+  transition: transform var(--dur-fast) var(--ease-pen);
+}
+.rail-chev.is-open {
+  transform: rotate(180deg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .rail-chev {
+    transition: none;
+  }
+}
+/* Destinations revealed by the disclosure, indented so the two tiers read as
+   tiers. Only in the expanded rail: at 84px there is no width to spend on an
+   indent, and the group is already bounded by its own divider. */
+.activity-rail.is-expanded .rail-button.is-nested {
+  padding-left: 22px;
+}
+.activity-rail.is-expanded .rail-button.is-nested[aria-current="true"]::before {
+  left: 8px;
+}
+/* Every tool unpinned — a real state, and one the sheet lets you reach. */
+.rail-empty {
+  margin: 2px 4px 6px;
+  font-size: var(--fs-micro);
+  line-height: 1.4;
+  color: var(--faint);
+}
+
+/* Product-area navigation: the current area is marked with a marker stroke
+   drawn down its edge plus a wash behind it. The rail is vertical, so the
+   swipe runs vertically; horizontal, text-led tabs take the same pen as an
+   underline. The label ALSO goes to full-strength ink and stays the only
+   aria-current item, so the state never rests on colour alone. */
+.rail-button[data-area][aria-current="true"] {
+  color: var(--text-strong);
+  background: var(--accent-ghost);
+}
+.rail-button[data-area][aria-current="true"] .rail-label {
+  font-weight: 600;
+}
+.rail-button[data-area][aria-current="true"]::before {
+  content: "";
+  position: absolute;
+  left: -6px;
+  top: 5px;
+  bottom: 5px;
+  width: 3px;
+  /* Uneven ends: a stroke laid down by hand, heavier where the pen landed and
+     lifting as it runs out. It starts in the accent INK rather than the marker
+     fill so the mark itself clears 3:1 in both themes — the marker alone is
+     ~1.9:1 on ivory, which is fine for a highlight behind a word and not fine
+     for the thing telling you where you are. The bold, full-ink label is still
+     the primary signal; this is the second one. */
+  border-radius: 3px 2px 3px 2px / 4px 3px 2px 3px;
+  background: linear-gradient(
+    180deg,
+    var(--accent) 0%,
+    var(--accent-fill) 58%,
+    color-mix(in srgb, var(--accent-fill) 50%, transparent) 100%
+  );
+  pointer-events: none;
+}
+/* The rail's own approval count and running dot used to live here, on the AI
+   pane toggle. Both moved to the toolbar's Assistant button (see .pill-count
+   and .pill-live in workspace.css) along with the toggle itself — a count is
+   only news while the pane it belongs to is shut, and the rail no longer has
+   anything to attach one to. */
+
+/* CSS tooltips for icon-only controls. */
+[data-tip] {
+  position: relative;
+}
+[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  z-index: 80;
+  pointer-events: none;
+  opacity: 0;
+  /* Unfolds like a small paper note: an opaque scrap with a drawn edge. */
+  color: var(--text);
+  background: var(--raised);
+  border: 1px solid var(--sketch);
+  border-radius: var(--radius-xs);
+  padding: 5px 8px;
+  white-space: nowrap;
+  font-size: var(--fs-micro);
+  line-height: 1.2;
+  box-shadow: 0 5px 18px var(--shadow);
+  transition: opacity var(--dur-fast) var(--ease-pen);
+}
+.icon-btn[data-tip]::after,
+.pane-icon-btn[data-tip]::after,
+.top-actions [data-tip]::after {
+  right: 0;
+  top: 31px;
+  left: auto;
+}
+[data-tip]:hover::after,
+[data-tip]:focus-visible::after {
+  opacity: 1;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-tip]::after {
+    transition: none;
+  }
+}
+
+/* ----- the three-pane grid ----- */
+
+.pane-grid {
+  --left-track: 18fr;
+  --center-track: 58fr;
+  --right-track: 24fr;
+  --split-a: 5px;
+  --split-b: 5px;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns:
+    minmax(0, var(--left-track)) var(--split-a) minmax(0, var(--center-track))
+    var(--split-b) minmax(0, var(--right-track));
+  background: transparent;
+  /* Drawer feel: collapsing/expanding the AI pane eases the tracks. Suppressed
+     mid-drag so the splitter tracks the cursor 1:1, and for reduced-motion. */
+  transition: grid-template-columns 0.16s ease;
+}
+.pane-grid.is-dragging {
+  transition: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pane-grid {
+    transition: none;
+  }
+}
+.pane {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  container-type: inline-size;
+}
+.pane.is-hidden {
+  visibility: hidden;
+  pointer-events: none;
+}
+/* The three panes are frames on the sheet, not three filled surfaces. The
+   side panes take the faintest paper wash so they read as sheets laid over
+   the page, and the centre stays bare paper with the grid showing through —
+   which is what makes the window read as one continuous notebook. */
+.pane-library,
+.pane-ai {
+  background: color-mix(in srgb, var(--surface) 55%, transparent);
+}
+.pane-center {
+  background: transparent;
+}
+
+/* The splitter is a drawn pencil gutter, not a filled column. */
+.splitter {
+  width: auto;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  cursor: col-resize;
+  position: relative;
+  z-index: 9;
+}
+.splitter.is-off {
+  visibility: hidden;
+  pointer-events: none;
+  border: 0;
+}
+/* GH #2: the grip is always visible. A 5px line with a hover-only grip reads as
+   a border, so the panes looked fixed-width to anyone who never happened to
+   drag exactly on it — the resize has always been here, it just wasn't
+   advertised. Quiet at rest, obvious on hover. */
+.splitter::after {
+  content: "";
+  position: absolute;
+  width: 2px;
+  height: 26px;
+  border-radius: 4px 2px 5px 3px / 3px 5px 2px 4px;
+  background: var(--faint);
+  opacity: 0.45;
+  left: 1px;
+  top: calc(50% - 13px);
+  transition: opacity 0.12s ease, height 0.12s ease;
+}
+/* Grab area much wider than the visible line, overflowing into both neighbours
+   without spending any layout width. 5px of drawn splitter is a ~5px target,
+   and QA on the real app still could not land a drag on it — the pointer-down
+   fell through to the transcript behind and selected text instead. 15px is the
+   difference between "there is no resize" and "there is". */
+.splitter::before {
+  content: "";
+  position: absolute;
+  inset: 0 -5px;
+  cursor: col-resize;
+  /* Own the gesture outright: without this a drag that starts here can be
+     claimed by the scroll container underneath. */
+  touch-action: none;
+}
+.splitter:hover,
+.splitter.is-dragging {
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg));
+  border-color: var(--accent);
+}
+.splitter:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+.splitter:hover::after,
+.splitter.is-dragging::after,
+.splitter:focus-visible::after {
+  opacity: 0.9;
+  height: 36px;
+  top: calc(50% - 18px);
+}
+@media (prefers-reduced-motion: reduce) {
+  .splitter::after {
+    transition: none;
+  }
+}
+body.resizing-col,
+body.resizing-col * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+/* ----- shared pane chrome ----- */
+
+.pane-header {
+  height: 39px;
+  flex: 0 0 auto;
+  padding: 0 6px 0 var(--sp-3);
+  border-bottom: 1px solid var(--line-soft);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  /* Every pane's title bar (Library / Workspace / AI chat) is app-generated
+     label text and icon buttons — furniture, not content (P0-3). */
+  user-select: none;
+}
+.pane-heading {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-strong);
+  font-size: var(--fs-meta);
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+/* A count in a drawn ring — the same mark paper.css's .nb-circled makes, in
+   the pane header's neutral ink rather than a semantic one, because "how many
+   files are in this room" is a fact and not a state. The RING is the notebook
+   here; the number inside it is a total the app counted and reads in the sans.
+   Kept in step with that primitive's geometry so two circled numbers on screen
+   at once (this and the rail's) read as the same pen. */
+.count-badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  color: var(--muted);
+  background: transparent;
+  border: 1.5px solid var(--rule-strong);
+  border-radius: 60% 55% 58% 62% / 58% 62% 55% 60%;
+  font-size: var(--fs-micro);
+  line-height: 1.15;
+  padding: 0 5px;
+  flex: 0 0 auto;
+}
+.pane-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+
+/* THE CONTEXTUAL SIDEBAR'S PRIMARY ACTION — New page / New sketch / New
+   creation, in the same slot in every destination that has one, so it is the
+   same control rather than three that happen to look alike. Pushed to the right
+   of the title by `margin-left: auto`, with `.pane-actions` losing its own auto
+   margin in that case so the two groups stay adjacent at the end of the row. */
+.pane-new-btn {
+  margin-left: auto;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: var(--raised);
+  color: var(--text);
+  font-size: var(--fs-micro);
+  white-space: nowrap;
+}
+.pane-new-btn:hover {
+  color: var(--text-strong);
+  background: var(--hover);
+  border-color: var(--accent);
+}
+.pane-new-btn + .pane-actions {
+  margin-left: 4px;
+}
+
+.pane-tabs {
+  height: 34px;
+  flex: 0 0 auto;
+  padding: 0 var(--sp-3);
+  display: flex;
+  align-items: flex-end;
+  gap: 13px;
+  border-bottom: 1px solid var(--line-soft);
+  /* A tab strip (P0-3) — the same furniture class as .tab-strip and
+     .assistant-header below. */
+  user-select: none;
+}
+.pane-tab {
+  height: 34px;
+  padding: 0 2px;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  font-size: var(--fs-micro);
+}
+.pane-tab:hover {
+  color: var(--text);
+  background: transparent;
+  border-color: transparent;
+  border-bottom-color: var(--line);
+}
+.pane-tab[aria-selected="true"] {
+  color: var(--text-strong);
+  border-bottom-color: transparent;
+  position: relative;
+}
+/* ONE active underline for the whole app: pane tabs, assistant tabs and the
+   document strip all draw the same swipe, ink where the pen landed and marker
+   where it ran out. Anything that has to say "this one" says it this way. */
+.pane-tab[aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  left: 1px;
+  right: 1px;
+  bottom: -1px;
+  height: 3px;
+  border-radius: 2px 3px 2px 4px / 3px 2px 4px 2px;
+  background: linear-gradient(
+    92deg,
+    var(--accent) 3%,
+    var(--accent-fill) 62%,
+    color-mix(in srgb, var(--accent-fill) 24%, transparent) 100%
+  );
+  pointer-events: none;
+}
+.pane-tab .count-badge {
+  margin-left: 5px;
+}
+
+/* Right-pane header tabs (Chat / Studio / Activity). */
+.assistant-header {
+  height: 39px;
+  flex: 0 0 auto;
+  padding: 0 5px 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-bottom: 1px solid var(--line-soft);
+  min-width: 0;
+  /* A tab strip (P0-3). */
+  user-select: none;
+}
+.assistant-tab {
+  height: 30px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 5px 3px 6px 4px / 4px 6px 3px 5px;
+  color: var(--muted);
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-micro);
+  position: relative;
+}
+.assistant-tab:hover {
+  color: var(--text);
+  background: var(--hover);
+  border-color: transparent;
+}
+/* Horizontal, text-led tabs take the marker underline rather than a fill, so
+   Chat / Studio / Activity read as pages in a notebook rather than segments
+   in a control. */
+.assistant-tab[aria-selected="true"] {
+  color: var(--text-strong);
+  background: transparent;
+}
+.assistant-tab[aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  bottom: 2px;
+  height: 3px;
+  border-radius: 2px 3px 2px 4px / 3px 2px 4px 2px;
+  background: linear-gradient(
+    92deg,
+    var(--accent) 3%,
+    var(--accent-fill) 62%,
+    color-mix(in srgb, var(--accent-fill) 24%, transparent) 100%
+  );
+  pointer-events: none;
+}

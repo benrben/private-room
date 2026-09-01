@@ -167,3 +167,62 @@ def test_all_blank_content_returns_none() -> None:
         }
     )
     assert epub.extract_epub(data) is None
+
+
+def test_unreadable_chapter_is_skipped_without_losing_readable_chapters(
+    monkeypatch,
+) -> None:
+    data = build_zip(
+        {
+            "OEBPS/aaa.xhtml": "<html><body><p>Unreadable chapter.</p></body></html>",
+            "OEBPS/bbb.xhtml": "<html><body><p>Readable chapter.</p></body></html>",
+        }
+    )
+    read_entry = epub.read_zip_entry_capped
+
+    def unreadable_first_entry(data: bytes, entry: str, cap: int) -> str | None:
+        if entry == "OEBPS/aaa.xhtml":
+            return None
+        return read_entry(data, entry, cap)
+
+    monkeypatch.setattr(epub, "read_zip_entry_capped", unreadable_first_entry)
+
+    text = epub.extract_epub(data)
+    assert text is not None
+    assert "Unreadable chapter" not in text
+    assert "Readable chapter" in text
+
+
+def test_chapter_loop_stops_once_the_text_budget_is_spent(monkeypatch) -> None:
+    data = build_zip(
+        {
+            "OEBPS/aaa.xhtml": "1234567890",
+            "OEBPS/bbb.xhtml": "This chapter must not be read.",
+        }
+    )
+    monkeypatch.setattr(epub, "MAX_ZIP_ENTRY_BYTES", 10)
+
+    assert epub.extract_epub(data) == "1234567890\n"
+
+
+def test_spine_order_skips_malformed_manifest_entries_and_unresolved_refs() -> None:
+    data = build_zip(
+        {
+            "content.opf": """<package><manifest>
+                <item href="missing-id.xhtml"/>
+                <item id="chapter" href="chapter.xhtml"/>
+                <item id="missing-href"/>
+            </manifest><spine>
+                <itemref/><itemref idref="unknown"/><itemref idref="chapter"/>
+            </spine></package>""",
+        }
+    )
+
+    assert epub._epub_spine_order(data, ["chapter.xhtml", "content.opf"]) == [
+        "chapter.xhtml"
+    ]
+
+
+def test_spine_order_returns_empty_without_a_readable_opf() -> None:
+    assert epub._epub_spine_order(b"not a zip", ["chapter.xhtml"]) == []
+    assert epub._epub_spine_order(b"not a zip", ["content.opf"]) == []

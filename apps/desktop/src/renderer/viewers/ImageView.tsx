@@ -1,509 +1,500 @@
-import { useEffect, useRef, useState } from "react";
-import { listen } from "../platform";
-import { api, ImageBox, recommendedModels, type DerivedPreviewStatus } from "../api";
-import { BOX_COLORS, ocrBody } from "./util";
-import { fileUrl, useFileBytes } from "./useFileBytes";
-import { useDecodedRaster, type RasterFormat } from "./useDecodedRaster";
+import { useRef, type RefObject } from "react";
+import { type ImageBox, type DerivedPreviewStatus } from "../api";
+import { BOX_COLORS } from "./util";
+import { useFileBytes } from "./useFileBytes";
+import { useDecodedRaster } from "./useDecodedRaster";
 import { derivedPreviewCaption } from "./derivedPreviewStatus";
+import {
+  MAX_ZOOM,
+  MIN_ZOOM,
+  ZOOM_STEP,
+  accessibleImageName,
+  imageExtension,
+  imageFailureReason,
+  imageOcrText,
+  imageSource,
+  loadingCaption,
+  rasterFormatFor,
+  rasterIsLoading,
+  useImageFailure,
+  useImageLocator,
+  useImagePan,
+  useImageZoom,
+  useVisionHelper,
+  type BytesState,
+  type DecodeState,
+  type VisionHelper,
+  type Zoom,
+} from "./imageViewState";
 
 interface Props {
   fileId: string;
   name: string;
   mime: string;
-  /** Streaming token for the picture's bytes (roommedia://). */
   mediaToken?: string | null;
-  /** Legacy base64 payload — honoured if byte delivery is ever switched back. */
   dataB64?: string | null;
-  /** Whatever OCR read off this picture, as stored on the file. */
   text?: string | null;
-  /** Present when the displayed pixels come from a hidden durable preview. */
   derivedPreview?: DerivedPreviewStatus;
 }
 
-const MIN_ZOOM = 0.25;
-const MAX_ZOOM = 4;
-const ZOOM_STEP = 0.25;
+function LoadingPreview({ extension }: { extension: string }) {
+  return <div className="empty-hint">{loadingCaption(extension)}</div>;
+}
 
-export default function ImageView({ fileId, name, mime, mediaToken, dataB64, text, derivedPreview }: Props) {
-  const accessibleName = name.trim() || "Image preview";
-  const ocrText = ocrBody(text);
-  // Streamed over the room's own URI scheme rather than inlined as base64.
-  // The old data URL was 4/3 the size of the picture and had to cross IPC as
-  // one string, which is why anything over 50 MB lost the image viewer
-  // entirely and opened as its OCR text. A 60 MB TIFF scan is just a picture.
-  const extension = name.split(".").pop()?.toLocaleLowerCase() ?? "";
-  const rasterFormat: RasterFormat | null = extension === "psd"
-    ? "psd"
-    : extension === "tif" || extension === "tiff"
-      ? "tiff"
-      : extension === "jxl" ? "jxl" : null;
-  const specialBytes = useFileBytes(rasterFormat ? mediaToken : null, rasterFormat ? dataB64 : null);
-  const decoded = useDecodedRaster(rasterFormat, specialBytes.bytes);
-  const src = rasterFormat
-    ? decoded.url
-    : dataB64 ? `data:${mime};base64,${dataB64}` : fileUrl(mediaToken);
-  const imgRef = useRef<HTMLImageElement>(null);
-  const [query, setQuery] = useState("");
-  const [boxes, setBoxes] = useState<ImageBox[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState("");
-  // An image the engine can't decode (empty, truncated, wrong extension) used
-  // to show only a broken-image glyph, with the zoom buttons and the "mark
-  // something" bar still live over nothing at all.
-  const [imgDead, setImgDead] = useState(!dataB64 && !mediaToken);
-
-  // Zoom: "fit" scales to the pane (the default); a number is a fraction of
-  // the image's natural size. The AI boxes are %-positioned, so they ride
-  // along with any zoom for free.
-  const [zoom, setZoom] = useState<number | "fit">("fit");
-  const [natW, setNatW] = useState(0);
-  const effectiveZoom = () => {
-    if (zoom !== "fit") return zoom;
-    const img = imgRef.current;
-    if (!img || !img.naturalWidth) return 1;
-    return img.clientWidth / img.naturalWidth;
-  };
-  const clampZoom = (z: number) =>
-    Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.round(z * 20) / 20));
-  const zoomBy = (d: number) => setZoom(clampZoom(effectiveZoom() + d));
-
-  // Drag to pan. Zooming in was possible before this; MOVING around the
-  // zoomed picture was not, short of hunting for the scrollbars — which on a
-  // trackpad Mac are hidden until you are already scrolling.
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const panning = useRef(false);
-  const panFrom = useRef({ x: 0, y: 0, left: 0, top: 0 });
-  function onPanStart(e: React.PointerEvent<HTMLDivElement>) {
-    const el = scrollRef.current;
-    // Only drag the picture itself — not the marker labels drawn over it.
-    if (!el || zoom === "fit" || (e.target as HTMLElement).closest(".img-box")) return;
-    panning.current = true;
-    panFrom.current = { x: e.clientX, y: e.clientY, left: el.scrollLeft, top: el.scrollTop };
-    el.setPointerCapture(e.pointerId);
-  }
-  function onPanMove(e: React.PointerEvent<HTMLDivElement>) {
-    const el = scrollRef.current;
-    if (!panning.current || !el) return;
-    el.scrollLeft = panFrom.current.left - (e.clientX - panFrom.current.x);
-    el.scrollTop = panFrom.current.top - (e.clientY - panFrom.current.y);
-  }
-  function onPanEnd(e: React.PointerEvent<HTMLDivElement>) {
-    panning.current = false;
-    scrollRef.current?.releasePointerCapture?.(e.pointerId);
-  }
-
-  // The recommended vision model, set only when it's worth offering to
-  // download it (Ollama is up but nothing installed can mark images).
-  const [visionModel, setVisionModel] = useState<string | null>(null);
-  const [pulling, setPulling] = useState(false);
-  const [pullStatus, setPullStatus] = useState("");
-  const [pullPercent, setPullPercent] = useState<number | null>(null);
-  const [pullErr, setPullErr] = useState("");
-  const [pullDone, setPullDone] = useState(false);
-
-  useEffect(() => {
-    if (rasterFormat) setImgDead(Boolean(specialBytes.error || decoded.error));
-    else setImgDead(!src);
-  }, [decoded.error, rasterFormat, specialBytes.error, src]);
-
-  // ---- decide whether to offer the vision helper (doesn't block the bar) ----
-  // ASK THE BACKEND, don't re-derive. This used to scan the local Ollama list
-  // for a name match against the recommended helper — so a room already running
-  // a vision-capable cloud model (or a local one with an unfamiliar name) was
-  // shown a Download button for a model it had no use for, permanently, under
-  // every picture. `groundingModelForRoom` is the same pick the marking call
-  // makes, so the offer appears only when marking genuinely cannot happen.
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      try {
-        const picked = await api.groundingModelForRoom();
-        if (!alive || picked) return;
-        // Nothing can see. Pulling a helper needs Ollama running; without it
-        // the only honest advice is the model picker, which the status line
-        // below gives.
-        const st = await api.aiStatus().catch(() => null);
-        if (!alive || !st?.running) return;
-        const rec = await recommendedModels().catch(() => null);
-        const vision = rec?.vision?.trim();
-        if (alive && vision) setVisionModel(vision);
-      } catch {
-        // offline or older backend — just don't offer anything
-      }
-    })();
-    return () => {
-      alive = false;
-    };
-  }, []);
-
-  async function locate(e: React.FormEvent) {
-    e.preventDefault();
-    const q = query.trim();
-    // Still gated on the image being on screen — the boxes are drawn over it —
-    // but its SIZE is no longer measured or sent: the command dropped
-    // imgWidth/imgHeight and the boxes come back in 0-1000 coordinates.
-    if (!q || busy || !imgRef.current) return;
-    setBusy(true);
-    setStatus("Looking…");
-    setBoxes([]);
-    try {
-      const found = await api.locateInImage(fileId, q);
-      setBoxes(found);
-      setStatus(
-        found.length === 0
-          ? "The AI could not locate that in this image."
-          : `Found ${found.length} match${found.length === 1 ? "" : "es"}.`,
-      );
-    } catch (err) {
-      // NO_VISION_MODEL is not a failure to find anything — it means nothing
-      // installed can aim at all. Saying "could not locate that" here would be
-      // a claim about the user's picture; this is a claim about their setup,
-      // and it comes with the one-click fix already wired below.
-      const msg = String(err);
-      if (msg.includes("NO_VISION_MODEL")) {
-        // Name the two real fixes. The old text said only "download one below",
-        // which is the wrong advice for anyone whose engine can already see —
-        // switching to a model carrying the `vision` badge in Settings → Model
-        // costs nothing and is usually the better one.
-        setStatus(
-          "Marking needs a model that can see images. This room's model can't, " +
-            "and nothing on this Mac can either — pick a model with the “vision” " +
-            "badge in Settings → Model, or download a local helper below.",
-        );
-        const rec = await recommendedModels().catch(() => null);
-        if (rec?.vision?.trim()) setVisionModel(rec.vision.trim());
-      } else {
-        setStatus(msg);
-      }
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  // Reuse the existing pull_model flow + its pull-progress events.
-  const unlistenPullRef = useRef<(() => void) | null>(null);
-  /** The model name a running download was started with — what Stop needs.
-   * Kept in a ref because `visionModel` is cleared the moment the pull
-   * succeeds, and Stop must never reach for a name that has already moved. */
-  const pullingNameRef = useRef<string | null>(null);
-  // Leaving the picture mid-download drops the event listener; the pull itself
-  // keeps running in the backend, which is deliberate (it is a large download
-  // and the room is not the only place it is useful) and is what the offer's
-  // wording says. Stop is the way out — it is not the same thing as leaving.
-  useEffect(
-    () => () => {
-      unlistenPullRef.current?.();
-      unlistenPullRef.current = null;
-    },
-    [],
-  );
-
-  /** Abandon a running download. `pull_model` registers its cancel flag under
-   * `pull:<model name>` in the SAME registry chat's Stop uses, so this is the
-   * whole wiring — the Rust half has been cancellable (and tested) all along
-   * with no surface calling it, which is why a started download could not be
-   * stopped, paused, or escaped by leaving the picture. */
-  function stopVisionHelper() {
-    const name = pullingNameRef.current;
-    if (!name) return;
-    setPullStatus("stopping…");
-    api.cancelAsk(`pull:${name}`).catch(() => {
-      // Nothing to stop (it just finished, or the flag is already gone). The
-      // pull's own result is the honest answer either way — say nothing here.
-    });
-  }
-
-  async function getVisionHelper() {
-    if (!visionModel || pulling) return;
-    const name = visionModel;
-    pullingNameRef.current = name;
-    setPulling(true);
-    setPullErr("");
-    setPullStatus("starting…");
-    setPullPercent(null);
-    const unlisten = await listen<{ status: string; percent: number | null }>(
-      "pull-progress",
-      (e) => {
-        setPullStatus(e.payload.status);
-        setPullPercent(e.payload.percent);
-      },
-    );
-    unlistenPullRef.current = unlisten;
-    try {
-      await api.pullModel(name);
-      setPullDone(true);
-      setVisionModel(null);
-    } catch (e) {
-      // A download YOU stopped is not a failure, and must not be reported in
-      // red as one. Anything else is.
-      const msg = String(e);
-      if (msg.includes("The download was cancelled")) {
-        setPullStatus("Download stopped. Nothing was installed.");
-      } else {
-        setPullErr(msg);
-        setPullStatus("");
-      }
-    } finally {
-      unlisten();
-      unlistenPullRef.current = null;
-      pullingNameRef.current = null;
-      setPulling(false);
-      setPullPercent(null);
-    }
-  }
-
-  if (rasterFormat && (specialBytes.loading || decoded.loading)) {
-    return <div className="empty-hint">Drawing {extension.toUpperCase()} preview…</div>;
-  }
-
-  if (imgDead) {
-    // Every other viewer names a decode failure plainly; this one used to leave
-    // a broken-image icon and a working "ask AI to mark it" bar over nothing.
-    return (
-      <div className="empty-hint">
-        This picture couldn’t be shown{specialBytes.error || decoded.error ? ` — ${specialBytes.error || decoded.error}` : " — the file appears to be empty, damaged, or in a format this Mac can’t decode"}. The original is still stored in
-        the room: export it from the toolbar above to inspect it, or import the
-        picture again to replace it.
-      </div>
-    );
-  }
-
+function ImageUnavailable({
+  bytes,
+  decoded,
+}: {
+  bytes: BytesState;
+  decoded: DecodeState;
+}) {
   return (
-    <div className="image-view">
-      {derivedPreview && (
-        <div className="viewer-status derived-preview-caption">
-          {derivedPreviewCaption(derivedPreview)}
-        </div>
-      )}
-      <form className="locate-bar" onSubmit={locate}>
-        <input
-          placeholder='Ask AI to mark something… e.g. "the red button", "faces", "the total price"'
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
-        <button className="primary" disabled={busy || !query.trim()}>
-          {busy ? (
-            "…"
-          ) : (
-            <>
-              {/* Monochrome crosshair (currentColor => white on the violet
-                  primary button), replacing the warm 🎯 emoji so the mark
-                  action stays on the single violet accent. */}
-              <svg
-                width={13}
-                height={13}
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth={1.8}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                style={{ verticalAlign: "-2px", marginRight: 5 }}
-                aria-hidden
-              >
-                <circle cx="12" cy="12" r="7.5" />
-                <path d="M12 2.5v3.5M12 18v3.5M2.5 12h3.5M18 12h3.5" />
-                <circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none" />
-              </svg>
-              {/* "Mark", not "Find". PdfView's toolbar has a Find that searches
-                  the document's own text; this asks a model to draw boxes on a
-                  picture. Two different acts under one word, in one family of
-                  viewers — and "mark" is the verb the rest of this component
-                  already uses (the placeholder, the status line, the offer). */}
-              Mark
-            </>
-          )}
-        </button>
-        {boxes.length > 0 && (
-          <button type="button" className="subtle" onClick={() => setBoxes([])}>
-            Clear
-          </button>
-        )}
-      </form>
+    <div className="empty-hint">
+      This picture couldn’t be shown{imageFailureReason(bytes, decoded)}. The
+      original is still stored in the room: export it from the toolbar above to
+      inspect it, or import the picture again to replace it.
+    </div>
+  );
+}
 
-      {/* Offer the vision helper when nothing installed can mark images.
-          Kept separate from the mark bar above so marking still works.
+function DerivedPreviewCaption({
+  derivedPreview,
+}: {
+  derivedPreview?: DerivedPreviewStatus;
+}) {
+  if (!derivedPreview) return null;
+  return (
+    <div className="viewer-status derived-preview-caption">
+      {derivedPreviewCaption(derivedPreview)}
+    </div>
+  );
+}
 
-          `.rdr-note` is the viewer chrome's technical notice, so this card is
-          drawn from the same tokens as every other one. Its own dress is cut
-          for a one-line caption in the margin — 46ch of micro type — and this
-          note is an INSTRUCTION with two buttons and a download bar in it, so
-          it takes the width and the reading size back. */}
-      {visionModel && !pullDone && (
-        <div
-          className="rdr-note"
-          style={{
-            flexWrap: "wrap",
-            alignItems: "center",
-            maxWidth: "none",
-            fontSize: "var(--fs-body)",
-          }}
-        >
-          <span>
-            {/* Offered only when the backend says nothing can mark — and framed
-                as one way out, not the way. Switching this room to any model
-                that carries the "vision" badge works just as well and downloads
-                nothing. No invented size figure: the build Ollama actually
-                fetches isn't known here (the old "~3 GB" was neither checked nor
-                right), and the progress bar below reports the real download. */}
-            Nothing here can mark images yet. Either pick a model with the
-            “vision” badge in Settings → Model, or download a local helper
-            (<code>{visionModel}</code>) — a large one-time download. It keeps
-            running if you leave this picture; use Stop to abandon it.
-          </span>
-          <button className="primary" onClick={getVisionHelper} disabled={pulling}>
-            {pulling ? "Downloading…" : "Download"}
-          </button>
-          {pulling && (
-            <button
-              className="subtle"
-              onClick={stopVisionHelper}
-              title="Abandon this download — nothing is installed and no partial file is kept"
-            >
-              Stop
-            </button>
-          )}
-          {(pullStatus || pullPercent != null) && (
-            <div className="pull-progress" style={{ flexBasis: "100%" }}>
-              {pullPercent != null && (
-                <div className="pull-bar">
-                  <div className="pull-bar-fill" style={{ width: `${pullPercent}%` }} />
-                </div>
-              )}
-              <span>
-                {pullStatus}
-                {pullPercent != null && ` — ${pullPercent.toFixed(0)}%`}
-              </span>
-            </div>
-          )}
-          {pullErr && <span style={{ color: "var(--danger)" }}>{pullErr}</span>}
-        </div>
-      )}
-      {pullDone && (
-        <div className="viewer-status">Vision helper ready — try marking now.</div>
-      )}
-
-      {/* A live region, because this string is REPLACED as work finishes:
-          "Looking…" becomes the count of matches, or the reason nothing could
-          be marked. `.viewer-status` also dresses static captions elsewhere
-          (a figcaption, a cue count, "Slide 3 of 12") — those are not announced
-          and should not be. The rule is the readout changing, not the class. */}
-      {status && (
-        <div className="viewer-status" role="status">
-          {status}
-        </div>
-      )}
-      <div className="pdf-zoombar img-zoombar">
-        <button
-          type="button"
-          className="pdf-zoom-btn"
-          onClick={() => zoomBy(-ZOOM_STEP)}
-          disabled={zoom !== "fit" && zoom <= MIN_ZOOM + 1e-9}
-          title="Zoom out"
-          aria-label="Zoom out"
-        >
-          −
-        </button>
-        <span className="pdf-zoom-pct">
-          {zoom === "fit" ? "Fit" : `${Math.round(zoom * 100)}%`}
-        </span>
-        <button
-          type="button"
-          className="pdf-zoom-btn"
-          onClick={() => zoomBy(ZOOM_STEP)}
-          disabled={zoom !== "fit" && zoom >= MAX_ZOOM - 1e-9}
-          title="Zoom in"
-          aria-label="Zoom in"
-        >
-          +
-        </button>
-        <button
-          type="button"
-          className="pdf-zoom-fit"
-          onClick={() => setZoom(1)}
-          title="Actual size"
-        >
-          100%
-        </button>
-        <button
-          type="button"
-          className="pdf-zoom-fit"
-          onClick={() => setZoom("fit")}
-          title="Fit to the pane"
-        >
-          Fit
-        </button>
-      </div>
-      <div
-        className="img-scroll"
-        ref={scrollRef}
-        onPointerDown={onPanStart}
-        onPointerMove={onPanMove}
-        onPointerUp={onPanEnd}
-        onPointerCancel={onPanEnd}
-        style={{ cursor: zoom !== "fit" ? (panning.current ? "grabbing" : "grab") : undefined }}
+function MarkButton({ busy, disabled }: { busy: boolean; disabled: boolean }) {
+  if (busy)
+    return (
+      <button className="primary" disabled>
+        …
+      </button>
+    );
+  return (
+    <button className="primary" disabled={disabled}>
+      <svg
+        width={13}
+        height={13}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={1.8}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        style={{ verticalAlign: "-2px", marginRight: 5 }}
+        aria-hidden
       >
+        <circle cx="12" cy="12" r="7.5" />
+        <path d="M12 2.5v3.5M12 18v3.5M2.5 12h3.5M18 12h3.5" />
+        <circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none" />
+      </svg>
+      Mark
+    </button>
+  );
+}
+
+function ClearBoxes({
+  boxes,
+  onClear,
+}: {
+  boxes: ImageBox[];
+  onClear: () => void;
+}) {
+  if (boxes.length === 0) return null;
+  return (
+    <button type="button" className="subtle" onClick={onClear}>
+      Clear
+    </button>
+  );
+}
+
+function LocateBar({
+  locator,
+}: {
+  locator: ReturnType<typeof useImageLocator>;
+}) {
+  return (
+    <form className="locate-bar" onSubmit={locator.locate}>
+      <input
+        placeholder='Ask AI to mark something… e.g. "the red button", "faces", "the total price"'
+        value={locator.query}
+        onChange={(event) => locator.setQuery(event.target.value)}
+      />
+      <MarkButton busy={locator.busy} disabled={!locator.query.trim()} />
+      <ClearBoxes boxes={locator.boxes} onClear={() => locator.setBoxes([])} />
+    </form>
+  );
+}
+
+function DownloadVisionButton({ helper }: { helper: VisionHelper }) {
+  if (helper.pulling)
+    return (
+      <button className="primary" onClick={helper.getVisionHelper} disabled>
+        Downloading…
+      </button>
+    );
+  return (
+    <button className="primary" onClick={helper.getVisionHelper}>
+      Download
+    </button>
+  );
+}
+
+function StopVisionButton({ helper }: { helper: VisionHelper }) {
+  if (!helper.pulling) return null;
+  return (
+    <button
+      className="subtle"
+      onClick={helper.stopVisionHelper}
+      title="Abandon this download — nothing is installed and no partial file is kept"
+    >
+      Stop
+    </button>
+  );
+}
+
+function PullBar({ percent }: { percent: number | null }) {
+  if (percent == null) return null;
+  return (
+    <div className="pull-bar">
+      <div className="pull-bar-fill" style={{ width: `${percent}%` }} />
+    </div>
+  );
+}
+
+function PullCaption({
+  percent,
+  status,
+}: {
+  percent: number | null;
+  status: string;
+}) {
+  if (percent == null) return <span>{status}</span>;
+  return (
+    <span>
+      {status} — {percent.toFixed(0)}%
+    </span>
+  );
+}
+
+function PullProgress({ helper }: { helper: VisionHelper }) {
+  if (!helper.pullStatus && helper.pullPercent == null) return null;
+  return (
+    <div className="pull-progress" style={{ flexBasis: "100%" }}>
+      <PullBar percent={helper.pullPercent} />
+      <PullCaption percent={helper.pullPercent} status={helper.pullStatus} />
+    </div>
+  );
+}
+
+function PullError({ error }: { error: string }) {
+  if (!error) return null;
+  return <span style={{ color: "var(--danger)" }}>{error}</span>;
+}
+
+function VisionOffer({ helper }: { helper: VisionHelper }) {
+  if (!helper.visionModel) return null;
+  if (helper.pullDone) return null;
+  return (
+    <div
+      className="rdr-note"
+      style={{
+        flexWrap: "wrap",
+        alignItems: "center",
+        maxWidth: "none",
+        fontSize: "var(--fs-body)",
+      }}
+    >
+      <span>
+        Nothing here can mark images yet. Either pick a model with the “vision”
+        badge in Settings → Model, or download a local helper (
+        <code>{helper.visionModel}</code>) — a large one-time download. It keeps
+        running if you leave this picture; use Stop to abandon it.
+      </span>
+      <DownloadVisionButton helper={helper} />
+      <StopVisionButton helper={helper} />
+      <PullProgress helper={helper} />
+      <PullError error={helper.pullErr} />
+    </div>
+  );
+}
+
+function VisionReady({ ready }: { ready: boolean }) {
+  if (!ready) return null;
+  return (
+    <div className="viewer-status">Vision helper ready — try marking now.</div>
+  );
+}
+
+function StatusLine({ status }: { status: string }) {
+  if (!status) return null;
+  return (
+    <div className="viewer-status" role="status">
+      {status}
+    </div>
+  );
+}
+
+function ZoomControls({
+  zoom,
+  setZoom,
+  zoomBy,
+}: Pick<ReturnType<typeof useImageZoom>, "zoom" | "setZoom" | "zoomBy">) {
+  return (
+    <div className="pdf-zoombar img-zoombar">
+      <button
+        type="button"
+        className="pdf-zoom-btn"
+        onClick={() => zoomBy(-ZOOM_STEP)}
+        disabled={zoom !== "fit" && zoom <= MIN_ZOOM + 1e-9}
+        title="Zoom out"
+        aria-label="Zoom out"
+      >
+        −
+      </button>
+      <span className="pdf-zoom-pct">
+        {zoom === "fit" ? "Fit" : `${Math.round(zoom * 100)}%`}
+      </span>
+      <button
+        type="button"
+        className="pdf-zoom-btn"
+        onClick={() => zoomBy(ZOOM_STEP)}
+        disabled={zoom !== "fit" && zoom >= MAX_ZOOM - 1e-9}
+        title="Zoom in"
+        aria-label="Zoom in"
+      >
+        +
+      </button>
+      <button
+        type="button"
+        className="pdf-zoom-fit"
+        onClick={() => setZoom(1)}
+        title="Actual size"
+      >
+        100%
+      </button>
+      <button
+        type="button"
+        className="pdf-zoom-fit"
+        onClick={() => setZoom("fit")}
+        title="Fit to the pane"
+      >
+        Fit
+      </button>
+    </div>
+  );
+}
+
+function imageWrapStyle(zoom: Zoom, naturalWidth: number) {
+  if (zoom === "fit") return undefined;
+  if (!naturalWidth) return undefined;
+  return { width: naturalWidth * zoom, maxWidth: "none" };
+}
+
+function imageCursor(zoom: Zoom, panning: boolean) {
+  if (zoom === "fit") return undefined;
+  return panning ? "grabbing" : "grab";
+}
+
+function boxStyle(box: ImageBox, index: number) {
+  const color = BOX_COLORS[index % BOX_COLORS.length];
+  return {
+    color,
+    style: {
+      left: `${box.x1 * 100}%`,
+      top: `${box.y1 * 100}%`,
+      width: `${(box.x2 - box.x1) * 100}%`,
+      height: `${(box.y2 - box.y1) * 100}%`,
+      borderColor: color,
+    },
+  };
+}
+
+function ImageBoxes({ boxes }: { boxes: ImageBox[] }) {
+  return (
+    <>
+      {boxes.map((box, index) => {
+        const appearance = boxStyle(box, index);
+        return (
+          <div key={index} className="img-box" style={appearance.style}>
+            <span
+              className="img-box-label"
+              style={{ background: appearance.color }}
+            >
+              {box.label}
+            </span>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+function ImageSurface({
+  accessibleName,
+  locator,
+  src,
+  failure,
+  zoomState,
+  imageRef,
+}: {
+  accessibleName: string;
+  locator: ReturnType<typeof useImageLocator>;
+  src: string | null;
+  failure: ReturnType<typeof useImageFailure>;
+  zoomState: ReturnType<typeof useImageZoom>;
+  imageRef: RefObject<HTMLImageElement | null>;
+}) {
+  const pan = useImagePan(zoomState.zoom);
+  return (
+    <div
+      className="img-scroll"
+      ref={pan.scrollRef}
+      onPointerDown={pan.onPanStart}
+      onPointerMove={pan.onPanMove}
+      onPointerUp={pan.onPanEnd}
+      onPointerCancel={pan.onPanEnd}
+      style={{ cursor: imageCursor(zoomState.zoom, pan.panning.current) }}
+    >
       <div
         className="img-wrap"
-        style={
-          zoom !== "fit" && natW
-            ? { width: natW * zoom, maxWidth: "none" }
-            : undefined
-        }
+        style={imageWrapStyle(zoomState.zoom, zoomState.natW)}
       >
         <img
-          ref={imgRef}
+          ref={imageRef}
           src={src ?? ""}
           alt={accessibleName}
           aria-label={accessibleName}
-          onLoad={(e) => setNatW(e.currentTarget.naturalWidth)}
-          onError={() => setImgDead(true)}
+          onLoad={(event) =>
+            zoomState.setNatW(event.currentTarget.naturalWidth)
+          }
+          onError={() => failure.setImgDead(true)}
         />
-        {boxes.map((b, i) => {
-          const color = BOX_COLORS[i % BOX_COLORS.length];
-          return (
-            <div
-              key={i}
-              className="img-box"
-              style={{
-                left: `${b.x1 * 100}%`,
-                top: `${b.y1 * 100}%`,
-                width: `${(b.x2 - b.x1) * 100}%`,
-                height: `${(b.y2 - b.y1) * 100}%`,
-                borderColor: color,
-              }}
-            >
-              <span className="img-box-label" style={{ background: color }}>
-                {b.label}
-              </span>
-            </div>
-          );
-        })}
+        <ImageBoxes boxes={locator.boxes} />
       </div>
-      </div>
-      {/* The words OCR read off this picture. They were computed, stored and
-          indexed — searchable, and fed to the model — but the viewer was never
-          handed them, so the one person who could tell they were WRONG was the
-          only one who could not see them. Collapsed by default: a picture is
-          still a picture. */}
-      {ocrText && (
-        <details className="img-ocr" open={false}>
-          <summary>
-            Text read from this picture
-            <span className="img-ocr-count">
-              {" "}
-              · {ocrText.length.toLocaleString()} characters
-            </span>
-          </summary>
-          <p className="img-ocr-note">
-            Recognised on this Mac. Machine reading is not perfect — check it
-            against the picture before relying on it.
-          </p>
-          <pre className="img-ocr-text" dir="auto">
-            {ocrText}
-          </pre>
-        </details>
-      )}
     </div>
+  );
+}
+
+function OcrPanel({ text }: { text: string }) {
+  if (!text) return null;
+  return (
+    <details className="img-ocr" open={false}>
+      <summary>
+        Text read from this picture
+        <span className="img-ocr-count">
+          {" "}
+          · {text.length.toLocaleString()} characters
+        </span>
+      </summary>
+      <p className="img-ocr-note">
+        Recognised on this Mac. Machine reading is not perfect — check it
+        against the picture before relying on it.
+      </p>
+      <pre className="img-ocr-text" dir="auto">
+        {text}
+      </pre>
+    </details>
+  );
+}
+
+function ImageViewerContent({
+  accessibleName,
+  derivedPreview,
+  failure,
+  helper,
+  imageRef,
+  locator,
+  ocrText,
+  src,
+  zoomState,
+}: {
+  accessibleName: string;
+  derivedPreview?: DerivedPreviewStatus;
+  failure: ReturnType<typeof useImageFailure>;
+  helper: VisionHelper;
+  imageRef: RefObject<HTMLImageElement | null>;
+  locator: ReturnType<typeof useImageLocator>;
+  ocrText: string;
+  src: string | null;
+  zoomState: ReturnType<typeof useImageZoom>;
+}) {
+  return (
+    <div className="image-view">
+      <DerivedPreviewCaption derivedPreview={derivedPreview} />
+      <LocateBar locator={locator} />
+      <VisionOffer helper={helper} />
+      <VisionReady ready={helper.pullDone} />
+      <StatusLine status={locator.status} />
+      <ZoomControls
+        zoom={zoomState.zoom}
+        setZoom={zoomState.setZoom}
+        zoomBy={zoomState.zoomBy}
+      />
+      <ImageSurface
+        accessibleName={accessibleName}
+        locator={locator}
+        src={src}
+        failure={failure}
+        zoomState={zoomState}
+        imageRef={imageRef}
+      />
+      <OcrPanel text={ocrText} />
+    </div>
+  );
+}
+
+export default function ImageView({
+  fileId,
+  name,
+  mime,
+  mediaToken,
+  dataB64,
+  text,
+  derivedPreview,
+}: Props) {
+  const extension = imageExtension(name);
+  const rasterFormat = rasterFormatFor(extension);
+  const specialBytes = useFileBytes(
+    rasterFormat ? mediaToken : null,
+    rasterFormat ? dataB64 : null,
+  );
+  const decoded = useDecodedRaster(rasterFormat, specialBytes.bytes);
+  const src = imageSource(rasterFormat, decoded.url, mime, dataB64, mediaToken);
+  const imageRef = useRef<HTMLImageElement>(null);
+  const helper = useVisionHelper();
+  const failure = useImageFailure(
+    rasterFormat,
+    specialBytes,
+    decoded,
+    src,
+    dataB64,
+    mediaToken,
+  );
+  const locator = useImageLocator(fileId, imageRef, helper.setVisionModel);
+  const zoomState = useImageZoom(imageRef);
+  if (rasterIsLoading(rasterFormat, specialBytes, decoded))
+    return <LoadingPreview extension={extension} />;
+  if (failure.imgDead)
+    return <ImageUnavailable bytes={specialBytes} decoded={decoded} />;
+  return (
+    <ImageViewerContent
+      accessibleName={accessibleImageName(name)}
+      derivedPreview={derivedPreview}
+      failure={failure}
+      helper={helper}
+      imageRef={imageRef}
+      locator={locator}
+      ocrText={imageOcrText(text)}
+      src={src}
+      zoomState={zoomState}
+    />
   );
 }

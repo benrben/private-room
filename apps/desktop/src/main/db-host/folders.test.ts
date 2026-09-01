@@ -114,6 +114,14 @@ describe("folders", () => {
     expect(() => createFolder(db, "  ")).toThrow();
   });
 
+  it("translates an insert-time uniqueness race into the same plain-language refusal", () => {
+    const db = freshRoom();
+    db.exec(`CREATE TRIGGER folders_race BEFORE INSERT ON folders
+      WHEN NEW.name = 'Race' BEGIN SELECT RAISE(ABORT, 'UNIQUE constraint failed: folders.name'); END`);
+    expect(() => createFolder(db, "Race")).toThrow('A folder named "Race" already exists.');
+    expect(listFolders(db)).toEqual([]);
+  });
+
   it("folder_names_are_unique_ignoring_case", () => {
     // "Legal" and "legal" used to be able to sit side by side, looking
     // identical in the sidebar with no way to tell them apart.

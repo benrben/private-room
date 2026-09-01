@@ -29,6 +29,7 @@ never typed the tag at all.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -52,12 +53,14 @@ from arcelle_sidecar.agents import (
     DOMAIN_KEYS,
     REGISTRY,
     agent_tool_specs,
+    get_agent,
     reachable_agent_ids,
     reachable_domain_keys,
     specialist_catalog,
     specialist_roster,
     specialist_workers,
     tagged_specialist,
+    worker_reachable,
 )
 
 _CORE_ONLY = set(CORE_TOOLS)
@@ -90,6 +93,23 @@ def test_cloud_privacy_catalog_keeps_transcript_status_but_hands_video_local() -
         assert rows[tag]["capability"] == "unavailable"
         assert rows[tag]["localHandoff"] is True
     assert "view_screenshot" not in effective
+
+
+def test_catalog_reasons_and_unavailable_workers_stay_unavailable() -> None:
+    web_disabled = {
+        row["key"]: row
+        for row in specialist_catalog(web_enabled=False, served_names=_EVERYTHING)
+    }
+    assert web_disabled["web"]["capabilityReason"] == "Turn on room internet"
+
+    connector_disabled = {
+        row["key"]: row
+        for row in specialist_catalog(web_enabled=True, served_names=_CORE_ONLY)
+    }
+    assert connector_disabled["connector"]["capabilityReason"] == "Install and enable a connector"
+
+    unavailable = replace(get_agent("files.read"), available=False)
+    assert not worker_reachable(unavailable, web_enabled=True, served_names=_EVERYTHING)
 
 
 def _names(specs: list[dict]) -> list[str]:
@@ -433,6 +453,23 @@ async def test_a_tagged_video_turn_is_refused_when_the_model_has_no_image_input(
     assert mcp.calls == []
     assert "*video isn't a specialist this room has" in out.final
     assert "On this Mac" in out.final
+
+
+async def test_a_video_tag_without_video_tools_has_no_capability_diagnosis() -> None:
+    """A missing room tool is not a privacy or model-capability failure."""
+    chat = FakeChatModel([Round(content="I saw the frame anyway")])
+    served = set(ALL_REGISTRY_TOOLS) - {"view_media_frame"}
+
+    out = await drive(
+        make_request("*video describe the frame at 1:05"),
+        chat,
+        FakeMCP(specs(sorted(served))),
+    )
+
+    assert chat.offered_names == []
+    assert "*video isn't a specialist this room has" in out.final
+    assert "Cloud Privacy" not in out.final
+    assert "Vision capability" not in out.final
 
 
 async def test_a_blind_tagged_file_turn_cannot_claim_static_visual_details() -> None:

@@ -293,6 +293,46 @@ describe("decodeAudioBytes", () => {
     }
   });
 
+  it("passes an avconvert-created private M4A to afconvert through the injected runner", async () => {
+    const commands: Array<[string, readonly string[]]> = [];
+    await transcodeWithMacOsUsing(
+      "/fake/source.mov",
+      "/fake/decoded.wav",
+      "video",
+      "/fake/temp",
+      {
+        exec: async (command, args) => { commands.push([command, args]); },
+      },
+    );
+    expect(commands).toEqual([
+      ["/usr/bin/avconvert", ["-p", "PresetAppleM4A", "-s", "/fake/source.mov", "-o", "/fake/temp/audio.m4a"]],
+      ["/usr/bin/afconvert", ["-f", "WAVE", "-d", "LEI16@16000", "/fake/temp/audio.m4a", "/fake/decoded.wav"]],
+    ]);
+  });
+
+  it("keeps fake converter start and fallback stderr errors on their correct paths", async () => {
+    await expect(transcodeWithMacOsUsing(
+      "/fake/source.mov",
+      "/fake/decoded.wav",
+      "video",
+      "/fake/temp",
+      {
+        findFfmpeg: () => null,
+        exec: async () => { throw { code: "ENOENT", message: "fake avconvert missing" }; },
+      },
+    )).rejects.toThrow("no readable audio track failed to start: fake avconvert missing");
+
+    await expect(transcodeWithMacOsUsing(
+      "/fake/source.wav",
+      "/fake/decoded.wav",
+      "audio",
+      "/fake/temp",
+      {
+        exec: async () => { throw { stderr: Buffer.from("fake unsupported codec") }; },
+      },
+    )).rejects.toThrow("audio decode failed: fake unsupported codec");
+  });
+
   it("decodes this app's own recordings, at recFormat's SAMPLE_RATE", async () => {
     const samples = new Float32Array([0, 0.5, -0.5, 0.25]);
     const decoded = await decodeAudioBytes(encodeWav(samples), "wav", "audio");

@@ -20,6 +20,7 @@ import threading
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 
 from arcelle_sidecar.stt import models
@@ -55,6 +56,10 @@ def _handler_factory(
                         else len(payload)
                     )
                     self.send_header("Content-Length", str(length))
+                    if length != len(payload):
+                        # A deliberately short body needs a closed socket for
+                        # httpx to report the truncated transfer immediately.
+                        self.send_header("Connection", "close")
                 else:
                     self.send_header("Connection", "close")
                 self.send_header("Content-Type", "application/octet-stream")
@@ -319,6 +324,53 @@ async def test_download_model_bad_status_wraps_message(
     assert not dest.exists()
     assert not Path(str(dest) + ".part").exists()
     assert not models.is_downloading()
+
+
+async def test_download_model_connection_failure_wraps_message_and_cleans_up(tmp_path: Path) -> None:
+    """A failure before an HTTP response takes the same public error path."""
+    models_dir = tmp_path / "models"
+
+    with pytest.raises(models.ModelDownloadError, match="download failed"):
+        await models.download_model(str(models_dir), None, url="http://127.0.0.1:1/unavailable")
+
+    dest = Path(models.model_path(str(models_dir)))
+    assert not dest.exists()
+    assert not Path(str(dest) + ".part").exists()
+    assert not models.is_downloading()
+
+
+async def test_download_model_mid_stream_failure_is_interrupted_and_cleans_up(
+    tmp_path: Path, make_server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A body shorter than its header is a transfer interruption, not a model."""
+    monkeypatch.setattr(models, "MIN_MODEL_BYTES", 1000)
+    payload = GGML_MAGIC + b"\x00" * 996
+    url = make_server(payload, declared_length_override=len(payload) * 2)
+    models_dir = tmp_path / "models"
+
+    with pytest.raises(models.ModelDownloadError, match="download interrupted"):
+        await models.download_model(str(models_dir), None, url=url)
+
+    dest = Path(models.model_path(str(models_dir)))
+    assert not dest.exists()
+    assert not Path(str(dest) + ".part").exists()
+    assert not models.is_downloading()
+
+
+def test_declared_download_size_ignores_a_non_numeric_header() -> None:
+    response = httpx.Response(200, headers={"content-length": "not-a-number"})
+    assert models._declared_download_size(response) is None
+
+
+def test_report_download_progress_skips_the_same_percent() -> None:
+    events: list[tuple[int, int, int]] = []
+
+    last_pct = models._report_download_progress(
+        lambda got, total, pct: events.append((got, total, pct)), 50, 100, 50
+    )
+
+    assert last_pct == 50
+    assert events == []
 
 
 async def test_download_model_cancel_mid_download_stops_and_cleans_up(

@@ -84,8 +84,8 @@ requested).
 
 from __future__ import annotations
 
-import datetime
 import io
+from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 import openpyxl
@@ -123,148 +123,213 @@ MAX_XLSX_DECOMPRESSED: int = 512 * 1024 * 1024
 # avoid the problem entirely by having no separate "declared" source at all.
 
 
+@dataclass
+class _TextOutput:
+    """Accumulate extracted text while retaining the truncation budget."""
+
+    parts: list[str] = field(default_factory=list)
+    length: int = 0
+
+    def append(self, text: str) -> None:
+        self.parts.append(text)
+        self.length += len(text)
+
+    def text(self) -> str:
+        return "".join(self.parts)
+
+
+@dataclass
+class _SheetWalk:
+    """The observed extents and unfinished row from one worksheet walk."""
+
+    cells: list[str] = field(default_factory=list)
+    row_no: int = 0
+    max_row_seen: int = 0
+    max_col_seen: int = 0
+    last_row: int | None = None
+
+
+@dataclass(frozen=True)
+class _SheetBounds:
+    rows_total: int
+    cols_total: int
+    max_row: int
+    max_col: int
+
+
 def extract_xlsx(data: bytes) -> str | None:
     """Extract every populated cell of every worksheet as text, numbers and
     strings alike, in workbook sheet order. `None` for anything that isn't
     a readable workbook, over either decompression-bomb cap, or whose
     extracted text is all-whitespace.
     """
+    if not _xlsx_is_safe_to_load(data):
+        return None
+    workbook = _load_xlsx(data)
+    if workbook is None:
+        return None
+    text = _extract_workbook_text(workbook)
+    return None if text.strip() == "" else text
+
+
+def _xlsx_is_safe_to_load(data: bytes) -> bool:
+    """Apply both archive-size checks in their original short-circuit order."""
     if not zip_declared_size_within(data, MAX_XLSX_DECOMPRESSED):
-        return None
-    if not zip_inflated_size_within(data, MAX_XLSX_DECOMPRESSED):
-        return None
+        return False
+    return zip_inflated_size_within(data, MAX_XLSX_DECOMPRESSED)
+
+
+def _load_xlsx(data: bytes) -> Any | None:
+    """Load only readable workbooks; malformed archives are an empty result."""
     try:
-        workbook = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        return openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     except Exception:
         return None
 
-    out_parts: list[str] = []
-    out_len = 0
 
-    def append(text: str) -> None:
-        nonlocal out_len
-        out_parts.append(text)
-        out_len += len(text)
-
+def _extract_workbook_text(workbook: Any) -> str:
+    """Extract all sheets and close the reader even when a later walk fails."""
+    output = _TextOutput()
     try:
-        for ws in workbook.worksheets:
-            # `ws.max_row`/`ws.max_column` come from the sheet's own
-            # `<dimension>` metadata (read_only mode parses it up front,
-            # never a live rescan). This is NOT the same source as umya's
-            # `highest_row()`/`highest_column()`: umya has no separate
-            # "declared bounds" concept at all -- it fully parses every
-            # `<c>` element into an in-memory cell collection first, and
-            # `highest_row()`/`highest_column()` simply read the max
-            # coordinate actually PRESENT in that collection, so no real
-            # cell can ever exceed it. openpyxl's `<dimension>` element, by
-            # contrast, is separate metadata a writer can get wrong -- a
-            # workbook from some other tool can declare a SMALLER extent
-            # than it actually contains (a stale/miscomputed dimension
-            # tag). Trusting it blindly here would silently drop every
-            # real cell beyond the lied-about bound, with NO truncation
-            # note at all (since the reported `rows_total`/`cols_total`
-            # would be the same too-small lie) -- exactly the "silently
-            # half-read export" failure this module's own truncation
-            # note exists to rule out. Confirmed empirically: a workbook
-            # patched to declare `<dimension ref="A1:A1"/>` while actually
-            # holding a cell at row 10/column 5 made this port drop that
-            # cell outright before this fix.
-            #
-            # So `rows_total`/`cols_total` below are the MAX of the
-            # declared bound and whatever the walk actually observes --
-            # never smaller than reality, matching umya's guarantee -- and
-            # the walk itself gates on the fixed `MAX_ROWS`/`MAX_COLS`
-            # ceilings directly rather than on a value derived from the
-            # (possibly-lying) declared bound. `None` when a sheet carries
-            # no dimension element at all (not something openpyxl's own
-            # writer ever produces, but a file from another tool might
-            # omit it) -- treated as 0, matching umya reporting 0 for a
-            # truly dimensionless sheet.
-            #
-            # One narrower gap remains, accepted deliberately: if the
-            # declared dimension lies the OTHER way -- claiming a sheet is
-            # completely empty (0) when it actually holds data -- this
-            # sheet is skipped before ever walking it, since the skip
-            # check below is the cheap pre-filter and nothing has been
-            # observed yet at that point. Fully closing that would mean
-            # unconditionally walking every worksheet regardless of its
-            # declared dimension, which is a larger change for a rarer
-            # failure mode (an "empty" lie is a stranger thing for a real
-            # writer to produce than an "understated" one) than the
-            # concretely-demonstrated bug this fix closes.
-            declared_rows = ws.max_row or 0
-            declared_cols = ws.max_column or 0
-            if declared_rows == 0 or declared_cols == 0:
-                continue
-            append(f"[sheet: {ws.title}]\n")
-
-            cells: list[str] = []
-            row_no = 0
-            max_row_seen = 0
-            max_col_seen = 0
-            last_row: int | None = None
-            for cell in _iter_populated_cells(ws):
-                row = cell["row"]
-                col = cell["column"]
-                # Track the TRUE extent from every cell actually present,
-                # regardless of whether it ends up gated out below -- this
-                # is what makes `rows_total`/`cols_total` trustworthy even
-                # when the declared dimension understates them.
-                if row > max_row_seen:
-                    max_row_seen = row
-                if col > max_col_seen:
-                    max_col_seen = col
-                if row <= 0 or col <= 0 or row > MAX_ROWS or col > MAX_COLS:
-                    continue
-                value = cell["value"]
-                if value is None or value == "":
-                    continue
-                if row != row_no:
-                    if cells:
-                        # " | ", not a tab: `normalize_whitespace` runs
-                        # over every extractor's output and collapses
-                        # tabs, which would flatten the grid into a run of
-                        # words and make empty cells vanish entirely -- so
-                        # the model would read "Name Total" for
-                        # "Name | (blank) | Total" and could line the
-                        # columns up wrong.
-                        append(" | ".join(cells))
-                        append("\n")
-                        cells = []
-                    if out_len >= MAX_TEXT_CHARS:
-                        last_row = row_no
-                        break
-                    row_no = row
-                if len(cells) < col:
-                    cells.extend([""] * (col - len(cells)))
-                cells[col - 1] = _format_cell_value(value)
-            if cells:
-                append(" | ".join(cells))
-                append("\n")
-
-            rows_total = max(declared_rows, max_row_seen)
-            cols_total = max(declared_cols, max_col_seen)
-            max_row = min(rows_total, MAX_ROWS)
-            max_col = min(cols_total, MAX_COLS)
-            if last_row is None:
-                # The walk ran to completion (no MAX_TEXT_CHARS break), so
-                # everything up to the clamp was read.
-                last_row = max_row
-
-            # Say so when anything was left out -- a silently half-read
-            # export is worse than a short one, because nothing downstream
-            # can tell.
-            if last_row < rows_total or cols_total > max_col:
-                append(
-                    f'[sheet "{ws.title}" truncated: read rows 1-{last_row} of '
-                    f"{rows_total}, columns 1-{max_col} of {cols_total}]\n"
-                )
-            append("\n")
+        for worksheet in workbook.worksheets:
+            _append_worksheet_text(worksheet, output)
     finally:
         workbook.close()
+    return output.text()
 
-    out = "".join(out_parts)
-    return None if out.strip() == "" else out
+
+def _append_worksheet_text(worksheet: Any, output: _TextOutput) -> None:
+    """Append one worksheet, retaining its declared extent for the notice."""
+    declared_rows, declared_cols = _declared_sheet_extent(worksheet)
+    if _has_no_declared_extent(declared_rows, declared_cols):
+        return
+    output.append(f"[sheet: {worksheet.title}]\n")
+    walk = _walk_populated_cells(worksheet, output)
+    _append_sheet_end(worksheet.title, declared_rows, declared_cols, walk, output)
+
+
+def _declared_sheet_extent(worksheet: Any) -> tuple[int, int]:
+    """Read the optional writer-supplied extent without treating it as truth."""
+    return worksheet.max_row or 0, worksheet.max_column or 0
+
+
+def _has_no_declared_extent(rows: int, cols: int) -> bool:
+    """Skip the cheap, known-empty worksheet case before parsing its XML."""
+    return rows == 0 or cols == 0
+
+
+def _walk_populated_cells(worksheet: Any, output: _TextOutput) -> _SheetWalk:
+    """Stream only stored cells while tracking their true worksheet extent."""
+    walk = _SheetWalk()
+    for cell in _iter_populated_cells(worksheet):
+        _record_cell_extent(walk, cell)
+        if not _cell_is_within_limits(cell):
+            continue
+        if not _cell_has_value(cell):
+            continue
+        if not _append_cell_to_row(walk, cell, output):
+            break
+    return walk
+
+
+def _record_cell_extent(walk: _SheetWalk, cell: dict) -> None:
+    """Keep the real extent even for an ignored or out-of-budget cell."""
+    walk.max_row_seen = max(walk.max_row_seen, cell["row"])
+    walk.max_col_seen = max(walk.max_col_seen, cell["column"])
+
+
+def _cell_is_within_limits(cell: dict) -> bool:
+    """Accept only positive coordinates inside the fixed extraction bounds."""
+    row = cell["row"]
+    col = cell["column"]
+    return 0 < row <= MAX_ROWS and 0 < col <= MAX_COLS
+
+
+def _cell_has_value(cell: dict) -> bool:
+    """Ignore stored-but-empty cells without adding an empty row."""
+    value = cell["value"]
+    return value is not None and value != ""
+
+
+def _append_cell_to_row(walk: _SheetWalk, cell: dict, output: _TextOutput) -> bool:
+    """Store a cell, flushing the preceding row on a row transition."""
+    row = cell["row"]
+    if row == walk.row_no:
+        _store_cell(walk.cells, cell)
+        return True
+    return _start_row_with_cell(walk, cell, output)
+
+
+def _start_row_with_cell(walk: _SheetWalk, cell: dict, output: _TextOutput) -> bool:
+    """Open a new row before placing the cell that caused the transition."""
+    if not _start_next_row(walk, cell["row"], output):
+        return False
+    _store_cell(walk.cells, cell)
+    return True
+
+
+def _start_next_row(walk: _SheetWalk, row: int, output: _TextOutput) -> bool:
+    """Flush the preceding row and stop before starting an over-budget row."""
+    _flush_pending_cells(walk, output)
+    if output.length >= MAX_TEXT_CHARS:
+        walk.last_row = walk.row_no
+        return False
+    walk.row_no = row
+    return True
+
+
+def _flush_pending_cells(walk: _SheetWalk, output: _TextOutput) -> None:
+    """Render the open row with explicit placeholders for blank columns."""
+    if not walk.cells:
+        return
+    output.append(" | ".join(walk.cells))
+    output.append("\n")
+    walk.cells.clear()
+
+
+def _store_cell(cells: list[str], cell: dict) -> None:
+    """Place one value at its one-based spreadsheet column."""
+    col = cell["column"]
+    missing_cells = col - len(cells)
+    if missing_cells > 0:
+        cells.extend([""] * missing_cells)
+    cells[col - 1] = _format_cell_value(cell["value"])
+
+
+def _append_sheet_end(
+    title: str,
+    declared_rows: int,
+    declared_cols: int,
+    walk: _SheetWalk,
+    output: _TextOutput,
+) -> None:
+    """Finish a worksheet and visibly report any row or column truncation."""
+    _flush_pending_cells(walk, output)
+    bounds = _sheet_bounds(declared_rows, declared_cols, walk)
+    last_row = _last_read_row(walk, bounds)
+    if _sheet_was_truncated(last_row, bounds):
+        output.append(
+            f'[sheet "{title}" truncated: read rows 1-{last_row} of '
+            f"{bounds.rows_total}, columns 1-{bounds.max_col} of {bounds.cols_total}]\n"
+        )
+    output.append("\n")
+
+
+def _sheet_bounds(declared_rows: int, declared_cols: int, walk: _SheetWalk) -> _SheetBounds:
+    """Combine declared and observed extents so understated metadata loses no cells."""
+    rows_total = max(declared_rows, walk.max_row_seen)
+    cols_total = max(declared_cols, walk.max_col_seen)
+    return _SheetBounds(rows_total, cols_total, min(rows_total, MAX_ROWS), min(cols_total, MAX_COLS))
+
+
+def _last_read_row(walk: _SheetWalk, bounds: _SheetBounds) -> int:
+    """Use the cap-stop row when present, otherwise the complete row bound."""
+    return bounds.max_row if walk.last_row is None else walk.last_row
+
+
+def _sheet_was_truncated(last_row: int, bounds: _SheetBounds) -> bool:
+    """Report either a row cap/text cap or a column cap."""
+    return last_row < bounds.rows_total or bounds.cols_total > bounds.max_col
 
 
 def _iter_populated_cells(ws: Any) -> Iterator[dict]:
@@ -306,9 +371,12 @@ def _format_cell_value(value: object) -> str:
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
-        if value.is_integer():
-            return str(int(value))
-        return str(value)
-    if isinstance(value, (datetime.datetime, datetime.date, datetime.time, datetime.timedelta)):
-        return str(value)
+        return _format_float(value)
+    return str(value)
+
+
+def _format_float(value: float) -> str:
+    """Avoid an artificial trailing `.0` on whole-number values."""
+    if value.is_integer():
+        return str(int(value))
     return str(value)

@@ -316,30 +316,37 @@ def _read_page_inner(html: str, url: str | None) -> PageCapture:
     # An absolute URL is what the scorer needs to resolve relative
     # references; a bare or malformed one must cost the URL, not the whole
     # extraction. Mirrors the Rust `abs` filter exactly.
-    abs_url = url if url is not None and (url.startswith("http://") or url.startswith("https://")) else None
+    summary_html = _article_summary(html, _absolute_page_url(url))
+    return PageCapture(meta=meta, article=_article_from_summary(summary_html))
 
-    summary_html: str | None = None
+
+def _absolute_page_url(url: str | None) -> str | None:
+    if url is None:
+        return None
+    return url if url.startswith("http://") or url.startswith("https://") else None
+
+
+def _article_summary(html: str, url: str | None) -> str | None:
     try:
         prepared = _prune_chrome(html)
-        document = readability.Document(prepared, url=abs_url)
-        summary_html = document.summary(html_partial=True)
+        document = readability.Document(prepared, url=url)
+        return document.summary(html_partial=True)
     except Exception:
         # A page the scorer cannot parse at all is "no article", exactly
         # like a page it parses but finds nothing in -- the caller already
         # handles both the same way. Metadata already captured above
         # survives this.
-        summary_html = None
+        return None
 
-    article: ArticleBody | None = None
-    if summary_html:
-        article_html = _unwrap_summary(summary_html)
-        article_html = _strip_event_handlers(article_html)
-        text = _article_text(article_html)
-        if len(text) >= MIN_ARTICLE_CHARS:
-            markdown = html_to_markdown(article_html)
-            article = ArticleBody(html=article_html, markdown=markdown, text=text)
 
-    return PageCapture(meta=meta, article=article)
+def _article_from_summary(summary_html: str | None) -> ArticleBody | None:
+    if not summary_html:
+        return None
+    article_html = _strip_event_handlers(_unwrap_summary(summary_html))
+    text = _article_text(article_html)
+    if len(text) < MIN_ARTICLE_CHARS:
+        return None
+    return ArticleBody(html=article_html, markdown=html_to_markdown(article_html), text=text)
 
 
 def _prune_chrome(html: str) -> str:
@@ -419,26 +426,45 @@ def _article_text(html: str) -> str:
 
 def _collect_text_blocks(node: BeautifulSoup | Tag, paragraphs: list[str]) -> None:
     for child in node.contents:
-        if isinstance(child, Tag):
-            name = (child.name or "").lower()
-            if name in ("script", "style"):
-                continue
-            if name in _BLOCK_TAGS:
-                has_block_child = any(
-                    isinstance(gc, Tag) and (gc.name or "").lower() in _BLOCK_TAGS for gc in child.contents
-                )
-                if has_block_child:
-                    _collect_text_blocks(child, paragraphs)
-                else:
-                    text = " ".join(child.get_text(" ").split())
-                    if text:
-                        paragraphs.append(text)
-            else:
-                _collect_text_blocks(child, paragraphs)
-        elif isinstance(child, NavigableString) and not isinstance(child, _STRING_NON_TEXT):
-            text = " ".join(str(child).split())
-            if text:
-                paragraphs.append(text)
+        _collect_text_child(child, paragraphs)
+
+
+def _collect_text_child(child: object, paragraphs: list[str]) -> None:
+    if isinstance(child, Tag):
+        _collect_tag_text(child, paragraphs)
+        return
+    if isinstance(child, NavigableString) and not isinstance(child, _STRING_NON_TEXT):
+        _append_collapsed_text(str(child), paragraphs)
+
+
+def _collect_tag_text(tag: Tag, paragraphs: list[str]) -> None:
+    if _is_ignored_text_tag(tag):
+        return
+    if not _is_block_tag(tag):
+        _collect_text_blocks(tag, paragraphs)
+        return
+    if _has_direct_block_child(tag):
+        _collect_text_blocks(tag, paragraphs)
+        return
+    _append_collapsed_text(tag.get_text(" "), paragraphs)
+
+
+def _is_ignored_text_tag(tag: Tag) -> bool:
+    return (tag.name or "").lower() in ("script", "style")
+
+
+def _is_block_tag(tag: Tag) -> bool:
+    return (tag.name or "").lower() in _BLOCK_TAGS
+
+
+def _has_direct_block_child(tag: Tag) -> bool:
+    return any(isinstance(child, Tag) and _is_block_tag(child) for child in tag.contents)
+
+
+def _append_collapsed_text(value: str, paragraphs: list[str]) -> None:
+    text = " ".join(value.split())
+    if text:
+        paragraphs.append(text)
 
 
 def read_page_bytes(data: bytes, url: str | None) -> PageCapture:

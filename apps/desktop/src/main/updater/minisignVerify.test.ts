@@ -270,6 +270,14 @@ describe("container parsing", () => {
     );
   });
 
+  it("rejects an unknown signature algorithm tag", () => {
+    const lines = key.signPayload(Buffer.of(1)).split("\n");
+    const inner = Buffer.from(lines[1]!, "base64");
+    inner.write("XX", 0, "latin1");
+    lines[1] = inner.toString("base64");
+    expect(() => parseSignatureFile(lines.join("\n"))).toThrow(/unsupported signature algorithm/);
+  });
+
   it("ignores lines past the ones the format defines, matching Rust's .lines()", () => {
     const sig = key.signPayload(Buffer.of(1)) + "an extra trailing line\n";
     expect(() => parseSignatureFile(sig)).not.toThrow();

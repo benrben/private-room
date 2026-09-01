@@ -3,7 +3,7 @@ import type { SimNode, View, Tip } from "./types";
 import { nodeRadius, handCircle } from "./layout";
 
 /** How far a press may travel and still count as a click on this star — the
- *  same 3px the backdrop's pan uses to tell a drag from a click. */
+ * same 3px the backdrop's pan uses to tell a drag from a click. */
 const DRAG_SLOP = 3;
 
 interface NodeStarProps {
@@ -20,133 +20,238 @@ interface NodeStarProps {
   setTip: (t: Tip | null) => void;
 }
 
-/** One node — an inked disc for a file, a ringed dot for a memory — with its
- *  hit target and hover/click wiring (all handlers threaded from the shell).
- *
- *  NODES ARE INK, NOT COLOUR. Both kinds are drawn in the pen, and which one a
- *  node is comes from its SHAPE: a filled disc is a file, an open ring around a
- *  dot is a memory, and the same ring is repeated in front of a memory's label.
- *  That leaves every hue on this map free to mean one thing — what a LINE
- *  between two nodes claims — instead of hue being asked to say two unrelated
- *  things at once. It also retires the last two colour literals the map
- *  carried (a violet wash and a neon green), which is where its glow came from.
- *
- *  Paint lives in roomMap.css, keyed off the classes below. Only stroke WIDTHS
- *  are set here, because they have to be divided by the zoom to stay a constant
- *  weight on screen, and only the browser knows the current scale at draw time.
- *
- *  Note that the class values are what protect these shapes from
- *  `.room-map-node { fill: … }` in misc-moonshot.css: that rule paints the
- *  wrapping <g>, and fill INHERITS, so a shape that declared nothing would pick
- *  the accent up. A rule matching the shape itself always beats a value
- *  inherited from its parent. */
-export default function NodeStar({
-  n,
-  degree,
-  hovered,
-  focusId,
-  focusNeighbors,
-  view,
-  onOpenFile,
-  setHovered,
-  setFocus,
-  showTip,
-  setTip,
-}: NodeStarProps) {
-  const deg = degree.get(n.id) ?? 0;
-  const r = nodeRadius(deg);
-  const isFile = n.kind === "file";
-  const active = hovered === n.id || focusId === n.id;
-  const neighbour = focusNeighbors?.has(n.id) ?? false;
-  const openable = isFile && onOpenFile != null;
-  const tipLines = [n.kind === "memory" ? "Memory" : n.folder || "Top level"];
-  // Generous invisible hit target so small stars are clickable.
-  const hit = Math.max(r * 1.6, 11 / view.k);
-  // Reachable by Tab and named for a screen reader — without this the map is
-  // empty space to anyone who can't use a mouse.
-  const label = [
-    isFile ? n.name : `Memory: ${n.name}`,
-    isFile ? n.folder || "Top level" : null,
-    `${deg} connection${deg === 1 ? "" : "s"}`,
-    openable ? "press Enter to open" : null,
+interface NodeFacts {
+  degree: number;
+  radius: number;
+  isFile: boolean;
+  active: boolean;
+  neighbour: boolean;
+  openable: boolean;
+  tipLines: string[];
+  hitRadius: number;
+  label: string;
+}
+
+function nodeDegree(degree: Map<string, number>, id: string) {
+  return degree.get(id) ?? 0;
+}
+
+function nodeState(n: SimNode, hovered: string | null, focusId: string | null) {
+  return hovered === n.id || focusId === n.id;
+}
+
+function isNeighbour(neighbors: Set<string> | null, id: string) {
+  return neighbors?.has(id) ?? false;
+}
+
+function isOpenable(isFile: boolean, onOpenFile?: (id: string) => void) {
+  return isFile && onOpenFile != null;
+}
+
+function tipLines(n: SimNode) {
+  if (n.kind === "memory") return ["Memory"];
+  return [n.folder || "Top level"];
+}
+
+function nodeName(n: SimNode, isFile: boolean) {
+  return isFile ? n.name : `Memory: ${n.name}`;
+}
+
+function folderName(n: SimNode, isFile: boolean) {
+  if (!isFile) return null;
+  return n.folder || "Top level";
+}
+
+function connectionName(degree: number) {
+  return `${degree} connection${degree === 1 ? "" : "s"}`;
+}
+
+function openingHint(openable: boolean) {
+  return openable ? "press Enter to open" : null;
+}
+
+function ariaLabel(
+  n: SimNode,
+  degree: number,
+  isFile: boolean,
+  openable: boolean,
+) {
+  return [
+    nodeName(n, isFile),
+    folderName(n, isFile),
+    connectionName(degree),
+    openingHint(openable),
   ]
     .filter(Boolean)
     .join(", ");
-  const activate = () => {
-    setFocus(n.id);
-    if (openable) onOpenFile?.(n.id);
+}
+
+function factsFor(props: NodeStarProps): NodeFacts {
+  const degree = nodeDegree(props.degree, props.n.id);
+  const radius = nodeRadius(degree);
+  const isFile = props.n.kind === "file";
+  const active = nodeState(props.n, props.hovered, props.focusId);
+  const neighbour = isNeighbour(props.focusNeighbors, props.n.id);
+  const openable = isOpenable(isFile, props.onOpenFile);
+  return {
+    degree,
+    radius,
+    isFile,
+    active,
+    neighbour,
+    openable,
+    tipLines: tipLines(props.n),
+    hitRadius: Math.max(radius * 1.6, 11 / props.view.k),
+    label: ariaLabel(props.n, degree, isFile, openable),
   };
-  // Where the press started, so a press that MOVED is not treated as a click.
-  // Opening a file unmounts the whole map — pan, zoom, filters and selection go
-  // with it — and a grab that begins on a star is the ordinary way someone
-  // tries to move the canvas.
+}
+
+function stateClass(active: boolean, neighbour: boolean) {
+  if (active) return " is-active";
+  if (neighbour) return " is-neighbour";
+  return "";
+}
+
+function nodeClass(facts: NodeFacts) {
+  const kind = facts.isFile ? "is-file" : "is-memory";
+  return `room-map-node ${kind}${stateClass(facts.active, facts.neighbour)}`;
+}
+
+function activateNode(
+  n: SimNode,
+  openable: boolean,
+  setFocus: (id: string | null) => void,
+  onOpenFile?: (id: string) => void,
+) {
+  setFocus(n.id);
+  if (openable) onOpenFile?.(n.id);
+}
+
+function movedSincePress(
+  start: { x: number; y: number } | null,
+  e: React.MouseEvent,
+) {
+  if (!start) return false;
+  return Math.hypot(e.clientX - start.x, e.clientY - start.y) > DRAG_SLOP;
+}
+
+function isActivationKey(key: string) {
+  return key === "Enter" || key === " ";
+}
+
+function useNodeInteraction(props: NodeStarProps, facts: NodeFacts) {
   const pressAt = useRef<{ x: number; y: number } | null>(null);
-  const onNodeClick = (ev: React.MouseEvent) => {
+  const activate = () =>
+    activateNode(props.n, facts.openable, props.setFocus, props.onOpenFile);
+  const onNodeClick = (e: React.MouseEvent) => {
     const start = pressAt.current;
     pressAt.current = null;
-    if (start && Math.hypot(ev.clientX - start.x, ev.clientY - start.y) > DRAG_SLOP) return;
+    if (movedSincePress(start, e)) return;
     activate();
   };
+  const onNodeEnter = (e: React.MouseEvent) => {
+    props.setHovered(props.n.id);
+    props.setFocus(props.n.id);
+    props.showTip(e, props.n.name, facts.tipLines);
+  };
+  const onNodeLeave = () => {
+    props.setHovered(null);
+    props.setTip(null);
+  };
+  const onNodeKeyDown = (e: React.KeyboardEvent) => {
+    if (!isActivationKey(e.key)) return;
+    e.preventDefault();
+    activate();
+  };
+  const onPointerDown = (e: React.PointerEvent) => {
+    pressAt.current = { x: e.clientX, y: e.clientY };
+  };
+  return {
+    onNodeClick,
+    onNodeEnter,
+    onNodeLeave,
+    onNodeKeyDown,
+    onPointerDown,
+    onNodeMove: (e: React.MouseEvent) =>
+      props.showTip(e, props.n.name, facts.tipLines),
+    onNodeFocus: () => {
+      props.setHovered(props.n.id);
+      props.setFocus(props.n.id);
+    },
+  };
+}
+
+function SelectionCircle({
+  active,
+  radius,
+  view,
+}: Pick<NodeFacts, "active" | "radius"> & { view: View }) {
+  if (!active) return null;
+  return (
+    <path
+      className="rm-node-circled"
+      d={handCircle(radius * 1.85)}
+      strokeWidth={1.7 / view.k}
+      aria-hidden="true"
+    />
+  );
+}
+
+function NodeGlyph({
+  isFile,
+  radius,
+  view,
+}: Pick<NodeFacts, "isFile" | "radius"> & { view: View }) {
+  if (isFile) {
+    return (
+      <circle className="rm-node-disc" r={radius} strokeWidth={1.4 / view.k} />
+    );
+  }
+  return (
+    <>
+      <circle
+        className="rm-node-ring"
+        r={radius * 0.95}
+        strokeWidth={1.4 / view.k}
+      />
+      <circle className="rm-node-core" r={radius * 0.36} />
+    </>
+  );
+}
+
+/** One node — an inked disc for a file, a ringed dot for a memory — with its
+ * hit target and hover/click wiring (all handlers threaded from the shell). */
+export default function NodeStar(props: NodeStarProps) {
+  const facts = factsFor(props);
+  const interaction = useNodeInteraction(props, facts);
   return (
     <g
-      className={`room-map-node ${isFile ? "is-file" : "is-memory"}${
-        active ? " is-active" : neighbour ? " is-neighbour" : ""
-      }`}
-      transform={`translate(${n.x} ${n.y})`}
-      style={{ cursor: openable ? "pointer" : "default" }}
+      className={nodeClass(facts)}
+      transform={`translate(${props.n.x} ${props.n.y})`}
+      style={{ cursor: facts.openable ? "pointer" : "default" }}
       role="button"
       tabIndex={0}
-      aria-label={label}
-      onMouseEnter={(ev) => {
-        setHovered(n.id);
-        setFocus(n.id); // sticky: label + neighbours persist
-        showTip(ev, n.name, tipLines);
-      }}
-      onMouseMove={(ev) => showTip(ev, n.name, tipLines)}
-      onMouseLeave={() => {
-        setHovered(null);
-        setTip(null);
-      }}
-      onFocus={() => {
-        setHovered(n.id);
-        setFocus(n.id);
-      }}
-      onBlur={() => {
-        setHovered(null);
-        setTip(null);
-      }}
-      onKeyDown={(ev) => {
-        if (ev.key === "Enter" || ev.key === " ") {
-          ev.preventDefault();
-          activate();
-        }
-      }}
-      onPointerDown={(ev) => {
-        pressAt.current = { x: ev.clientX, y: ev.clientY };
-      }}
-      onClick={onNodeClick}
+      aria-label={facts.label}
+      onMouseEnter={interaction.onNodeEnter}
+      onMouseMove={interaction.onNodeMove}
+      onMouseLeave={interaction.onNodeLeave}
+      onFocus={interaction.onNodeFocus}
+      onBlur={interaction.onNodeLeave}
+      onKeyDown={interaction.onNodeKeyDown}
+      onPointerDown={interaction.onPointerDown}
+      onClick={interaction.onNodeClick}
     >
-      <circle className="rm-node-hit" r={hit} />
-      {/* The selected node is CIRCLED, the way you would circle it on paper.
-          A drawn shape, not a colour swap and not a glow — so the selection
-          survives greyscale, and it is also the keyboard indicator, since
-          focusing a node selects it (onFocus above). */}
-      {active && (
-        <path
-          className="rm-node-circled"
-          d={handCircle(r * 1.85)}
-          strokeWidth={1.7 / view.k}
-          aria-hidden="true"
-        />
-      )}
-      {isFile ? (
-        <circle className="rm-node-disc" r={r} strokeWidth={1.4 / view.k} />
-      ) : (
-        <>
-          <circle className="rm-node-ring" r={r * 0.95} strokeWidth={1.4 / view.k} />
-          <circle className="rm-node-core" r={r * 0.36} />
-        </>
-      )}
+      <circle className="rm-node-hit" r={facts.hitRadius} />
+      <SelectionCircle
+        active={facts.active}
+        radius={facts.radius}
+        view={props.view}
+      />
+      <NodeGlyph
+        isFile={facts.isFile}
+        radius={facts.radius}
+        view={props.view}
+      />
     </g>
   );
 }

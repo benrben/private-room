@@ -141,3 +141,47 @@ def test_stops_appending_slides_once_budget_is_spent() -> None:
     assert capped is not None, "first slide"
     assert "slide 1 body text" in capped, f"got: {capped}"
     assert "slide 3 body text" not in capped, f"budget ignored: {capped}"
+
+
+def test_budget_stops_before_notes_followup_parts_and_later_slides() -> None:
+    # Labels count against the aggregate output budget too. A one-byte slide
+    # body produces a labelled result larger than this tiny budget, so no
+    # notes, charts, or later slides may be consulted afterward.
+    data = build_zip(
+        {
+            "ppt/slides/slide1.xml": "x",
+            "ppt/slides/slide2.xml": "y",
+            "ppt/charts/chart1.xml": "a chart value",
+        }
+    )
+    text = pptx._extract_pptx_budgeted(data, 1)
+    assert text == "[slide 1]\nx\n"
+
+
+def test_skips_single_word_notes_charts_and_diagrams() -> None:
+    data = build_zip(
+        {
+            "ppt/slides/slide1.xml": "body",
+            "ppt/notesSlides/notesSlide1.xml": "alone",
+            "ppt/charts/chart1.xml": "alone",
+            "ppt/diagrams/data1.xml": "alone",
+        }
+    )
+    text = pptx._extract_pptx_budgeted(data, 1_000)
+    assert text == "[slide 1]\nbody\n"
+
+
+def test_returns_none_when_a_part_exceeds_the_remaining_budget() -> None:
+    data = build_zip({"ppt/charts/chart1.xml": "a chart value"})
+    assert pptx._extract_pptx_budgeted(data, 1) is None
+
+
+def test_helper_paths_match_the_rust_style_part_rules() -> None:
+    assert pptx.slide_number("ppt/slides/slideNaN.xml") is None
+    assert pptx.notes_part(b"", "slide.xml", 4) == "ppt/notesSlides/notesSlide4.xml"
+    assert pptx.resolve_part("ppt/slides", "/ppt/notesSlides/notesSlide1.xml") == (
+        "ppt/notesSlides/notesSlide1.xml"
+    )
+    assert pptx.resolve_part("ppt/slides", "./../notesSlides/notesSlide1.xml") == (
+        "ppt/notesSlides/notesSlide1.xml"
+    )

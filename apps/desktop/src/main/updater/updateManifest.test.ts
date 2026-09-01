@@ -98,6 +98,12 @@ describe("parseUpdateManifest — pub_date is a HARD failure", () => {
     ).toThrow(/pub_date/);
   });
 
+  it("rejects a non-string pub_date instead of silently treating it as absent", () => {
+    expect(() => parseUpdateManifest('{"version":"1.0.0","pub_date":42,"platforms":{}}')).toThrow(
+      /pub_date/,
+    );
+  });
+
   it("an omitted or null pub_date is fine", () => {
     expect(parseUpdateManifest('{"version":"1.0.0","platforms":{}}').pubDate).toBeUndefined();
     expect(parseUpdateManifest('{"version":"1.0.0","pub_date":null,"platforms":{}}').pubDate).toBeUndefined();
@@ -144,6 +150,18 @@ describe("parseUpdateManifest — Static vs Dynamic", () => {
       /'notes' must be a string/,
     );
     expect(parseUpdateManifest('{"version":"1.0.0","notes":null,"platforms":{}}').notes).toBeUndefined();
+  });
+
+  it("rejects a non-string top-level signature before selecting the manifest form", () => {
+    expect(() => parseUpdateManifest('{"version":"1.0.0","signature":42,"platforms":{}}')).toThrow(
+      /'signature' must be a string/,
+    );
+  });
+
+  it("rejects a present platforms value that is not an object", () => {
+    expect(() => parseUpdateManifest('{"version":"1.0.0","platforms":[]}')).toThrow(
+      /'platforms' must be an object/,
+    );
   });
 
   it("an unparseable url fails, even at the top level of a Static manifest", () => {
@@ -266,6 +284,9 @@ describe("semver comparison", () => {
     for (let i = 0; i + 1 < order.length; i++) {
       expect(compareSemVer(parseSemVer(order[i]!), parseSemVer(order[i + 1]!)), `${order[i]} < ${order[i + 1]}`).toBe(-1);
     }
+    // The inverse proves the shorter RIGHT side takes the higher-precedence
+    // branch; both directions matter after the comparator's loop was split.
+    expect(compareSemVer(parseSemVer("1.0.0-alpha.1"), parseSemVer("1.0.0-alpha"))).toBe(1);
   });
 
   it("ignores build metadata", () => {

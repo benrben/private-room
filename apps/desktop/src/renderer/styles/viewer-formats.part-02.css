@@ -1,0 +1,154 @@
+
+.html-view .html-doc,
+.book-view .html-doc,
+.odoc-view .html-doc {
+  max-width: var(--doc-measure);
+  margin: 0 auto;
+  padding: var(--doc-pad-b) var(--doc-pad-i) calc(var(--doc-pad-b) * 2);
+  background: var(--doc-paper);
+  border: var(--stroke-w) solid var(--doc-edge);
+  border-radius: var(--radius-lg);
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+/* Markup is technical content — mono earns its place. */
+.html-view .html-src .html-doc {
+  font-family: var(--mono);
+  font-size: var(--fs-meta);
+  line-height: 1.6;
+  tab-size: 2;
+}
+/* The page's own words are prose — interface face, page measure, and the
+   fallback chain that keeps Hebrew and CJK rendering. */
+.html-view .html-text .html-doc,
+.book-view .book-text .html-doc,
+.odoc-view .odoc-text .html-doc {
+  font-family: var(--sans);
+  font-size: var(--fs-lead);
+  line-height: 1.7;
+}
+
+/* ---- image annotation ---- */
+
+.image-view {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.locate-bar {
+  display: flex;
+  gap: 8px;
+}
+
+.locate-bar input {
+  flex: 1;
+  font-size: 13px;
+}
+
+.img-wrap {
+  position: relative;
+  display: inline-block;
+  align-self: flex-start;
+  max-width: 100%;
+}
+
+/* The image viewer proper: the picture centers in its own scroll container
+   (chat thumbnails keep the plain inline .img-wrap above), and a zoomed
+   image scrolls instead of squeezing. */
+.img-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.img-scroll .img-wrap {
+  display: block;
+  width: fit-content;
+  margin: 0 auto;
+}
+
+/* Same zoom pill as the PDF viewer, sat in the image toolbar row — and it
+   keeps `.pdf-zoombar`'s sticky, because zooming a scan to 400% to read a
+   stamp is the exact moment the control must not scroll away. */
+.img-zoombar {
+  margin-bottom: 0;
+}
+
+.img-wrap img {
+  display: block;
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+}
+
+.img-box {
+  position: absolute;
+  border: 2.5px solid;
+  border-radius: 4px 2px 5px 3px / 3px 5px 2px 4px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+}
+
+.img-wrap.chat-img {
+  margin-top: 10px;
+}
+
+.img-wrap.chat-img img {
+  max-height: 340px;
+}
+
+.img-box-label {
+  position: absolute;
+  top: -22px;
+  left: -2px;
+  color: var(--btn-ink-text);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px var(--sp-2);
+  border-radius: 4px 2px 5px 3px / 3px 5px 2px 4px;
+  white-space: nowrap;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+
+/* The words OCR read off a picture, under it and folded away. A scan that was
+   read WRONG is only correctable by someone who can see what was read. */
+.img-ocr {
+  flex: 0 0 auto;
+  margin: 8px 0 0;
+  padding: var(--sp-2) 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2, transparent);
+}
+.img-ocr > summary {
+  cursor: pointer;
+  font-size: var(--fs-meta);
+  color: var(--text-dim);
+}
+.img-ocr-count {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.img-ocr-note {
+  margin: 8px 0 4px;
+  font-size: var(--fs-micro);
+  color: var(--text-dim);
+}
+/* OCR output is a document's prose — a scanned letter, a receipt, a Hebrew
+   page — so it is drawn in the interface face, not the one reserved for wire
+   formats. TWO classes on purpose: this is a <pre>, and `.viewer-body pre`
+   (styles/viewer.css) is (0,1,1), so a single class loses and both the face
+   and the size silently stay whatever that rule says. */
+.image-view .img-ocr-text {
+  margin: 0;
+  max-height: 40vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--sans);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  user-select: text;
+}

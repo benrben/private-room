@@ -7,12 +7,7 @@ import {
 } from "react";
 import { jobMeter } from "./jobProgress";
 import {
-  api,
   RoomInfo,
-  splitExternalModel,
-  type HarnessApprovalDecision,
-  type HarnessCapabilities,
-  type HarnessProvider,
 } from "../api";
 import {
   ActivityIcon,
@@ -51,11 +46,15 @@ import {
   runningJobCount,
 } from "../shell/activity";
 import {
-  registerHarnessRun,
-  mergeHarnessHistory,
-  resolveHarnessApproval,
-  type HarnessUiRun,
-} from "./harnessUi";
+  groupHistoryRuns,
+  HarnessRunner,
+  HistoryEntry,
+  StateTape,
+} from "./aiActivityRows";
+
+export { groupHistoryRuns } from "./aiActivityRows";
+
+const STEP_KINDS: readonly string[] = ["studio", "podcast_audio"];
 
 /** Not a scope. The last option in the scope select opens the sources list
  * rather than changing what the turn reads — see the strip below for why it
@@ -65,31 +64,106 @@ const PICK_FILES = "__pick_files";
 /** The tab order the strip renders, and the order the arrow keys walk. */
 const AI_TABS = ["chat", "studio", "activity"] as const;
 
-/** Job kinds that narrate themselves through `studio-step` rather than through
- * `job-progress`. Both emit one progress event ("Starting…") and then go quiet
- * for minutes; the podcast recorder is on the list because its steps include
- * the one saying every line is sent to a cloud voice service, which is a
- * privacy consequence and must not go unsaid because the row that carried it
- * was folded into the job's own. Emitters: commands/studios.rs and
- * commands/studios/podcast_audio.rs. */
-const STEP_KINDS: readonly string[] = ["studio", "podcast_audio"];
-
 /** Pane 3: persistent Chat / Studio / Activity tabs. Chat keeps the entire
  * existing conversation surface; Studio hosts the room's transformations;
  * Activity centralizes background jobs, imports, saves, and approvals. */
-export default function AiPane({
-  s,
-  a,
-  info,
-  layout,
-  area,
-}: {
+type AiPaneProps = {
   s: WSState;
   a: WSActions;
   info: RoomInfo;
   layout: LayoutApi;
   area: WorkArea;
+};
+
+function activityTabLabel(pendingApprovals: number, jobsRunning: number) {
+  if (pendingApprovals > 0) return "Activity — something needs your approval";
+  if (jobsRunning > 0) return "Activity — background work is running";
+  return "Activity";
+}
+
+function activityBadge(pendingApprovals: number, jobsRunning: number) {
+  if (pendingApprovals > 0) return <span className="nb-circled nb-sem-pending ap-tab-count" aria-hidden="true" title="Something needs your approval">{pendingApprovals}</span>;
+  if (jobsRunning > 0) return <span className="ap-tab-live" aria-hidden="true" title="Background work is running" />;
+  return null;
+}
+
+function tabDestination(key: string, current: number) {
+  if (key === "ArrowLeft") return (current + AI_TABS.length - 1) % AI_TABS.length;
+  if (key === "ArrowRight") return (current + 1) % AI_TABS.length;
+  if (key === "Home") return 0;
+  if (key === "End") return AI_TABS.length - 1;
+  return -1;
+}
+
+function AiTabButton({ tab, active, setTab, children, label }: {
+  tab: typeof AI_TABS[number];
+  active: typeof AI_TABS[number];
+  setTab: WSState["setAiTab"];
+  children: React.ReactNode;
+  label: string;
 }) {
+  return (
+    <button id={`ai-tab-${tab}`} className="assistant-tab" role="tab" aria-selected={active === tab} tabIndex={active === tab ? 0 : -1} aria-label={label} data-tip={tab[0].toUpperCase() + tab.slice(1)} onClick={() => setTab(tab)}>
+      {children}
+    </button>
+  );
+}
+
+function AiTabs({ s, layout, pendingApprovals, jobsRunning }: Pick<AiPaneProps, "s" | "layout"> & { pendingApprovals: number; jobsRunning: number }) {
+  const onTabKey = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const from = AI_TABS.indexOf(s.aiTab);
+    if (from < 0 || !(event.target as HTMLElement).closest(".assistant-tab")) return;
+    const to = tabDestination(event.key, from);
+    if (to < 0) return;
+    event.preventDefault();
+    s.setAiTab(AI_TABS[to]);
+    document.getElementById(`ai-tab-${AI_TABS[to]}`)?.focus();
+  };
+  return (
+    <div className="assistant-header" role="tablist" aria-label="AI tools" onKeyDown={onTabKey}>
+      <AiTabButton tab="chat" active={s.aiTab} setTab={s.setAiTab} label="Chat"><ChatBubbleIcon size={14} /><span>Chat</span></AiTabButton>
+      <AiTabButton tab="studio" active={s.aiTab} setTab={s.setAiTab} label="Studio"><SparkIcon size={14} /><span>Studio</span></AiTabButton>
+      <AiTabButton tab="activity" active={s.aiTab} setTab={s.setAiTab} label={activityTabLabel(pendingApprovals, jobsRunning)}><ActivityIcon size={14} /><span>Activity</span>{activityBadge(pendingApprovals, jobsRunning)}</AiTabButton>
+      <div className="pane-actions">
+        <button className="pane-icon-btn" data-tip="Focus this pane" aria-label="Give the AI pane the full width" onClick={() => layout.toggleFocus("ai")}><FocusIcon size={14} /></button>
+        <button className="pane-icon-btn" data-tip="Collapse" aria-label="Collapse the AI pane" onClick={() => layout.collapsePane("ai")}><CollapseRightIcon size={14} /></button>
+      </div>
+    </div>
+  );
+}
+
+function ChatView({ s, a, info, layout, subject, view, setChosen, cloud, trust }: {
+  s: WSState;
+  a: WSActions;
+  info: RoomInfo;
+  layout: LayoutApi;
+  subject: Parameters<typeof chatScope>[0];
+  view: ReturnType<typeof chatScope>;
+  setChosen: (value: BrowserScope) => void;
+  cloud: boolean;
+  trust: ReturnType<typeof trustState>;
+}) {
+  const chooseScope = (value: string) => {
+    if (value === PICK_FILES) {
+      s.setLibraryTab("sources");
+      layout.showPane("library");
+      return;
+    }
+    setChosen(value as BrowserScope);
+  };
+  return (
+    <>
+      <div className="context-strip">
+        <span className="context-label"><span className="context-label-prefix">Answering from </span><select className="context-scope" aria-label="What this chat answers from" title="Change what this chat answers from" value={view.scope} onChange={(event) => chooseScope(event.target.value)}>{view.available.map((scope) => <option key={scope} value={scope}>{scopeLabel(scope, subject)}</option>)}<option value={PICK_FILES}>{s.attachments.length > 0 ? "Change which files are attached…" : "Choose files…"}</option></select></span>
+        {view.sendsPageText && cloud && <span className="context-leaves" title={trust.title}>The page’s text will leave your Mac.</span>}
+        <span className={`local-mini ${trust.tone}`} title={trust.title}>{cloud ? <CloudIcon size={12} /> : <span className="status-dot" aria-hidden />}<span>{trust.label}</span></span>
+      </div>
+      <ChatPane s={s} a={a} info={info} />
+    </>
+  );
+}
+
+export default function AiPane({ s, a, info, layout, area }: AiPaneProps) {
   // One definition, shared with the status bar and the Activity list — see
   // ../shell/activity.
   const pendingApprovals = pendingApprovalCount(s);
@@ -128,182 +202,11 @@ export default function AiPane({
     setTurnScope(view);
     return () => setTurnScope(ROOM_ONLY);
   }, [view]);
-  // A `role="tablist"` owes Left/Right and Home/End, and ONE Tab stop rather
-  // than one per tab — the same contract shell/TabStrip.tsx keeps. This strip
-  // announced the pattern and answered none of it, on the pane a person meets
-  // every session. The header also holds the pane's own icon buttons, so the
-  // handler acts only when a tab has the focus.
-  const onTabKey = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    const from = AI_TABS.indexOf(s.aiTab);
-    if (from < 0 || !(e.target as HTMLElement).closest(".assistant-tab")) return;
-    const to =
-      e.key === "ArrowLeft"
-        ? (from + AI_TABS.length - 1) % AI_TABS.length
-        : e.key === "ArrowRight"
-          ? (from + 1) % AI_TABS.length
-          : e.key === "Home"
-            ? 0
-            : e.key === "End"
-              ? AI_TABS.length - 1
-              : -1;
-    if (to < 0) return;
-    e.preventDefault();
-    s.setAiTab(AI_TABS[to]);
-    document.getElementById(`ai-tab-${AI_TABS[to]}`)?.focus();
-  };
   return (
     <>
-      <div
-        className="assistant-header"
-        role="tablist"
-        aria-label="AI tools"
-        onKeyDown={onTabKey}
-      >
-        <button
-          id="ai-tab-chat"
-          className="assistant-tab"
-          role="tab"
-          aria-selected={s.aiTab === "chat"}
-          tabIndex={s.aiTab === "chat" ? 0 : -1}
-          aria-label="Chat"
-          data-tip="Chat"
-          onClick={() => s.setAiTab("chat")}
-        >
-          <ChatBubbleIcon size={14} />
-          <span>Chat</span>
-        </button>
-        <button
-          id="ai-tab-studio"
-          className="assistant-tab"
-          role="tab"
-          aria-selected={s.aiTab === "studio"}
-          tabIndex={s.aiTab === "studio" ? 0 : -1}
-          aria-label="Studio"
-          data-tip="Studio"
-          onClick={() => s.setAiTab("studio")}
-        >
-          <SparkIcon size={14} />
-          <span>Studio</span>
-        </button>
-        <button
-          id="ai-tab-activity"
-          className="assistant-tab"
-          role="tab"
-          aria-selected={s.aiTab === "activity"}
-          tabIndex={s.aiTab === "activity" ? 0 : -1}
-          aria-label={
-            pendingApprovals > 0
-              ? "Activity — something needs your approval"
-              : jobsRunning > 0
-                ? "Activity — background work is running"
-                : "Activity"
-          }
-          data-tip="Activity"
-          onClick={() => s.setAiTab("activity")}
-        >
-          <ActivityIcon size={14} />
-          <span>Activity</span>
-          {/* Two different things used to share one 6px dot in two different
-              colours, so "something needs your approval" and "work is running"
-              were told apart by hue alone. They are different SHAPES now — a
-              hand-circled count and a live dot — and the count says how many.
-              The tab's own aria-label still carries the words. */}
-          {pendingApprovals > 0 ? (
-            <span
-              className="nb-circled nb-sem-pending ap-tab-count"
-              aria-hidden="true"
-              title="Something needs your approval"
-            >
-              {pendingApprovals}
-            </span>
-          ) : jobsRunning > 0 ? (
-            <span
-              className="ap-tab-live"
-              aria-hidden="true"
-              title="Background work is running"
-            />
-          ) : null}
-        </button>
-        <div className="pane-actions">
-          <button
-            className="pane-icon-btn"
-            data-tip="Focus this pane"
-            aria-label="Give the AI pane the full width"
-            onClick={() => layout.toggleFocus("ai")}
-          >
-            <FocusIcon size={14} />
-          </button>
-          <button
-            className="pane-icon-btn"
-            data-tip="Collapse"
-            aria-label="Collapse the AI pane"
-            onClick={() => layout.collapsePane("ai")}
-          >
-            <CollapseRightIcon size={14} />
-          </button>
-        </div>
-      </div>
+      <AiTabs s={s} layout={layout} pendingApprovals={pendingApprovals} jobsRunning={jobsRunning} />
 
-      {s.aiTab === "chat" && (
-        <>
-          <div className="context-strip">
-            <span className="context-label">
-              <span className="context-label-prefix">Answering from </span>
-              {/* One control, always. This slot used to be a select when a page
-                  was on screen and a button that navigated away when one was
-                  not — the same appearance for two different acts, and no route
-                  to the sources list at all while the select was showing. The
-                  files option stays last and is not a scope; it opens the list
-                  and leaves the chosen scope alone. Nothing may float over the
-                  native web page — but this is the sibling pane, so a plain
-                  select is exactly what it looks like. */}
-              <select
-                className="context-scope"
-                aria-label="What this chat answers from"
-                title="Change what this chat answers from"
-                value={view.scope}
-                onChange={(e) => {
-                  if (e.target.value === PICK_FILES) {
-                    s.setLibraryTab("sources");
-                    layout.showPane("library");
-                    return;
-                  }
-                  setChosen(e.target.value as BrowserScope);
-                }}
-              >
-                {view.available.map((k) => (
-                  <option key={k} value={k}>
-                    {scopeLabel(k, subject)}
-                  </option>
-                ))}
-                <option value={PICK_FILES}>
-                  {s.attachments.length > 0
-                    ? "Change which files are attached…"
-                    : "Choose files…"}
-                </option>
-              </select>
-            </span>
-            {/* The consequence of the scope, in the words the composer's own
-                cloud strip uses for the same fact. Only when it is true: on a
-                local route the page text is read and answered on this Mac, and
-                the trust pill beside this already says so. */}
-            {view.sendsPageText && cloud && (
-              <span className="context-leaves" title={trust.title}>
-                The page’s text will leave your Mac.
-              </span>
-            )}
-            <span className={`local-mini ${trust.tone}`} title={trust.title}>
-              {cloud ? (
-                <CloudIcon size={12} />
-              ) : (
-                <span className="status-dot" aria-hidden />
-              )}
-              <span>{trust.label}</span>
-            </span>
-          </div>
-          <ChatPane s={s} a={a} info={info} />
-        </>
-      )}
+      {s.aiTab === "chat" && <ChatView s={s} a={a} info={info} layout={layout} subject={subject} view={view} setChosen={setChosen} cloud={cloud} trust={trust} />}
 
       {s.aiTab === "studio" && <StudioView s={s} a={a} area={area} />}
 
@@ -354,111 +257,160 @@ function useOpenSketch(openFile: WSState["openFile"]): OpenSketch | null {
 
 /* ---------- Studio tab ---------- */
 
-function StudioView({
-  s,
-  a,
-  area,
-}: {
-  s: WSState;
-  a: WSActions;
-  area: WorkArea;
-}) {
+function hasSummaryJob(jobs: WSState["jobs"]) {
+  return jobs.some((job) => job.kind === "deep_summary" && (job.status === "running" || job.status === "queued"));
+}
+
+function StudioStep({ s }: { s: WSState }) {
+  if (!s.studioStep.text) return null;
+  return <div className="studio-running" role="status"><span className="nb-tape nb-sem-pending">Working</span><span className={s.studioStep.local ? "studio-running-step" : "studio-running-cloud"}>{s.studioStep.text}</span></div>;
+}
+
+function StudioSummary({ s, a }: { s: WSState; a: WSActions }) {
+  const working = s.summaryStarting || hasSummaryJob(s.jobs);
+  return (
+    <button className="studio-row ap-sig-d" disabled={s.files.length === 0 || working} title="Write a short overview of this room and what's inside — runs in the background" onClick={() => void a.startDeepSummary()}>
+      <span className="studio-row-icon"><SparkIcon size={14} /></span>
+      <span className="studio-row-text"><span className="studio-row-title">Summarize the room</span><span className="studio-row-copy">A cited overview of everything inside</span></span>
+      <span className={`studio-row-state${working ? " is-working nb-tape nb-sem-pending" : ""}`}>{working ? "Working…" : "Create"}</span>
+    </button>
+  );
+}
+
+function StudioPrivacyNote({ s }: { s: WSState }) {
+  const location = isCloudRoute(s.model, s.ai) ? " — but the current engine is a cloud model, so prompts leave this Mac" : ", processed on this Mac";
+  return <div className="studio-note nb-taped"><strong>Private by design.</strong> Studio uses only this room's content{location}.</div>;
+}
+
+function PodcastStudio({ scope, s, a }: { scope: string; s: WSState; a: WSActions }) {
+  return <div className="studio-tab-view"><p className="studio-intro">Give this script voices and record it. Each host reads in their own voice; the finished episode is saved back into the room.</p><PodcastPanel fileId={scope} s={s} a={a} /></div>;
+}
+
+function StudioView({ s, a, area }: { s: WSState; a: WSActions; area: WorkArea }) {
   void area;
   const scope = s.openFile?.id;
-  // The row may only report on the work it starts. Read across every job kind,
-  // this greyed itself out and said "Working…" about a film run or a flashcard
-  // deck — a false reading on the one row whose state a person waits on. The
-  // kind is the same one `startDeepSummary` tests before deciding anything.
-  const summaryRunning = s.jobs.some(
-    (j) =>
-      j.kind === "deep_summary" &&
-      (j.status === "running" || j.status === "queued"),
-  );
-  const working = s.summaryStarting || summaryRunning;
-  // A podcast script's own panel takes over the top of this tab. It is the one
-  // thing you can make FROM this particular file, and burying it under the
-  // three generic "make something new" cards would put the least discoverable
-  // action furthest down.
-  if (s.openPodcast && scope) {
-    return (
-      <div className="studio-tab-view">
-        <p className="studio-intro">
-          Give this script voices and record it. Each host reads in their own
-          voice; the finished episode is saved back into the room.
-        </p>
-        <PodcastPanel fileId={scope} s={s} a={a} />
-      </div>
-    );
-  }
+  if (s.openPodcast && scope) return <PodcastStudio scope={scope} s={s} a={a} />;
   return (
     <div className="studio-tab-view">
-      <p className="studio-intro">
-        Turn {scope ? "the open file" : "this room's sources"} into something
-        useful. Outputs are saved back into the room.
-      </p>
-      {/* AUDIT 262 named the step the host has always emitted; it only ever
-          reached Activity. On a local model a deck takes minutes, so the tab
-          you pressed Create on showed no sign of anything happening at all.
-          The word carries it, the pending marker only agrees. */}
-      {s.studioStep.text && (
-        <div className="studio-running" role="status">
-          <span className="nb-tape nb-sem-pending">Working</span>
-          {/* A cloud stage says room content is leaving this Mac, which is a
-              consequence, not an aside — so it drops the hand and takes the
-              caution note, exactly as the chat's route line does for the same
-              fact (see .chat-route / .chat-route-cloud in chat.css). The flag
-              comes from the event, never from matching the sentence. */}
-          <span
-            className={
-              s.studioStep.local ? "studio-running-step" : "studio-running-cloud"
-            }
-          >
-            {s.studioStep.text}
-          </span>
-        </div>
-      )}
+      <p className="studio-intro">Turn {scope ? "the open file" : "this room's sources"} into something useful. Outputs are saved back into the room.</p>
+      <StudioStep s={s} />
       <StudioShelf scope={scope} s={s} a={a} />
       <div className="studio-section-title">Whole room</div>
-      {/* No category hue on this one, deliberately: the three cards above make
-          an artefact, this one is about the room itself, and the bare pencil
-          tile is the difference. */}
-      <button
-        className="studio-row ap-sig-d"
-        disabled={s.files.length === 0 || working}
-        title="Write a short overview of this room and what's inside — runs in the background"
-        onClick={() => void a.startDeepSummary()}
-      >
-        <span className="studio-row-icon">
-          <SparkIcon size={14} />
-        </span>
-        <span className="studio-row-text">
-          <span className="studio-row-title">Summarize the room</span>
-          <span className="studio-row-copy">
-            A cited overview of everything inside
-          </span>
-        </span>
-        <span
-          className={`studio-row-state${working ? " is-working nb-tape nb-sem-pending" : ""}`}
-        >
-          {working ? "Working…" : "Create"}
-        </span>
-      </button>
-      <div className="studio-note nb-taped">
-        <strong>Private by design.</strong> Studio uses only this room's
-        content{isCloudRoute(s.model, s.ai) ? " — but the current engine is a cloud model, so prompts leave this Mac" : ", processed on this Mac"}.
-      </div>
+      <StudioSummary s={s} a={a} />
+      <StudioPrivacyNote s={s} />
     </div>
   );
 }
 
 /* ---------- Activity tab ---------- */
 
-/** A job's state as a WORD, plus the product-wide marker meaning that agrees
- * with it. Activity is the surface a person audits background work from, so
- * nothing here is signalled by hue alone: the tape carries the word, and the
- * marker is the second, redundant cue. Blue is "active", yellow "pending or
- * waiting on you", red "failed", green "complete" — the same five meanings
- * the rest of the product uses, never repurposed locally. */
+function useElapsed(jobActive: boolean) {
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    if (!jobActive) return;
+    const timer = window.setInterval(() => setNowTick(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [jobActive]);
+  return useMemo(() => (createdAt: string) => {
+    const start = Date.parse(createdAt);
+    if (Number.isNaN(start)) return "";
+    const seconds = Math.max(0, Math.round((nowTick - start) / 1000));
+    return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+  }, [nowTick]);
+}
+
+function isSavingRecording(s: WSState) {
+  return s.recSave != null || s.recLive?.status === "saving";
+}
+
+function activityIsEmpty(values: unknown[]) {
+  return !values.some(Boolean);
+}
+
+function ApprovalRows({ s, count }: { s: WSState; count: number }) {
+  if (count === 0) return null;
+  return <><div className="activity-group-title">Needs your approval</div>
+    {s.scriptApprovals.map((request) => <div key={request.id} className="activity-row"><div className="activity-row-head"><span className="activity-row-title">Run script {request.name}?</span><StateTape word="Waiting" mark="nb-sem-pending" /></div><div className="activity-copy">The consent card is open — approving is always your click, never the agent's.</div></div>)}
+    {s.mcpApprovals.map((request) => <McpApprovalRow key={request.id} request={request} />)}
+    {s.browseConsents.map((request) => <div key={request.id} className="activity-row"><div className="activity-row-head"><span className="activity-row-title">Type room information into a page?</span><StateTape word="Waiting" mark="nb-sem-pending" /></div><div className="activity-copy">The assistant wants to type something private into {request.field} — review the open consent card.</div></div>)}
+    {s.editApprovals.map((request) => <div key={request.id} className="activity-row"><div className="activity-row-head"><span className="activity-row-title">Apply AI edits?</span><StateTape word="Diff ready" mark="nb-sem-pending" /></div><div className="activity-copy">Review the proposed change before anything is written.</div></div>)}
+  </>;
+}
+
+function McpApprovalRow({ request }: { request: WSState["mcpApprovals"][number] }) {
+  const title = request.confirm ? `Delete ${request.tool} “${request.server}”?` : `Tool call: ${request.tool}`;
+  const copy = request.confirm ? "The AI asked to delete something that cannot be restored — review the open card." : "A connected tool wants to run — review the open consent card.";
+  return <div className="activity-row"><div className="activity-row-head"><span className="activity-row-title">{title}</span><StateTape word="Waiting" mark="nb-sem-pending" /></div><div className="activity-copy">{copy}</div></div>;
+}
+
+function OcrActivity({ files }: { files: string[] }) {
+  if (files.length === 0) return null;
+  const title = files.length === 1 ? "Reading a scanned page" : `Reading ${files.length} scanned pages`;
+  return <div className="activity-row" role="status"><div className="activity-row-head"><span className="activity-row-title">{title}</span><StateTape word="Running" mark="nb-sem-linked" /></div><div className="activity-copy">{files.join(", ")}</div><div className="activity-progress"><span className="indeterminate" /></div></div>;
+}
+
+function ImportActivity({ progress }: { progress: WSState["importProgress"] }) {
+  if (!progress) return null;
+  const percent = Math.round((progress.done / Math.max(1, progress.total)) * 100);
+  return <div className="activity-row" role="status"><div className="activity-row-head"><span className="activity-row-title">Importing {progress.done + 1} of {progress.total}</span><StateTape word="Running" mark="nb-sem-linked" /></div><div className="activity-copy">{progress.name}</div><div className="activity-progress"><span style={{ width: `${percent}%` }} /></div></div>;
+}
+
+function SummaryStarting({ s }: { s: WSState }) {
+  if (!s.summaryStarting || hasSummaryJob(s.jobs)) return null;
+  return <div className="activity-row" role="status"><div className="activity-row-head"><span className="activity-row-title">Room summary</span><StateTape word="Starting…" mark="nb-sem-linked" /></div><div className="activity-progress"><span className="indeterminate" /></div></div>;
+}
+
+function recordingCopy(s: WSState) {
+  if (s.recSave?.stage === "writing") return "Audio saved — writing into the room…";
+  if (s.recSave && s.recSave.remaining > 0) return `Audio saved — transcribing (${s.recSave.remaining} to go)`;
+  return "Audio saved — finishing the transcript…";
+}
+
+function RecordingActivity({ s, a, elapsedOf }: { s: WSState; a: WSActions; elapsedOf: (createdAt: string) => string }) {
+  if (!isSavingRecording(s)) return null;
+  const openFile = () => { if (s.recLive?.fileId) void a.viewFile(s.recLive.fileId); };
+  return <div className="activity-row" role="status"><div className="activity-row-head"><span className="activity-row-title">Saving recording</span><StateTape word="Saving" mark="nb-sem-linked" />{s.recSave && <span className="activity-state">{elapsedOf(s.recSave.startedAt)}</span>}</div><div className="activity-copy ap-note">{recordingCopy(s)}</div>{s.recLive?.fileId && <div className="activity-row-actions"><button className="subtle" title="Open the recording" onClick={openFile}>Open</button></div>}</div>;
+}
+
+function LiveActivity({ s, a, running, parked, elapsedOf }: { s: WSState; a: WSActions; running: WorkspaceJob[]; parked: WorkspaceJob[]; elapsedOf: (createdAt: string) => string }) {
+  const saving = isSavingRecording(s);
+  const hasLive = [running.length, s.summaryStarting, s.importProgress, s.ocrFiles.length, saving].some(Boolean);
+  return <section className="activity-live" aria-label="Work happening now">{hasLive && <div className="activity-group-title">Running now</div>}<OcrActivity files={s.ocrFiles} /><ImportActivity progress={s.importProgress} /><SummaryStarting s={s} /><RecordingActivity s={s} a={a} elapsedOf={elapsedOf} />{running.map((job) => <JobRow key={job.id} j={job} s={s} a={a} elapsedOf={elapsedOf} />)}{parked.length > 0 && <div className="activity-group-title">Stopped — waiting for you</div>}{parked.map((job) => <JobRow key={job.id} j={job} s={s} a={a} elapsedOf={elapsedOf} />)}</section>;
+}
+
+function OrganizedActivity({ records }: { records: WSState["organized"] }) {
+  if (records.length === 0) return null;
+  return <section className="activity-organized" aria-label="Organised by the assistant"><div className="activity-group-title">Library changes <span className="activity-history-note">made by the assistant, at your request</span></div>{records.map((record) => <OrganizedRow key={record.seq} record={record} />)}</section>;
+}
+
+function OrganizedRow({ record }: { record: WSState["organized"][number] }) {
+  const title = record.linked ? "Added" : "Removed";
+  const copy = record.linked ? "Home’s Library now lists it too. It stayed in its own section, and nothing was copied." : "Home’s Library no longer lists it. The object itself is untouched, in its own section.";
+  return <div className="activity-row history"><div className="activity-row-head"><span className="activity-row-title">{title} “{displayName(record.name)}”</span><StateTape word="Done" mark="nb-sem-done" /></div><div className="activity-copy ap-note">{copy}</div></div>;
+}
+
+function HistoryActivity({ history, shown }: { history: WorkspaceJob[]; shown: WorkspaceJob[] }) {
+  if (shown.length === 0) return null;
+  const note = history.length > shown.length ? `the ${shown.length} most recent of ${history.length} — a record, nothing to act on` : "a record, nothing to act on";
+  return <section className="activity-history" aria-label="What already happened"><div className="activity-group-title">History <span className="activity-history-note">{note}</span></div>{groupHistoryRuns(shown).map((group) => <HistoryEntry key={group[0].id} jobs={group} />)}</section>;
+}
+
+function IdleActivity({ show }: { show: boolean }) {
+  if (!show) return null;
+  return <div className="activity-empty"><ActivityIcon size={16} /><p>The room is idle. Work you start will show its progress here.</p></div>;
+}
+
+function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
+  const pending = pendingApprovalCount(s);
+  const { active: running, parked, history } = groupActivity(s.jobs);
+  const shown = history.slice(0, HISTORY_LIMIT);
+  const organized = s.organized.slice(0, HISTORY_LIMIT);
+  const runs = Object.values(s.harnessRuns ?? {}).sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+  const elapsedOf = useElapsed(runningJobCount(s) > 0);
+  const idle = activityIsEmpty([pending, runningJobCount(s), parked.length, history.length, organized.length, runs.length, s.importProgress, s.privacyScanning]);
+  return <div className="activity-view"><p className="activity-summary">Background work, imports, saves, and consent requests stay in one predictable place.</p><HarnessRunner s={s} runs={runs} /><ApprovalRows s={s} count={pending} /><LiveActivity s={s} a={a} running={running} parked={parked} elapsedOf={elapsedOf} /><OrganizedActivity records={organized} /><HistoryActivity history={history} shown={shown} /><IdleActivity show={idle} /></div>;
+}
+
 const JOB_FLAG: Record<string, { word: string; mark: string }> = {
   running: { word: "Running", mark: "nb-sem-linked" },
   queued: { word: "Queued", mark: "nb-sem-pending" },
@@ -467,904 +419,159 @@ const JOB_FLAG: Record<string, { word: string; mark: string }> = {
   done: { word: "Done", mark: "nb-sem-done" },
 };
 
-/** A status this build has never heard of is reported as waiting rather than
- * as anything more definite — the same direction `groupActivity` files it in. */
 function jobFlag(status: string): { word: string; mark: string } {
   return JOB_FLAG[status] ?? { word: "Waiting", mark: "nb-sem-pending" };
 }
 
-/** One strip of tape naming a state. Contains no control, by design: History
- * must render without a single button in it. */
-function StateTape({ word, mark }: { word: string; mark: string }) {
-  return <span className={`nb-tape ${mark} activity-flag`}>{word}</span>;
+type WorkspaceJob = WSState["jobs"][number];
+type JobMeter = ReturnType<typeof jobMeter>;
+
+function queuePosition(job: WorkspaceJob, jobs: WorkspaceJob[]) {
+  return jobs.filter((other) => other.status === "queued" && other.createdAt <= job.createdAt).length;
 }
 
-function ActivityPanel({ s, a }: { s: WSState; a: WSActions }) {
-  // A once-a-second tick so running cards' elapsed time advances. Armed only
-  // while something is actually running.
-  const jobActive = runningJobCount(s) > 0;
-  const [nowTick, setNowTick] = useState(() => Date.now());
-  useEffect(() => {
-    if (!jobActive) return;
-    const t = window.setInterval(() => setNowTick(Date.now()), 1000);
-    return () => window.clearInterval(t);
-  }, [jobActive]);
-  const elapsedOf = useMemo(
-    () => (createdAt: string) => {
-      const start = Date.parse(createdAt);
-      if (Number.isNaN(start)) return "";
-      const s2 = Math.max(0, Math.round((nowTick - start) / 1000));
-      const m = Math.floor(s2 / 60);
-      return `${m}:${String(s2 % 60).padStart(2, "0")}`;
-    },
-    [nowTick],
-  );
+function queueOrdinal(position: number) {
+  return ["th", "st", "nd", "rd"][position] ?? "th";
+}
 
-  const pendingApprovals = pendingApprovalCount(s);
-  // Decision #12: Activity is a live MANAGER and an audit LOG, and the two are
-  // separate places on the screen — not a sort order inside one list. The rule
-  // lives in shell/activity.ts so the counters, the attention dot and this list
-  // can never disagree about which side a job is on.
-  const { active: running, parked, history } = groupActivity(s.jobs);
-  const shownHistory = history.slice(0, HISTORY_LIMIT);
-  // The assistant's organization changes belong in the same half as finished
-  // jobs — something happened, there is nothing to act on — but they are not
-  // jobs and are not grouped or counted as any. They have no duration, no
-  // progress and no run to resume.
-  const organized = s.organized.slice(0, HISTORY_LIMIT);
-  const harnessRuns = Object.values(s.harnessRuns ?? {}).sort((left, right) =>
-    right.startedAt.localeCompare(left.startedAt),
-  );
-  // A recording is "being written out" while EITHER signal is up — the two
-  // arrive a beat apart, and the counters use the same rule.
-  const savingRec = s.recSave != null || s.recLive?.status === "saving";
-  const nothing =
-    pendingApprovals === 0 &&
-    runningJobCount(s) === 0 &&
-    parked.length === 0 &&
-    history.length === 0 &&
-    organized.length === 0 &&
-    harnessRuns.length === 0 &&
-    !s.importProgress &&
-    // The privacy scanner has no job row, so nothing above can see it — and
-    // "The room is idle" is a flat claim this pane would otherwise make while
-    // the scanner is reading every file. It gets no row here on purpose (it is
-    // uncancellable and has nothing to show), so the honest move is to withhold
-    // the claim rather than invent a card for it.
-    !s.privacyScanning;
+function studioStepFor(job: WorkspaceJob, s: WSState) {
+  return STEP_KINDS.includes(job.kind) && s.studioStep.text ? s.studioStep.text : null;
+}
 
+function friendlyJobError(error: string | null) {
+  if (error === "OLLAMA_DOWN") return "The local AI isn't running.";
+  if (error?.startsWith("MODEL_MISSING")) return "The AI model isn't installed.";
+  return error;
+}
+
+function pausedDescription(reason: string | null, meter: JobMeter) {
+  if (reason && meter.figure) return `${reason} Picks up at ${meter.figure.done} of ${meter.figure.total}.`;
+  if (reason) return `${reason} Picks up where it stopped.`;
+  if (meter.figure) return `Paused at ${meter.figure.done} of ${meter.figure.total}`;
+  return "Paused";
+}
+
+function queuedDescription(position: number) {
+  return `Waiting — ${position}${queueOrdinal(position)} in line`;
+}
+
+function runningDescription(step: string | null, liveLabel: string | undefined) {
+  return step ?? liveLabel ?? "Working…";
+}
+
+function stoppedDescription(job: WorkspaceJob, meter: JobMeter) {
+  if (job.status === "error") return friendlyJobError(job.error) ?? "Stopped.";
+  return pausedDescription(job.parkedReason ?? null, meter);
+}
+
+function jobDescription({ job, queued, running, position, step, liveLabel, meter }: {
+  job: WorkspaceJob;
+  queued: boolean;
+  running: boolean;
+  position: number;
+  step: string | null;
+  liveLabel: string | undefined;
+  meter: JobMeter;
+}) {
+  if (queued) return queuedDescription(position);
+  if (running) return runningDescription(step, liveLabel);
+  return stoppedDescription(job, meter);
+}
+
+function JobHeader({ job, running, elapsedOf, dismiss }: {
+  job: WorkspaceJob;
+  running: boolean;
+  elapsedOf: (createdAt: string) => string;
+  dismiss: () => void;
+}) {
   return (
-    <div className="activity-view">
-      <p className="activity-summary">
-        Background work, imports, saves, and consent requests stay in one
-        predictable place.
-      </p>
-
-      <HarnessRunner s={s} runs={harnessRuns} />
-
-      {pendingApprovals > 0 && (
-        <>
-          <div className="activity-group-title">Needs your approval</div>
-          {s.scriptApprovals.map((r) => (
-            <div key={r.id} className="activity-row">
-              <div className="activity-row-head">
-                <span className="activity-row-title">Run script {r.name}?</span>
-                <StateTape word="Waiting" mark="nb-sem-pending" />
-              </div>
-              <div className="activity-copy">
-                The consent card is open — approving is always your click, never
-                the agent's.
-              </div>
-            </div>
-          ))}
-          {s.mcpApprovals.map((r) => (
-            <div key={r.id} className="activity-row">
-              <div className="activity-row-head">
-                <span className="activity-row-title">
-                  {r.confirm ? `Delete ${r.tool} “${r.server}”?` : `Tool call: ${r.tool}`}
-                </span>
-                <StateTape word="Waiting" mark="nb-sem-pending" />
-              </div>
-              <div className="activity-copy">
-                {r.confirm
-                  ? "The AI asked to delete something that cannot be restored — review the open card."
-                  : "A connected tool wants to run — review the open consent card."}
-              </div>
-            </div>
-          ))}
-          {s.browseConsents.map((r) => (
-            <div key={r.id} className="activity-row">
-              <div className="activity-row-head">
-                <span className="activity-row-title">
-                  Type room information into a page?
-                </span>
-                <StateTape word="Waiting" mark="nb-sem-pending" />
-              </div>
-              <div className="activity-copy">
-                The assistant wants to type something private into {r.field} —
-                review the open consent card.
-              </div>
-            </div>
-          ))}
-          {s.editApprovals.map((r) => (
-            <div key={r.id} className="activity-row">
-              <div className="activity-row-head">
-                <span className="activity-row-title">Apply AI edits?</span>
-                <StateTape word="Diff ready" mark="nb-sem-pending" />
-              </div>
-              <div className="activity-copy">
-                Review the proposed change before anything is written.
-              </div>
-            </div>
-          ))}
-        </>
-      )}
-
-      {/* The LIVE half: work in flight and work waiting to be picked back up.
-          Jobs here can be stopped and resumed; the rows that are not jobs — the
-          OCR pass, an import, the recording drain and the optimistic card that
-          answers the summary button before the backend does — carry no control,
-          because there is nothing to interrupt. */}
-      <section className="activity-live" aria-label="Work happening now">
-        {(running.length > 0 ||
-          s.summaryStarting ||
-          s.importProgress ||
-          s.ocrFiles.length > 0 ||
-          savingRec) && (
-          <div className="activity-group-title">Running now</div>
-        )}
-
-        {/* AUDIT 262: a scanned page being read. The host has emitted this the
-            whole time and nothing listened, so a vision pass that runs for
-            minutes on a local model showed no sign of activity anywhere. */}
-        {s.ocrFiles.length > 0 && (
-          <div className="activity-row" role="status">
-            <div className="activity-row-head">
-              <span className="activity-row-title">
-                Reading {s.ocrFiles.length === 1 ? "a scanned page" : `${s.ocrFiles.length} scanned pages`}
-              </span>
-              <StateTape word="Running" mark="nb-sem-linked" />
-            </div>
-            {/* Filenames, so the interface sans — the hand is for the aside,
-                never for a path or a name the user has to match by eye. */}
-            <div className="activity-copy">{s.ocrFiles.join(", ")}</div>
-            <div className="activity-progress">
-              <span className="indeterminate" />
-            </div>
-          </div>
-        )}
-
-        {/* AUDIT 262's Studio step had its own card here, beside the JobRow for
-            the same run: one card carried the words and no Stop, the other
-            carried Stop and the stale "Starting…" the backend emits once. The
-            step is on that JobRow now — one card per run. */}
-
-        {s.importProgress && (
-          <div className="activity-row" role="status">
-            <div className="activity-row-head">
-              <span className="activity-row-title">
-                Importing {s.importProgress.done + 1} of {s.importProgress.total}
-              </span>
-              <StateTape word="Running" mark="nb-sem-linked" />
-            </div>
-            <div className="activity-copy">{s.importProgress.name}</div>
-            <div className="activity-progress">
-              <span
-                style={{
-                  width: `${Math.round((s.importProgress.done / Math.max(1, s.importProgress.total)) * 100)}%`,
-                }}
-              />
-            </div>
-          </div>
-        )}
-
-        {/* The summary command can take seconds to RESOLVE on a cold local
-            model; this optimistic card shows the instant the button is pressed,
-            so a click is never silent. */}
-        {s.summaryStarting &&
-          !s.jobs.some(
-            (j) =>
-              j.kind === "deep_summary" &&
-              (j.status === "running" || j.status === "queued"),
-          ) && (
-            <div className="activity-row" role="status">
-              <div className="activity-row-head">
-                <span className="activity-row-title">Room summary</span>
-                <StateTape word="Starting…" mark="nb-sem-linked" />
-              </div>
-              <div className="activity-progress">
-                <span className="indeterminate" />
-              </div>
-            </div>
-          )}
-
-        {/* A recording being finalized keeps a visible card here, so leaving
-            the recording view never turns the save into a mystery. The audio
-            is already durable when this card appears — the label says so. */}
-        {savingRec && (
-          <div className="activity-row" role="status">
-            <div className="activity-row-head">
-              <span className="activity-row-title">Saving recording</span>
-              <StateTape word="Saving" mark="nb-sem-linked" />
-              {s.recSave && (
-                <span className="activity-state">{elapsedOf(s.recSave.startedAt)}</span>
-              )}
-            </div>
-            <div className="activity-copy ap-note">
-              {s.recSave?.stage === "writing"
-                ? "Audio saved — writing into the room…"
-                : s.recSave && s.recSave.remaining > 0
-                  ? `Audio saved — transcribing (${s.recSave.remaining} to go)`
-                  : "Audio saved — finishing the transcript…"}
-            </div>
-            {s.recLive?.fileId && (
-              <div className="activity-row-actions">
-                <button
-                  className="subtle"
-                  title="Open the recording"
-                  onClick={() => {
-                    const id = s.recLive?.fileId;
-                    if (id) void a.viewFile(id);
-                  }}
-                >
-                  Open
-                </button>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* ADD-30: background-job cards — live progress while running. */}
-        {running.map((j) => (
-          <JobRow key={j.id} j={j} s={s} a={a} elapsedOf={elapsedOf} />
-        ))}
-
-        {parked.length > 0 && (
-          <div className="activity-group-title">Stopped — waiting for you</div>
-        )}
-        {parked.map((j) => (
-          <JobRow key={j.id} j={j} s={s} a={a} elapsedOf={elapsedOf} />
-        ))}
-      </section>
-
-      {/* The AUDIT half (decision #12). Deliberately a separate section with its
-          own heading and its own muted styling, not a run of quieter cards at
-          the bottom of one list: the user must be able to tell at a glance what
-          they can still act on from what is only a record. No job here has an
-          ACTION button — a finished job is not a thing you resume — but a
-          repeated-run group's own "show runs" disclosure toggle is not a job
-          action, it just un-collapses detail already on the screen. */}
-      {/* What the assistant changed about how the room is ORGANISED. Its own
-          group above the job log, because a promotion is not a run: it took no
-          time, it has no steps, and the only thing worth saying about it is
-          which object went which way. Before this it existed solely inside the
-          turn that made it — findable by scrolling the transcript back to the
-          right message, and absent from the panel that offers itself as the
-          room's record of what has been done to it. */}
-      {organized.length > 0 && (
-        <section className="activity-organized" aria-label="Organised by the assistant">
-          <div className="activity-group-title">
-            Library changes
-            <span className="activity-history-note">
-              made by the assistant, at your request
-            </span>
-          </div>
-          {organized.map((c) => (
-            <div key={c.seq} className="activity-row history">
-              <div className="activity-row-head">
-                <span className="activity-row-title">
-                  {c.linked ? "Added" : "Removed"} “{displayName(c.name)}”
-                </span>
-                <StateTape word="Done" mark="nb-sem-done" />
-              </div>
-              <div className="activity-copy ap-note">
-                {c.linked
-                  ? "Home’s Library now lists it too. It stayed in its own section, and nothing was copied."
-                  : "Home’s Library no longer lists it. The object itself is untouched, in its own section."}
-              </div>
-            </div>
-          ))}
-        </section>
-      )}
-
-      {shownHistory.length > 0 && (
-        <section className="activity-history" aria-label="What already happened">
-          <div className="activity-group-title">
-            History
-            <span className="activity-history-note">
-              {history.length > shownHistory.length
-                ? `the ${shownHistory.length} most recent of ${history.length} — a record, nothing to act on`
-                : "a record, nothing to act on"}
-            </span>
-          </div>
-          {/* D4: repeated same-day runs of the same workflow/script collapse to
-              one summary row instead of N identical ones — see
-              `groupHistoryRuns`. A single run, or a run of something else in
-              between, breaks the run and renders exactly as it always did. */}
-          {groupHistoryRuns(shownHistory).map((group) =>
-            group.length > 1 ? (
-              <HistoryGroupRow key={group[0].id} jobs={group} />
-            ) : (
-              <HistoryRow key={group[0].id} j={group[0]} />
-            ),
-          )}
-        </section>
-      )}
-
-      {nothing && (
-        <div className="activity-empty">
-          <ActivityIcon size={16} />
-          <p>The room is idle. Work you start will show its progress here.</p>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** Native workspace-agent launcher and audit cards. The event listener lives
- * at Workspace scope, so closing Activity does not lose a running agent. */
-function HarnessRunner({ s, runs }: { s: WSState; runs: HarnessUiRun[] }) {
-  const [capabilities, setCapabilities] = useState<HarnessCapabilities | null>(null);
-  const [capabilityError, setCapabilityError] = useState("");
-  const [provider, setProvider] = useState<HarnessProvider>("codex");
-  const [, selectedModel] = splitExternalModel(s.model ?? "");
-  const [model, setModel] = useState(selectedModel ?? "default");
-  const [prompt, setPrompt] = useState("");
-  // Workspace agents are primarily used to do file work. Start with the
-  // rollback-protected write capability enabled; users can still explicitly
-  // switch a run to read-only before starting it.
-  const [writeEnabled, setWriteEnabled] = useState(true);
-  const [starting, setStarting] = useState(false);
-  const [rollbackBusy, setRollbackBusy] = useState<string | null>(null);
-  const [restoreConflicts, setRestoreConflicts] = useState<Record<string, string[]>>({});
-
-  const refreshCapabilities = () => {
-    setCapabilityError("");
-    void api.harnessCapabilities().then(setCapabilities).catch((error) => {
-      setCapabilities(null);
-      setCapabilityError(String(error));
-    });
-  };
-  useEffect(refreshCapabilities, []);
-
-  const available = capabilities?.providers[provider];
-  const start = async () => {
-    const text = prompt.trim();
-    if (!text || starting) return;
-    setStarting(true);
-    try {
-      const requestedModel = model.trim() || "default";
-      const privacyMode = provider === "ollama-local"
-        ? "local"
-        : s.privacyOn
-          ? "cloud-redacted"
-          : "cloud-direct";
-      const result = await api.harnessStart({
-        provider,
-        model: requestedModel,
-        privacyMode,
-        writeEnabled,
-        text,
-      });
-      s.setHarnessRuns((current) => registerHarnessRun(current, result.runId, provider, {
-        model: requestedModel,
-        privacyMode,
-        writeEnabled,
-      }));
-      setPrompt("");
-    } catch (error) {
-      s.pushToast("error", `Couldn't start the workspace agent: ${String(error)}`);
-      refreshCapabilities();
-    } finally {
-      setStarting(false);
-    }
-  };
-
-  const approve = async (
-    run: HarnessUiRun,
-    requestId: string,
-    decision: HarnessApprovalDecision,
-  ) => {
-    try {
-      if (requestId === `cloud-writeback-${run.runId}`) {
-        await api.harnessCloudWriteback(
-          run.runId,
-          decision === "allow-once" || decision === "allow-run",
-        );
-      } else {
-        await api.harnessApprove(run.runId, requestId, decision);
-      }
-      s.setHarnessRuns((current) =>
-        resolveHarnessApproval(current, run.runId, requestId),
-      );
-    } catch (error) {
-      s.pushToast("error", `Couldn't answer the agent request: ${String(error)}`);
-    }
-  };
-
-  const rollback = async (run: HarnessUiRun) => {
-    setRollbackBusy(run.runId);
-    try {
-      const result = await api.harnessRollback(run.runId);
-      setRestoreConflicts((all) => ({ ...all, [run.runId]: result.conflicts }));
-      const count = result.restored.length + result.removedCreated.length;
-      s.pushToast(
-        result.conflicts.length ? "info" : "success",
-        result.conflicts.length
-          ? `Restored ${count} changes. ${result.conflicts.length} newer file changes were kept.`
-          : `Restored ${count} agent file changes.`,
-      );
-      const history = await api.harnessListRuns();
-      s.setHarnessRuns((runs) => mergeHarnessHistory(runs, history));
-      api.listFiles().then(s.setFiles).catch(() => {});
-    } catch (error) {
-      s.pushToast("error", `Couldn't roll back this run: ${String(error)}`);
-    } finally {
-      setRollbackBusy(null);
-    }
-  };
-
-  const restoreCopies = async (runId: string, paths: string[]) => {
-    setRollbackBusy(runId);
-    try {
-      const created = await api.harnessRestoreBaselineCopies(runId, paths);
-      setRestoreConflicts((all) => ({ ...all, [runId]: [] }));
-      s.pushToast(
-        "success",
-        `Restored ${created.length} baseline ${created.length === 1 ? "copy" : "copies"}.`,
-      );
-      api.listFiles().then(s.setFiles).catch(() => {});
-      api.harnessListRuns()
-        .then((history) => s.setHarnessRuns((runs) => mergeHarnessHistory(runs, history)))
-        .catch(() => {});
-    } catch (error) {
-      s.pushToast("error", `Couldn't restore baseline copies: ${String(error)}`);
-    } finally {
-      setRollbackBusy(null);
-    }
-  };
-
-  return (
-    <section className="harness-runner" aria-label="Workspace agents">
-      <div className="activity-group-title">Workspace agent</div>
-      <p className="activity-copy harness-disclosure">
-        {provider === "ollama-local"
-          ? "Local Ollama works through Arcelle's controlled file backend. It receives no database keys or unrestricted system paths."
-          : s.privacyOn
-          ? "Cloud Privacy is on. The agent works in a temporary redacted copy; protected values and original binary files stay on this Mac."
-          : "Cloud Privacy is off. The cloud agent can receive the real room files. File changes are enabled with an encrypted rollback baseline; the private .arcelle folder stays blocked."}
-      </p>
-      <div className="harness-compose">
-        <div className="harness-options">
-          <label>
-            Agent
-            <select
-              value={provider}
-              onChange={(event) => {
-                const next = event.target.value as HarnessProvider;
-                setProvider(next);
-                if (next === "ollama-local" || next === "ollama-cloud" || next === "openrouter") {
-                  setModel(s.model ?? "");
-                } else {
-                  setModel(selectedModel ?? "default");
-                }
-              }}
-            >
-              <option value="codex">Codex</option>
-              <option value="claude">Claude</option>
-              <option value="ollama-local">Ollama local</option>
-              <option value="ollama-cloud">Ollama cloud</option>
-              <option value="openrouter">OpenRouter</option>
-            </select>
-          </label>
-          <label>
-            Model
-            <input value={model} onChange={(event) => setModel(event.target.value)} placeholder="default" />
-          </label>
-          <label className="settings-label harness-write-toggle">
-            <input type="checkbox" checked={writeEnabled} onChange={(event) => setWriteEnabled(event.target.checked)} />
-            Allow file changes
-          </label>
-        </div>
-        <textarea
-          value={prompt}
-          onChange={(event) => setPrompt(event.target.value)}
-          placeholder="Describe the work for the workspace agent…"
-          aria-label="Workspace agent task"
-          rows={3}
-        />
-        {capabilityError && <p className="gate-error" role="alert">{capabilityError}</p>}
-        {available && !available.enabled && (
-          <p className="activity-copy">Unavailable: {available.reason ?? "the runtime self-test did not pass."}</p>
-        )}
-        <div className="harness-actions">
-          <button className="primary" disabled={!prompt.trim() || starting || available?.enabled !== true} onClick={() => void start()}>
-            {starting ? "Starting…" : writeEnabled ? "Run with file access" : "Run read-only"}
-          </button>
-          <button className="subtle" onClick={refreshCapabilities}>Test agents again</button>
-        </div>
-      </div>
-
-      {runs.map((run) => {
-        const live = run.status === "starting" || run.status === "running" || run.status === "waiting";
-        const persistedConflicts = run.changes
-          .filter((change) => change.rollbackState === "conflict")
-          .map((change) => change.relativePath);
-        const conflicts = restoreConflicts[run.runId] ?? persistedConflicts;
-        return (
-          <article className="activity-row harness-run" key={run.runId}>
-            <div className="activity-row-head">
-              <span className="activity-row-title">{
-                run.provider === "claude" ? "Claude"
-                  : run.provider === "codex" ? "Codex"
-                    : run.provider === "ollama-local" ? "Ollama local"
-                      : run.provider === "ollama-cloud" ? "Ollama cloud"
-                        : run.provider === "openrouter" ? "OpenRouter"
-                          : "Workspace agent"
-              }</span>
-              <StateTape
-                word={run.status === "completed" ? "Done" : run.status === "failed" ? "Failed" : run.status === "cancelled" ? "Stopped" : run.status === "interrupted" ? "Interrupted" : run.status === "rolled_back" ? "Rolled back" : run.status === "waiting" ? "Waiting" : "Running"}
-                mark={run.status === "completed" || run.status === "rolled_back" ? "nb-sem-done" : run.status === "failed" || run.status === "interrupted" ? "nb-sem-urgent" : run.status === "running" ? "nb-sem-linked" : "nb-sem-pending"}
-              />
-            </div>
-            <div className="activity-copy">
-              {[run.harness, run.model, run.privacyMode].filter(Boolean).join(" · ")}
-              {` · Started ${new Date(run.startedAt).toLocaleString()}`}
-              {run.completedAt ? ` · Finished ${new Date(run.completedAt).toLocaleString()}` : ""}
-            </div>
-            {run.status === "interrupted" && (
-              <div className="activity-copy">The app closed before this run finished. Its recorded file changes remain reviewable and protected by the saved baseline.</div>
-            )}
-            {run.plan && <div className="activity-copy"><strong>Plan:</strong> {run.plan}</div>}
-            {run.currentTool && <div className="activity-copy">Using {run.currentTool}…</div>}
-            {run.text && <pre className="harness-output">{run.text}</pre>}
-            {run.error && <div className="gate-error" role="alert">{run.error}</div>}
-            {run.approvals.map((request) => (
-              <div className="harness-approval" data-agent-blocked="true" key={request.requestId}>
-                <strong>{request.tool} needs approval</strong>
-                <span>{request.detail}</span>
-                <div className="harness-actions">
-                  <button className="primary" onClick={() => void approve(run, request.requestId, "allow-once")}>Allow once</button>
-                  {request.tool !== "cloud_writeback" && <button className="subtle" onClick={() => void approve(run, request.requestId, "allow-run")}>Allow for run</button>}
-                  <button className="subtle danger" onClick={() => void approve(run, request.requestId, "deny")}>Deny</button>
-                </div>
-              </div>
-            ))}
-            {run.changes.length > 0 && (
-              <details className="harness-changes" open={run.status === "completed"}>
-                <summary>{run.changes.length} file {run.changes.length === 1 ? "change" : "changes"}</summary>
-                <ul>{run.changes.map((change) => <li key={change.relativePath}><code>{change.relativePath}</code> — {change.change}</li>)}</ul>
-              </details>
-            )}
-            {(run.inputTokens > 0 || run.outputTokens > 0) && <div className="activity-copy">{run.inputTokens.toLocaleString()} input · {run.outputTokens.toLocaleString()} output tokens{run.costUsd != null ? ` · $${run.costUsd.toFixed(4)}` : ""}</div>}
-            <div className="harness-actions">
-              {live && <button className="subtle danger" onClick={() => void api.harnessCancel(run.runId).catch((error) => s.pushToast("error", String(error)))}>Stop</button>}
-              {!live && run.writeEnabled && run.baselineCompleted && run.rollbackStatus === "none" && run.changes.length > 0 && <button className="subtle" disabled={rollbackBusy === run.runId} onClick={() => void rollback(run)}>{rollbackBusy === run.runId ? "Restoring…" : "Roll back file changes"}</button>}
-            </div>
-            {conflicts.length > 0 && (
-              <div className="harness-conflicts" data-agent-blocked="true">
-                <p>These files changed again after the run, so Arcelle kept them: {conflicts.join(", ")}.</p>
-                <button className="subtle" disabled={rollbackBusy === run.runId} onClick={() => void restoreCopies(run.runId, conflicts)}>Restore baselines as copies</button>
-              </div>
-            )}
-          </article>
-        );
-      })}
-    </section>
-  );
-}
-
-/** One finished job in the audit log. A record, so it carries no Stop, no
- * Resume, no Dismiss — the live section owns every affordance. It reports what
- * the row itself stored (`cursor` of `total`, and when it last moved); nothing
- * here is inferred, because a finished job's own numbers are the only evidence
- * of what it did. */
-function HistoryRow({ j }: { j: WSState["jobs"][number] }) {
-  const when = Date.parse(j.updatedAt);
-  return (
-    <div className="activity-row history">
-      <div className="activity-row-head">
-        <span className="activity-row-title">{j.title}</span>
-        {/* `groupActivity` files only `done` here, so the tape is not guessing:
-            everything in the log finished. */}
-        <StateTape word="Done" mark="nb-sem-done" />
-        <span className="activity-state">
-          {Number.isNaN(when) ? "" : new Date(when).toLocaleString()}
-        </span>
-      </div>
-      <div className="activity-copy ap-note">
-        Finished
-        {j.total > 0 ? ` — ${Math.min(j.cursor, j.total)} of ${j.total} steps` : ""}
-      </div>
-    </div>
-  );
-}
-
-type HistoryJob = WSState["jobs"][number];
-
-/** D4: a room that runs the same workflow/script every day fills History with
- * identical-looking rows — this collapses a same-day run of the same thing
- * into one group the way a person would read it at a glance.
- *
- * `jobs` must already be in the order History renders them (most recent
- * first — `list_jobs` sorts by `created_at DESC`, and nothing downstream of
- * it reorders). Grouping only ever merges items that are ALREADY adjacent in
- * that order and share both a title and a local calendar day — a run of
- * "stock_metrics.py" on Monday and another on Tuesday stays two separate
- * rows (and two separate groups) even though the titles match, and a
- * different job landing in between breaks the run rather than being skipped
- * over. A group of exactly one job is returned as its own one-element array,
- * so a caller can render it exactly like today (no grouping UI) just by
- * checking `.length > 1`. */
-export function groupHistoryRuns(jobs: HistoryJob[]): HistoryJob[][] {
-  const groups: HistoryJob[][] = [];
-  for (const j of jobs) {
-    const current = groups[groups.length - 1];
-    const prev = current?.[current.length - 1];
-    if (prev && prev.title === j.title && sameLocalDay(prev.updatedAt, j.updatedAt)) {
-      current.push(j);
-    } else {
-      groups.push([j]);
-    }
-  }
-  return groups;
-}
-
-function sameLocalDay(a: string, b: string): boolean {
-  const da = new Date(a);
-  const db = new Date(b);
-  if (Number.isNaN(da.getTime()) || Number.isNaN(db.getTime())) return false;
-  return da.toDateString() === db.toDateString();
-}
-
-/** "today" / "yesterday" / a compact date, for one group's shared day — the
- * same no-year-unless-it-isn't-this-one convention SearchExpanded's
- * `shortWhen` uses for a margin date. */
-function dayLabelOf(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "that day";
-  const now = new Date();
-  if (d.toDateString() === now.toDateString()) return "today";
-  const yesterday = new Date(now);
-  yesterday.setDate(now.getDate() - 1);
-  if (d.toDateString() === yesterday.toDateString()) return "yesterday";
-  const opts: Intl.DateTimeFormatOptions =
-    d.getFullYear() === now.getFullYear()
-      ? { month: "short", day: "numeric" }
-      : { month: "short", day: "numeric", year: "numeric" };
-  return `on ${d.toLocaleDateString(undefined, opts)}`;
-}
-
-/** One collapsed group of 2+ same-day, same-name finished runs. The header
- * line and the summary under it are both built in code from the runs' own
- * fields, so neither is ever blank and neither waits on anything. Individual
- * runs are collapsed by default behind "Show runs" — nothing is deleted,
- * `HistoryRow` still renders each one unchanged once expanded. */
-function HistoryGroupRow({ jobs }: { jobs: HistoryJob[] }) {
-  const [expanded, setExpanded] = useState(false);
-  const latest = jobs[0]; // most recent first, per `groupHistoryRuns`'s contract
-  const name = latest.title;
-  const runCount = jobs.length;
-  // The only per-run signal History's own data actually carries: did a run's
-  // cursor reach its own total. `status` can't add anything here — only
-  // `done` jobs ever reach History (`groupActivity`), so it is constant
-  // within a group and would be a fact with nothing left to say.
-  const allSucceeded = jobs.every(
-    (j) => j.error == null && (j.total <= 0 || j.cursor >= j.total),
-  );
-  const when = Date.parse(latest.updatedAt);
-
-  // Written in code, not generated. The only inputs a model had here were the
-  // name, the count and whether every run finished — all three already stated
-  // exactly in the header line above, so the call could only paraphrase its own
-  // evidence less precisely, and paid for the privilege on every visit.
-  const summary = allSucceeded
-    ? `${runCount} runs, all finished.`
-    : `${runCount} runs — not every one finished all its steps.`;
-
-  const runsId = `history-group-runs-${latest.id}`;
-  return (
-    <div className="activity-row history activity-history-group">
-      <div className="activity-row-head">
-        <span className="activity-row-title">
-          {name} — {runCount} runs {dayLabelOf(latest.updatedAt)}
-          {allSucceeded ? ", all clean" : ", some incomplete"}
-        </span>
-        <StateTape word="Done" mark="nb-sem-done" />
-        <span className="activity-state">
-          {Number.isNaN(when) ? "" : new Date(when).toLocaleString()}
-        </span>
-      </div>
-      <div className="activity-copy ap-note">{summary}</div>
-      <div className="activity-row-actions">
-        <button
-          className="subtle"
-          aria-expanded={expanded}
-          aria-controls={runsId}
-          onClick={() => setExpanded((v) => !v)}
-        >
-          {expanded ? "Hide runs" : "Show runs"}
+    <div className="activity-row-head">
+      <span className="activity-row-title">{job.title}</span>
+      <StateTape {...jobFlag(job.status)} />
+      {running ? <span className="activity-state">{elapsedOf(job.createdAt)}</span> : (
+        <button className="chip-btn" title="Dismiss this job" aria-label="Dismiss this job" onClick={dismiss}>
+          <CloseIcon size={12} />
         </button>
-      </div>
-      {expanded && (
-        <div id={runsId} className="activity-history-group-runs">
-          {jobs.map((j) => (
-            <HistoryRow key={j.id} j={j} />
-          ))}
-        </div>
       )}
     </div>
   );
 }
 
-function JobRow({
-  j,
-  s,
-  a,
-  elapsedOf,
-}: {
-  j: WSState["jobs"][number];
+function passWindowCount(plan: WorkspaceJob["plan"]) {
+  const windows = (plan as { windows?: unknown[] } | null)?.windows;
+  return Array.isArray(windows) ? windows.length : 0;
+}
+
+function PassMosaic({ job, done, running }: { job: WorkspaceJob; done: number; running: boolean }) {
+  if (job.kind !== "file_pass") return null;
+  const windows = passWindowCount(job.plan);
+  if (windows < 2) return null;
+  const cells = Math.min(windows, 192);
+  const mapped = Math.min(done, windows);
+  const cellsDone = Math.floor((mapped * cells) / windows);
+  const weaving = running && done >= windows;
+  return (
+    <div className={`pass-mosaic${weaving ? " weaving" : ""}`} title={`${mapped} of ${windows} parts read`}>
+      {Array.from({ length: cells }, (_, cell) => (
+        <span
+          key={cell}
+          className={`pass-cell${cell < cellsDone ? " on" : ""}${cell === cellsDone && running && !weaving ? " now" : ""}`}
+          style={{ "--h": Math.round((cell * 300) / cells) } as CSSProperties}
+        />
+      ))}
+    </div>
+  );
+}
+
+function JobMeterView({ meter }: { meter: JobMeter }) {
+  return (
+    <div className="activity-meter">
+      <div className="activity-progress">
+        <span className={meter.indeterminate ? "indeterminate" : undefined} style={meter.indeterminate ? undefined : { width: `${meter.percent}%` }} />
+      </div>
+      {meter.figure && <span className="activity-figure">{meter.figure.done}/{meter.figure.total}</span>}
+    </div>
+  );
+}
+
+function jobFootClass(step: string | null, job: WorkspaceJob, running: boolean, s: WSState) {
+  if (step && running && job.status !== "queued" && !s.studioStep.local) return "activity-copy studio-running-cloud";
+  return `activity-copy${job.status === "error" ? "" : " ap-note"}`;
+}
+
+function JobAction({ job, queued, running, pause, resume }: {
+  job: WorkspaceJob;
+  queued: boolean;
+  running: boolean;
+  pause: () => void;
+  resume: () => void;
+}) {
+  if (queued) return <button className="subtle" title="Remove this job from the queue" onClick={pause}>Remove</button>;
+  if (running) return <button className="subtle" title="Stop — it checkpoints so you can resume later" onClick={pause}>Stop</button>;
+  return <button className="subtle" onClick={resume}>{job.status === "error" ? "Retry" : "Resume"}</button>;
+}
+
+function JobRow({ j, s, a, elapsedOf }: {
+  j: WorkspaceJob;
   s: WSState;
   a: WSActions;
   elapsedOf: (createdAt: string) => string;
 }) {
   const live = s.jobProgress[j.id];
-  // Wave 4a: a QUEUED job is waiting for the single heavy-work slot — it is
-  // not actually running yet, so it shows "Waiting — Nth in line" with a
-  // "Remove" affordance (Stop on it is a no-op; cancel_job parks the row).
   const queued = j.status === "queued";
   const running = j.status === "running" || queued;
-  const queuePos = queued
-    ? s.jobs.filter((o) => o.status === "queued" && o.createdAt <= j.createdAt)
-        .length
-    : 0;
-  // The indeterminate bar means "running, and its position is not yet known".
-  // A QUEUED job is neither: it has not started, so it shows its real starting
-  // point — 0, or wherever a parked run left off — instead of an animation
-  // sliding over work that nothing is doing. Under reduced motion the same
-  // animation degrades to a FULL bar, which said a job that had not begun was
-  // finished. See jobProgress.ts for the rule and what it refuses to invent.
   const meter = jobMeter(j.status, j.cursor, j.total, live);
-  // Only meaningful while the job is stopped-but-resumable; a running job is
-  // not being interrupted by anything, and the backend clears the column the
-  // moment it moves off 'paused'.
-  const parkedReason = !running ? (j.parkedReason ?? null) : null;
-  // A Studio run emits `job-progress` exactly once, at the start, so `live`
-  // holds "Starting…" for the whole of a run that can take minutes. Its real
-  // phases arrive on a separate event, and that is the line worth reading —
-  // including the one saying the content is leaving this Mac. Cleared by the
-  // terminal job event, so it can never outlive the run it describes.
-  const studioStep =
-    STEP_KINDS.includes(j.kind) && s.studioStep.text ? s.studioStep.text : null;
-  const friendlyError =
-    j.error === "OLLAMA_DOWN"
-      ? "The local AI isn't running."
-      : j.error?.startsWith("MODEL_MISSING")
-        ? "The AI model isn't installed."
-        : j.error;
+  const position = queued ? queuePosition(j, s.jobs) : 0;
+  const step = studioStepFor(j, s);
+  const description = jobDescription({ job: j, queued, running, position, step, liveLabel: live?.label, meter });
   return (
     <div className={`activity-row job ${j.status}`} role="status">
-      <div className="activity-row-head">
-        <span className="activity-row-title">{j.title}</span>
-        {/* The word first, the marker second. A queued job says "Queued", not
-            "Running", because the queue is a real state the row already
-            explains in its foot. */}
-        <StateTape {...jobFlag(queued ? "queued" : j.status)} />
-        {running ? (
-          <span className="activity-state">{elapsedOf(j.createdAt)}</span>
-        ) : (
-          <button
-            className="chip-btn"
-            title="Dismiss this job"
-            aria-label="Dismiss this job"
-            onClick={() => void a.dismissJob(j.id)}
-          >
-            <CloseIcon size={12} />
-          </button>
-        )}
-      </div>
-      {/* ADD-32: the pass mosaic — one cell per stretch of the file, lighting
-          up in spectral order as each part is read. */}
-      {j.kind === "file_pass" &&
-        (() => {
-          const plan = (j.plan ?? {}) as { windows?: unknown[] };
-          const nWin = Array.isArray(plan.windows) ? plan.windows.length : 0;
-          if (nWin < 2) return null;
-          const cells = Math.min(nWin, 192);
-          // The mosaic counts against the PLAN's own window count, which is a
-          // different quantity from the meter's total and known even when that
-          // one is not.
-          const done = live?.done ?? j.cursor;
-          const mapsDone = Math.min(done, nWin);
-          const cellsDone = Math.floor((mapsDone * cells) / nWin);
-          const weaving = running && done >= nWin;
-          return (
-            <div
-              className={`pass-mosaic${weaving ? " weaving" : ""}`}
-              title={`${mapsDone} of ${nWin} parts read`}
-            >
-              {Array.from({ length: cells }, (_, c) => (
-                <span
-                  key={c}
-                  className={`pass-cell${c < cellsDone ? " on" : ""}${
-                    c === cellsDone && running && !weaving ? " now" : ""
-                  }`}
-                  style={{ "--h": Math.round((c * 300) / cells) } as CSSProperties}
-                />
-              ))}
-            </div>
-          );
-        })()}
-      {/* A marker stroke and a written count, never one without the other: a
-          length and a colour on their own do not state a quantity, and an
-          indeterminate bar has no quantity to state — its label does the work
-          instead. */}
-      <div className="activity-meter">
-        <div className="activity-progress">
-          <span
-            className={meter.indeterminate ? "indeterminate" : undefined}
-            style={meter.indeterminate ? undefined : { width: `${meter.percent}%` }}
-          />
-        </div>
-        {meter.figure && (
-          <span className="activity-figure">
-            {meter.figure.done}/{meter.figure.total}
-          </span>
-        )}
-      </div>
+      <JobHeader job={j} running={running} elapsedOf={elapsedOf} dismiss={() => void a.dismissJob(j.id)} />
+      <PassMosaic job={j} done={live?.done ?? j.cursor} running={running} />
+      <JobMeterView meter={meter} />
       <div className="activity-row-foot">
-        {/* A cloud stage says room content is leaving this Mac, and it keeps the
-            caution treatment here that it had on the card this row replaced —
-            the same one chat.css gives .chat-route-cloud for the same fact. The
-            flag comes from the event, never from reading the sentence. */}
-        <span
-          className={
-            studioStep && running && !queued && !s.studioStep.local
-              ? "activity-copy studio-running-cloud"
-              : `activity-copy${j.status === "error" ? "" : " ap-note"}`
-          }
-        >
-          {queued
-            ? `Waiting — ${queuePos}${queuePos === 1 ? "st" : queuePos === 2 ? "nd" : queuePos === 3 ? "rd" : "th"} in line`
-            : running
-              ? (studioStep ?? live?.label ?? "Working…")
-              : j.status === "error"
-                ? (friendlyError ?? "Stopped.")
-                : // A job the APP stopped must not read like one the user
-                  // chose to pause. `parkedReason` is set only when the room
-                  // was locked (or the app closed) with this job in flight, so
-                  // the card names what actually interrupted it — and says the
-                  // checkpoint is still there, which is the whole reason Resume
-                  // is worth pressing.
-                  parkedReason
-                  ? meter.figure
-                    ? `${parkedReason} Picks up at ${meter.figure.done} of ${meter.figure.total}.`
-                    : `${parkedReason} Picks up where it stopped.`
-                  : meter.figure
-                    ? `Paused at ${meter.figure.done} of ${meter.figure.total}`
-                    : "Paused"}
-        </span>
-        {queued ? (
-          <button
-            className="subtle"
-            title="Remove this job from the queue"
-            onClick={() => void a.pauseJob(j.id)}
-          >
-            Remove
-          </button>
-        ) : running ? (
-          <button
-            className="subtle"
-            title="Stop — it checkpoints so you can resume later"
-            onClick={() => void a.pauseJob(j.id)}
-          >
-            Stop
-          </button>
-        ) : (
-          <button className="subtle" onClick={() => void a.resumeJob(j.id)}>
-            {j.status === "error" ? "Retry" : "Resume"}
-          </button>
-        )}
+        <span className={jobFootClass(step, j, running, s)}>{description}</span>
+        <JobAction job={j} queued={queued} running={running} pause={() => void a.pauseJob(j.id)} resume={() => void a.resumeJob(j.id)} />
       </div>
     </div>
   );

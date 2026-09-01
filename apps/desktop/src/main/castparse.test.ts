@@ -52,6 +52,25 @@ Appearance: Small, close-cropped hair, ink on both hands.
     expect(cast[0]?.story).toBe("An archivist who hears the dead.");
   });
 
+  it("REGRESSION: labelled continuations survive labels without inline values, but blank lines end them", () => {
+    // A label can introduce a multi-line value. Once a blank line breaks that
+    // continuation, an unlabelled line belongs to story rather than silently
+    // extending the preceding appearance field.
+    const cast = parseCast(`## Noa
+Appearance:
+Small, close-cropped hair.
+Backstory:
+Lost her map in the flood.
+
+A final fact the author did not label.
+`);
+    expect(cast).toEqual([{
+      name: "Noa",
+      description: "Small, close-cropped hair.",
+      story: "Lost her map in the flood. A final fact the author did not label.",
+    }]);
+  });
+
   it("a section title is never mistaken for a hero", () => {
     // Without this, every sheet imports "Cast" and "Characters" as people.
     for (const word of ["# Cast", "## Characters", "**Dramatis Personae**", "## Setting"]) {
@@ -101,6 +120,15 @@ The tide turns, and the rope goes slack.
     expect(isPersonHeading("## Captain Mira Halloran")).toBe(true);
     expect(isPersonHeading("## She walks the quay counting the moorings")).toBe(false);
     expect(isPersonHeading("**Mira walks, and the tide turns.**")).toBe(false);
+  });
+
+  it("heading punctuation cleanup preserves strict name guards", () => {
+    // Rust strips all trailing colons from styled headings and both underscore
+    // runs around a bare heading; neither cleanup may weaken byte/name limits.
+    expect(bare("__Mira__")).toBe("Mira");
+    expect(isPersonHeading("**Mira**:::" )).toBe(true);
+    expect(isPersonHeading(`${"É".repeat(21)}: details`)).toBe(false);
+    expect(isPersonHeading("A B C D: details")).toBe(false);
   });
 });
 

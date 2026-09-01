@@ -4,7 +4,7 @@ import type { IpcMain, IpcMainInvokeEvent } from "electron";
 import path from "node:path";
 import { Readable } from "node:stream";
 import type { BulkReport } from "../shared/apiTypes.js";
-import type { RoomManagerState } from "./roomManager.js";
+import type { Room, RoomManagerState } from "./roomManager.js";
 import {
   anyFileName,
   availableName,
@@ -83,6 +83,85 @@ async function batchAsync(
   return report;
 }
 
+function renameFileForRoom(
+  open: Room,
+  id: string,
+  name: string,
+  changed: () => void,
+): void | Promise<void> {
+  if (open.workspace === undefined) {
+    renameFile(open.conn, id, name);
+    changed();
+    return;
+  }
+  return renameWorkspaceFile(open, id, name).then(changed);
+}
+
+function renameWorkspaceFile(open: Room, id: string, name: string): Promise<void> {
+  const row = open.conn.prepare("SELECT relative_path FROM files WHERE id = ?").get(id) as {
+    relative_path: string | null;
+  } | undefined;
+  if (row?.relative_path === null || row?.relative_path === undefined) throw new Error("That file is unavailable.");
+  const parent = path.posix.dirname(row.relative_path);
+  const destination = parent === "." ? name : path.posix.join(parent, name);
+  return open.workspace!.move(id, destination);
+}
+
+function moveFilesToFolder(
+  state: RoomManagerState,
+  open: Room,
+  rawFileIds: unknown,
+  folderId: string | null,
+  changedIf: (report: BulkReport) => BulkReport,
+): BulkReport | Promise<BulkReport> {
+  if (open.workspace === undefined) {
+    return changedIf(batch(state, stringIds(rawFileIds), (id) => moveFileToFolder(open.conn, id, folderId)));
+  }
+  return moveWorkspaceFilesToFolder(state, open, rawFileIds, folderId).then(changedIf);
+}
+
+function moveWorkspaceFilesToFolder(
+  state: RoomManagerState,
+  open: Room,
+  rawFileIds: unknown,
+  folderId: string | null,
+): Promise<BulkReport> {
+  const folderName = workspaceFolderName(open, folderId);
+  return batchAsync(
+    state,
+    stringIds(rawFileIds),
+    (id) => moveWorkspaceFileToFolder(open, id, folderId, folderName),
+  );
+}
+
+function workspaceFolderName(open: Room, folderId: string | null): string | null {
+  if (folderId === null) return null;
+  const folder = open.conn.prepare("SELECT name FROM folders WHERE id = ?").get(folderId) as {
+    name: string;
+  } | undefined;
+  if (folder === undefined) throw new Error("That folder no longer exists.");
+  return folder.name;
+}
+
+async function moveWorkspaceFileToFolder(
+  open: Room,
+  id: string,
+  folderId: string | null,
+  folderName: string | null,
+): Promise<void> {
+  const row = open.conn.prepare(
+    "SELECT relative_path, content_sha256 FROM files WHERE id = ? AND trashed_at IS NULL",
+  ).get(id) as { relative_path: string | null; content_sha256: string | null } | undefined;
+  if (row?.relative_path === null || row?.relative_path === undefined) {
+    throw new Error("That file is no longer in this room.");
+  }
+  const destination = folderName === null
+    ? path.posix.basename(row.relative_path)
+    : path.posix.join(folderName, path.posix.basename(row.relative_path));
+  await open.workspace!.move(id, destination, row.content_sha256 ?? undefined);
+  open.conn.prepare("UPDATE files SET folder_id = ? WHERE id = ?").run(folderId, id);
+}
+
 export function registerFileSurfaceIpc(
   ipcMain: Pick<IpcMain, "handle">,
   state: RoomManagerState,
@@ -109,17 +188,7 @@ export function registerFileSurfaceIpc(
     const open = room();
     const id = String(a.id ?? "");
     const name = String(a.name ?? "");
-    if (open.workspace !== undefined) {
-      const row = open.conn.prepare("SELECT relative_path FROM files WHERE id = ?").get(id) as {
-        relative_path: string | null;
-      } | undefined;
-      if (row?.relative_path === null || row?.relative_path === undefined) throw new Error("That file is unavailable.");
-      const parent = path.posix.dirname(row.relative_path);
-      const destination = parent === "." ? name : path.posix.join(parent, name);
-      return open.workspace.move(id, destination).then(() => { changed(); });
-    }
-    renameFile(open.conn, id, name);
-    changed();
+    return renameFileForRoom(open, id, name, changed);
   });
   ipcMain.handle("trash_file", (_event: IpcMainInvokeEvent, raw: unknown) => {
     const open = room();
@@ -238,27 +307,7 @@ export function registerFileSurfaceIpc(
     const a = args(raw);
     const folderId = typeof a.folderId === "string" ? a.folderId : null;
     const open = room();
-    if (open.workspace === undefined) {
-      return changedIf(batch(state, stringIds(a.fileIds), (id) => moveFileToFolder(open.conn, id, folderId)));
-    }
-    const folder = folderId === null ? null : open.conn.prepare(
-      "SELECT name FROM folders WHERE id = ?",
-    ).get(folderId) as { name: string } | undefined;
-    if (folderId !== null && folder === undefined) throw new Error("That folder no longer exists.");
-    const folderName = folder?.name ?? null;
-    return changedIf(await batchAsync(state, stringIds(a.fileIds), async (id) => {
-      const row = open.conn.prepare(
-        "SELECT relative_path, content_sha256 FROM files WHERE id = ? AND trashed_at IS NULL",
-      ).get(id) as { relative_path: string | null; content_sha256: string | null } | undefined;
-      if (row?.relative_path === null || row?.relative_path === undefined) {
-        throw new Error("That file is no longer in this room.");
-      }
-      const destination = folderName === null
-        ? path.posix.basename(row.relative_path)
-        : path.posix.join(folderName, path.posix.basename(row.relative_path));
-      await open.workspace!.move(id, destination, row.content_sha256 ?? undefined);
-      open.conn.prepare("UPDATE files SET folder_id = ? WHERE id = ?").run(folderId, id);
-    }));
+    return moveFilesToFolder(state, open, a.fileIds, folderId, changedIf);
   });
   ipcMain.handle("delete_files_permanently", (_event: IpcMainInvokeEvent, raw: unknown) =>
     changedIf(batch(state, stringIds(args(raw).ids), (id) => {

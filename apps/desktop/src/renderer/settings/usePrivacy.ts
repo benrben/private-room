@@ -9,6 +9,50 @@ import {
   touchIdLostWarning,
 } from "../rooms/passwordChange";
 
+type StringSetter = (value: string) => void;
+type BooleanSetter = (value: boolean) => void;
+
+async function hadRecoveryKeyBeforePasswordChange(roomPath: string): Promise<boolean> {
+  if (!roomPath) return false;
+  return hasRecoveryKey(roomPath).catch(() => false);
+}
+
+function showPasswordWarning(
+  warning: string | null,
+  warnings: string[],
+  setPwError: StringSetter,
+): void {
+  if (!warning) return;
+  warnings.push(warning);
+  setPwError(warnings.join(" "));
+}
+
+async function showPostPasswordWarnings(
+  hadRecovery: boolean,
+  freshCode: string | null,
+  setPwError: StringSetter,
+): Promise<void> {
+  const warnings: string[] = [];
+  showPasswordWarning(revokedRecoveryWarning(hadRecovery, freshCode), warnings, setPwError);
+  const strandedWarning = strandedCheckpointWarning(
+    await api.listStrandedCheckpoints().catch(() => []),
+  );
+  showPasswordWarning(strandedWarning, warnings, setPwError);
+}
+
+async function refreshTouchIdAfterPasswordChange(
+  roomPath: string,
+  wasOn: boolean,
+  setTouchIdOn: BooleanSetter,
+  setTouchIdErr: StringSetter,
+): Promise<void> {
+  if (!roomPath) return;
+  const stillOn = await api.touchIdHas(roomPath).catch(() => wasOn);
+  setTouchIdOn(stillOn);
+  const warning = touchIdLostWarning(wasOn, stillOn);
+  if (warning) setTouchIdErr(warning);
+}
+
 /** Privacy section (Wave 2): auto-lock, change password, Touch ID unlock,
  * duplicate room, and compact. */
 export function usePrivacy() {
@@ -77,9 +121,7 @@ export function usePrivacy() {
     try {
       // Asked BEFORE the change, because afterwards a room that never had a
       // recovery key and one whose key was just lost look identical.
-      const hadRecovery = roomPath
-        ? await hasRecoveryKey(roomPath).catch(() => false)
-        : false;
+      const hadRecovery = await hadRecoveryKeyBeforePasswordChange(roomPath);
       const freshCode = await api.changePassword(pwCurrent, pwNew);
       setPwCurrent("");
       setPwNew("");
@@ -92,27 +134,14 @@ export function usePrivacy() {
       // written over this one, so the credential that is now permanently gone
       // went unmentioned. Accumulate: whichever happened gets said, and when
       // both happened both get said.
-      const warnings: string[] = [];
-      const revoked = revokedRecoveryWarning(hadRecovery, freshCode);
-      if (revoked) {
-        warnings.push(revoked);
-        // Painted before the stranded-checkpoint query, which is a round trip.
-        setPwError(warnings.join(" "));
-      }
-      const strandedWarning = strandedCheckpointWarning(
-        await api.listStrandedCheckpoints().catch(() => []),
-      );
-      if (strandedWarning) {
-        warnings.push(strandedWarning);
-        setPwError(warnings.join(" "));
-      }
+      await showPostPasswordWarnings(hadRecovery, freshCode, setPwError);
       // Ask the Keychain rather than assume either way.
-      if (roomPath) {
-        const still = await api.touchIdHas(roomPath).catch(() => touchIdOn);
-        setTouchIdOn(still);
-        const lost = touchIdLostWarning(touchIdOn, still);
-        if (lost) setTouchIdErr(lost);
-      }
+      await refreshTouchIdAfterPasswordChange(
+        roomPath,
+        touchIdOn,
+        setTouchIdOn,
+        setTouchIdErr,
+      );
       window.setTimeout(() => setPwSaved(false), 2400);
     } catch (e) {
       setPwError(String(e));

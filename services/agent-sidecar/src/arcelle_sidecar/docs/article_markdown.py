@@ -49,6 +49,8 @@ Rust side):
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from bs4 import (
     BeautifulSoup,
     CData,
@@ -104,122 +106,185 @@ def html_to_markdown(html: str) -> str:
     """Serialize extracted article markup as Markdown -- headings, lists,
     block quotes, code, tables, links and images kept.
     """
-    # See the "Parser choice" note in the module docstring, point 2.
-    html = html.replace("\r\n", "\n").replace("\r", "\n")
-    soup = BeautifulSoup(html, "html.parser")
-    top_level = soup.body.contents if soup.body is not None else soup.contents
-
     out: list[str] = []
-    for child in top_level:
-        _write_block(child, out, 0)
+    _write_blocks(_article_nodes(html), out, 0)
+    return _join_blocks(out)
 
+
+def _article_nodes(html: str) -> list[object]:
+    # See the "Parser choice" note in the module docstring, point 2.
+    soup = BeautifulSoup(html.replace("\r\n", "\n").replace("\r", "\n"), "html.parser")
+    return soup.body.contents if soup.body is not None else soup.contents
+
+
+def _join_blocks(blocks: list[str]) -> str:
     # Blocks each end with their own blank line; collapse the runs that
     # nesting produces so the file does not read as double-spaced.
     text_parts: list[str] = []
     blanks = 0
-    for line in _lines("".join(out)):
-        if line.strip() == "":
-            blanks += 1
-            continue
-        if text_parts and blanks > 0:
-            text_parts.append("\n\n")
-        blanks = 0
-        # A line inside a list or a code fence keeps its neighbours: only
-        # the blank-run counter above separates blocks.
-        text_parts.append(line.rstrip())
-        text_parts.append("\n")
+    for line in _lines("".join(blocks)):
+        blanks = _append_markdown_line(text_parts, line, blanks)
     return "".join(text_parts)
+
+
+def _append_markdown_line(text_parts: list[str], line: str, blanks: int) -> int:
+    if line.strip() == "":
+        return blanks + 1
+    _append_block_separator(text_parts, blanks)
+    text_parts.append(line.rstrip())
+    text_parts.append("\n")
+    return 0
+
+
+def _append_block_separator(text_parts: list[str], blanks: int) -> None:
+    if text_parts and blanks > 0:
+        text_parts.append("\n\n")
 
 
 def _write_block(node: object, out: list[str], depth: int) -> None:
     """Emit one block-level node. `depth` is the list nesting level."""
     if _is_text(node):
-        t = _collapse(str(node))
-        if t:
-            _push_block(out, t)
+        _write_text_block(node, out)
         return
     if not _is_element(node):
         return
 
-    name = _node_name(node)
-
-    if name in ("h1", "h2", "h3", "h4", "h5", "h6"):
-        level = int(name[1:])
-        text = _inline(node)
-        if text:
-            _push_block(out, f"{'#' * level} {text}")
+    writer = _BLOCK_WRITERS.get(_node_name(node))
+    if writer is not None:
+        writer(node, out, depth)
         return
+    _write_container(node, out, depth)
 
-    if name in ("p", "figcaption"):
-        text = _inline(node)
-        if text:
-            _push_block(out, text)
-        return
 
-    if name == "blockquote":
-        inner: list[str] = []
-        for child in node.contents:
-            _write_block(child, inner, depth)
-        quoted = [f"> {line}" for line in _lines("".join(inner)) if line.strip()]
-        if quoted:
-            _push_block(out, "\n".join(quoted))
-        return
+def _write_text_block(node: object, out: list[str]) -> None:
+    text = _collapse(str(node))
+    if text:
+        _push_block(out, text)
 
-    if name in ("ul", "ol"):
-        ordered = name == "ol"
-        indent = "  " * depth
-        n = 0
-        items: list[str] = []
-        for li in node.contents:
-            if _node_name(li) != "li":
-                continue
-            n += 1
-            marker = f"{n}. " if ordered else "- "
-            text = _inline(li)
-            if text:
-                items.append(f"{indent}{marker}{text}\n")
-            # A nested list is a block inside the item, not inline text.
-            for child in li.contents:
-                if _node_name(child) in ("ul", "ol"):
-                    _write_block(child, items, depth + 1)
-        joined = "".join(items)
-        if joined.strip():
-            _push_block(out, joined.rstrip("\n"))
-        return
 
-    if name == "pre":
-        code = _text_content(node)
-        if code.strip():
-            _push_block(out, f"```\n{code.rstrip()}\n```")
-        return
+def _write_heading(node: Tag, out: list[str], _depth: int) -> None:
+    text = _inline(node)
+    if text:
+        _push_block(out, f"{'#' * int(_node_name(node)[1:])} {text}")
 
-    if name == "hr":
-        _push_block(out, "---")
-        return
 
-    if name == "table":
-        table_md = _write_table(node)
-        if table_md:
-            _push_block(out, table_md)
-        return
+def _write_inline_block(node: Tag, out: list[str], _depth: int) -> None:
+    text = _inline(node)
+    if text:
+        _push_block(out, text)
 
-    if name == "img":
-        text = _inline(node)
-        if text:
-            _push_block(out, text)
-        return
 
+def _write_blockquote(node: Tag, out: list[str], depth: int) -> None:
+    inner: list[str] = []
+    _write_blocks(node.contents, inner, depth)
+    quoted = _quoted_lines(inner)
+    if quoted:
+        _push_block(out, "\n".join(quoted))
+
+
+def _write_blocks(nodes: list[object], out: list[str], depth: int) -> None:
+    for child in nodes:
+        _write_block(child, out, depth)
+
+
+def _quoted_lines(blocks: list[str]) -> list[str]:
+    return [f"> {line}" for line in _lines("".join(blocks)) if line.strip()]
+
+
+def _write_unordered_list(node: Tag, out: list[str], depth: int) -> None:
+    _write_list(node, out, depth, _unordered_marker)
+
+
+def _write_ordered_list(node: Tag, out: list[str], depth: int) -> None:
+    _write_list(node, out, depth, _ordered_marker)
+
+
+def _write_list(node: Tag, out: list[str], depth: int, marker_for: Callable[[int], str]) -> None:
+    items: list[str] = []
+    for number, item in enumerate(_list_items(node), start=1):
+        _append_list_item(items, item, "  " * depth, marker_for(number), depth)
+    _push_list_block(items, out)
+
+
+def _list_items(node: Tag) -> list[Tag]:
+    return [child for child in node.contents if _node_name(child) == "li"]
+
+
+def _append_list_item(items: list[str], item: Tag, indent: str, marker: str, depth: int) -> None:
+    text = _inline(item)
+    if text:
+        items.append(f"{indent}{marker}{text}\n")
+    _append_nested_lists(item, items, depth)
+
+
+def _append_nested_lists(item: Tag, items: list[str], depth: int) -> None:
+    for child in item.contents:
+        if _node_name(child) in ("ul", "ol"):
+            _write_block(child, items, depth + 1)
+
+
+def _unordered_marker(_number: int) -> str:
+    return "- "
+
+
+def _ordered_marker(number: int) -> str:
+    return f"{number}. "
+
+
+def _push_list_block(items: list[str], out: list[str]) -> None:
+    joined = "".join(items)
+    if joined.strip():
+        _push_block(out, joined.rstrip("\n"))
+
+
+def _write_pre(node: Tag, out: list[str], _depth: int) -> None:
+    code = _text_content(node)
+    if code.strip():
+        _push_block(out, f"```\n{code.rstrip()}\n```")
+
+
+def _write_horizontal_rule(_node: Tag, out: list[str], _depth: int) -> None:
+    _push_block(out, "---")
+
+
+def _write_table_block(node: Tag, out: list[str], _depth: int) -> None:
+    table_md = _write_table(node)
+    if table_md:
+        _push_block(out, table_md)
+
+
+def _write_container(node: Tag, out: list[str], depth: int) -> None:
     # Anything else (div, section, article, figure, aside kept by the
     # scorer…) is a container: recurse when it holds blocks, otherwise
     # treat its inline content as one paragraph. Without the second half a
     # `<div>bare text</div>` would vanish.
-    if any(_is_block(child) for child in node.contents):
-        for child in node.contents:
-            _write_block(child, out, depth)
-    else:
-        text = _inline(node)
-        if text:
-            _push_block(out, text)
+    if _contains_block(node):
+        _write_blocks(node.contents, out, depth)
+        return
+    _write_inline_block(node, out, depth)
+
+
+def _contains_block(node: Tag) -> bool:
+    return any(_is_block(child) for child in node.contents)
+
+
+_BLOCK_WRITERS: dict[str, Callable[[Tag, list[str], int], None]] = {
+    "h1": _write_heading,
+    "h2": _write_heading,
+    "h3": _write_heading,
+    "h4": _write_heading,
+    "h5": _write_heading,
+    "h6": _write_heading,
+    "p": _write_inline_block,
+    "figcaption": _write_inline_block,
+    "blockquote": _write_blockquote,
+    "ul": _write_unordered_list,
+    "ol": _write_ordered_list,
+    "pre": _write_pre,
+    "hr": _write_horizontal_rule,
+    "table": _write_table_block,
+    "img": _write_inline_block,
+}
 
 
 def _is_block(node: object) -> bool:
@@ -230,25 +295,42 @@ def _write_table(table: Tag) -> str:
     """Markdown rows for one table. Headerless tables get an empty header
     row, so the result is still a table every renderer accepts.
     """
-    rows: list[list[str]] = []
-    for tr in table.find_all("tr"):
-        cells = [
-            _inline(c).replace("|", "\\|")
-            for c in tr.contents
-            if _is_element(c) and _node_name(c) in ("td", "th")
-        ]
-        if cells:
-            rows.append(cells)
+    rows = _table_rows(table)
     if not rows:
         return ""
+    return _markdown_table(rows)
+
+
+def _table_rows(table: Tag) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for tr in table.find_all("tr"):
+        cells = _table_cells(tr)
+        if cells:
+            rows.append(cells)
+    return rows
+
+
+def _table_cells(row: Tag) -> list[str]:
+    return [
+        _inline(cell).replace("|", "\\|")
+        for cell in row.contents
+        if _is_element(cell) and _node_name(cell) in ("td", "th")
+    ]
+
+
+def _markdown_table(rows: list[list[str]]) -> str:
     width = max(len(r) for r in rows)
     out: list[str] = []
     for i, row in enumerate(rows):
-        cells = row + [""] * (width - len(row))
-        out.append(f"| {' | '.join(cells)} |\n")
-        if i == 0:
-            out.append("|" + " --- |" * width + "\n")
+        _append_table_row(out, row, width, i)
     return "".join(out).rstrip()
+
+
+def _append_table_row(out: list[str], row: list[str], width: int, index: int) -> None:
+    cells = row + [""] * (width - len(row))
+    out.append(f"| {' | '.join(cells)} |\n")
+    if index == 0:
+        out.append("|" + " --- |" * width + "\n")
 
 
 def _inline(node: object) -> str:
@@ -265,48 +347,68 @@ def _inline_into(node: object, out: list[str]) -> None:
     if not _is_element(node):
         return
 
-    name = _node_name(node)
-
-    if name == "a":
-        text = _collapse(_text_content(node))
-        # A link with no text is furniture (an icon, an anchor); a
-        # `javascript:` href is not somewhere the reader can go.
-        if not text:
-            return
-        href = node.get("href") or ""
-        if not href or href.startswith("javascript:"):
-            out.append(text)
-        else:
-            out.append(f"[{text}]({href})")
+    writer = _INLINE_WRITERS.get(_node_name(node))
+    if writer is not None:
+        writer(node, out)
         return
+    _write_inline_children(node, out)
 
-    if name == "img":
-        src = node.get("src") or ""
-        if src:
-            alt = _collapse(node.get("alt") or "")
-            out.append(f"![{alt}]({src})")
+
+def _write_link(node: Tag, out: list[str]) -> None:
+    text = _collapse(_text_content(node))
+    # A link with no text is furniture (an icon, an anchor); a
+    # `javascript:` href is not somewhere the reader can go.
+    if not text:
         return
-
-    if name == "br":
-        out.append(" ")
+    href = node.get("href") or ""
+    if not href or href.startswith("javascript:"):
+        out.append(text)
         return
+    out.append(f"[{text}]({href})")
 
-    if name in ("code", "kbd", "samp"):
-        text = _collapse(_text_content(node))
-        if text:
-            out.append(f"`{text}`")
-        return
 
-    if name in ("strong", "b"):
-        _wrap_children(node, out, "**")
-        return
+def _write_image(node: Tag, out: list[str]) -> None:
+    src = node.get("src") or ""
+    if src:
+        alt = _collapse(node.get("alt") or "")
+        out.append(f"![{alt}]({src})")
 
-    if name in ("em", "i"):
-        _wrap_children(node, out, "*")
-        return
 
+def _write_break(_node: Tag, out: list[str]) -> None:
+    out.append(" ")
+
+
+def _write_code(node: Tag, out: list[str]) -> None:
+    text = _collapse(_text_content(node))
+    if text:
+        out.append(f"`{text}`")
+
+
+def _write_strong(node: Tag, out: list[str]) -> None:
+    _wrap_children(node, out, "**")
+
+
+def _write_emphasis(node: Tag, out: list[str]) -> None:
+    _wrap_children(node, out, "*")
+
+
+def _write_inline_children(node: Tag, out: list[str]) -> None:
     for child in node.contents:
         _inline_into(child, out)
+
+
+_INLINE_WRITERS: dict[str, Callable[[Tag, list[str]], None]] = {
+    "a": _write_link,
+    "img": _write_image,
+    "br": _write_break,
+    "code": _write_code,
+    "kbd": _write_code,
+    "samp": _write_code,
+    "strong": _write_strong,
+    "b": _write_strong,
+    "em": _write_emphasis,
+    "i": _write_emphasis,
+}
 
 
 def _wrap_children(node: Tag, out: list[str], marker: str) -> None:

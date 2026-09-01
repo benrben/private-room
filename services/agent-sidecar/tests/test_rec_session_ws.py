@@ -32,6 +32,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -55,7 +56,16 @@ from arcelle_sidecar.rec.engine import (
     Save,
 )
 from arcelle_sidecar.rec.lanes import Source
-from arcelle_sidecar.rec.meta import SAMPLE_RATE, RecMeta, RecSegment
+from arcelle_sidecar.rec.meta import (
+    SAMPLE_RATE,
+    By,
+    NoteKind,
+    RecChapter,
+    RecHighlight,
+    RecMeta,
+    RecNote,
+    RecSegment,
+)
 from arcelle_sidecar.rec.session_ws import (
     EditMetaRequest,
     RecSessionManager,
@@ -502,6 +512,28 @@ def test_note_and_chapter_ops_round_trip() -> None:
     )(meta) == 'Unknown item kind "nonsense".'
 
 
+def test_delete_item_removes_only_the_requested_annotation_kind() -> None:
+    meta = RecMeta(
+        notes=[RecNote(id="note", t0=1, kind=NoteKind.POINT, text="keep no other note", by=By.YOU)],
+        chapters=[RecChapter(id="chapter", t0=2, title="Keep no other chapter", by=By.YOU)],
+        highlights=[RecHighlight(id="highlight", t0=3, t1=4, by=By.YOU)],
+    )
+
+    assert session_ws._apply_delete_item("note", "note")(meta) is None
+    assert meta.notes == []
+    assert [item.id for item in meta.chapters] == ["chapter"]
+    assert [item.id for item in meta.highlights] == ["highlight"]
+
+    assert session_ws._apply_delete_item("chapter", "chapter")(meta) is None
+    assert session_ws._apply_delete_item("highlight", "highlight")(meta) is None
+    assert meta.chapters == [] and meta.highlights == []
+    assert (
+        session_ws._apply_delete_item("note", "gone")(meta)
+        == "That item is no longer in this recording."
+    )
+    assert session_ws._apply_delete_item("other", "gone")(meta) == 'Unknown item kind "other".'
+
+
 def test_add_highlight_with_t1_before_t0_marks_the_instant() -> None:
     engine = _engine_for_ops()
     meta = RecMeta()
@@ -544,6 +576,335 @@ def test_a_mark_past_the_end_is_refused_but_the_live_head_counts() -> None:
 def test_unknown_or_incomplete_ops_are_rejected(body: dict) -> None:
     with pytest.raises(ValueError):
         _build_apply(EditMetaRequest(fileId="f", **body), _engine_for_ops())
+
+
+async def test_rec_host_route_handles_fake_socket_state_and_ack_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSocket:
+        def __init__(self, file_id: str, messages: list[dict | BaseException]) -> None:
+            self.query_params = {"fileId": file_id}
+            self.messages = messages
+            self.accepted = 0
+            self.closed: list[int] = []
+
+        async def accept(self) -> None:
+            self.accepted += 1
+
+        async def close(self, code: int) -> None:
+            self.closed.append(code)
+
+        async def receive(self) -> dict:
+            message = self.messages.pop(0)
+            if isinstance(message, BaseException):
+                raise message
+            return message
+
+    app = FastAPI()
+    manager = register_rec_routes(app)
+    host_route = next(route.endpoint for route in app.routes if route.path == "/rec/host")
+
+    missing = FakeSocket("missing", [])
+    await host_route(missing)
+    assert missing.closed == [4404]
+
+    host = _HostLink()
+    manager.current = SimpleNamespace(
+        file_id="f", finalized=False, ports=SimpleNamespace(host=host)
+    )
+    host.attach(object())
+    duplicate = FakeSocket("f", [])
+    await host_route(duplicate)
+    assert duplicate.closed == [4409]
+    host.detach()
+
+    resolved: list[dict] = []
+    monkeypatch.setattr(host, "resolve", resolved.append)
+    normal = FakeSocket(
+        "f",
+        [
+            {"type": "websocket.receive", "bytes": b"ignored"},
+            {"type": "websocket.receive", "text": "not json"},
+            {"type": "websocket.receive", "text": "[]"},
+            {"type": "websocket.receive", "text": '{"reqId":"save","ok":true}'},
+            {"type": "websocket.disconnect"},
+        ],
+    )
+    await host_route(normal)
+    assert normal.accepted == 1
+    assert host.ws is None
+    assert resolved == [{"reqId": "save", "ok": True}]
+
+    disconnected = FakeSocket("f", [WebSocketDisconnect(code=1001)])
+    await host_route(disconnected)
+    assert disconnected.accepted == 1
+    assert host.ws is None
+
+
+def test_rename_speaker_helpers_keep_refusal_and_guess_cleanup_behavior() -> None:
+    assert session_ws._apply_rename_speaker(" ", "Ben")(RecMeta()) == "No speaker selected."
+    assert session_ws._apply_rename_speaker("Speaker 1", "Ben")(RecMeta()) == (
+        "That recording has no transcript yet."
+    )
+    meta = _meta_with_speaker()
+    meta.speaker_names["Speaker 1"] = "Dana"
+    meta.recognized.update({"Dana", "Ben"})
+
+    assert session_ws._apply_rename_speaker("Speaker 1", " Ben ")(meta) is None
+    assert meta.speaker_names == {"Speaker 1": "Ben"}
+    assert meta.recognized == set()
+    assert session_ws._apply_rename_speaker("Other", "Ben")(meta) == (
+        'Nobody in this recording is labelled "Other".'
+    )
+    assert session_ws._apply_rename_speaker("Speaker 1", "Speaker 1")(meta) is None
+    assert meta.speaker_names == {}
+
+
+async def test_host_link_call_classifies_all_fake_transport_outcomes() -> None:
+    class FakeSocket:
+        def __init__(self, ack: dict | None = None, error: Exception | None = None) -> None:
+            self.ack = ack
+            self.error = error
+            self.host: _HostLink | None = None
+
+        async def send_text(self, text: str) -> None:
+            if self.error is not None:
+                raise self.error
+            assert self.host is not None
+            if self.ack is not None:
+                self.host.resolve(json.loads(text) | self.ack)
+
+    async def call_with(ack: dict | None = None, error: Exception | None = None) -> _HostLink:
+        host = _HostLink()
+        socket = FakeSocket(ack, error)
+        socket.host = host
+        host.ws = socket
+        return host
+
+    success = await call_with({"ok": True})
+    await success.call({"reqId": "ok"}, timeout=0.1)
+
+    absent = _HostLink()
+    with pytest.raises(PersistFailed, match="not connected"):
+        await absent.call({"reqId": "none"}, timeout=0.1)
+
+    broken = await call_with(error=RuntimeError("gone"))
+    with pytest.raises(PersistFailed, match="Could not reach"):
+        await broken.call({"reqId": "broken"}, timeout=0.1)
+
+    silent = await call_with()
+    with pytest.raises(PersistFailed, match="did not answer"):
+        await silent.call({"reqId": "late"}, timeout=0.001)
+
+    closed = await call_with({"ok": False, "reason": "closed"})
+    with pytest.raises(RoomClosed):
+        await closed.call({"reqId": "closed"}, timeout=0.1)
+
+    failed = await call_with({"ok": False, "message": "no space"})
+    with pytest.raises(PersistFailed, match="no space"):
+        await failed.call({"reqId": "failed"}, timeout=0.1)
+
+
+async def test_persist_helpers_run_only_against_fake_engine_spool_and_host() -> None:
+    class FakeSpool:
+        def __init__(self, *, fail_append: bool = False) -> None:
+            self.fail_append = fail_append
+            self.appended: list[bytes] = []
+            self.truncated: list[int] = []
+            self.unlinked = 0
+
+        def append(self, data: bytes) -> tuple[int, int]:
+            if self.fail_append:
+                raise OSError("full disk")
+            start = sum(len(item) for item in self.appended)
+            self.appended.append(data)
+            return start, start + len(data)
+
+        def truncate_to(self, offset: int) -> None:
+            self.truncated.append(offset)
+
+        def unlink(self) -> None:
+            self.unlinked += 1
+
+    class FakeHost:
+        def __init__(self, failure: Exception | None = None) -> None:
+            self.failure = failure
+            self.messages: list[dict] = []
+
+        async def call(self, message: dict, *, timeout: float) -> None:
+            self.messages.append(message)
+            if self.failure is not None:
+                raise self.failure
+
+    def ports_for(spool: FakeSpool, host: FakeHost) -> WsEnginePorts:
+        ports = WsEnginePorts(file_id="f", spool=spool, base_url="unused")
+        ports.bind_engine(SimpleNamespace(mixed=np.zeros(5), flushed_samples=7))
+        ports.host = host
+        return ports
+
+    full_spool, full_host = FakeSpool(), FakeHost()
+    await ports_for(full_spool, full_host).persist(
+        Save.FULL, wav=b"wav", checkpoint_pcm=None, meta_json="{}", text="done"
+    )
+    assert full_host.messages[-1] | {"reqId": "ignored"} == {
+        "reqId": "ignored",
+        "kind": "full",
+        "fromSample": 0,
+        "toSample": 5,
+        "spoolRange": [0, 3],
+        "metaJson": "{}",
+        "text": "done",
+    }
+    assert full_spool.appended == [b"wav"] and full_spool.unlinked == 1
+
+    checkpoint_spool, checkpoint_host = FakeSpool(), FakeHost()
+    samples = np.asarray([1, 2], dtype=np.float32)
+    await ports_for(checkpoint_spool, checkpoint_host).persist(
+        Save.CHECKPOINT, wav=None, checkpoint_pcm=samples, meta_json="m", text="t"
+    )
+    assert checkpoint_host.messages[-1]["fromSample"] == 7
+    assert checkpoint_host.messages[-1]["toSample"] == 9
+    assert checkpoint_spool.appended == [samples.astype("<f4").tobytes()]
+
+    transcript_spool, transcript_host = FakeSpool(), FakeHost()
+    await ports_for(transcript_spool, transcript_host).persist(
+        Save.TRANSCRIPT, wav=None, checkpoint_pcm=None, meta_json="{}", text="only text"
+    )
+    assert transcript_spool.appended == []
+    assert transcript_host.messages[-1]["spoolRange"] is None
+
+    rollback_spool, rollback_host = FakeSpool(), FakeHost(PersistFailed("host failed"))
+    with pytest.raises(PersistFailed, match="host failed"):
+        await ports_for(rollback_spool, rollback_host).persist(
+            Save.CHECKPOINT, wav=None, checkpoint_pcm=samples, meta_json="{}", text=""
+        )
+    assert rollback_spool.truncated == [0]
+
+    with pytest.raises(PersistFailed, match="spool file could not be written"):
+        await ports_for(FakeSpool(fail_append=True), FakeHost()).persist(
+            Save.CHECKPOINT, wav=None, checkpoint_pcm=samples, meta_json="{}", text=""
+        )
+    with pytest.raises(PersistFailed, match="no WAV bytes"):
+        await ports_for(FakeSpool(), FakeHost()).persist(
+            Save.FULL, wav=None, checkpoint_pcm=None, meta_json="{}", text=""
+        )
+
+
+async def test_start_helpers_and_session_socket_route_use_only_fakes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSpool:
+        def __init__(self, path: Path, key: bytes) -> None:
+            self.path, self.key, self.unlinked = path, key, 0
+
+        def unlink(self) -> None:
+            self.unlinked += 1
+
+    class FakeSocket:
+        def __init__(self, file_id: str, messages: list[dict | BaseException]) -> None:
+            self.query_params = {"fileId": file_id}
+            self.messages = messages
+            self.accepted = 0
+            self.closed: list[int] = []
+
+        async def accept(self) -> None:
+            self.accepted += 1
+
+        async def close(self, code: int) -> None:
+            self.closed.append(code)
+
+        async def receive(self) -> dict:
+            message = self.messages.pop(0)
+            if isinstance(message, BaseException):
+                raise message
+            return message
+
+    class FakePorts:
+        def __init__(self) -> None:
+            self.attached: list[FakeSocket] = []
+            self.detached: list[FakeSocket] = []
+
+        def attach_session_socket(self, socket: FakeSocket) -> "asyncio.Queue[str]":
+            self.attached.append(socket)
+            return asyncio.Queue()
+
+        def detach_session_socket(self, socket: FakeSocket) -> None:
+            self.detached.append(socket)
+
+    req = session_ws.StartSessionRequest(
+        fileId="f", modelPath="unused", spoolDir="/fake-spools", baseUrl="unused"
+    )
+    app = FastAPI()
+    manager = register_rec_routes(app)
+    start_route = next(route.endpoint for route in app.routes if route.path == "/rec/start")
+    session_route = next(route.endpoint for route in app.routes if route.path == "/rec/session")
+    monkeypatch.setattr(session_ws, "SpoolWriter", FakeSpool)
+    monkeypatch.setattr(session_ws, "WsEnginePorts", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(session_ws.AESGCM, "generate_key", lambda bit_length: b"k" * 32)
+    monkeypatch.setattr(session_ws, "_engine_config", lambda request: SimpleNamespace(file_id=request.file_id))
+
+    async def starts(cfg, ports):
+        return SimpleNamespace(file_id=cfg.file_id)
+
+    monkeypatch.setattr(manager, "start", starts)
+    started = await start_route(req)
+    assert started["fileId"] == "f" and base64.b64decode(started["spoolKey"]) == b"k" * 32
+    assert (await start_route(req.model_copy(update={"file_id": "../bad"}))).status_code == 400
+
+    monkeypatch.setattr(session_ws, "_engine_config", lambda request: (_ for _ in ()).throw(ValueError("bad")))
+    assert (await start_route(req)).status_code == 400
+
+    monkeypatch.setattr(session_ws, "_engine_config", lambda request: SimpleNamespace(file_id=request.file_id))
+    monkeypatch.setattr(session_ws, "SpoolWriter", lambda path, key: (_ for _ in ()).throw(FileExistsError()))
+    assert (await start_route(req)).status_code == 409
+    monkeypatch.setattr(session_ws, "SpoolWriter", lambda path, key: (_ for _ in ()).throw(OSError("denied")))
+    assert (await start_route(req)).status_code == 500
+
+    made: list[FakeSpool] = []
+
+    def make_spool(path: Path, key: bytes) -> FakeSpool:
+        spool = FakeSpool(path, key)
+        made.append(spool)
+        return spool
+
+    monkeypatch.setattr(session_ws, "SpoolWriter", make_spool)
+
+    async def already_live(cfg, ports):
+        raise session_ws.SessionAlreadyLive()
+
+    monkeypatch.setattr(manager, "start", already_live)
+    assert (await start_route(req)).status_code == 409 and made[-1].unlinked == 1
+
+    async def broken_start(cfg, ports):
+        raise RuntimeError("broken engine")
+
+    monkeypatch.setattr(manager, "start", broken_start)
+    assert (await start_route(req)).status_code == 500 and made[-1].unlinked == 1
+
+    ports = FakePorts()
+    manager.current = SimpleNamespace(file_id="f", finalized=False, ports=ports, engine=object())
+    received: list[tuple[str, object]] = []
+    monkeypatch.setattr(session_ws, "_handle_audio_frame", lambda engine, data: received.append(("audio", data)))
+    monkeypatch.setattr(session_ws, "_handle_control_text", lambda engine, text: received.append(("text", text)))
+    socket = FakeSocket(
+        "f",
+        [
+            {"type": "websocket.receive", "bytes": b"audio"},
+            {"type": "websocket.receive", "text": "control"},
+            {"type": "websocket.disconnect"},
+        ],
+    )
+    await session_route(socket)
+    assert socket.accepted == 1 and ports.attached == [socket] and ports.detached == [socket]
+    assert received == [("audio", b"audio"), ("text", "control")]
+
+    missing = FakeSocket("gone", [])
+    await session_route(missing)
+    assert missing.closed == [4404]
+
+    disconnected = FakeSocket("f", [WebSocketDisconnect(code=1001)])
+    await session_route(disconnected)
+    assert disconnected.accepted == 1 and ports.detached[-1] is disconnected
 
 
 # ============================================================================

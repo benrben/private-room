@@ -150,6 +150,130 @@ function parseErrorBody(v: unknown): { code: string; error: string } {
   return { code, error };
 }
 
+function stopped(): SidecarPostOutcome {
+  return { kind: "stopped" };
+}
+
+function errorOutcome(code: string, error: string, status: number): SidecarPostOutcome {
+  return { kind: "error", error: { code, error, status } };
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+async function startedSidecar(): Promise<string | SidecarPostOutcome> {
+  try {
+    return await ensureUp();
+  } catch (err) {
+    return errorOutcome(SIDECAR_DOWN, errorMessage(err), 503);
+  }
+}
+
+interface RequestState {
+  cancelledByFlag: boolean;
+  timedOut: boolean;
+}
+
+interface RequestGuard {
+  readonly signal: AbortSignal;
+  wasCancelled(): boolean;
+  timedOut(): boolean;
+  release(): void;
+}
+
+function cancelRequestWhenRequested(cancel: CancelFlag, state: RequestState, controller: AbortController): void {
+  if (cancel.load()) {
+    state.cancelledByFlag = true;
+    controller.abort();
+  }
+}
+
+function cancelRequestForTimeout(state: RequestState, controller: AbortController): void {
+  state.timedOut = true;
+  controller.abort();
+}
+
+function cancellableRequestGuard(cancel: CancelFlag, timeoutMs: number): RequestGuard {
+  const controller = new AbortController();
+  const state: RequestState = { cancelledByFlag: false, timedOut: false };
+  const poll = setInterval(() => cancelRequestWhenRequested(cancel, state, controller), CANCEL_POLL_MS);
+  const budget = setTimeout(() => cancelRequestForTimeout(state, controller), timeoutMs);
+  return {
+    signal: controller.signal,
+    wasCancelled: () => state.cancelledByFlag,
+    timedOut: () => state.timedOut,
+    release: () => {
+      clearInterval(poll);
+      clearTimeout(budget);
+    },
+  };
+}
+
+function postJson(base: string, path: string, body: unknown, signal: AbortSignal): Promise<Response> {
+  return fetch(`${base}${path}`, {
+    method: "POST",
+    headers: { ...authedHeaders(), "content-type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+function timeoutOutcome(timeoutMs: number): SidecarPostOutcome {
+  return errorOutcome(
+    "ENGINE_ERROR",
+    `The AI engine did not answer within ${Math.round(timeoutMs / 1000)}s. Try a shorter request, or a faster model in Settings → Model.`,
+    0
+  );
+}
+
+function failedRequestOutcome(err: unknown): SidecarPostOutcome {
+  const code = isConnectionRefused(err) ? "OLLAMA_DOWN" : "ENGINE_ERROR";
+  return errorOutcome(code, errorMessage(err), 0);
+}
+
+function failedFetchOutcome(err: unknown, guard: RequestGuard, timeoutMs: number): SidecarPostOutcome {
+  if (guard.wasCancelled()) {
+    return stopped();
+  }
+  if (guard.timedOut()) {
+    return timeoutOutcome(timeoutMs);
+  }
+  return failedRequestOutcome(err);
+}
+
+function failedJsonBodyOutcome(err: unknown, status: number, guard: RequestGuard): SidecarPostOutcome {
+  if (guard.wasCancelled()) {
+    return stopped();
+  }
+  return errorOutcome("ENGINE_ERROR", errorMessage(err), status);
+}
+
+async function successfulResponseOutcome(response: Response, guard: RequestGuard): Promise<SidecarPostOutcome> {
+  try {
+    return { kind: "value", value: await response.json() };
+  } catch (err) {
+    return failedJsonBodyOutcome(err, response.status, guard);
+  }
+}
+
+async function responseJsonOrNull(response: Response): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+async function failedResponseOutcome(response: Response, guard: RequestGuard): Promise<SidecarPostOutcome> {
+  const body = await responseJsonOrNull(response);
+  if (guard.wasCancelled()) {
+    return stopped();
+  }
+  const { code, error } = parseErrorBody(body);
+  return errorOutcome(code, error, response.status);
+}
+
 /**
  * POST a JSON body to a sidecar feature endpoint, cancellable.
  *
@@ -173,106 +297,31 @@ export async function sidecarJsonCancellable(
   timeoutMs: number = SIDECAR_TIMEOUT_MS
 ): Promise<SidecarPostOutcome> {
   if (cancel.load()) {
-    return { kind: "stopped" };
+    return stopped();
   }
 
-  let base: string;
-  try {
-    base = await ensureUp();
-  } catch (err) {
-    // "A dead sidecar is its OWN failure, not Ollama's" — Rust's
-    // `sidecar_lifecycle::ensure_up()` failure branch.
-    return {
-      kind: "error",
-      error: { code: SIDECAR_DOWN, error: err instanceof Error ? err.message : String(err), status: 503 },
-    };
+  const base = await startedSidecar();
+  if (typeof base !== "string") {
+    return base;
   }
 
   const guard = busy();
-  const controller = new AbortController();
-  let cancelledByFlag = false;
-  let timedOut = false;
-  const poll = setInterval(() => {
-    if (cancel.load()) {
-      cancelledByFlag = true;
-      controller.abort();
-    }
-  }, CANCEL_POLL_MS);
-  const budget = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
+  const request = cancellableRequestGuard(cancel, timeoutMs);
 
   try {
     let resp: Response;
     try {
-      resp = await fetch(`${base}${path}`, {
-        method: "POST",
-        headers: { ...authedHeaders(), "content-type": "application/json" },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
+      resp = await postJson(base, path, body, request.signal);
     } catch (err) {
-      if (cancelledByFlag) {
-        return { kind: "stopped" };
-      }
-      if (timedOut) {
-        return {
-          kind: "error",
-          error: {
-            code: "ENGINE_ERROR",
-            error: `The AI engine did not answer within ${Math.round(timeoutMs / 1000)}s. Try a shorter request, or a faster model in Settings → Model.`,
-            status: 0,
-          },
-        };
-      }
-      // A CONNECT failure to a sidecar that just answered ensureUp()'s own
-      // health check is an engine-availability failure — OLLAMA_DOWN, so the
-      // caller's existing branch fires (matches Rust's `e.is_connect()`).
-      return {
-        kind: "error",
-        error: {
-          code: isConnectionRefused(err) ? "OLLAMA_DOWN" : "ENGINE_ERROR",
-          error: err instanceof Error ? err.message : String(err),
-          status: 0,
-        },
-      };
+      return failedFetchOutcome(err, request, timeoutMs);
     }
 
     if (resp.ok) {
-      try {
-        return { kind: "value", value: await resp.json() };
-      } catch (err) {
-        // The headers arrived but the BODY did not finish. A Stop that landed
-        // in that gap aborted the body stream itself, so the read failed
-        // BECAUSE of the cancel — reporting it as an engine error would put an
-        // "AI error" toast in front of a user who pressed Stop, and (worse)
-        // `isFatal` would not park the job, so the caller would mark the
-        // window skipped and carry on past a Stop. Rust's `select!` returns
-        // `Ok(None)` for the whole race once the flag is set; so do we.
-        if (cancelledByFlag) {
-          return { kind: "stopped" };
-        }
-        return {
-          kind: "error",
-          error: { code: "ENGINE_ERROR", error: err instanceof Error ? err.message : String(err), status: resp.status },
-        };
-      }
+      return await successfulResponseOutcome(resp, request);
     }
-    let body2: unknown = null;
-    try {
-      body2 = await resp.json();
-    } catch {
-      body2 = null;
-    }
-    if (cancelledByFlag) {
-      return { kind: "stopped" };
-    }
-    const { code, error } = parseErrorBody(body2);
-    return { kind: "error", error: { code, error, status: resp.status } };
+    return await failedResponseOutcome(resp, request);
   } finally {
-    clearInterval(poll);
-    clearTimeout(budget);
+    request.release();
     guard.release();
   }
 }

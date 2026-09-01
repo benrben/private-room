@@ -363,6 +363,24 @@ describe("dedupeParkedJobs", () => {
     db.close();
   });
 
+  it("leaves parked rows with unreadable plans untouched", () => {
+    const db = freshRoom();
+    legacyJob(
+      db,
+      "broken",
+      "file_pass",
+      "Full pass — damaged plan",
+      { instruction: "summarize" },
+      "paused",
+      "2026-08-01T09:00:00Z",
+    );
+    db.prepare("UPDATE jobs SET plan = '{broken' WHERE id = 'broken'").run();
+
+    expect(dedupeParkedJobs(db)).toBe(0);
+    expect(ids(db)).toEqual(["broken"]);
+    db.close();
+  });
+
   it("failed_auto_index_attempts_collapse_but_named_summaries_do_not", () => {
     const db = freshRoom();
     const auto = (n: number) => ({ auto: true, reduce: false, steps: new Array(n).fill(0) });
@@ -521,9 +539,30 @@ describe("workflow run row lifecycle on delete", () => {
     expect(row.finished_at, "the run row must be closed, not left open").not.toBeNull();
     db.close();
   });
+
+  it("still deletes the job when best-effort workflow cleanup is unavailable", () => {
+    const db = freshRoom();
+    const id = createJob(db, "file_pass", "Standalone work", {}, 1);
+    db.exec("DROP TABLE workflow_runs");
+
+    expect(() => deleteJob(db, id)).not.toThrow();
+    expect(db.prepare("SELECT count(*) AS n FROM jobs WHERE id = ?").get(id)).toEqual({ n: 0 });
+    db.close();
+  });
 });
 
 describe("pruneJobHistory", () => {
+  it("leaves a finished row with an unreadable plan as independent evidence", () => {
+    const db = freshRoom();
+    const id = createJob(db, "file_pass", "bad plan", {}, 1);
+    setJobStatus(db, id, "done", null);
+    db.prepare("UPDATE jobs SET plan = '{broken' WHERE id = ?").run(id);
+
+    expect(pruneJobHistory(db)).toBe(0);
+    expect(db.prepare("SELECT count(*) AS n FROM jobs WHERE id = ?").get(id)).toEqual({ n: 1 });
+    db.close();
+  });
+
   it("finished_history_rolls_off_but_live_and_evidenced_rows_stay", () => {
     const db = freshRoom();
     const plan = { file_id: "f1" };
@@ -593,6 +632,15 @@ describe("pruneJobHistory", () => {
 });
 
 describe("error status", () => {
+  it("maps malformed persisted JSON fields to null instead of failing the Activity list", () => {
+    const db = freshRoom();
+    const id = createJob(db, "deep_summary", "legacy row", {}, 1);
+    db.prepare("UPDATE jobs SET plan = '{bad', state = '{also-bad' WHERE id = ?").run(id);
+
+    expect(getJob(db, id)).toMatchObject({ id, plan: null, state: null });
+    db.close();
+  });
+
   it("error_status_carries_a_message", () => {
     const db = freshRoom();
     const id = createJob(db, "deep_summary", "x", {}, 1);

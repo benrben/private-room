@@ -143,6 +143,121 @@ def _num(v: Any) -> float | None:
     return None
 
 
+def _box_label(item: dict[Any, Any]) -> str:
+    """Return the model label with the Rust-compatible fallback order."""
+    label = item.get("label")
+    if isinstance(label, str):
+        return label
+    name = item.get("name")
+    if isinstance(name, str):
+        return name
+    return "match"
+
+
+def _box_coordinates(item: dict[Any, Any]) -> tuple[list[Any], bool, bool] | None:
+    """Return coordinates and their convention, in precedence order."""
+    if isinstance(item.get("bbox_2d"), list):
+        return item["bbox_2d"], False, True
+    if isinstance(item.get("bbox"), list):
+        return item["bbox"], False, True
+    if isinstance(item.get("box_2d"), list):
+        return item["box_2d"], True, False
+    if isinstance(item.get("box"), list):
+        return item["box"], False, False
+    return None
+
+
+def _numeric_coordinates(coords: list[Any]) -> list[float] | None:
+    """Accept exactly four JSON numbers, excluding Python boolean values."""
+    if len(coords) != 4:
+        return None
+    values = [number for value in coords if (number := _num(value)) is not None]
+    if len(values) != 4:
+        return None
+    return values
+
+
+def _xy_coordinates(values: list[float], y_first: bool) -> tuple[float, float, float, float]:
+    """Put a supported coordinate convention into x1, y1, x2, y2 order."""
+    if y_first:
+        return values[1], values[0], values[3], values[2]
+    return values[0], values[1], values[2], values[3]
+
+
+def _image_scales(
+    values: list[float],
+    bounds: tuple[float, float, float, float],
+    pixels: bool,
+    img_w: float,
+    img_h: float,
+) -> tuple[float, float]:
+    """Choose the scale matching the model's apparent coordinate convention."""
+    a, b, c, d = bounds
+    out_of_range = max(a, c) > img_w * 1.05 or max(b, d) > img_h * 1.05
+    if max([0.0, *values]) <= 1.0:
+        return 1.0, 1.0
+    if pixels and not out_of_range:
+        return max(img_w, 1.0), max(img_h, 1.0)
+    return 1000.0, 1000.0
+
+
+def _scaled_bounds(
+    bounds: tuple[float, float, float, float], scales: tuple[float, float]
+) -> tuple[float, float, float, float]:
+    """Apply independent horizontal and vertical normalization scales."""
+    a, b, c, d = bounds
+    sx, sy = scales
+    return a / sx, b / sy, c / sx, d / sy
+
+
+def _ordered_bounds(bounds: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    """Return bounds with their start coordinate no greater than their end."""
+    a, b, c, d = bounds
+    if a > c:
+        a, c = c, a
+    if b > d:
+        b, d = d, b
+    return a, b, c, d
+
+
+def _clamp_unit(value: float) -> float:
+    """Keep a coordinate within the normalized image plane."""
+    return min(max(value, 0.0), 1.0)
+
+
+def _clamped_bounds(bounds: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    """Clamp every normalized coordinate to the image plane."""
+    a, b, c, d = bounds
+    return _clamp_unit(a), _clamp_unit(b), _clamp_unit(c), _clamp_unit(d)
+
+
+def _has_area(bounds: tuple[float, float, float, float]) -> bool:
+    """Require the same minimum normalized extent as the Rust implementation."""
+    a, b, c, d = bounds
+    return c - a >= 0.001 and d - b >= 0.001
+
+
+def _box_from_item(item: Any, img_w: float, img_h: float) -> dict[str, Any] | None:
+    """Normalize one model item or return no box for malformed input."""
+    if not isinstance(item, dict):
+        return None
+    label = _box_label(item)
+    coordinate_details = _box_coordinates(item)
+    if coordinate_details is None:
+        return None
+    coords, y_first, pixels = coordinate_details
+    values = _numeric_coordinates(coords)
+    if values is None:
+        return None
+    bounds = _xy_coordinates(values, y_first)
+    scales = _image_scales(values, bounds, pixels, img_w, img_h)
+    normalized_bounds = _clamped_bounds(_ordered_bounds(_scaled_bounds(bounds, scales)))
+    if not _has_area(normalized_bounds):
+        return None
+    a, b, c, d = normalized_bounds
+    return {"label": label, "x1": a, "y1": b, "x2": c, "y2": d}
+
+
 def boxes_from_items(items: list[Any], img_w: float, img_h: float) -> list[dict[str, Any]]:
     """One ``ImageBox`` dict per valid item (vision.rs ``boxes_from_items``).
 
@@ -154,67 +269,9 @@ def boxes_from_items(items: list[Any], img_w: float, img_h: float) -> list[dict[
     (label, x1, y1, x2, y2), all normalized 0..1, top-left origin."""
     boxes: list[dict[str, Any]] = []
     for item in items:
-        if not isinstance(item, dict):
-            continue
-        # as_str() semantics: use label only if it IS a string (even ""), then
-        # name, then the "match" fallback.
-        label = item.get("label")
-        if not isinstance(label, str):
-            label = item.get("name")
-            if not isinstance(label, str):
-                label = "match"
-
-        # Requested "bbox_2d" is absolute pixels. "box_2d" is Google-style
-        # [ymin, xmin, ymax, xmax] 0-1000.
-        if isinstance(item.get("bbox_2d"), list):
-            coords, y_first, pixels = item["bbox_2d"], False, True
-        elif isinstance(item.get("bbox"), list):
-            coords, y_first, pixels = item["bbox"], False, True
-        elif isinstance(item.get("box_2d"), list):
-            coords, y_first, pixels = item["box_2d"], True, False
-        elif isinstance(item.get("box"), list):
-            coords, y_first, pixels = item["box"], False, False
-        else:
-            continue
-
-        if len(coords) != 4:
-            continue
-        vals = [n for n in (_num(c) for c in coords) if n is not None]
-        if len(vals) != 4:
-            continue
-
-        if y_first:
-            a, b, c, d = vals[1], vals[0], vals[3], vals[2]
-        else:
-            a, b, c, d = vals[0], vals[1], vals[2], vals[3]
-
-        # Scale to 0..1. Pixel keys use the image dims — unless the values
-        # overshoot them, which means the model answered in its own
-        # 0-1000-normalized space (qwen2.5vl does this on small images).
-        max_val = max([0.0, *vals])
-        out_of_range = max(a, c) > img_w * 1.05 or max(b, d) > img_h * 1.05
-        if max_val <= 1.0:
-            sx, sy = 1.0, 1.0
-        elif pixels and not out_of_range:
-            sx, sy = max(img_w, 1.0), max(img_h, 1.0)
-        else:
-            sx, sy = 1000.0, 1000.0
-        a /= sx
-        c /= sx
-        b /= sy
-        d /= sy
-        if a > c:
-            a, c = c, a
-        if b > d:
-            b, d = d, b
-
-        def clamp(v: float) -> float:
-            return min(max(v, 0.0), 1.0)
-
-        a, b, c, d = clamp(a), clamp(b), clamp(c), clamp(d)
-        if c - a < 0.001 or d - b < 0.001:
-            continue
-        boxes.append({"label": label, "x1": a, "y1": b, "x2": c, "y2": d})
+        box = _box_from_item(item, img_w, img_h)
+        if box is not None:
+            boxes.append(box)
     return boxes
 
 

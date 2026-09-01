@@ -118,6 +118,44 @@ def _rank(q: str, spec: AgentSpec) -> tuple[int, bool, int]:
 rank_worker = _rank
 
 
+def _domain_members(tool: str) -> tuple[str, ...]:
+    """Return the registered members for ``tool``, or no members if unknown."""
+    for name, members, _ in AGENT_TOOL_DOMAINS:
+        if name == tool:
+            return members
+    return ()
+
+
+def _served_members(
+    members: tuple[str, ...], *, web_enabled: bool, served_names: set[str] | None
+) -> tuple[str, ...]:
+    """Keep the members that can act now, defaulting an empty domain subset."""
+    if served_names is None:
+        return members
+    usable = reachable_members(
+        members, web_enabled=web_enabled, served_names=served_names
+    )
+    return usable or (DEFAULT_AGENT_ID,)
+
+
+def _navigation_worker(members: tuple[str, ...], instruction: str) -> str | None:
+    """Return the browser worker when a reachable browser owns the intent."""
+    if "chat.browse" in members and wants_navigation(instruction):
+        return "chat.browse"
+    return None
+
+
+def _best_ranked_member(members: tuple[str, ...], instruction: str) -> str:
+    """Choose the highest-ranked member, retaining domain order on a tie."""
+    q = instruction.lower()
+    best_id, best_key = members[0], (-1, False, -1)
+    for member_id in members:
+        key = _rank(q, get_agent(member_id))
+        if key > best_key:
+            best_id, best_key = member_id, key
+    return best_id
+
+
 def resolve_worker(
     tool: str,
     instruction: str,
@@ -141,20 +179,14 @@ def resolve_worker(
     by re-saving an unrelated earlier reply. Omitted (tests, callers with no
     catalog) means "assume everything is served".
     """
-    members: tuple[str, ...] = ()
-    for name, domain_members, _ in AGENT_TOOL_DOMAINS:
-        if name == tool:
-            members = domain_members
-            break
+    members = _domain_members(tool)
     if not members:
         return DEFAULT_AGENT_ID
-    if served_names is not None:
-        usable = reachable_members(
-            members, web_enabled=web_enabled, served_names=served_names
-        )
-        # Every member unreachable: the domain should not have been offered at
-        # all, so fall back to the default worker rather than an empty box.
-        members = usable or (DEFAULT_AGENT_ID,)
+    # Every member unreachable: the domain should not have been offered at all,
+    # so fall back to the default worker rather than an empty box.
+    members = _served_members(
+        members, web_enabled=web_enabled, served_names=served_names
+    )
     if len(members) == 1:
         return members[0]
 
@@ -168,22 +200,10 @@ def resolve_worker(
     # Browser agent switched off falls through to the scorer and lands on the
     # Web agent, which searches instead (owner decision: fall back, don't
     # refuse).
-    if "chat.browse" in members and wants_navigation(instruction):
-        return "chat.browse"
-
-    # Lowercased ONCE for the whole scoring pass (`_rank` and `_hits` take it
-    # as given): three rungs × every candidate used to re-lower the same string,
-    # and the innermost `q` shadowed this one.
-    q = instruction.lower()
-
-    # Strictly-greater keeps the FIRST member on a full tie — the domain's
-    # stated default. See `_rank` for what each rung is for.
-    best_id, best_key = members[0], (-1, False, -1)
-    for member_id in members:
-        key = _rank(q, get_agent(member_id))
-        if key > best_key:
-            best_id, best_key = member_id, key
-    return best_id
+    navigation_worker = _navigation_worker(members, instruction)
+    if navigation_worker is not None:
+        return navigation_worker
+    return _best_ranked_member(members, instruction)
 
 
 __all__ = [

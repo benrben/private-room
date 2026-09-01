@@ -64,7 +64,7 @@ import numpy as np
 import pytest
 
 from arcelle_sidecar.diar import cluster as dc
-from arcelle_sidecar.diar.embed import NEURAL_GATES, VoicePrint
+from arcelle_sidecar.diar.embed import DSP_GATES, NEURAL_GATES, VoicePrint
 
 
 def _unit(v: np.ndarray) -> np.ndarray:
@@ -527,6 +527,94 @@ def test_cluster_no_strong_prints_everyone_who_spoke_is_one() -> None:
     spans = _sequential_spans(5)
     out = dc.cluster(prints, spans, dc.AUTO_MAX_SPEAKERS)
     assert out == [0, 0, 0, 0, 0]
+
+
+def test_cluster_gated_dsp_path_keeps_distinct_raw_space_voices() -> None:
+    """The legacy five-dimensional path must not center its inputs, and its
+    single pair below 0.30 must stay split."""
+    prints = [
+        VoicePrint(vec=np.array([1.0, 0.0, 0.0, 0.0, 0.0]), voiced_frames=100),
+        VoicePrint(vec=np.array([0.0, 1.0, 0.0, 0.0, 0.0]), voiced_frames=100),
+    ]
+
+    assert dc.cluster_gated(prints, [(0, 100), (300, 400)], 2, dc.MIN_NEW_VOICE_FRAMES) == [0, 1]
+
+
+def test_dsp_and_count_stop_rules_keep_their_distinct_decisions() -> None:
+    same = np.array([1.0, 0.0, 0.0, 0.0, 0.0])
+    different = np.array([0.0, 1.0, 0.0, 0.0, 0.0])
+
+    assert dc._dsp_stop_rule([same, same]) == ("merge_all", 0.0)
+    assert dc._dsp_stop_rule([same, different]) == ("bar", 0.30)
+    assert dc._centered_stop_rule(NEURAL_GATES, [0, 1, 2], [same] * 3, 3) == (
+        "bar",
+        NEURAL_GATES.split,
+    )
+    kind, count = dc._count_stop_rule([same] * (dc._COUNT_SAMPLE + 1), 3)
+    assert kind == "count"
+    assert 1 <= count <= 3
+    assert dc._stop_rule(DSP_GATES, [0, 1], [same, different], 2) == ("bar", 0.30)
+
+
+def test_merge_stop_rules_cover_bar_merge_all_and_single_voice() -> None:
+    assert dc._should_stop_merging(3, 2, "bar", 0.5, 0.1) is False
+    assert dc._should_stop_merging(2, 2, "bar", 0.5, 0.4) is True
+    assert dc._should_stop_merging(2, 2, "merge_all", 0.0, 0.0) is False
+
+    voice = dc.Voice.seed(0, np.array([1.0, 0.0]), 100)
+    units = [voice.unit()]
+    dc._merge_to_stop_rule([voice], units, "bar", 0.5, 1)
+    assert len(units) == 1
+
+
+def test_phantom_absorption_helpers_preserve_real_voice_rules() -> None:
+    phantom = dc.Voice.seed(0, np.array([0.0, 1.0]), 10)
+    real = dc.Voice.seed(1, np.array([1.0, 0.0]), dc.MIN_CLUSTER_FRAMES)
+
+    assert dc._is_real_voice(real, True, dc.MIN_CLUSTER_PHRASES, 0)
+    assert dc._has_real_alternative([phantom, real], 0, False, dc.MIN_CLUSTER_PHRASES, dc.MIN_CLUSTER_FRAMES)
+    assert dc._nearest_real_voice(
+        [phantom, real],
+        [phantom.unit(), real.unit()],
+        0,
+        False,
+        dc.MIN_CLUSTER_PHRASES,
+        dc.MIN_CLUSTER_FRAMES,
+    ) == 1
+
+    voices = [phantom, real]
+    units = [voice.unit() for voice in voices]
+    dc._absorb_phantom_voices(voices, units, 20, dc.MIN_NEW_VOICE_FRAMES)
+    assert len(voices) == len(units) == 1
+
+    two_real = [
+        dc.Voice.seed(0, np.array([1.0, 0.0]), dc.MIN_CLUSTER_FRAMES),
+        dc.Voice.seed(1, np.array([0.0, 1.0]), dc.MIN_CLUSTER_FRAMES),
+    ]
+    dc._absorb_phantom_voices(two_real, [voice.unit() for voice in two_real], 20, dc.MIN_NEW_VOICE_FRAMES)
+    assert len(two_real) == 2
+
+    two_phantoms = [
+        dc.Voice.seed(0, np.array([1.0, 0.0]), 10),
+        dc.Voice.seed(1, np.array([0.0, 1.0]), 10),
+    ]
+    dc._absorb_phantom_voices(
+        two_phantoms,
+        [voice.unit() for voice in two_phantoms],
+        20,
+        dc.MIN_NEW_VOICE_FRAMES,
+    )
+    assert len(two_phantoms) == 2
+
+
+def test_continuity_transition_boundaries_keep_the_original_priors() -> None:
+    close_stay, _ = dc._transition_logs((0, 100), (200, 300), 2)
+    middle_stay, _ = dc._transition_logs((0, 100), (300, 400), 2)
+    distant_stay, _ = dc._transition_logs((0, 100), (400, 500), 2)
+
+    assert math.exp(close_stay) == pytest.approx(0.9)
+    assert math.exp(middle_stay) == pytest.approx(0.7)
+    assert math.exp(distant_stay) == pytest.approx(0.5)
 
 
 # =============================================================================

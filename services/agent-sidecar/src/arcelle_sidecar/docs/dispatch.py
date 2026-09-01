@@ -111,6 +111,16 @@ def is_text_extension(ext: str) -> bool:
 # ------------------------------------------------------------------- sniffing
 
 
+def _sniff_source_is_safe(source: EncodingSource, data: bytes) -> bool:
+    if source == EncodingSource.BOM:
+        return True
+    return source == EncodingSource.UTF8 and 0 not in data
+
+
+def _sniffed_text_is_usable(text: str, lossy: bool) -> bool:
+    return not lossy and bool(text.strip())
+
+
 def _sniff_text_bytes(data: bytes) -> str | None:
     """Text from bytes alone, or None -- the last resort for a name that
     says nothing about its contents (no extension at all).
@@ -126,13 +136,9 @@ def _sniff_text_bytes(data: bytes) -> str | None:
     stripping, is also rejected.
     """
     decoded = decode_text_detail(data)
-    if decoded.source == EncodingSource.BOM:
-        pass
-    elif decoded.source == EncodingSource.UTF8 and 0 not in data:
-        pass
-    else:
+    if not _sniff_source_is_safe(decoded.source, data):
         return None
-    if decoded.lossy or not decoded.text.strip():
+    if not _sniffed_text_is_usable(decoded.text, decoded.lossy):
         return None
     return decoded.text
 
@@ -157,96 +163,150 @@ def _contain_parser_panic(read: Callable[[], str | None]) -> str | None:
 # --------------------------------------------------------------- the dispatch
 
 
-def extract_text(name: str, data: bytes) -> str | None:
-    """Extract readable text from a file's bytes, best-effort. Returns None
-    for formats we can't read (images, unknown binaries).
-    """
-    ext = extension_of(name)
+FormatReader = Callable[[str, bytes], str | None]
 
-    # A file whose extension is already in the plain-text registry is
-    # decoded directly -- no panic containment needed, `decode_text_bytes`
-    # cannot meaningfully "fail" the way a third-party document parser can,
-    # matching the Rust source's own early return before the
-    # panic-containment closure even begins.
-    if ext in TEXT_EXTENSIONS:
-        return decode_text_bytes(data)
 
-    # A file with NO extension at all is decided on its bytes alone, also
-    # before panic containment begins -- there is no third-party parser
-    # involved, just the same encoding-detection machinery every other text
-    # file goes through, gated much more conservatively (see
-    # `_sniff_text_bytes`).
-    if ext == "":
-        sniffed = _sniff_text_bytes(data)
-        if sniffed is not None:
-            return sniffed
+def _read_pdf(_: str, data: bytes) -> str | None:
+    return extract_pdf(data)
 
-    def _read() -> str | None:
-        if ext == "pdf":
-            return extract_pdf(data)
-        if ext == "docx":
-            return extract_docx(data)
-        if ext == "xlsx":
-            return extract_xlsx(data)
-        if ext == "pptx":
-            return extract_pptx(data)
-        if ext in ("html", "htm"):
-            # Same decoder as plain text: a legacy-encoded HTML page is
-            # exactly as common as a legacy-encoded .txt, and `strip_html`
-            # cannot recover a character that was already replaced before
-            # it ran. The article reading (Readability-style scoring) goes
-            # first, `strip_html` is the fallback for a page with nothing
-            # scorable.
-            text = decode_text_bytes(data)
-            article = read_page(text, None).article
-            return article.text if article is not None else strip_html(text)
-        if ext == "epub":
-            return extract_epub(data)
-        if ext == "rtf":
-            # Deliberately a SIMPLE lossy UTF-8 decode (matching Rust's
-            # `String::from_utf8_lossy` exactly), NOT the full
-            # `decode_text_bytes` cascade -- an intentional asymmetry with
-            # the html/htm branch above, not an inconsistency to "fix".
-            return extract_rtf(data.decode("utf-8", errors="replace"))
-        if ext == "doc":
-            return extract_legacy_doc(name, data)
-        if ext == "ppt":
-            return extract_legacy_ppt(data)
-        if ext in ("xls", "ods"):
-            return extract_legacy_spreadsheet(data, ext)
-        if ext in ("pages", "key", "numbers"):
-            return extract_iwork(data)
-        if ext == "ipynb":
-            return extract_ipynb(data)
-        if ext == "eml":
-            # Same lossy-UTF-8-only note as rtf above.
-            return extract_eml(data.decode("utf-8", errors="replace"))
-        if ext in ("srt", "vtt"):
-            # Same lossy-UTF-8-only note as rtf above.
-            return extract_subtitles(data.decode("utf-8", errors="replace"))
-        if ext == "svg":
-            # Same lossy-UTF-8-only note as rtf above.
-            return extract_svg(data.decode("utf-8", errors="replace"))
-        if ext == "sketch":
-            # DELIBERATE, DOCUMENTED GAP -- not an oversight. The Rust
-            # source dispatches this to
-            # `commands::sketchdoc::Sketch::from_json(...).extracted_text()`,
-            # a whole separate in-house drawing-format feature module that
-            # has not been ported to this Python sidecar yet. Revisit once
-            # that module exists; until then a `.sketch` import reads as no
-            # text, honestly, rather than guessing at one.
-            return None
-        if ext == "zip":
-            return extract_zip_listing(data)
+
+def _read_docx(_: str, data: bytes) -> str | None:
+    return extract_docx(data)
+
+
+def _read_xlsx(_: str, data: bytes) -> str | None:
+    return extract_xlsx(data)
+
+
+def _read_pptx(_: str, data: bytes) -> str | None:
+    return extract_pptx(data)
+
+
+def _read_html(_: str, data: bytes) -> str | None:
+    """Read legacy-encoded HTML before choosing the article or plain-text view."""
+    text = decode_text_bytes(data)
+    article = read_page(text, None).article
+    return article.text if article is not None else strip_html(text)
+
+
+def _read_epub(_: str, data: bytes) -> str | None:
+    return extract_epub(data)
+
+
+def _read_rtf(_: str, data: bytes) -> str | None:
+    return extract_rtf(data.decode("utf-8", errors="replace"))
+
+
+def _read_doc(name: str, data: bytes) -> str | None:
+    return extract_legacy_doc(name, data)
+
+
+def _read_ppt(_: str, data: bytes) -> str | None:
+    return extract_legacy_ppt(data)
+
+
+def _read_xls(_: str, data: bytes) -> str | None:
+    return extract_legacy_spreadsheet(data, "xls")
+
+
+def _read_ods(_: str, data: bytes) -> str | None:
+    return extract_legacy_spreadsheet(data, "ods")
+
+
+def _read_iwork(_: str, data: bytes) -> str | None:
+    return extract_iwork(data)
+
+
+def _read_notebook(_: str, data: bytes) -> str | None:
+    return extract_ipynb(data)
+
+
+def _read_eml(_: str, data: bytes) -> str | None:
+    return extract_eml(data.decode("utf-8", errors="replace"))
+
+
+def _read_subtitles(_: str, data: bytes) -> str | None:
+    return extract_subtitles(data.decode("utf-8", errors="replace"))
+
+
+def _read_svg(_: str, data: bytes) -> str | None:
+    return extract_svg(data.decode("utf-8", errors="replace"))
+
+
+def _read_sketch(_: str, __: bytes) -> str | None:
+    return None
+
+
+def _read_zip(_: str, data: bytes) -> str | None:
+    return extract_zip_listing(data)
+
+
+FORMAT_READERS: dict[str, FormatReader] = {
+    "pdf": _read_pdf,
+    "docx": _read_docx,
+    "xlsx": _read_xlsx,
+    "pptx": _read_pptx,
+    "html": _read_html,
+    "htm": _read_html,
+    "epub": _read_epub,
+    "rtf": _read_rtf,
+    "doc": _read_doc,
+    "ppt": _read_ppt,
+    "xls": _read_xls,
+    "ods": _read_ods,
+    "pages": _read_iwork,
+    "key": _read_iwork,
+    "numbers": _read_iwork,
+    "ipynb": _read_notebook,
+    "eml": _read_eml,
+    "srt": _read_subtitles,
+    "vtt": _read_subtitles,
+    "svg": _read_svg,
+    "sketch": _read_sketch,
+    "zip": _read_zip,
+}
+
+
+def _plain_text_for_extension(ext: str, data: bytes) -> str | None:
+    if ext not in TEXT_EXTENSIONS:
         return None
+    return decode_text_bytes(data)
 
-    result = _contain_parser_panic(_read)
+
+def _sniffed_text_for_extension(ext: str, data: bytes) -> str | None:
+    if ext != "":
+        return None
+    return _sniff_text_bytes(data)
+
+
+def _normalized_format_text(ext: str, name: str, data: bytes) -> str | None:
+    reader = FORMAT_READERS.get(ext)
+    if reader is None:
+        return None
+    result = _contain_parser_panic(lambda: reader(name, data))
     if result is None:
         return None
     normalized = normalize_whitespace(result)
     if not normalized.strip():
         return None
     return normalized
+
+
+def extract_text(name: str, data: bytes) -> str | None:
+    """Extract readable text from a file's bytes, best-effort. Returns None
+    for formats we can't read (images, unknown binaries).
+    """
+    ext = extension_of(name)
+
+    direct = _plain_text_for_extension(ext, data)
+    if direct is not None:
+        return direct
+
+    sniffed = _sniffed_text_for_extension(ext, data)
+    if sniffed is not None:
+        return sniffed
+
+    return _normalized_format_text(ext, name, data)
 
 
 __all__ = [

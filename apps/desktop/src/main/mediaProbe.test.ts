@@ -13,8 +13,22 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import type { MediaMeta } from "../shared/apiTypes.js";
+
+// Keep the real filesystem by default, while making the two synchronous
+// error paths deterministically exercisable. Node's ESM namespace exports
+// cannot be spied on after import; this module-level wrapper is the supported
+// Vitest seam and each failure fixture below changes one call only.
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    statSync: vi.fn(actual.statSync),
+    writeFileSync: vi.fn(actual.writeFileSync),
+  };
+});
+
 import {
   codecName,
   EMPTY_MEDIA_META,
@@ -393,6 +407,16 @@ describe("findFfmpeg / findFfprobe", () => {
       findFfprobe({ isFile: (p) => p.endsWith("/ffmpeg"), pathEnv: "" })
     ).toBeNull();
   });
+
+  it("treats stat failures from the default finder as absent binaries", () => {
+    const statSync = vi.mocked(fs.statSync);
+    for (let i = 0; i < 4; i++) {
+      statSync.mockImplementationOnce(() => {
+        throw new Error("unreadable PATH entry");
+      });
+    }
+    expect(findFfmpeg({ pathEnv: "/unreadable" })).toBeNull();
+  });
 });
 
 // -------------------------------------------------------------- temp hygiene
@@ -522,6 +546,19 @@ describe("probeBytes", () => {
     await probeBytes(Buffer.from("secret video bytes"), "probetest", async () => null);
     expect(leftovers()).toBe(0);
   });
+
+  it("returns null and attempts cleanup when staging cannot create the private file", async () => {
+    vi.mocked(fs.writeFileSync).mockImplementationOnce(() => {
+      throw new Error("disk full");
+    });
+    let called = false;
+    const engine: ProbeEngine = async () => {
+      called = true;
+      return { ...EMPTY_MEDIA_META, hasAudio: true };
+    };
+    await expect(probeBytes(Buffer.from("video"), "mp4", engine)).resolves.toBeNull();
+    expect(called).toBe(false);
+  });
 });
 
 // ----------------------------------------------------------------- lastFramePng
@@ -569,6 +606,19 @@ describe("lastFramePng", () => {
     };
     await expect(lastFramePng(Buffer.from("bytes"), "endframetest", engine)).rejects.toThrow("boom");
     expect(fs.existsSync(seenPath)).toBe(false);
+  });
+
+  it("returns null when its private staging write cannot be created", async () => {
+    vi.mocked(fs.writeFileSync).mockImplementationOnce(() => {
+      throw new Error("disk full");
+    });
+    let called = false;
+    const engine: LastFrameEngine = async () => {
+      called = true;
+      return Buffer.from("png");
+    };
+    await expect(lastFramePng(Buffer.from("video"), "mov", engine)).resolves.toBeNull();
+    expect(called).toBe(false);
   });
 });
 
@@ -710,6 +760,24 @@ describe("parseFfprobeOutput, adversarial documents", () => {
     expect(parseFfprobeOutput('{"streams": [{"codec_type": "subtitle"}]}')).toBeNull();
   });
 
+  it("ignores null stream entries instead of letting malformed ffprobe JSON abort a valid track", () => {
+    // A damaged or hand-built ffprobe document can carry a JSON null in the
+    // streams array. It is not a track, so it must be skipped just like the
+    // scalar entries above; a later valid video track remains a real finding.
+    const meta = parseFfprobeOutput(
+      JSON.stringify({
+        streams: [null, { codec_type: "video", width: 4, height: 3, codec_tag_string: "avc1" }],
+      }),
+    );
+    expect(meta).toEqual({
+      ...EMPTY_MEDIA_META,
+      width: 4,
+      height: 3,
+      videoCodec: "H.264",
+      hasAudio: false,
+    });
+  });
+
   it("a '__proto__'-shaped codec tag neither pollutes Object.prototype nor renames a codec (rule 2)", () => {
     // The lookup table is a Map for exactly this reason: a `{}` literal keyed
     // by a container's own tag string answers "__proto__" with an object.
@@ -796,6 +864,24 @@ describe("parseFfprobeOutput, adversarial documents", () => {
     );
     expect(meta!.width).toBe(1920);
     expect(meta!.height).toBe(1080);
+  });
+
+  it("falls through an unusable side-data list to the legacy rotation tag", () => {
+    const meta = parseFfprobeOutput(
+      JSON.stringify({
+        streams: [
+          {
+            codec_type: "video",
+            width: 1920,
+            height: 1080,
+            side_data_list: [{}, null, { rotation: "not-a-number" }],
+            tags: { rotate: "90" },
+          },
+        ],
+      }),
+    );
+    expect(meta!.width).toBe(1080);
+    expect(meta!.height).toBe(1920);
   });
 });
 

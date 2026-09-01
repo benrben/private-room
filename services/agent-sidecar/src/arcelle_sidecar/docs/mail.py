@@ -75,6 +75,7 @@ from __future__ import annotations
 
 from base64 import b64decode
 from binascii import Error as _BinasciiError
+from collections.abc import Iterator
 
 from arcelle_sidecar.docs.html import strip_html
 
@@ -114,18 +115,27 @@ def _rust_lines(s: str) -> list[str]:
     """
     if s == "":
         return []
+    parts, ends_with_newline = _rust_line_parts(s)
+    last_part = len(parts) - 1
+    return [
+        _rust_line_piece(piece, index != last_part or ends_with_newline)
+        for index, piece in enumerate(parts)
+    ]
+
+
+def _rust_line_parts(s: str) -> tuple[list[str], bool]:
+    """Split `s`, dropping only the phantom part after a final newline."""
     parts = s.split("\n")
-    ends_with_newline = s.endswith("\n")
-    if ends_with_newline:
-        parts = parts[:-1]
-    n = len(parts)
-    lines: list[str] = []
-    for i, piece in enumerate(parts):
-        terminated_by_newline = i < n - 1 or ends_with_newline
-        if terminated_by_newline and piece.endswith("\r"):
-            piece = piece[:-1]
-        lines.append(piece)
-    return lines
+    if not s.endswith("\n"):
+        return parts, False
+    return parts[:-1], True
+
+
+def _rust_line_piece(piece: str, newline_terminated: bool) -> str:
+    """Remove CR only when Rust's `lines()` treats it as a line terminator."""
+    if newline_terminated and piece.endswith("\r"):
+        return piece[:-1]
+    return piece
 
 
 def _push_capped(out: list[str], s: str, total_len: list[int]) -> None:
@@ -220,60 +230,101 @@ def _eml_body_text(headers: str, body: str) -> str:
     part."""
     content_type = (_header(headers, "Content-Type") or "").lower()
     boundary = _mime_boundary(content_type)
-    if boundary is not None:
-        html_fallback = ""
-        for part in body.split(f"--{boundary}")[1:]:
-            # `trim_start_matches("--")` strips the pattern repeatedly, not
-            # just once (matters for the trailing `--{boundary}--` close
-            # delimiter's piece, which can start with more than one pair).
-            while part.startswith("--"):
-                part = part[2:]
-            if not part.strip():
-                continue
-            part_headers, part_body = _split_headers(part)
-            part_type = (_header(part_headers, "Content-Type") or "").lower()
-            # Nested multipart (the common multipart/mixed -> multipart/alternative
-            # shape) recurses rather than being skipped as an unknown part.
-            if part_type.startswith("multipart/"):
-                nested = _eml_body_text(part_headers, part_body)
-                if nested.strip():
-                    return nested
-                continue
-            decoded = _decode_transfer(part_headers, part_body)
-            if part_type.startswith("text/plain"):
-                return decoded
-            if part_type.startswith("text/html") and not html_fallback:
-                html_fallback = strip_html(decoded)
-        return html_fallback
+    if boundary is None:
+        return _decoded_body_text(headers, body, content_type)
+    return _multipart_body_text(boundary, body)
+
+
+def _decoded_body_text(headers: str, body: str, content_type: str) -> str:
+    """Decode a non-multipart body and make an HTML body indexable text."""
     decoded = _decode_transfer(headers, body)
-    if content_type.startswith("text/html"):
-        return strip_html(decoded)
-    return decoded
+    return strip_html(decoded) if content_type.startswith("text/html") else decoded
+
+
+def _multipart_body_text(boundary: str, body: str) -> str:
+    """Return the first plain/nested part, retaining the first HTML fallback."""
+    html_fallback = ""
+    for part in _multipart_parts(boundary, body):
+        selected, html = _multipart_part_text(part)
+        if selected is not None:
+            return selected
+        if not html_fallback and html is not None:
+            html_fallback = html
+    return html_fallback
+
+
+def _multipart_parts(boundary: str, body: str) -> Iterator[str]:
+    """The delimiter suffixes, after removing every leading close marker."""
+    for part in body.split(f"--{boundary}")[1:]:
+        yield _without_leading_close_markers(part)
+
+
+def _without_leading_close_markers(part: str) -> str:
+    """Mirror Rust's repeated `trim_start_matches("--")` for a delimiter part."""
+    while part.startswith("--"):
+        part = part[2:]
+    return part
+
+
+def _multipart_part_text(part: str) -> tuple[str | None, str | None]:
+    """Classify one non-empty part as selected readable text or HTML fallback."""
+    if not part.strip():
+        return None, None
+    part_headers, part_body = _split_headers(part)
+    part_type = (_header(part_headers, "Content-Type") or "").lower()
+    return _part_text_by_type(part_headers, part_body, part_type)
+
+
+def _part_text_by_type(
+    part_headers: str, part_body: str, part_type: str
+) -> tuple[str | None, str | None]:
+    """Choose text for an already-split MIME part by its declared type."""
+    if part_type.startswith("multipart/"):
+        nested = _eml_body_text(part_headers, part_body)
+        return (nested, None) if nested.strip() else (None, None)
+    decoded = _decode_transfer(part_headers, part_body)
+    if part_type.startswith("text/plain"):
+        return decoded, None
+    if part_type.startswith("text/html"):
+        return None, strip_html(decoded)
+    return None, None
 
 
 def _mime_boundary(content_type: str) -> str | None:
     if not content_type.startswith("multipart/"):
         return None
+    rest = _boundary_parameter(content_type)
+    return _boundary_value(rest) if rest is not None else None
+
+
+def _boundary_parameter(content_type: str) -> str | None:
+    """Return the text following the first MIME boundary parameter key."""
     key = "boundary="
     at = content_type.find(key)
     if at == -1:
         return None
-    rest = content_type[at + len(key) :].strip()
+    return content_type[at + len(key) :].strip()
+
+
+def _boundary_value(rest: str) -> str | None:
+    """Read a quoted boundary or the leading token of an unquoted one."""
     if rest.startswith('"'):
         value = rest[1:].split('"', 1)[0]
-    else:
-        # Match against every separator simultaneously, like Rust's
-        # `split(&[';', ' ', '\r', '\n'][..])`, not one at a time in a fixed
-        # order (which would understate the cut if a later separator in
-        # this list actually appears earlier in the string).
-        value = rest
-        first: int | None = None
-        for sep in (";", " ", "\r", "\n"):
-            i = value.find(sep)
-            if i != -1 and (first is None or i < first):
-                first = i
-        if first is not None:
-            value = value[:first]
+        return value if value else None
+    return _unquoted_boundary_value(rest)
+
+
+def _unquoted_boundary_value(rest: str) -> str | None:
+    """Take the first boundary token, matching Rust's separator-set split."""
+    # Match against every separator simultaneously, like Rust's
+    # `split(&[';', ' ', '\r', '\n'][..])`, not one at a time in a fixed
+    # order (which would understate the cut if a later separator in this
+    # list actually appears earlier in the string).
+    first = min(
+        (index for sep in (";", " ", "\r", "\n") if (index := rest.find(sep)) != -1),
+        default=len(rest),
+    )
+    value = rest[:first]
     return value if value else None
 
 
@@ -292,29 +343,42 @@ def _decode_quoted_printable(s: str) -> str:
     two escapes (by a soft break) survives."""
     out = bytearray()
     lines = _rust_lines(s)
-    last_index = len(lines) - 1
     for idx, line in enumerate(lines):
-        if line.endswith("="):
-            content = line[:-1]
-            soft_break = True
-        else:
-            content = line
-            soft_break = False
-        raw = content.encode("utf-8")
-        i = 0
-        n = len(raw)
-        while i < n:
-            if raw[i] == 0x3D and i + 2 < n:  # b'='
-                hi, lo = _HEX_DIGITS[raw[i + 1]], _HEX_DIGITS[raw[i + 2]]
-                if hi is not None and lo is not None:
-                    out.append((hi << 4) | lo)
-                    i += 3
-                    continue
-            out.append(raw[i])
-            i += 1
-        if not soft_break and idx != last_index:
-            out.append(0x0A)  # b'\n'
+        _append_quoted_printable_line(out, line)
+        _append_quoted_printable_newline(out, line, idx, len(lines))
     return out.decode("utf-8", errors="replace")
+
+
+def _append_quoted_printable_line(out: bytearray, line: str) -> None:
+    """Append one quoted-printable line, without its optional soft break."""
+    raw = line.removesuffix("=").encode("utf-8")
+    index = 0
+    while index < len(raw):
+        decoded = _quoted_printable_escape(raw, index)
+        if decoded is None:
+            out.append(raw[index])
+            index += 1
+            continue
+        out.append(decoded)
+        index += 3
+
+
+def _quoted_printable_escape(raw: bytes, index: int) -> int | None:
+    """Decode one strict `=XX` escape, retaining malformed input literally."""
+    if raw[index] != 0x3D or index + 2 >= len(raw):  # b'='
+        return None
+    hi, lo = _HEX_DIGITS[raw[index + 1]], _HEX_DIGITS[raw[index + 2]]
+    if hi is None or lo is None:
+        return None
+    return (hi << 4) | lo
+
+
+def _append_quoted_printable_newline(
+    out: bytearray, line: str, index: int, line_count: int
+) -> None:
+    """Retain hard line breaks, but omit soft ones and the final terminator."""
+    if not line.endswith("=") and index != line_count - 1:
+        out.append(0x0A)  # b'\n'
 
 
 def _decode_base64_text(s: str) -> str:
@@ -350,32 +414,50 @@ def _decode_mime_words(value: str) -> str:
     """
     out: list[str] = []
     rest = value
-    while True:
-        start = rest.find("=?")
-        if start == -1:
-            break
-        out.append(rest[:start])
-        after = rest[start + 2 :]
-        end = after.find("?=")
-        if end == -1:
+    while (mime_word_start := _mime_word_start(rest)) is not None:
+        prefix, after_start = mime_word_start
+        out.append(prefix)
+        encoded_word = _encoded_mime_word(after_start)
+        if encoded_word is None:
             # `rest` (the full, un-advanced remainder -- including the
             # prefix just appended above) is what gets appended after the
             # loop below; see the docstring note on this duplication.
             break
-        word = after[:end]
-        parts = word.split("?", 2)
-        if len(parts) == 3:
-            encoding = parts[1].upper()
-            if encoding == "B":
-                decoded = _decode_base64_text(parts[2])
-            elif encoding == "Q":
-                # In an encoded word, `_` means space.
-                decoded = _decode_quoted_printable(parts[2].replace("_", " "))
-            else:
-                decoded = word
-            out.append(decoded)
-        else:
-            out.append(word)
-        rest = after[end + 2 :]
+        word, rest = encoded_word
+        out.append(_decoded_mime_word(word))
     out.append(rest)
     return "".join(out).strip()
+
+
+def _mime_word_start(rest: str) -> tuple[str, str] | None:
+    """Split the prefix before the next encoded-word marker from its payload."""
+    start = rest.find("=?")
+    if start == -1:
+        return None
+    return rest[:start], rest[start + 2 :]
+
+
+def _encoded_mime_word(after_start: str) -> tuple[str, str] | None:
+    """Return one encoded word and the text after its terminator, if present."""
+    end = after_start.find("?=")
+    if end == -1:
+        return None
+    return after_start[:end], after_start[end + 2 :]
+
+
+def _decoded_mime_word(word: str) -> str:
+    """Decode one complete encoded word, retaining malformed words verbatim."""
+    parts = word.split("?", 2)
+    if len(parts) != 3:
+        return word
+    return _decoded_mime_word_payload(parts[1], parts[2], word)
+
+
+def _decoded_mime_word_payload(encoding: str, payload: str, word: str) -> str:
+    """Decode the two transfer encodings supported by the Rust source."""
+    if encoding.upper() == "B":
+        return _decode_base64_text(payload)
+    if encoding.upper() == "Q":
+        # In an encoded word, `_` means space.
+        return _decode_quoted_printable(payload.replace("_", " "))
+    return word

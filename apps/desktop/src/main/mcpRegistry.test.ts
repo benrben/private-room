@@ -181,6 +181,17 @@ describe("normalizeServers", () => {
     expect(e.install).toEqual({ kind: "stdio", command: "uvx", args: ["db-tools-mcp"], envKeys: ["DATABASE_URL"] });
   });
 
+  it("maps OCI to docker and honors an explicit runner hint", () => {
+    const entries = normalizeServers({
+      servers: [
+        { server: { name: "com.example/oci", packages: [{ registryType: "oci", identifier: "example/oci-mcp" }] } },
+        { server: { name: "com.example/bun", packages: [{ registryType: "npm", identifier: "bun-mcp", runtimeHint: "bunx" }] } },
+      ],
+    });
+    expect(entries[0]?.install).toEqual({ kind: "stdio", command: "docker", args: ["run", "-i", "--rm", "example/oci-mcp"], envKeys: [] });
+    expect(entries[1]?.install).toEqual({ kind: "stdio", command: "bunx", args: ["bun-mcp"], envKeys: [] });
+  });
+
   it("flags a remote endpoint as http", () => {
     const e = entryAt(2);
     expect(e.remote).toBe(true);
@@ -297,6 +308,21 @@ describe("normalizeServers", () => {
         },
       ],
     };
+    expect(normalizeServers(payload)).toEqual([]);
+  });
+
+  it("reads only own record fields and rejects an explicit non-object server", () => {
+    const inherited = Object.create({
+      name: "io.github.should-not/inherit",
+      packages: [{ registryType: "npm", identifier: "should-not-install" }],
+    });
+    const payload = {
+      servers: [
+        inherited,
+        { server: [{ name: "io.github.should-not/array" }] },
+      ],
+    };
+
     expect(normalizeServers(payload)).toEqual([]);
   });
 

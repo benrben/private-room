@@ -3,19 +3,29 @@ import path from "node:path";
 
 export const PRIVATE_DIR = ".arcelle";
 
-/** Convert a user/tool path into one portable, room-relative representation. */
-export function normalizeRelativePath(input: string): string {
+function isAbsolutePath(input: string): boolean {
+  return path.isAbsolute(input) || path.posix.isAbsolute(input) || path.win32.isAbsolute(input);
+}
+
+function validatePathInput(input: string): void {
   if (input.includes("\0")) throw new Error("A file path cannot contain NUL.");
-  if (path.isAbsolute(input) || path.posix.isAbsolute(input) || path.win32.isAbsolute(input)) {
-    throw new Error("Only room-relative paths are allowed.");
-  }
-  const portable = input.replace(/\\/g, "/").normalize("NFC");
-  const parts = portable.split("/").filter((part) => part !== "" && part !== ".");
+  if (isAbsolutePath(input)) throw new Error("Only room-relative paths are allowed.");
+}
+
+function validateRelativeParts(parts: string[]): void {
   if (parts.length === 0) throw new Error("A file path cannot be empty.");
   if (parts.some((part) => part === "..")) throw new Error("A file path cannot leave the room.");
   if (parts[0]?.toLocaleLowerCase("en-US") === PRIVATE_DIR) {
     throw new Error("The .arcelle directory is private.");
   }
+}
+
+/** Convert a user/tool path into one portable, room-relative representation. */
+export function normalizeRelativePath(input: string): string {
+  validatePathInput(input);
+  const portable = input.replace(/\\/g, "/").normalize("NFC");
+  const parts = portable.split("/").filter((part) => part !== "" && part !== ".");
+  validateRelativeParts(parts);
   return parts.join("/");
 }
 
@@ -27,11 +37,28 @@ export function pathKey(relativePath: string): string {
 export function resolveWorkspacePath(rootPath: string, relativePath: string): string {
   const normalized = normalizeRelativePath(relativePath);
   const root = path.resolve(rootPath);
-  const resolved = path.resolve(root, ...normalized.split("/"));
-  if (resolved === root || !resolved.startsWith(`${root}${path.sep}`)) {
-    throw new Error("A file path cannot leave the room.");
+  return path.resolve(root, ...normalized.split("/"));
+}
+
+type PathSegmentCheck =
+  | { kind: "present" }
+  | { kind: "missing"; error: unknown };
+
+async function checkPathSegment(segmentPath: string): Promise<PathSegmentCheck> {
+  try {
+    const stat = await lstat(segmentPath);
+    if (stat.isSymbolicLink()) throw new Error("Symlinks are not allowed in managed room paths.");
+    return { kind: "present" };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { kind: "missing", error };
+    }
+    throw error;
   }
-  return resolved;
+}
+
+function permitsMissingSegment(index: number, segmentCount: number, allowMissingLeaf: boolean): boolean {
+  return index < segmentCount - 1 || allowMissingLeaf;
 }
 
 /**
@@ -50,14 +77,9 @@ export async function assertNoSymlinkSegments(
   const parts = normalized.split("/");
   for (let index = 0; index < parts.length; index += 1) {
     cursor = path.join(cursor, parts[index]!);
-    try {
-      const stat = await lstat(cursor);
-      if (stat.isSymbolicLink()) throw new Error("Symlinks are not allowed in managed room paths.");
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" && index < parts.length - 1) return;
-      if (code === "ENOENT" && allowMissingLeaf && index === parts.length - 1) return;
-      throw error;
-    }
+    const segment = await checkPathSegment(cursor);
+    if (segment.kind !== "missing") continue;
+    if (permitsMissingSegment(index, parts.length, allowMissingLeaf)) return;
+    throw segment.error;
   }
 }

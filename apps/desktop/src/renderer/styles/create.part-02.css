@@ -1,0 +1,494 @@
+
+.cr-field:focus {
+  border-color: var(--accent);
+}
+
+.cr-opts {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+/* An engaged option carries a TICK as well as the wash behind it — the same
+   rule the model-picker's capability chips follow. */
+.cr-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  font-weight: 500;
+  color: var(--muted);
+  transition: all var(--dur-fast) var(--ease-pen);
+}
+.cr-opt:hover {
+  border-color: var(--sketch);
+  color: var(--text);
+}
+.cr-opt.is-on {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--mk-berry) 70%, transparent);
+  background: var(--selected);
+}
+
+/* The outbound seam. Yellow is the pending/caution marker, and it rides with
+   a padlock and a sentence — never the hue alone. */
+.cr-seam {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: flex-start;
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--mk-yellow) 15%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--mk-yellow) 44%, transparent);
+  color: var(--amber);
+}
+.cr-seam p {
+  margin: 0;
+  font-size: var(--fs-micro);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+
+.cr-go {
+  width: 100%;
+  justify-content: center;
+}
+
+.cr-bench-hint {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: var(--lh-body);
+  color: var(--faint);
+  text-align: center;
+}
+
+/* ==========================================================================
+   6. RESULTS
+   ========================================================================== */
+
+.cr-results {
+  margin-top: var(--sp-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.cr-sec-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.cr-job {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 11px var(--sp-4);
+}
+
+.cr-job-dot {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--sketch) 35%, transparent);
+  border-top-color: var(--accent);
+  animation: cr-spin 0.95s linear infinite;
+}
+@keyframes cr-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cr-job-dot {
+    animation: none;
+  }
+}
+
+.cr-job-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cr-job-title {
+  font-size: var(--fs-meta);
+  font-weight: 700;
+  color: var(--text);
+}
+.cr-job-sub {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.cr-job-bar {
+  width: 120px;
+  height: 5px;
+  flex: 0 0 auto;
+  border-radius: 3px;
+  background: var(--hover);
+  overflow: hidden;
+}
+.cr-job-fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent-fill);
+  transition: width var(--dur) var(--ease-pen);
+}
+
+.cr-sheet {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--sp-2);
+}
+
+.cr-made {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  text-align: left;
+  cursor: pointer;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-family: var(--sans);
+  color: inherit;
+}
+.cr-made:hover {
+  border-color: var(--sketch);
+}
+.cr-made:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.cr-made-name {
+  font-size: var(--fs-micro);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+   7. EMPTY STATES
+   ========================================================================== */
+
+.cr-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-8) var(--sp-4);
+  text-align: center;
+  color: var(--faint);
+}
+.cr-empty h2 {
+  margin: 0;
+  font-size: var(--fs-card);
+  font-weight: 800;
+  color: var(--text-strong);
+}
+.cr-empty p {
+  margin: 0;
+  max-width: 52ch;
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  color: var(--muted);
+}
+
+@media (max-width: 1080px) {
+  .cr-worktable {
+    grid-template-columns: 1fr;
+  }
+  .cr-bench {
+    position: static;
+  }
+}
+
+/* ----- a generation that failed -----
+   Red is the urgent marker, and it rides with the word "nothing was made"
+   plus the provider's own sentence — never the hue alone. This row exists
+   because a failure that only removes itself from the live list reads as the
+   app losing the work rather than as the model refusing it. */
+.cr-job-bad {
+  border-color: color-mix(in srgb, var(--mk-red) 70%, transparent);
+  background: color-mix(in srgb, var(--mk-red) 10%, transparent);
+  align-items: flex-start;
+}
+.cr-job-why {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: var(--lh-body);
+  color: var(--muted);
+  /* A provider error can be a paragraph; let it wrap rather than clip the
+     one piece of information the row exists to carry. */
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.cr-job-dismiss {
+  flex: 0 0 auto;
+  border: none;
+  background: none;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  color: var(--faint);
+  font-size: 13px;
+  line-height: 1;
+}
+.cr-job-dismiss:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.cr-job-dismiss:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ==========================================================================
+   7. THE STORY SURFACE — a cast, a shot list, and pictures from this room.
+
+   One idea drives the layout: a character IS a picture. So the cast is drawn
+   as a row of faces at a size where a face is actually recognizable, and a
+   character with no picture yet is marked as unfinished rather than merely
+   left blank — a faceless hero is the state that quietly makes every shot of
+   them look like a different person.
+   ========================================================================== */
+
+.cr-story {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  padding: 0 var(--sp-4) var(--sp-4);
+}
+
+/* ----- the cast ----- */
+
+.cr-cast {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+}
+.cr-cast-why {
+  margin: 0;
+  font-size: 12px;
+  line-height: var(--lh-body);
+  color: var(--muted);
+  max-width: 62ch;
+}
+/* Scrolls sideways rather than wrapping into a tall wall. A cast built from
+   room files gets big, and every extra row of faces pushes the shot list —
+   the thing actually being worked on — further off the screen. */
+.cr-cast-row {
+  display: flex;
+  gap: var(--sp-2);
+  overflow-x: auto;
+  padding-bottom: var(--sp-1);
+  scrollbar-width: thin;
+}
+.cr-cast-row > * {
+  flex: 0 0 auto;
+}
+
+/* Sized so a dozen people still read as a strip rather than a wall. Faces
+   come from room files, so a cast grows fast — the picture stays big enough
+   to recognize a face while the prose is clamped to two lines. */
+.cr-hero {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  width: 136px;
+  padding: var(--sp-2);
+  text-align: left;
+}
+.cr-hero-desc,
+.cr-hero-story {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* The edit form floats out of the card rather than being squeezed into
+   136px, where every field would be one word wide. */
+.cr-hero .cr-hero-form {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 5;
+  width: 320px;
+  margin-top: var(--sp-1);
+  background: var(--panel, var(--page));
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.28);
+}
+/* A hero with no picture is UNFINISHED, and says so in two ways at once —
+   a dashed edge and the words "no face yet" — because the consequence
+   (they will look different in every shot) is invisible until it is paid for. */
+.cr-hero.is-faceless {
+  border-style: dashed;
+}
+.cr-hero-face {
+  border: none;
+  background: var(--hover);
+  border-radius: var(--radius-sm);
+  padding: 0;
+  cursor: pointer;
+  overflow: hidden;
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+}
+.cr-hero-face img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.cr-hero-face:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.cr-hero-noface {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  color: var(--faint);
+  font-size: 11px;
+}
+.cr-hero-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.cr-hero-name {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+}
+.cr-hero-desc,
+.cr-hero-story {
+  font-size: 11px;
+  line-height: var(--lh-body);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.cr-hero-story {
+  color: var(--faint);
+  font-style: italic;
+}
+.cr-hero-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  margin-top: auto;
+}
+.cr-hero-acts button {
+  border: none;
+  background: none;
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--faint);
+}
+.cr-hero-acts button:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+}
+.cr-hero-add {
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  border-style: dashed;
+  color: var(--muted);
+  cursor: pointer;
+  min-height: 136px;
+  font-size: 11px;
+  text-align: center;
+}
+.cr-hero-add span:first-child {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.cr-hero-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--hover);
+}
+.cr-form-acts {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+.cr-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: var(--lh-body);
+  color: var(--faint);
+}
+
+/* ----- the shot list ----- */
+
+.cr-shots {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+}
+.cr-shots-pick {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.cr-list-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.cr-list-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+.cr-select {
+  padding: 4px 6px;
+  font-size: 12px;
+}
+
+.cr-shot-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.cr-shot {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: var(--sp-3);
+  align-items: start;
+  padding: var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
