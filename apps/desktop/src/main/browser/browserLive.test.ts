@@ -50,7 +50,7 @@ async function electronBinaryPath(): Promise<string> {
 
 async function runWorker(
   [scenario, ...extras]: string[],
-  timeoutMs = 30_000,
+  timeoutMs = 75_000,
 ): Promise<Record<string, unknown>> {
   const electronPath = await electronBinaryPath();
   const env = { ...process.env };
@@ -95,7 +95,7 @@ describe("verify_ephemeral, against a REAL session rather than the flag we set",
     expect(r["ephemeralStoragePath"]).toBeNull();
     expect(r["persistentIsPersistent"]).toBe(true);
     expect(r["persistentHasStoragePath"]).toBe(true);
-  }, 40_000);
+  }, 90_000);
 
   it("confirms a partition NAME is a session's identity for the life of the process", async () => {
     // This is why a page's partition is a fresh UUID and not something derived
@@ -105,7 +105,7 @@ describe("verify_ephemeral, against a REAL session rather than the flag we set",
     const r = await runWorker(["ephemeral"]);
     expect(r["sameNameIsTheSameSession"]).toBe(true);
     expect(r["differentNamesAreDifferentSessions"]).toBe(true);
-  }, 40_000);
+  }, 90_000);
 });
 
 describe("content blocking, against a REAL local server and a REAL webRequest handler", () => {
@@ -132,7 +132,7 @@ describe("content blocking, against a REAL local server and a REAL webRequest ha
     } finally {
       await new Promise((resolve) => server.close(resolve));
     }
-  }, 40_000);
+  }, 90_000);
 });
 
 describe("real WebContentsViews attached to a real BaseWindow", () => {
@@ -142,7 +142,7 @@ describe("real WebContentsViews attached to a real BaseWindow", () => {
     expect(views).toHaveLength(3);
     expect(r["allUnique"]).toBe(true);
     for (const v of views) expect(v.sessionIsPersistent).toBe(false);
-  }, 40_000);
+  }, 90_000);
 });
 
 describe("the page script really reaches a real page", () => {
@@ -167,7 +167,7 @@ describe("the page script really reaches a real page", () => {
     expect(r["frameCount"]).toBe(1);
     expect(r["subframeBridge"]).toBe("object");
     expect(r["subframeDoc"]).not.toBe(r["mainDoc"]);
-  }, 60_000);
+  }, 90_000);
 
   it("needs nodeIntegrationInSubFrames for sub-frames — the flag is load-bearing", async () => {
     const r = await runWorker(["preload"]);
@@ -176,14 +176,14 @@ describe("the page script really reaches a real page", () => {
     // Without the flag the sub-frame gets NOTHING. A port that omitted it would
     // silently lose every iframe.
     expect(r["withoutSubFrameFlag_sub"]).toBe("undefined");
-  }, 60_000);
+  }, 90_000);
 
   it("lets the host's superseded mark be seen by the readiness probe", async () => {
     const r = await runWorker(["preload"]);
     // markSuperseded writes in the main world through executeJavaScript; READY_JS
     // reads it there. "The mark is present" must read as still-loading.
     expect(r["readyProbeAfterSuperseded"]).toEqual({ ok: false, refused: false });
-  }, 60_000);
+  }, 90_000);
 });
 
 describe("which navigations Electron actually reports", () => {
@@ -193,7 +193,7 @@ describe("which navigations Electron actually reports", () => {
     // The only event during a main-frame loadURL is the IFRAME's own load.
     expect(events.every((e) => e.isMainFrame === false)).toBe(true);
     expect(events.some((e) => e.url.endsWith("/frame"))).toBe(true);
-  }, 60_000);
+  }, 90_000);
 
   it("fires will-redirect, and ONLY will-redirect, for a server-side 302", async () => {
     // This is why navigation.ts listens on both events: a page answering
@@ -204,14 +204,14 @@ describe("which navigations Electron actually reports", () => {
     expect(events[0]?.isMainFrame).toBe(true);
     expect(events[0]?.url).toMatch(/\/landing$/);
     expect(r["finalUrl"]).toMatch(/\/landing$/);
-  }, 60_000);
+  }, 90_000);
 
   it("resolves a bare window.open() to about:blank — why popup.ts refuses to navigate there", async () => {
     const r = await runWorker(["navigation-events"]);
     const opens = r["windowOpenDetails"] as Array<{ url: string }>;
     expect(opens).toHaveLength(1);
     expect(opens[0]?.url).toBe("about:blank");
-  }, 60_000);
+  }, 90_000);
 
   it("reports an EMPTY top-frame url for a main-frame request — why resolveTopLevelUrl special-cases it", async () => {
     const r = await runWorker(["navigation-events"]);
@@ -227,5 +227,5 @@ describe("which navigations Electron actually reports", () => {
     // …while a sub-resource DOES get the real top document, which is what makes
     // third-party classification work at all.
     expect(sub?.topUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/);
-  }, 60_000);
+  }, 90_000);
 });

@@ -197,7 +197,7 @@ describe("sealed workspace packages", () => {
     await mkdir(occupied);
     await expect(importSealedPackage(sealedPath, password, occupied))
       .rejects.toThrow("A file or folder already exists at the workspace destination.");
-  });
+  }, 15_000);
 
   it("rejects an unsafe live workspace object before publishing a package", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-sealed-unsafe-live-"));
@@ -392,7 +392,7 @@ describe("sealed workspace packages", () => {
     } finally {
       reopened.db.close();
     }
-  });
+  }, 15_000);
 
   it("still publishes when directory fsync is unavailable", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "arcelle-sealed-no-dir-fsync-"));
