@@ -29,8 +29,9 @@ vi.mock("./FileRow", () => ({
   default: ({ f, a }: { f: { id: string; name: string }; a: { viewFile: (id: string) => void } }) => createElement("button", { className: "file-row", onClick: () => a.viewFile(f.id) }, f.name),
 }));
 vi.mock("./TrashPanel", () => ({ default: () => createElement("div", null, "trash panel") }));
+vi.mock("../skin/SkinControls", () => ({ SkinControls: () => createElement("div", null, "skin controls") }));
 vi.mock("./destinations", () => ({
-  SIDEBAR_TITLES: { files: "Library", home: "Library", recordings: "Recordings", workflows: "Workflows", scripts: "Scripts", skills: "Skills", memory: "Memory", connectors: "Connectors", browser: "Private pages", sketch: "Sketches", create: "Creations", map: "Map" },
+  SIDEBAR_TITLES: { files: "Library", home: "Library", recordings: "Recordings", workflows: "Workflows", scripts: "Scripts", skills: "Skills", memory: "Memory", connectors: "Connectors", browser: "Private pages", sketch: "Sketches", create: "Creations", map: "Map", skin: "Skin Studio" },
   newItemOf: (area: string) => ({ browser: "page", sketch: "sketch", create: "creation" } as Record<string, string>)[area] ?? "note",
   newItemLabel: (area: string) => ({ browser: "New page", sketch: "New sketch", create: "New creation" } as Record<string, string>)[area] ?? "New page",
 }));
@@ -164,13 +165,25 @@ function dataTransfer(ids = "file-1\nfile-2") {
 
 describe("LibraryPane", () => {
   it("preserves the home library, selection, folder, filter, and add-menu actions", async () => {
+    let prunedTrash = new Set<string>();
     const s = state({
       creatingFolder: "New folder", renamingFolder: { id: "folder-1", name: "Folder" }, dragOverFolder: "__root__",
-      setSelectedTrashIds: vi.fn((update: unknown) => typeof update === "function" && (update as (value: Set<string>) => Set<string>)(new Set(["trash-1", "gone"]))),
+      setSelectedTrashIds: vi.fn((update: unknown) => {
+        if (typeof update === "function") prunedTrash = (update as (value: Set<string>) => Set<string>)(new Set(["trash-1", "gone"]));
+      }),
       setSelectedFileIds: vi.fn((update: unknown) => typeof update === "function" && (update as (value: Set<string>) => Set<string>)(new Set(["file-1", "gone"]))),
     });
     const view = await renderSidebar(s);
     expect(view.host.textContent).toContain("Library");
+    expect([...prunedTrash]).toEqual(["trash-1"]);
+    expect([...view.host.querySelectorAll(".file-row")].map((row) => row.textContent)).toEqual(["match.md", "match-folder.md"]);
+    expect([...view.host.querySelectorAll(".count-badge")].map((badge) => badge.textContent)).toEqual(["2", "1", "1"]);
+    expect(view.host.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toBe("Browse");
+    expect(view.host.querySelector('[role="tab"]:nth-child(2)')?.getAttribute("aria-selected")).toBe("false");
+    expect(view.host.querySelector('[role="tab"]:nth-child(3)')?.getAttribute("aria-selected")).toBe("false");
+    const liveRecording = [...view.host.querySelectorAll("button")].find((candidate) => candidate.textContent?.includes("Live recording")) as HTMLButtonElement;
+    expect(liveRecording.disabled).toBe(false);
+    expect(liveRecording.textContent).toContain("Mic + Mac audio");
     const collapse = view.host.querySelector(".pane-icon-btn");
     if (!collapse) throw new Error("collapse button missing");
     await invoke(collapse);
@@ -210,7 +223,9 @@ describe("LibraryPane", () => {
     if (!renameFolder) throw new Error("rename folder button missing");
     await invoke(renameFolder);
     await clickText(view, "delete folder:folder-1");
+    s.setAddMenuOpen.mockClear();
     for (const listener of view.listeners) listener({ key: "Escape", target: null, stopPropagation: vi.fn(), preventDefault: vi.fn() });
+    expect(s.setAddMenuOpen).toHaveBeenCalledWith(false);
     Object.defineProperty(view.document, "activeElement", { configurable: true, value: view.host });
     for (const listener of view.listeners) listener({ key: "a", metaKey: true, ctrlKey: false, target: null, stopPropagation: vi.fn(), preventDefault: vi.fn() });
     expect(view.a.importFiles).toHaveBeenCalled();
@@ -228,12 +243,17 @@ describe("LibraryPane", () => {
     await clickText(view, "match.md");
     await view.draw(state({ libraryTab: "trash", selectedTrashIds: new Set(["trash-1", "trash-2"]) }));
     expect(view.host.textContent).toContain("trash panel");
+    expect(view.host.querySelector('[role="tab"]:nth-child(3)')?.getAttribute("aria-selected")).toBe("true");
+    expect((view.host.querySelector(".add-source-button") as HTMLButtonElement).disabled).toBe(false);
     await clickText(view, "Restore selected");
     expect(view.a.restoreFiles).toHaveBeenCalled();
+    await view.draw(state({ libraryTab: "trash", selectedTrashIds: new Set() }));
+    expect((view.host.querySelector(".add-source-button") as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("keeps every destination lens and its navigation handlers active", async () => {
     const view = await renderSidebar(state({ fileFilter: "", files: [file("rec", "meeting.m4a", { kind: "recording" })] }), actions(), pages(), "recordings");
+    expect(view.host.querySelector('input[aria-label="Filter recordings"]')).not.toBeNull();
     await clickText(view, "New live recording");
     await clickText(view, "Voice note");
     await view.draw(state({ fileFilter: "", files: [] }), "recordings");
@@ -270,6 +290,7 @@ describe("LibraryPane", () => {
     if (!closePage) throw new Error("close page button missing");
     await invoke(closePage);
     await view.draw(state({ fileFilter: "", files: [file("sketch-1", "drawing.sketch", { kind: "sketch", aiSummary: "A flow" })], renamingFile: { id: "sketch-1", name: "drawing.sketch", where: "library" } }), "sketch");
+    expect(view.host.querySelector('input[aria-label="Filter sketches"]')).not.toBeNull();
     const sketchRow = view.host.querySelector("[role='listitem']");
     const renameSketch = view.host.querySelector(".chip-btn");
     if (!sketchRow || !renameSketch) throw new Error("sketch actions missing");
@@ -351,5 +372,7 @@ describe("LibraryPane", () => {
     expect(view.host.textContent).toContain("Nothing sketched yet");
     await view.draw(state({ files: [file("sketch", "plain.sketch")], fileFilter: "missing" }), "sketch");
     expect(view.host.textContent).toContain("No sketches match");
+    await view.draw(state(), "skin");
+    expect(view.host.textContent).toContain("skin controls");
   });
 });

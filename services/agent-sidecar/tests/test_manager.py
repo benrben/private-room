@@ -38,6 +38,7 @@ from arcelle_sidecar.routing import (
     MCP_MANAGEMENT_TOOL_NAMES,
     SKILL_TOOL_NAMES,
     BROWSE_TOOL_NAMES,
+    DESIGN_TOOL_NAMES,
     UI_TOOL_NAMES,
     WRITE_TOOL_NAMES,
 )
@@ -411,8 +412,9 @@ def test_a_cloud_cli_room_reaches_every_domain_the_local_engine_does() -> None:
         )
         == "jobs.workflows"
     )
-    # The screen is the one thing a cloud engine still cannot touch — and the
-    # App DOMAIN goes with it (2026-08-01).
+    # The screen is the one thing this tier still cannot touch. Skin Studio's
+    # typed design tools do not drive the screen, so the App domain remains
+    # honestly reachable through app.design while app.ui stays unavailable.
     #
     # This used to assert the opposite: `ask_app_agent in names`, on the
     # reasoning that the agent "stays reachable on its media half … but holds
@@ -428,7 +430,14 @@ def test_a_cloud_cli_room_reaches_every_domain_the_local_engine_does() -> None:
     #
     # Nothing is lost — watching a room video is `media.video`'s job under
     # ask_file_agent, and that still works here.
-    assert "ask_app_agent" not in names
+    assert "ask_app_agent" in names
+    assert resolve_worker(
+        "ask_app_agent", "make the app colors warmer",
+        served_names=_CLOUD_ENGINE_TIER,
+    ) == "app.design"
+    assert not worker_reachable(
+        get_agent("app.ui"), web_enabled=True, served_names=_CLOUD_ENGINE_TIER
+    )
     assert "view_media_frame" in toolbox_for("media.video", _CLOUD_ENGINE_TIER)
     assert (
         resolve_worker(
@@ -703,6 +712,17 @@ def test_single_member_domains_pass_through() -> None:
     assert resolve_worker("ask_file_agent", "read the lease") == "files.read"
     assert resolve_worker("ask_web_agent", "latest news") == "chat.web"
     assert resolve_worker("ask_app_agent", "open the settings view") == "app.ui"
+
+
+def test_app_design_requests_reach_the_typed_design_specialist() -> None:
+    assert resolve_worker("ask_app_agent", "make the app colors warmer") == "app.design"
+    assert resolve_worker("ask_app_agent", "change the font and layout") == "app.design"
+    assert resolve_worker("ask_app_agent", "make folder surfaces transparent with frosted blur") == "app.design"
+    assert resolve_worker("ask_app_agent", "use spring press feedback and tighter heading tracking") == "app.design"
+    assert resolve_worker("ask_app_agent", "open the settings view") == "app.ui"
+    design = get_agent("app.design")
+    assert set(design.tools) == set(DESIGN_TOOL_NAMES)
+    assert design.tag == "design"
 
 
 def test_sibling_domains_resolve_by_vocabulary() -> None:
@@ -983,7 +1003,7 @@ def test_the_app_agent_needs_the_screen_verbs_not_just_any_tool_in_its_box() -> 
         scripts, web_enabled=True, served_names=set(CORE_TOOLS) | {"list_scripts"}
     )
     assert [s.id for s in REGISTRY if s.requires] == [
-        "scripts.run", "app.ui", "creator.draw"
+        "scripts.run", "app.ui", "app.design", "creator.draw"
     ]
 
 

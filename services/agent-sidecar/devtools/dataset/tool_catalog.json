@@ -1858,5 +1858,348 @@
       "type": "object"
     },
     "name": "write_skill_resource"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read the active visual skin, collaboration mode, exact draft revision, validation result, and recent attributed changes. Always call this before proposing a skin change.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "read_skin"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Apply one allow-listed visual-system patch to the live draft. Requires the exact revision returned by read_skin and never saves automatically.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "label": {
+          "description": "Short human-readable description of this change",
+          "type": "string"
+        },
+        "patch": {
+          "additionalProperties": false,
+          "properties": {
+            "canvas": {
+              "additionalProperties": false,
+              "properties": {
+                "backdrop": {
+                  "enum": ["solid", "glow", "aurora"],
+                  "type": "string"
+                },
+                "intensity": {
+                  "maximum": 1,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "gridGap": {
+                  "maximum": 40,
+                  "minimum": 12,
+                  "type": "number"
+                },
+                "surfaceOpacity": {
+                  "maximum": 1,
+                  "minimum": 0.35,
+                  "type": "number"
+                },
+                "blur": {
+                  "maximum": 40,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "saturation": {
+                  "maximum": 2,
+                  "minimum": 0.5,
+                  "type": "number"
+                },
+                "scrollFade": {
+                  "maximum": 48,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "texture": {
+                  "enum": ["off", "dots", "grid"],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "layout": {
+              "additionalProperties": false,
+              "properties": {
+                "agentWidth": {
+                  "maximum": 560,
+                  "minimum": 280,
+                  "type": "number"
+                },
+                "paneGap": {
+                  "maximum": 24,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "railWidth": {
+                  "maximum": 112,
+                  "minimum": 52,
+                  "type": "number"
+                },
+                "sidebarWidth": {
+                  "maximum": 420,
+                  "minimum": 210,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "accessibility": {
+              "additionalProperties": false,
+              "properties": {
+                "contrast": {
+                  "enum": ["system", "more", "normal"],
+                  "type": "string"
+                },
+                "transparency": {
+                  "enum": ["system", "reduce", "allow"],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "motion": {
+              "additionalProperties": false,
+              "properties": {
+                "reduce": {
+                  "type": "boolean"
+                },
+                "pressScale": {
+                  "maximum": 1,
+                  "minimum": 0.94,
+                  "type": "number"
+                },
+                "curve": {
+                  "enum": ["calm", "snappy", "spring"],
+                  "type": "string"
+                },
+                "overscroll": {
+                  "enum": ["native", "contained", "none"],
+                  "type": "string"
+                },
+                "speed": {
+                  "maximum": 2,
+                  "minimum": 0.5,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "palette": {
+              "additionalProperties": false,
+              "properties": {
+                "dark": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "accent": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "accentLift": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "danger": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "info": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "ink": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "inkStrong": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "muted": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "page": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "rule": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "ruleStrong": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "success": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "surface": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "surfaceRaised": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "warning": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"}
+                  },
+                  "type": "object"
+                },
+                "light": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "accent": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "accentLift": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "danger": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "info": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "ink": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "inkStrong": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "muted": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "page": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "rule": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "ruleStrong": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "success": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "surface": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "surfaceRaised": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"},
+                    "warning": {"pattern": "^#[0-9a-fA-F]{6}$", "type": "string"}
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "shape": {
+              "additionalProperties": false,
+              "properties": {
+                "borderWidth": {
+                  "maximum": 3,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "radius": {
+                  "maximum": 28,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "redrawOffset": {
+                  "maximum": 6,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "cornerStyle": {
+                  "enum": ["round", "squircle"],
+                  "type": "string"
+                },
+                "shadow": {
+                  "maximum": 1,
+                  "minimum": 0,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "spacing": {
+              "additionalProperties": false,
+              "properties": {
+                "scale": {
+                  "maximum": 1.4,
+                  "minimum": 0.75,
+                  "type": "number"
+                }
+              },
+              "type": "object"
+            },
+            "typography": {
+              "additionalProperties": false,
+              "properties": {
+                "bodySize": {
+                  "maximum": 24,
+                  "minimum": 11,
+                  "type": "number"
+                },
+                "bodyTracking": {
+                  "maximum": 0.12,
+                  "minimum": -0.04,
+                  "type": "number"
+                },
+                "displayFont": {"type": "string"},
+                "lineHeight": {
+                  "maximum": 2,
+                  "minimum": 1.2,
+                  "type": "number"
+                },
+                "headingTracking": {
+                  "maximum": 0.08,
+                  "minimum": -0.08,
+                  "type": "number"
+                },
+                "monoFont": {"type": "string"},
+                "numericTracking": {
+                  "maximum": 0.08,
+                  "minimum": -0.08,
+                  "type": "number"
+                },
+                "scale": {
+                  "maximum": 1.5,
+                  "minimum": 0.8,
+                  "type": "number"
+                },
+                "uiFont": {"type": "string"},
+                "userFont": {"type": "string"}
+              },
+              "type": "object"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "required": ["expected_revision", "label", "patch"],
+      "type": "object"
+    },
+    "name": "update_skin_draft"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Undo the latest skin-draft change. Requires the current revision and respects the collaboration mode.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_revision": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": ["expected_revision"],
+      "type": "object"
+    },
+    "name": "undo_skin_change"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Validate the current draft ranges, values, and body-text contrast without changing it.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "validate_skin"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Save and activate the current draft only when the user enabled agent save permission. Requires the current revision.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Name for the saved skin",
+          "type": "string"
+        }
+      },
+      "required": ["expected_revision", "name"],
+      "type": "object"
+    },
+    "name": "save_skin"
   }
 ]

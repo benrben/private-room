@@ -44,9 +44,10 @@ GROUPS: tuple[str, ...] = ("app_ui", "jobs", "skills", "connectors")
 # turn's catalog — a crash mid-answer, at the one moment the user is watching.
 # The same import-time guard the domain blurbs get (see the assert beside
 # DOMAIN_KEYS), so the mistake costs a failed start-up instead.
-assert set(GROUPS) <= set(TOOL_GROUP_LABELS), (
+_MISSING_TOOL_GROUP_LABELS = set(GROUPS).difference(TOOL_GROUP_LABELS)
+assert not _MISSING_TOOL_GROUP_LABELS, (
     "every request_tools group needs a prompts.TOOL_GROUP_LABELS row; missing="
-    f"{sorted(set(GROUPS) - set(TOOL_GROUP_LABELS))}"
+    f"{sorted(_MISSING_TOOL_GROUP_LABELS)}"
 )
 
 # --------------------------------------------------------------------------- #
@@ -94,9 +95,10 @@ AGENT_TOOL_DOMAINS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ),
     (
         "ask_app_agent",
-        ("app.ui",),
-        "Ask the App agent to see or operate this app's own interface: open "
-        "views, click buttons, show the user around.",
+        ("app.ui", "app.design"),
+        "Ask the App agent to see or operate this app's own interface, or to "
+        "design its visual skin: colours, font roles, translucent materials, "
+        "type rhythm, accessibility, motion, spacing and layout.",
     ),
     (
         "ask_jobs_agent",

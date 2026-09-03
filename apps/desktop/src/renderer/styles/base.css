@@ -19,6 +19,10 @@ body,
   overflow: hidden;
 }
 
+html {
+  overscroll-behavior: var(--skin-overscroll);
+}
+
 /* No background here: paper.css paints the dotted sheet on <html> and this
    element stays transparent so it shows through. */
 body {
@@ -26,6 +30,7 @@ body {
   font-family: var(--sans);
   font-size: var(--fs-body);
   line-height: var(--lh-body);
+  letter-spacing: var(--tracking-body);
   -webkit-font-smoothing: antialiased;
 }
 
@@ -54,7 +59,7 @@ button:hover {
 
 /* Pressed against the paper. */
 button:active:not(:disabled) {
-  transform: translateY(1px);
+  transform: translateY(1px) scale(var(--press-scale));
 }
 
 button:disabled {
@@ -189,6 +194,56 @@ code {
   padding: 1px 6px;
   font-family: var(--mono);
   font-size: var(--fs-micro);
+}
+
+html[data-skin] :is(h1, h2, h3, h4, h5, h6) {
+  letter-spacing: var(--tracking-heading);
+}
+
+html[data-skin] :is(output, .nb-num, .count-badge, [class$="-count"], [class$="-value"]) {
+  letter-spacing: var(--tracking-numeric);
+  font-variant-numeric: tabular-nums;
+}
+
+html[data-skin] :is(.compare-pane-label, .model-catalog-controls, .cap-matrix thead th, .cap-matrix tbody th[scope="row"], .pdf-zoombar, .skin-studio-bar, .ac-hint-row) {
+  background: var(--surface-glass);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  box-shadow: 0 var(--scroll-fade) var(--scroll-fade) calc(var(--scroll-fade) * -0.65) var(--shadow-lift);
+}
+
+html[data-skin-transparency="reduce"] {
+  --skin-surface-opacity: 100% !important;
+  --skin-raised-opacity: 100% !important;
+  --glass-blur: 0px !important;
+  --glass-saturation: 1 !important;
+}
+
+html[data-skin-contrast="more"] {
+  --rule: var(--ink-2) !important;
+  --rule-strong: var(--ink) !important;
+}
+
+@supports (corner-shape: squircle) {
+  html[data-skin-corners="squircle"] :is(button, input, textarea, select, [class*="card"], [class*="panel"]) {
+    corner-shape: squircle;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  html[data-skin-transparency="system"] {
+    --skin-surface-opacity: 100% !important;
+    --skin-raised-opacity: 100% !important;
+    --glass-blur: 0px !important;
+    --glass-saturation: 1 !important;
+  }
+}
+
+@media (prefers-contrast: more) {
+  html[data-skin-contrast="system"] {
+    --rule: var(--ink-2) !important;
+    --rule-strong: var(--ink) !important;
+  }
 }
 
 /* buttons that pair an icon with a label */

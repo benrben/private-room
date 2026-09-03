@@ -330,8 +330,10 @@ describe("the tab strip", () => {
     const db = freshRoom();
     const { browser } = harness(db);
     const deps = baseDeps(db, browser);
-    const a = await browserNewTab(deps, "https://example.com/");
-    const b = await browserNewTab(deps, "https://example.org/");
+    // This case is about local tab lifecycle only. URL guarding and its DNS
+    // recheck are covered above, so keep this test deterministic and offline.
+    const a = await browserNewTab(deps, "");
+    const b = await browserNewTab(deps, "");
     expect(browserTabs(deps).map((t) => t.id)).toEqual([a, b]);
     expect(browserTabs(deps).find((t) => t.active)?.id).toBe(b);
 

@@ -15,7 +15,7 @@ describe("quality metrics coverage scope", () => {
   });
 
   it("uses the validated desktop coverage worker count", () => {
-    expect(desktopPackage.scripts["test:unit"]).toContain("--maxWorkers 6");
+    expect(desktopPackage.scripts["test:unit"]).toContain("--maxWorkers 4");
   });
 
   it("traces only sidecar production source with the low-overhead core", () => {

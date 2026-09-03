@@ -37,6 +37,7 @@ export const SIDEBAR_TITLES: Record<WorkArea, string | null> = {
   skills: "Skills",
   memory: "Memory",
   connectors: "Connectors",
+  skin: "Skin Studio",
   create: "Creations",
   sketch: "Sketches",
   browser: "Private pages",

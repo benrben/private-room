@@ -11,6 +11,7 @@ from .prompts import (
     FILES_PROMPT,
     SCRIPTS_PROMPT,
     UI_PROMPT,
+    DESIGN_PROMPT,
     WEB_PROMPT,
     WORKFLOWS_PROMPT,
 )
@@ -19,6 +20,7 @@ from .routing import (
     DOWNLOAD_TOOL_NAMES,
     ORGANIZE_TOOL_NAMES,
     UI_TOOL_NAMES,
+    DESIGN_TOOL_NAMES,
 )
 
 REGISTRY_1: tuple[AgentSpec, ...] = (
@@ -298,6 +300,29 @@ REGISTRY_1: tuple[AgentSpec, ...] = (
         # wire it in was removed 2026-08-01; UI_HINTS itself is still the Rust
         # parity list `routing.wants_ui_tools` matches on.
         group="app_ui",
+    ),
+    AgentSpec(
+        id="app.design",
+        flow=Flow(probe="read_skin"),
+        template="react_verify",
+        label="Design agent",
+        tag="design",
+        area="the app's visual skin",
+        summary=(
+            "Designs the app with you: colours, every font role, translucent "
+            "materials, type rhythm, shape, motion and layout, as a reversible draft."
+        ),
+        tools=DESIGN_TOOL_NAMES,
+        requires=("read_skin", "update_skin_draft"),
+        prompt=DESIGN_PROMPT,
+        hints=(
+            "skin", "theme", "visual design", "appearance", "font", "typeface",
+            "typography", "color", "colour", "palette", "background", "canvas",
+            "spacing", "corner", "radius", "layout", "dark mode", "light mode",
+            "transparent", "translucent", "opacity", "frosted", "blur", "glass",
+            "tracking", "press feedback", "spring", "overscroll", "contrast",
+            "עיצוב", "צבע", "צבעים", "גופן", "רקע", "פריסה",
+        ),
     ),
     AgentSpec(
         id="jobs.run",

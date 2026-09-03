@@ -214,6 +214,7 @@ describe("FrontPage", () => {
       scripts: [
         { approved: false, changedSinceApproval: false },
         { approved: true, changedSinceApproval: false, lastRun: { status: "failed" } },
+        { approved: true, changedSinceApproval: false, lastRun: { status: "error" } },
       ],
       workflows: [{ createdBy: "user", status: "draft" }],
     });
@@ -224,7 +225,7 @@ describe("FrontPage", () => {
     expect(entries[0]).toContain("raw cloud model");
     expect(entries[1]).toContain("haven't been scanned");
     expect(entries[2]).toContain("need review");
-    expect(entries[3]).toContain("failed on");
+    expect(entries[3]).toContain("2 scripts failed on their last run");
     expect(entries[4]).toContain("workflow is a draft");
     await click(button(view, "Review privacy"));
     await click(button(view, "Scan now"));
@@ -281,6 +282,11 @@ describe("FrontPage", () => {
     expect(view.host.textContent).toContain("shown report.pdf");
     expect(view.host.textContent).toContain("Chat");
     expect(view.host.textContent).toContain("1");
+    expect([...view.host.querySelectorAll(".rh-tl-title")].map((entry) => entry.textContent)).toEqual([
+      "Index report",
+      "Discuss report",
+      "shown report.pdf",
+    ]);
     await click(view.host.querySelector('button[title="Index report"]')!);
     await click(view.host.querySelector('button[title="report.pdf"]')!);
     await click(view.host.querySelector('button[title="Discuss report"]')!);

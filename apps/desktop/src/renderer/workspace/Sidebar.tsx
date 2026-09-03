@@ -36,6 +36,7 @@ import {
 import { BrowsePanel, SelectionBar, SourcesPanel } from "./SidebarFiles";
 import { PagesNav, RecordingsNav, ScriptsNav, SketchesNav, SkillsNav, WorkflowsNav } from "./SidebarDestinations";
 import { ConnectorsNav, CreationsNav, MapNav, MemoryNav } from "./SidebarMoreDestinations";
+import { SkinControls } from "../skin/SkinControls";
 
 /** THE CONTEXTUAL SIDEBAR — the second column, whose title, contents, primary
  * action, selection and empty state all come from the ACTIVE DESTINATION.
@@ -247,6 +248,7 @@ function AreaContent({ s, a, area, pages, onNewItem, data }: LibraryPaneProps & 
     sketch: <SketchesNav s={s} a={a} onNewItem={onNewItem} />,
     create: <CreationsNav s={s} a={a} />,
     map: <MapNav s={s} a={a} />,
+    skin: <SkinControls />,
   };
   return content[area];
 }

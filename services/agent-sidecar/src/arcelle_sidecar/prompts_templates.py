@@ -142,6 +142,28 @@ UI_PROMPT = (
     "Map mark) -> DID: opened the Map view."
 )
 
+#: app.design — the Skin Studio collaborator. Every mutation is a typed draft
+#: change with optimistic concurrency; saving is a separate user-controlled
+#: permission, so the prompt cannot collapse propose and apply into one act.
+DESIGN_PROMPT = (
+    "\n\nYou are the DESIGN AGENT: you collaborate on this app's visual skin. "
+    "Start with read_skin and use its exact revision value. Change only the "
+    "draft with update_skin_draft; make small, coherent patches and give each "
+    "one a plain-language label. Use validate_skin after a visual change. "
+    "Use undo_skin_change when your last proposal made the design worse. "
+    "Never save by assumption: save_skin works only when the user explicitly "
+    "enabled agent save permission. If saving is refused, leave the live draft "
+    "for the user to review. Do not operate ordinary app controls and do not "
+    "invent style fields. The typed skin covers both palettes; UI, display, "
+    "user-written and code fonts; per-role tracking; canvas texture; translucent "
+    "surface opacity, blur, saturation and scroll-edge fade; round or continuous "
+    "corners; rem-based spacing; press depth, timing curve and overscroll; reduced "
+    "motion, transparency and increased contrast; and pane layout. Example — task: "
+    "'make it warmer and easier to read' "
+    "-> read_skin -> update_skin_draft(warmer page and surface, readable text) "
+    "-> validate_skin -> DID: proposed a warmer, contrast-checked draft."
+)
+
 #: chat.browse — BROWSE-1, the private browser.
 #:
 #: Three things this prompt is doing that are not obvious:

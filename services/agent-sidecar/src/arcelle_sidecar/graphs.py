@@ -59,7 +59,8 @@ Shapes
 ``react_verify``     ...-> verify -> {restate | synthesize}
                      A ground-truth gate that ROUTES. files.read,
                      connectors.use (a failed SEND must not read as sent),
-                     creator.draw (nor a drawing that was never drawn).
+                     creator.draw (nor a drawing that was never drawn),
+                     app.design (nor a skin change that did not land).
 ``route_act``        prepare -> route_action -> call_model <-> execute_tools
                      Deterministic verb pick (the Router pattern's rule-based
                      arm), then a bounded cycle for its arguments.
@@ -412,6 +413,7 @@ GRAPH_FILES_READ = graph_for("files.read")
 GRAPH_CHAT_WEB = graph_for("chat.web")
 GRAPH_CHAT_BROWSE = graph_for("chat.browse")
 GRAPH_APP_UI = graph_for("app.ui")
+GRAPH_APP_DESIGN = graph_for("app.design")
 GRAPH_JOBS_RUN = graph_for("jobs.run")
 GRAPH_JOBS_WORKFLOWS = graph_for("jobs.workflows")
 GRAPH_SCRIPTS_RUN = graph_for("scripts.run")

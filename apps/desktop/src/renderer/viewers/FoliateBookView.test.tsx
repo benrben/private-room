@@ -418,8 +418,9 @@ describe("FoliateBookView", () => {
     expect(view.host.textContent).toContain("Opening book…");
     await act(async () => view.root.unmount());
     const opened = book([section(() => "blob:unused")]);
-    lateBook.resolve(opened);
-    await flush();
-    expect(opened.destroy).toHaveBeenCalledOnce();
+    await act(async () => {
+      lateBook.resolve(opened);
+      await vi.waitFor(() => expect(opened.destroy).toHaveBeenCalledOnce());
+    });
   });
 });

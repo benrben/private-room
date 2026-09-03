@@ -81,10 +81,13 @@ import {
 import { createToolEffects, execTool, type ExecToolDeps } from "./execTool.js";
 import {
   mediaFrameNote,
+  mediaFrameRequestedAt,
   mediaFrameReceipt,
   ORGANIZE_RUNTIME_ACTIONS,
   type NamedToolCall,
 } from "./execToolDispatchCore.js";
+import { studioSpecForTool } from "./execToolDispatch.js";
+import { hasVisualEffects } from "./execToolEffects.js";
 import { realOutboundUrlRefusal } from "./execToolAdvisor.js";
 import { execCreateFile, execMarkImage } from "./organizeTools.js";
 
@@ -97,6 +100,13 @@ function deps(overrides: Partial<ExecToolDeps> = {}): ExecToolDeps {
 afterEach(() => vi.clearAllMocks());
 
 describe("media-frame receipt validation", () => {
+  it("normalizes requested timestamps and rejects other value types", () => {
+    expect(mediaFrameRequestedAt({ at: "00:12" })).toBe("00:12");
+    expect(mediaFrameRequestedAt({ at: 12.5 })).toBe("12.5");
+    expect(mediaFrameRequestedAt({ at: true })).toBe("0");
+    expect(mediaFrameRequestedAt({})).toBe("0");
+  });
+
   it("allows an ordinary URL when privacy has no protected name to hide", () => {
     expect(realOutboundUrlRefusal("https://example.com/public")).toBeNull();
   });
@@ -116,6 +126,20 @@ describe("media-frame receipt validation", () => {
       width: 640,
       height: 360,
     })).toBe("Frame receipt: clip.mp4 at 1.250s; SHA-256 abc123; 640×360 PNG.");
+  });
+});
+
+describe("focused dispatcher helpers", () => {
+  it("selects the matching studio specification", () => {
+    expect(studioSpecForTool("studio_mindmap")).toEqual({ kind: "mindmap" });
+    expect(studioSpecForTool("generate_podcast_script")).toEqual({ kind: "podcast" });
+  });
+
+  it("recognizes each visual effect collection independently", () => {
+    const blank = createToolEffects();
+    expect(hasVisualEffects(blank)).toBe(false);
+    expect(hasVisualEffects({ ...blank, editOutcomes: [{} as never] })).toBe(true);
+    expect(hasVisualEffects({ ...blank, mediaFrames: [{} as never] })).toBe(true);
   });
 });
 
@@ -204,6 +228,23 @@ describe("execTool Map dispatch live seams", () => {
     await expect(execTool("view_media_frame", { name: "clip.mp4", at: "0:01" }, effects, context))
       .resolves.toEqual({ ok: true, text: "custom receipt" });
     expect(effects.pendingImages).toEqual([imageB64]);
+  });
+
+  it("routes typed skin tools through their dedicated renderer request kinds", async () => {
+    const agentUi = vi.fn(async (kind: string) => ({ kind, revision: 4 }));
+    const context = deps({ agentUi });
+
+    await expect(execTool("read_skin", {}, createToolEffects(), context)).resolves.toEqual({
+      ok: true,
+      text: "{\n  \"kind\": \"skin_read\",\n  \"revision\": 4\n}",
+    });
+    await expect(execTool("update_skin_draft", {
+      expected_revision: 4,
+      label: "Warmer surface",
+      patch: { palette: { dark: { surface: "#24211f" } } },
+    }, createToolEffects(), context)).resolves.toMatchObject({ ok: true });
+    expect(agentUi).toHaveBeenNthCalledWith(1, "skin_read", {});
+    expect(agentUi).toHaveBeenNthCalledWith(2, "skin_update", expect.objectContaining({ expected_revision: 4 }));
   });
 
   it("forwards successful sketch, studio, deletion, and workflow calls", async () => {

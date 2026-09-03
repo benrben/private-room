@@ -5,7 +5,7 @@ import ViewerPane from "./ViewerPane";
 
 const { act, createElement } = React;
 
-const { actions, encoding, visibility, frameSelection, composer } = vi.hoisted(() => ({
+const { actions, encoding, visibility, frameSelection, composer, model } = vi.hoisted(() => ({
   actions: {
     exportOne: vi.fn(),
     setQuestion: vi.fn(),
@@ -17,6 +17,7 @@ const { actions, encoding, visibility, frameSelection, composer } = vi.hoisted((
   visibility: { libraryStatus: vi.fn(() => null) },
   frameSelection: { frameSelectionOf: vi.fn(() => null) },
   composer: { provenanceLine: vi.fn(() => "") },
+  model: { isModelReady: vi.fn(() => true) },
 }));
 
 vi.mock("../api", () => ({ formatSize: (bytes: number) => `${bytes} B` }));
@@ -51,12 +52,12 @@ vi.mock("./ViewerRouter", () => ({ default: () => createElement("div", { "data-t
 vi.mock("../viewers/CloudView", () => ({ default: () => createElement("div", { "data-testid": "cloud-view" }, "cloud preview") }));
 vi.mock("../viewers/frameSelection", () => ({ frameSelectionOf: frameSelection.frameSelectionOf }));
 vi.mock("../viewers/htmlText", () => ({ textOf: (text: string) => text }));
-vi.mock("./FrontPage", () => ({ default: () => createElement("div", null, "front page") }));
+vi.mock("./FrontPage", () => ({ default: () => createElement("div", { "data-testid": "front-page" }, "front page") }));
 vi.mock("./MemoryView", () => ({ default: () => createElement("div", null, "memory") }));
 vi.mock("./RecordingsPage", () => ({ default: () => createElement("div", null, "recordings") }));
 vi.mock("../viewers/TextEncoding", () => ({ useTextEncoding: encoding.useTextEncoding }));
 vi.mock("./ReaderShell", () => ({
-  DocSourceCard: () => createElement("div", null, "source"),
+  DocSourceCard: ({ file }: { file?: { name?: string } }) => createElement("div", null, file ? `source ${file.name}` : "source missing"),
   READER_KINDS: new Set(["prose", "markdown"]),
   ReadingProgress: () => createElement("div", null, "progress"),
   useReadingProgress: () => ({ progress: 0, ref: null }),
@@ -71,11 +72,12 @@ vi.mock("./quoteSelection", () => ({
 }));
 vi.mock("./markup", () => ({
   isCloudRoute: () => false,
-  isModelReady: () => true,
+  isModelReady: model.isModelReady,
   trustState: () => ({ tone: "good", title: "Nothing leaves the device" }),
 }));
 vi.mock("./ConnectorsView", () => ({ default: () => createElement("div", null, "connectors") }));
-vi.mock("./BrowserView", () => ({ BrowserView: ({ onAsk }: { onAsk: (query: string) => void }) => createElement("button", { onClick: () => onAsk("browser question") }, "browser") }));
+vi.mock("./BrowserView", () => ({ BrowserView: ({ onAsk, parked }: { onAsk: (query: string) => void; parked: boolean }) => createElement("div", { "data-testid": "browser-view", "data-parked": String(parked) }, createElement("button", { onClick: () => onAsk("browser question") }, "browser")) }));
+vi.mock("../skin/SkinStudio", () => ({ SkinStudio: () => createElement("div", null, "skin studio") }));
 vi.mock("./workflows/WorkflowsPage", () => ({ WorkflowsPage: () => createElement("div", null, "workflows") }));
 vi.mock("./workflows/workflowGlyph", () => ({ WorkflowGlyph: () => null }));
 vi.mock("./scripts/ScriptsPage", () => ({ ScriptsPage: () => createElement("div", null, "scripts") }));
@@ -104,6 +106,8 @@ afterEach(() => {
   frameSelection.frameSelectionOf.mockReturnValue(null);
   composer.provenanceLine.mockReturnValue("");
   encoding.useTextEncoding.mockReturnValue({ text: null, picker: null });
+  model.isModelReady.mockReset();
+  model.isModelReady.mockReturnValue(true);
   for (const [key, value] of Object.entries(originalGlobals)) {
     if (value === undefined) Reflect.deleteProperty(globalThis, key);
     else Reflect.set(globalThis, key, value);
@@ -261,6 +265,7 @@ describe("ViewerPane", () => {
 
     expect(host.querySelector('[data-testid="viewer-router"]')).not.toBeNull();
     expect(host.textContent).toContain("note.txt");
+    expect(host.querySelector(".viewer-body")?.classList.contains("fill")).toBe(false);
     const exportButton = [...host.querySelectorAll("button")].find((button) => button.textContent?.includes("Export"));
     await act(async () => exportButton?.dispatchEvent(new window.Event("click", { bubbles: true })));
     expect(actions.exportOne).toHaveBeenCalledWith("file-1", "note.txt");
@@ -401,6 +406,7 @@ describe("ViewerPane", () => {
     };
     const media = await renderPane(audio, { staleFile: "file-1", openingFileId: "other-file" });
     expect(media.host.textContent).toContain("Opening…");
+    expect(media.host.textContent).toContain("The AI changed this file");
     const minutes = [...media.host.querySelectorAll("button")].find((button) => button.textContent?.includes("Minutes"));
     const load = [...media.host.querySelectorAll("button")].find((button) => button.textContent?.includes("Load AI version"));
     await act(async () => minutes?.dispatchEvent(new media.window.Event("click", { bubbles: true })));
@@ -481,7 +487,7 @@ describe("ViewerPane", () => {
     const examples = [
       ["browser", "browser"], ["connectors", "connectors"], ["skills", "skills"],
       ["memory", "memory"], ["recordings", "recordings"], ["create", "create"],
-      ["sketch", "New sketch"], ["files", "Your room is sealed"],
+      ["sketch", "Nothing sketched yet"], ["skin", "skin studio"], ["files", "Your room is sealed"],
     ] as const;
     for (const [area, expected] of examples) {
       const { host, root } = await renderPane(null, {}, area);
@@ -501,5 +507,101 @@ describe("ViewerPane", () => {
     const map = await renderPane(null, { showMap: true });
     expect(map.host.textContent).toContain("room map");
     await act(async () => map.root.unmount());
+  });
+
+  it("keeps viewer fill and reader metadata decisions observable", async () => {
+    const openFile = {
+      id: "file-1",
+      content: { kind: "text", name: "note.txt", mime: "text/plain", editable: true, text: "hello", dataB64: null, mediaToken: null, mediaMeta: null, webMeta: null },
+    };
+    const grid = await renderPane(openFile, { editMode: true }, "files", { editModeOf: () => "grid" });
+    expect(grid.host.querySelector(".viewer-body")?.classList.contains("fill")).toBe(false);
+    await act(async () => grid.root.unmount());
+    const editor = await renderPane(openFile, { editMode: true }, "files", { editModeOf: () => "editor" });
+    expect(editor.host.querySelector(".viewer-body")?.classList.contains("fill")).toBe(true);
+    await act(async () => editor.root.unmount());
+
+    const prose = { ...openFile, content: { ...openFile.content, kind: "prose", name: "article.md" } };
+    const reader = await renderPane(prose, {
+      files: [
+        { id: "other", name: "wrong.md", folderId: null, aiSummary: "Wrong" },
+        { id: "file-1", name: "article.md", folderId: "folder", aiSummary: "Right summary" },
+      ],
+      folders: [{ id: "folder", name: "Reading" }],
+    });
+    expect(reader.host.textContent).toContain("Reading / article.md");
+    expect(reader.host.textContent).toContain("Right summary");
+    expect(reader.host.textContent).toContain("source article.md");
+    await act(async () => reader.root.unmount());
+  });
+
+  it("distinguishes sealed, front-page, privacy, sketch, and breadcrumb states", async () => {
+    model.isModelReady.mockReturnValue(false);
+    const defaultHome = await renderPane(null);
+    expect(defaultHome.host.querySelector(".crumb-title")?.textContent).toBe("Home");
+    expect(defaultHome.host.textContent).toContain("Summarize room");
+    expect(defaultHome.host.textContent).toContain("Ask the room");
+    await act(async () => defaultHome.root.unmount());
+    model.isModelReady.mockReturnValue(true);
+
+    const noFiles = await renderPane(null, { files: [] });
+    expect(noFiles.host.textContent).not.toContain("Summarize room");
+    await act(async () => noFiles.root.unmount());
+
+    const queued = await renderPane(null, { jobs: [{ status: "queued" }] });
+    const summarize = [...queued.host.querySelectorAll("button")].find((button) => button.textContent?.includes("Summarize room")) as HTMLButtonElement;
+    expect(summarize.disabled).toBe(true);
+    await act(async () => queued.root.unmount());
+
+    for (const outside of [{ webOn: true }, { mcpTools: [{}] }]) {
+      const view = await renderPane(null, outside);
+      expect(view.host.textContent).toContain("online search or a connected tool sends");
+      await act(async () => view.root.unmount());
+    }
+
+    for (const fp of [
+      { fileCount: 1, chatCount: 0, memories: [] },
+      { fileCount: 0, chatCount: 1, memories: [] },
+      { fileCount: 0, chatCount: 0, memories: [{}] },
+    ]) {
+      const view = await renderPane(null, { fp });
+      expect(view.host.querySelector('[data-testid="front-page"]')).not.toBeNull();
+      await act(async () => view.root.unmount());
+    }
+    const emptyFp = await renderPane(null, { fp: { fileCount: 0, chatCount: 0, memories: [] } });
+    expect(emptyFp.host.textContent).toContain("Your room is sealed");
+    await act(async () => emptyFp.root.unmount());
+
+    const sketch = await renderPane(null, { files: [{ id: "sketch", name: "drawing.sketch", kind: "sketch" }] }, "sketch");
+    expect(sketch.host.textContent).toContain("Pick a sketch to open it");
+    await act(async () => sketch.root.unmount());
+
+    const workflows = await renderPane(null, { showWorkflows: true });
+    expect(workflows.host.querySelector(".crumb-title")?.textContent).toBe("Files");
+    await act(async () => workflows.root.unmount());
+    const browser = await renderPane(null, {}, "browser");
+    expect(browser.host.querySelector(".crumb-title")?.textContent).toBe("Private browser");
+    await act(async () => browser.root.unmount());
+  });
+
+  it("parks the browser for every blocking overlay and not for an idle room", async () => {
+    const idle = await renderPane(null, {}, "browser");
+    expect(idle.host.querySelector('[data-testid="browser-view"]')?.getAttribute("data-parked")).toBe("false");
+    await act(async () => idle.root.unmount());
+    const overlays = [
+      { browseConsents: [{}] },
+      { mcpApprovals: [{}] },
+      { editApprovals: [{}] },
+      { scriptApprovals: [{}] },
+      { aiPrompt: {} },
+      { studioPrompt: {} },
+      { compare: {} },
+      { ctxMenu: {} },
+    ];
+    for (const overlay of overlays) {
+      const view = await renderPane(null, overlay, "browser");
+      expect(view.host.querySelector('[data-testid="browser-view"]')?.getAttribute("data-parked")).toBe("true");
+      await act(async () => view.root.unmount());
+    }
   });
 });

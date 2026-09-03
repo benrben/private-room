@@ -3,6 +3,23 @@
 All notable, user-facing changes to Arcelle. Versions follow
 [semver](https://semver.org); dates are the GitHub release dates.
 
+## 0.26.14 — 2026-09-03
+
+Skin Studio now drives Arcelle's visual system through a validated, portable
+configuration. Users and the Design agent can work separately or together on
+dark and light colours, four font roles, type scale and tracking, canvas
+materials, glass opacity and blur, spacing, corners, shadows, press feedback,
+motion, overscroll, accessibility preferences, and pane proportions. Drafts
+remain reversible and separate from the active skin until they are saved.
+
+The Design specialist is available from the room's specialist menu and
+understands transparent surfaces, frosted chrome, motion curves and detailed
+typography. Arbitrary CSS and scripts remain outside the skin allow-list.
+
+Room folders no longer paint an opaque block over the Library. Their resting
+surface is transparent and their hover state uses the configured glass
+material.
+
 ## 0.26.13 — 2026-09-01
 
 Browser automation is fully wired in packaged builds again. All five ordered

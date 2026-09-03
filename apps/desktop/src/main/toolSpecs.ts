@@ -2,5 +2,6 @@
 export * from "./toolSpecsBrowse.js";
 export * from "./toolSpecsCatalog.js";
 export * from "./toolSpecsMedia.js";
+export * from "./toolSpecsSkin.js";
 export * from "./toolSpecsTypes.js";
 export * from "./toolSpecsWork.js";

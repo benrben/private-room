@@ -68,6 +68,7 @@ describe("the schema TABLE's own membership", () => {
       "open_file", // toolsCatalog
       "web_search", // toolsCatalog, web half
       "ui_act", // uiToolsSpecs
+      "update_skin_draft", // skinToolsSpecs
       "browse_do", // browseToolsSpecs
       "start_file_pass", // jobToolsSpecs
       "save_workflow", // workflowToolsSpecs
@@ -83,6 +84,7 @@ describe("the schema TABLE's own membership", () => {
     // …and the guard really fires for one from each of those groups, so
     // "present in the table" is not satisfied by an empty schema.
     expect(missingRequiredArg("browse_do", {})).toContain("actions is required");
+    expect(missingRequiredArg("update_skin_draft", {})).toContain("expected_revision is required");
     expect(missingRequiredArg("save_workflow", {})).toContain("name is required");
     expect(missingRequiredArg("local_generate", {})).toContain("prompt is required");
   });

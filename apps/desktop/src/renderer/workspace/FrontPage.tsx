@@ -18,7 +18,6 @@ interface BriefItem {
   cta: string;
   run: () => void;
 }
-const TONE_RANK: Record<BriefTone, number> = { danger: 0, warn: 1, info: 2 };
 /** A strip's colour comes from the marker MEANING, never from a hue picked by
  * hand, so "red means urgent" stays a fact of the stylesheet rather than a
  * convention this file has to remember. */
@@ -144,8 +143,7 @@ function briefItems(s: WSState, a: WSActions): BriefItem[] {
     failedScriptItem(s, a),
     workflowDraftItem(s, a),
   ]
-    .filter((item): item is BriefItem => item !== null)
-    .sort((first, second) => TONE_RANK[first.tone] - TONE_RANK[second.tone]);
+    .filter((item): item is BriefItem => item !== null);
 }
 
 function BriefItemRow({ item }: { item: BriefItem }) {
@@ -391,7 +389,7 @@ export default function FrontPage({
 }) {
   const [suggestionsOpen, setSuggestionsOpen] = useState(false);
   const goArea = (
-    area: "files" | "recordings" | "memory" | "skills" | "connectors" | "sketch" | "create",
+    area: "files" | "recordings" | "memory" | "skills" | "connectors" | "sketch" | "create" | "skin",
   ) => {
     s.setShowMap(false);
     s.setShowWorkflows(false);
@@ -418,6 +416,7 @@ export default function FrontPage({
     skills: () => goArea("skills"),
     connectors: () => goArea("connectors"),
     memory: () => goArea("memory"),
+    skin: () => goArea("skin"),
   };
   const recent = timeline(page, s, a, layout);
   return (

@@ -40,6 +40,7 @@ import { WorkflowsPage } from "./workflows/WorkflowsPage";
 import { ScriptsPage } from "./scripts/ScriptsPage";
 import SkillsView from "./skills/SkillsView";
 import { CreatePage } from "./create/CreatePage";
+import { SkinStudio } from "../skin/SkinStudio";
 import type { ViewerKind } from "../api";
 import { NO_FILE, useDismissOnEscape, useDocumentQuote, useFrameQuote, type ViewerQuote } from "./viewerQuote";
 import { FileHeader, LibraryChip, QuoteAction } from "./ViewerFileHeader";
@@ -89,6 +90,7 @@ const AREA_CRUMBS: Record<WorkArea, string> = {
   create: "Create",
   sketch: "Sketch",
   browser: "Private browser",
+  skin: "Skin Studio",
 };
 
 /** Escape dismisses the popover, not the document behind it.
@@ -272,6 +274,7 @@ function AreaSurface({ s, a, info, layout, area, overlayShowing, frontPageView, 
     recordings: <RecordingsPage s={s} a={a} info={info} />,
     create: <CreatePage s={s} a={a} />,
     sketch: <SketchLanding s={s} a={a} />,
+    skin: <SkinStudio layout={layout} question={s.question} setQuestion={s.setQuestion} showAgent={() => layout.showPane("ai")} />,
   };
   return surfaces[area] ?? <HomeSurface {...{ s, a, info, layout, frontPageView, aiReady, trust, alsoSendsOut }} />;
 }

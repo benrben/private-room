@@ -28,6 +28,7 @@ describe("sidebarRegionLabel", () => {
     expect(sidebarRegionLabel("create")).toBe("Creations");
     expect(sidebarRegionLabel("sketch")).toBe("Sketches");
     expect(sidebarRegionLabel("browser")).toBe("Private pages");
+    expect(sidebarRegionLabel("skin")).toBe("Skin Studio");
   });
 
   it("uses the generic region name for a destination declared without a second column", () => {
@@ -44,7 +45,7 @@ describe("newItemOf", () => {
     expect(newItemOf("create")).toBe("creation");
     expect(newItemOf("files")).toBe("note");
     expect(newItemOf("home")).toBe("note");
-    for (const area of ["map", "recordings", "workflows", "scripts", "skills", "memory", "connectors"] as const) {
+    for (const area of ["map", "recordings", "workflows", "scripts", "skills", "memory", "connectors", "skin"] as const) {
       expect(newItemOf(area)).toBeNull();
     }
   });
@@ -59,7 +60,7 @@ describe("destination labels", () => {
 
     expect(showsDocumentTabs("files")).toBe(true);
     expect(showsDocumentTabs("home")).toBe(true);
-    for (const area of ["map", "recordings", "workflows", "scripts", "skills", "memory", "connectors", "create", "sketch", "browser"] as const) {
+    for (const area of ["map", "recordings", "workflows", "scripts", "skills", "memory", "connectors", "create", "sketch", "browser", "skin"] as const) {
       expect(showsDocumentTabs(area)).toBe(false);
     }
   });
@@ -70,7 +71,7 @@ describe("destination labels", () => {
     expect(newItemLabel("create")).toBe("New creation");
     expect(newItemLabel("files")).toBe("New note");
     expect(newItemLabel("home")).toBe("New note");
-    for (const area of ["map", "recordings", "workflows", "scripts", "skills", "memory", "connectors"] as const) {
+    for (const area of ["map", "recordings", "workflows", "scripts", "skills", "memory", "connectors", "skin"] as const) {
       expect(newItemLabel(area)).toBeNull();
     }
   });

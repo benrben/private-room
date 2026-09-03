@@ -240,8 +240,31 @@ export function execEditTool(call: NamedToolCall): Promise<ToolOutcome> {
   );
 }
 
-export function uiKind(name: string): "ui_snapshot" | "ui_act" | "view_screenshot" | "media_frame" {
-  return name === "view_media_frame" ? "media_frame" : name as "ui_snapshot" | "ui_act" | "view_screenshot";
+export type RendererAgentRequestKind =
+  | "ui_snapshot"
+  | "ui_act"
+  | "view_screenshot"
+  | "media_frame"
+  | "skin_read"
+  | "skin_update"
+  | "skin_undo"
+  | "skin_validate"
+  | "skin_save";
+
+const RENDERER_REQUEST_KINDS: Readonly<Record<string, RendererAgentRequestKind>> = {
+  ui_snapshot: "ui_snapshot",
+  ui_act: "ui_act",
+  view_screenshot: "view_screenshot",
+  view_media_frame: "media_frame",
+  read_skin: "skin_read",
+  update_skin_draft: "skin_update",
+  undo_skin_change: "skin_undo",
+  validate_skin: "skin_validate",
+  save_skin: "skin_save",
+};
+
+export function uiKind(name: string): RendererAgentRequestKind {
+  return RENDERER_REQUEST_KINDS[name] ?? "ui_snapshot";
 }
 
 export function asUiPayload(payload: unknown): Record<string, unknown> {

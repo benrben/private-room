@@ -389,7 +389,7 @@ export function toolsCatalog(webEnabled: boolean): OllamaToolSpec[] {
               // schema would change what `save_skill` accepts, process-wide.
               enum: [...SKILL_AGENT_IDS],
               description:
-                "Optional: the sub-agent this procedure belongs to, so only that specialist is offered it — files.read (room files), scripts.run (this room's scripts), chat.web (internet search/fetch), chat.browse (driving web pages in the private browser), app.ui (this app's interface), jobs.run (whole-file passes), jobs.workflows (automation), skills.use (running skills), skills.author (writing skills), connectors.use (connected services), connectors.admin (connector setup), media.transcribe (transcripts), media.video (watching room videos), creator.studio (flashcards, mind maps, podcast scripts), creator.draw (drawing on the room's sketches). Omit for a skill any agent may use.",
+                "Optional: the sub-agent this procedure belongs to, so only that specialist is offered it — files.read (room files), scripts.run (this room's scripts), chat.web (internet search/fetch), chat.browse (driving web pages in the private browser), app.ui (this app's interface), app.design (the app's visual skin), jobs.run (whole-file passes), jobs.workflows (automation), skills.use (running skills), skills.author (writing skills), connectors.use (connected services), connectors.admin (connector setup), media.transcribe (transcripts), media.video (watching room videos), creator.studio (flashcards, mind maps, podcast scripts), creator.draw (drawing on the room's sketches). Omit for a skill any agent may use.",
             },
           },
           required: ["name", "description", "instructions"],

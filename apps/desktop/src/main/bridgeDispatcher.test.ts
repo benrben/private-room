@@ -187,6 +187,8 @@ describe("searchableMcpTools / mcpSearchScore / searchMcpEntries", () => {
     const entries = searchableMcpTools(routes);
     const results = searchMcpEntries(entries, "stock price", undefined);
     expect(results[0]?.tool).toBe("acme_stock_price");
+    expect(mcpSearchScore(entries[0]!, ["acme"])).toBe(11);
+    expect(mcpSearchScore(entries[1]!, ["price"])).toBe(1);
   });
 
   it("filters by connector name", () => {
@@ -197,10 +199,23 @@ describe("searchableMcpTools / mcpSearchScore / searchMcpEntries", () => {
   });
 
   it("ties break alphabetically by tool id", () => {
-    const routes = [route("zzz_tool", "s", "widget"), route("aaa_tool", "s", "widget")];
+    const routes = [
+      route("bbb_tool", "s", "widget"),
+      route("aaa_tool", "s", "widget"),
+      route("ccc_tool", "s", "widget"),
+    ];
     const entries = searchableMcpTools(routes);
     const results = searchMcpEntries(entries, "widget", undefined);
-    expect(results.map((r) => r.tool)).toEqual(["aaa_tool", "zzz_tool"]);
+    expect(results.map((r) => r.tool)).toEqual(["aaa_tool", "bbb_tool", "ccc_tool"]);
+  });
+
+  it("sorts lower-scored input ahead of a later higher-scored entry", () => {
+    const routes = [
+      route("low", "one", "stock"),
+      route("high_stock", "two", "stock"),
+    ];
+    expect(searchMcpEntries(searchableMcpTools(routes), "stock", undefined).map((entry) => entry.tool))
+      .toEqual(["high_stock", "low"]);
   });
 
   it("an empty query matches everything (score 1)", () => {
@@ -229,6 +244,8 @@ describe("scopedSpecs / tierToolNames / roomToolNamesWith", () => {
     const names = scopedSpecs(true, LOCAL_ENGINE).map((t) => t.name);
     for (const expected of [
       "ui_snapshot",
+      "read_skin",
+      "update_skin_draft",
       "start_file_pass",
       "list_scripts",
       "studio_flashcards",

@@ -156,6 +156,24 @@ def intents(agent: str) -> list[str]:
             "switch to dark mode", "show me what's on screen", "scroll down a bit",
             "take me to the dashboard", "close this panel",
         ]
+    if agent == "app.design":
+        return [
+            "make the app warmer and more editorial",
+            "use a calm blue palette with softer corners",
+            "make the type larger and easier to read",
+            "give the canvas a subtle dotted texture",
+            "make the workspace denser without changing the content",
+            "widen the file sidebar and narrow the assistant",
+            "switch the interface to a high-contrast monochrome look",
+            "try a playful rounded skin as a draft",
+            "undo that last design change",
+            "check whether this theme has enough contrast",
+            "save this skin as Focus Blue",
+            "show me the current skin settings",
+            "change only the light-mode background",
+            "reduce motion across the app",
+            "use a serif display face but keep controls sans serif",
+        ]
     if agent == "jobs.run":
         return [f"translate {x} to Hebrew" for x in f[:6]] + [
             f"summarize all of {x}" for x in f[:6]
@@ -520,6 +538,45 @@ REPLIES: dict[str, Any] = {
     "view_file_image": lambda a: f'Image receipt: "{_a(a, "name", default="diagram.png")}"; '
     "SHA-256 0c4a7f82737a7a155821afbab1dadb57bcee5decc9e06f64a0ec9f210a3c5a9d; "
     "1280×720 PNG.",
+    # --- skin studio ------------------------------------------------------
+    "read_skin": json.dumps(
+        {
+            "mode": "together",
+            "agentCanSave": False,
+            "revision": 7,
+            "dirty": True,
+            "validation": {"valid": True, "errors": [], "warnings": []},
+            "recentChanges": [
+                {"actor": "user", "label": "Warmer accent", "revision": 7}
+            ],
+        }
+    ),
+    "update_skin_draft": lambda a: json.dumps(
+        {
+            "updated": True,
+            "saved": False,
+            "revision": int(a.get("expected_revision", 0)) + 1,
+            "label": _a(a, "label", default="Updated visual skin"),
+        }
+    ),
+    "undo_skin_change": lambda a: json.dumps(
+        {
+            "undone": True,
+            "saved": False,
+            "revision": int(a.get("expected_revision", 0)) + 1,
+        }
+    ),
+    "validate_skin": json.dumps(
+        {"valid": True, "errors": [], "warnings": [], "contrast": 7.4}
+    ),
+    "save_skin": lambda a: json.dumps(
+        {
+            "saved": True,
+            "active": True,
+            "name": _a(a, "name", default="Focus Blue"),
+            "revision": int(a.get("expected_revision", 0)),
+        }
+    ),
     # --- transcription -----------------------------------------------------
     "stt_status": "speech model ready (whisper-large-v3, on this Mac).",
     "retranscribe_file": lambda a: f"re-transcribing {_a(a, 'name', default='talk.mp4')} on this "
@@ -627,6 +684,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "creator.studio",
         "creator.draw",
         "app.ui",
+        "app.design",
     ),
 }
 

@@ -95,6 +95,11 @@ _LABELS: dict[str, str] = {
     "ui_act": "Operated the app",
     "view_screenshot": "Looked at the screen",
     "view_media_frame": "Looked at a video frame",
+    "read_skin": "Read the visual skin",
+    "update_skin_draft": "Changed the skin draft",
+    "undo_skin_change": "Undid a skin change",
+    "validate_skin": "Checked the skin",
+    "save_skin": "Saved and applied the skin",
     # ADD-32: the whole-file pass — durable background reading.
     "start_file_pass": "Started a whole-file pass",
     "job_status": "Checked the background jobs",

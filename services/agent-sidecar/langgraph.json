@@ -11,6 +11,7 @@
     "agent.chat.web": "devtools.studio:CHAT_WEB",
     "agent.chat.browse": "devtools.studio:CHAT_BROWSE",
     "agent.app.ui": "devtools.studio:APP_UI",
+    "agent.app.design": "devtools.studio:APP_DESIGN",
     "agent.jobs.run": "devtools.studio:JOBS_RUN",
     "agent.jobs.workflows": "devtools.studio:JOBS_WORKFLOWS",
     "agent.scripts.run": "devtools.studio:SCRIPTS_RUN",

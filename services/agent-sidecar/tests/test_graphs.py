@@ -1111,6 +1111,21 @@ async def test_stage_catalog_restores_its_full_box_and_reoffers_only_a_missing_v
     assert missed_available["stage_retried"] is True
 
 
+def test_graphs_facade_advances_both_available_and_absent_stages() -> None:
+    """The compatibility facade must preserve the stage cursor contract."""
+    from arcelle_sidecar.graphs import _next_stage_catalog
+
+    flow = Flow(stages=("web_search", "fetch_page"))
+    complete_box = [tool.to_ollama() for tool in specs(["web_search", "fetch_page"])]
+
+    available = _next_stage_catalog({}, flow, 1, complete_box)  # type: ignore[arg-type]
+    assert available["stage"] == 2
+    assert [tool["function"]["name"] for tool in available["tools"]] == ["fetch_page"]
+
+    absent = _next_stage_catalog({}, flow, 1, complete_box[:1])  # type: ignore[arg-type]
+    assert absent == {"stage": 2, "full_tools": complete_box[:1]}
+
+
 def test_chain_stage_routes_a_declined_stage_back_to_the_chain() -> None:
     """Structural guard for the above — the behavioural test could be satisfied
     by a model script that simply never declines."""

@@ -62,6 +62,7 @@ describe("workspace area file ownership", () => {
 
   it("keeps runtime area and file classifiers precise", () => {
     expect(isWorkArea("browser")).toBe(true);
+    expect(isWorkArea("skin")).toBe(true);
     expect(isWorkArea("retired-area")).toBe(false);
     expect(isSketchFile(file("sketch", "drawing.sketch"))).toBe(true);
     expect(isCreationFile(file("creation", "image.png", { originDestination: "create" }))).toBe(true);

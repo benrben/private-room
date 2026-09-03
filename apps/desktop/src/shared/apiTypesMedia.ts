@@ -34,6 +34,11 @@ export interface AgentUiRequest {
     | "ui_act"
     | "view_screenshot"
     | "media_frame"
+    | "skin_read"
+    | "skin_update"
+    | "skin_undo"
+    | "skin_validate"
+    | "skin_save"
     // BROWSE-1: the OUTBOUND privacy door. Unlike the others this is not
     // performed by the DOM driver — it needs a human answer, so effects.ts
     // intercepts it and queues a consent card.

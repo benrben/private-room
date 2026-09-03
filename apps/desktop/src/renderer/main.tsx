@@ -4,6 +4,7 @@ import App from "./App";
 import { checkForUpdatesQuietly } from "./updater";
 import { initTheme } from "./theme";
 import { initInterface } from "./settings/useInterfaceSettings";
+import { initSkin } from "./skin/skinStore";
 import { warmRichPlugins } from "./viewers/markdownRich";
 import ErrorBoundary from "./shell/ErrorBoundary";
 
@@ -14,6 +15,9 @@ initTheme();
 // it a compact room opens comfortable for one frame and then snaps, which is
 // exactly the flash initTheme exists to prevent.
 initInterface();
+// The saved visual skin is another device-wide design layer. It comes after
+// theme/density so its allow-listed tokens intentionally win before paint.
+initSkin();
 
 // Maths and syntax highlighting live in their own chunk so they cost nothing
 // at cold start; fetch it once the window is idle, so the first note or chat

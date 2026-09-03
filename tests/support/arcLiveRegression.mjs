@@ -28,7 +28,7 @@ const GOLDEN_VIDEO_B64 =
 
 const CANONICAL_SPECIALISTS = [
   "file", "scripts", "transcribe", "video", "studio", "sketch", "web", "browse",
-  "app", "jobs", "workflows", "skills", "skillbuilder", "connector", "connectorsetup",
+  "app", "design", "jobs", "workflows", "skills", "skillbuilder", "connector", "connectorsetup",
 ];
 
 export async function runArcLiveRegression({ window, invoke, waitFor, temp, log }) {
@@ -47,7 +47,7 @@ export async function runArcLiveRegression({ window, invoke, waitFor, temp, log 
   await window.getByTitle("Send this turn to one specialist agent").click();
   const specialistOptions = window.locator('#ac-listbox [role="option"]');
   await waitFor(async () => (await specialistOptions.count()) === 15, "ARC-001 specialist menu");
-  assert.equal(await window.getByText("15 specialists", { exact: true }).count(), 1);
+  assert.equal(await window.getByText("16 specialists", { exact: true }).count(), 1);
   for (const key of ["web", "browse", "connector"]) {
     const row = specialistOptions.filter({
       has: window.getByText(`*${key}`, { exact: true }),

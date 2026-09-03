@@ -14,6 +14,7 @@ import {
   mcpManagementToolsSpecs,
   externalAgentToolsSpecs,
   scriptToolsSpecs,
+  skinToolsSpecs,
   studioToolsSpecs,
   transcribeToolsSpecs,
   toolsCatalog,
@@ -175,6 +176,7 @@ export function builtinParamSchemas(): Map<string, Record<string, unknown>> {
   // validation table, not a catalog, so breadth is correct here.
   absorb(toolsCatalog(true));
   absorb(uiToolsSpecs());
+  absorb(skinToolsSpecs());
   absorb(browseToolsSpecs());
   absorb(jobToolsSpecs());
   absorb(workflowToolsSpecs());

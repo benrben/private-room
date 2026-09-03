@@ -485,7 +485,16 @@ export interface ExecToolDeps {
   runStudioDeps?: RunStudioDeps;
   /** Live renderer driver for app controls, screenshots, and staged media frames. */
   agentUi?: (
-    kind: "ui_snapshot" | "ui_act" | "view_screenshot" | "media_frame",
+    kind:
+      | "ui_snapshot"
+      | "ui_act"
+      | "view_screenshot"
+      | "media_frame"
+      | "skin_read"
+      | "skin_update"
+      | "skin_undo"
+      | "skin_validate"
+      | "skin_save",
     args: Record<string, unknown>
   ) => Promise<unknown>;
   /** App-wide implementations for tool arms whose engines live in host

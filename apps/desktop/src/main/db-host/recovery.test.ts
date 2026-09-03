@@ -115,14 +115,16 @@ describe("recovery_alphabet_is_drawn_uniformly", () => {
   // alphabet characters and 8 onto the other 23 — ~12.5% bias on every
   // character of the one secret we ask the user to write down. With
   // rejection sampling the letter frequencies converge; with `% 31` they
-  // do not, and this margin is far outside sampling noise at this N. Uses
+  // do not. The larger sample keeps the 4% boundary far outside normal
+  // sampling noise while preserving ample separation from the ~12.5% bug.
+  // Uses
   // real crypto-random bytes (generateRecoveryCode -> node:crypto
   // randomBytes) since the whole point is proving the real sampling is
   // unbiased, not a seeded/fake RNG.
-  it("shows no first-eight-letters bias across 2000 codes", () => {
+  it("shows no first-eight-letters bias across 8000 codes", () => {
     const counts = new Array(31).fill(0) as number[];
     let total = 0;
-    for (let i = 0; i < 2000; i++) {
+    for (let i = 0; i < 8000; i++) {
       for (const c of generateRecoveryCode()) {
         if (c === "-") continue;
         const idx = RECOVERY_ALPHABET.indexOf(c);
@@ -131,7 +133,7 @@ describe("recovery_alphabet_is_drawn_uniformly", () => {
         total++;
       }
     }
-    expect(total).toBe(2000 * 24);
+    expect(total).toBe(8000 * 24);
     const biased = counts.slice(0, 8).reduce((a, b) => a + b, 0);
     const rest = counts.slice(8).reduce((a, b) => a + b, 0);
     const a = biased / 8;

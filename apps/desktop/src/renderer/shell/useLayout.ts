@@ -40,6 +40,34 @@ export type { PaneKey, PresetName, SidePane } from "./layoutState";
 
 export type LayoutApi = ReturnType<typeof useLayout>;
 
+interface SkinLayoutDetail {
+  enabled: boolean;
+  layout: {
+    railWidth: number;
+    sidebarWidth: number;
+    agentWidth: number;
+    paneGap: number;
+  };
+}
+
+function skinRatios(detail: SkinLayoutDetail["layout"], viewportWidth: number): Record<PaneKey, number> {
+  const available = Math.max(760, viewportWidth - detail.railWidth - detail.paneGap * 2);
+  let library = bound(detail.sidebarWidth / available, CLAMP.library.min, CLAMP.library.max);
+  let ai = bound(detail.agentWidth / available, CLAMP.ai.min, CLAMP.ai.max);
+  const center = 1 - library - ai;
+  if (center < CLAMP.centerMin) {
+    const reducibleLibrary = library - CLAMP.library.min;
+    const reducibleAi = ai - CLAMP.ai.min;
+    const reducible = reducibleLibrary + reducibleAi;
+    const needed = CLAMP.centerMin - center;
+    if (reducible > 0) {
+      library -= needed * (reducibleLibrary / reducible);
+      ai -= needed * (reducibleAi / reducible);
+    }
+  }
+  return { library, center: 1 - library - ai, ai };
+}
+
 /** The pane layout state machine: ratios, true collapse, focus/maximize,
  * reset, per-room persistence, ⌘1/2/3, and the narrow single-pane fallback.
  * Collapse is real — hidden panes and their splitters get 0px tracks. */
@@ -71,6 +99,8 @@ export function useLayout(roomPath: string) {
   }));
   const [focusPane, setFocusPane] = useState<PaneKey | null>(null);
   const [dragging, setDragging] = useState<"a" | "b" | null>(null);
+  const [skinPaneGap, setSkinPaneGap] = useState(5);
+  const preSkinRatios = useRef<Record<PaneKey, number> | null>(null);
   /** The rail showing icon + full label. Persisted like the ratios — it's a
    * standing preference, not a transient mode — and ON by default: navigation
    * a first-time reader has to hover to identify is not navigation. See
@@ -112,6 +142,27 @@ export function useLayout(roomPath: string) {
     const onChange = () => setIsNarrow(mq.matches);
     mq.addEventListener("change", onChange);
     return () => mq.removeEventListener("change", onChange);
+  }, []);
+
+  useEffect(() => {
+    const onSkinLayout = (event: Event) => {
+      const detail = (event as CustomEvent<SkinLayoutDetail>).detail;
+      if (!detail?.layout) return;
+      if (!detail.enabled) {
+        const previous = preSkinRatios.current;
+        preSkinRatios.current = null;
+        setSkinPaneGap(5);
+        if (previous) setRatios(previous);
+        return;
+      }
+      setRatios((current) => {
+        if (!preSkinRatios.current) preSkinRatios.current = { ...current };
+        return skinRatios(detail.layout, window.innerWidth);
+      });
+      setSkinPaneGap(bound(detail.layout.paneGap, 0, 24));
+    };
+    window.addEventListener("arcelle-skin-layout", onSkinLayout);
+    return () => window.removeEventListener("arcelle-skin-layout", onSkinLayout);
   }, []);
 
   useEffect(() => {
@@ -180,10 +231,10 @@ export function useLayout(roomPath: string) {
       "--left-track": track("library"),
       "--center-track": track("center"),
       "--right-track": track("ai"),
-      "--split-a": showSplitA ? "5px" : "0px",
-      "--split-b": showSplitB ? "5px" : "0px",
+      "--split-a": showSplitA ? `${skinPaneGap}px` : "0px",
+      "--split-b": showSplitB ? `${skinPaneGap}px` : "0px",
     } as CSSProperties;
-  }, [visible, ratios, showSplitA, showSplitB]);
+  }, [visible, ratios, showSplitA, showSplitB, skinPaneGap]);
 
   /** Has the reader said anything about the AI column this session? Set by
    * every path a PERSON can take to it — the rail button, ⌘3, a collapse

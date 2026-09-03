@@ -62,8 +62,12 @@ function installDom(markup = "<html><body></body></html>") {
     Reflect.set(globalThis, key, Reflect.get(window, key));
   }
   class FakeMouseEvent extends window.Event {
-    constructor(type: string, init?: EventInit) {
+    readonly clientX: number;
+    readonly clientY: number;
+    constructor(type: string, init?: MouseEventInit) {
       super(type, init);
+      this.clientX = init?.clientX ?? 0;
+      this.clientY = init?.clientY ?? 0;
     }
   }
   Reflect.set(globalThis, "MouseEvent", FakeMouseEvent);
@@ -257,7 +261,20 @@ describe("agent UI driver", () => {
       value: 700,
     });
     const clicked = vi.fn();
+    const pointerPosition = vi.fn();
     click.addEventListener("click", clicked);
+    click.addEventListener("pointerdown", (event) => pointerPosition((event as PointerEvent).clientX, (event as PointerEvent).clientY));
+
+    const boundaryScroller = document.createElement("div");
+    Object.defineProperties(boundaryScroller, {
+      clientHeight: { configurable: true, value: 100 },
+      scrollHeight: { configurable: true, value: 100 },
+      scrollBy: { configurable: true, value: vi.fn() },
+    });
+    boundaryScroller.setAttribute("data-overflow-y", "auto");
+    const pageScroll = document.querySelector('[aria-label="Page scroll"]');
+    pageScroll?.parentElement?.appendChild(boundaryScroller);
+    if (pageScroll) boundaryScroller.appendChild(pageScroll);
 
     const result = await snapshot();
     if (!result.elements) throw new Error(JSON.stringify(result));
@@ -285,12 +302,14 @@ describe("agent UI driver", () => {
     await expect(handleAgentUiRequest(request("ui_act", { mark: clickMark, action: "click" })))
       .resolves.toEqual(expect.objectContaining({ done: true }));
     expect(clicked).toHaveBeenCalledOnce();
+    expect(pointerPosition).toHaveBeenCalledWith(60, 25);
     await expect(handleAgentUiRequest(request("ui_act", { mark: scrollMark, action: "scroll", text: "up" })))
       .resolves.toEqual(expect.objectContaining({ done: true, description: expect.stringContaining("Scrolled up") }));
     expect(scroller.scrollBy).toHaveBeenCalledWith({ top: -80, behavior: "auto" });
     await expect(handleAgentUiRequest(request("ui_act", { mark: pageScrollMark, action: "scroll", text: "down" })))
       .resolves.toEqual(expect.objectContaining({ done: true, description: expect.stringContaining("Scrolled down") }));
     expect(pageScrollBy).toHaveBeenCalledWith({ top: 560, behavior: "auto" });
+    expect(boundaryScroller.scrollBy).not.toHaveBeenCalled();
     await expect(handleAgentUiRequest(request("ui_act", { mark: searchMark, action: "set" })))
       .resolves.toEqual({ error: 'Action "set" needs a "text" argument.' });
     await expect(handleAgentUiRequest(request("ui_act", { mark: sortMark, action: "set", text: "missing" })))
@@ -333,7 +352,7 @@ describe("agent UI driver", () => {
     const secondCanvas = document.createElement("canvas");
     Object.defineProperties(firstCanvas, { width: { configurable: true, value: 100 }, height: { configurable: true, value: 80 } });
     Object.defineProperties(secondCanvas, { width: { configurable: true, value: 200 }, height: { configurable: true, value: 120 } });
-    setRect(firstCanvas, { width: 20, height: 20 });
+    setRect(firstCanvas, { left: 1190, right: 1210, top: 790, bottom: 810, width: 20, height: 20 });
     setRect(secondCanvas, { width: 40, height: 40 });
     pane.append(firstCanvas, secondCanvas);
     await handleAgentUiRequest(request("view_screenshot"));
@@ -350,6 +369,8 @@ describe("agent UI driver", () => {
     mocks.grabFrame.mockRejectedValueOnce(new Error("frame failed"));
     await expect(handleAgentUiRequest(request("media_frame", { token: "token" })))
       .resolves.toEqual({ error: "frame failed" });
+    await expect(handleAgentUiRequest(request("skin_validate")))
+      .resolves.toMatchObject({ valid: true, revision: expect.any(Number) });
     await expect(handleAgentUiRequest(request("browse_consent")))
       .resolves.toEqual({ error: 'Unknown agent UI request kind "browse_consent".' });
   });

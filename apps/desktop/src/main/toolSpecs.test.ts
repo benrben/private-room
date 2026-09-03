@@ -18,6 +18,7 @@ import {
   outboundUrlRefusal,
   resolveLocalGenerateModel,
   scriptToolsSpecs,
+  skinToolsSpecs,
   studioToolsSpecs,
   toolsCatalog,
   transcribeToolsSpecs,
@@ -74,6 +75,32 @@ describe("tool group builders", () => {
 
   it("ui_tools_specs names all four UI/perception tools", () => {
     expect(names(uiToolsSpecs())).toEqual(["ui_snapshot", "ui_act", "view_screenshot", "view_media_frame"]);
+  });
+
+  it("skin_tools_specs exposes the typed design workflow without arbitrary CSS", () => {
+    expect(names(skinToolsSpecs())).toEqual([
+      "read_skin",
+      "update_skin_draft",
+      "undo_skin_change",
+      "validate_skin",
+      "save_skin",
+    ]);
+    const update = skinToolsSpecs().find((spec) => spec.function.name === "update_skin_draft")!;
+    expect(JSON.stringify(update.function.parameters)).not.toContain("css");
+    expect(update.function.parameters).toMatchObject({
+      properties: {
+        patch: {
+          properties: {
+            typography: { properties: { userFont: { type: "string" }, headingTracking: { minimum: -0.08, maximum: 0.08 } } },
+            canvas: { properties: { gridGap: { minimum: 12, maximum: 40 }, surfaceOpacity: { minimum: 0.35, maximum: 1 }, blur: { maximum: 40 } } },
+            shape: { properties: { redrawOffset: { minimum: 0, maximum: 6 }, cornerStyle: { enum: ["round", "squircle"] } } },
+            motion: { properties: { pressScale: { minimum: 0.94, maximum: 1 }, curve: { enum: ["calm", "snappy", "spring"] } } },
+            accessibility: { properties: { transparency: { enum: ["system", "reduce", "allow"] }, contrast: { enum: ["system", "more", "normal"] } } },
+          },
+        },
+      },
+    });
+    expect((update.function.parameters.required as string[])).toContain("expected_revision");
   });
 
   it("media_tools_specs is the view_media_frame subset of ui_tools_specs", () => {

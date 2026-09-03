@@ -10,12 +10,13 @@ vi.mock("../icons", () => ({
   LinkIcon: () => null,
   MemoryIcon: () => null,
   MicIcon: () => null,
+  PencilIcon: () => null,
   ScriptIcon: () => null,
   SketchIcon: () => null,
   WorkflowsIcon: () => null,
 }));
 
-import { DEFAULT_PINNED, defaultPrefs, loadPrefs, moveWithin, type NavPrefs } from "./navPrefs";
+import { DEFAULT_PINNED, areaDef, areaLabel, defaultPrefs, loadPrefs, moveWithin, type NavPrefs } from "./navPrefs";
 
 const originalStorage = Reflect.get(globalThis, "localStorage");
 
@@ -50,6 +51,7 @@ describe("loadPrefs", () => {
     const prefs = loadPrefs();
     expect(prefs.order.slice(0, 3)).toEqual(["files", "files", "home"]);
     expect(prefs.order).toContain("memory");
+    expect(prefs.order).toContain("skin");
     expect(prefs.pinned).toEqual([]);
   });
 
@@ -95,5 +97,14 @@ describe("moveWithin", () => {
     expect(moveWithin(prefs, "home", -1)).toBe(prefs);
     expect(moveWithin(prefs, "skills", 1)).toBe(prefs);
     expect(moveWithin(prefs, "browser", 1)).toBe(prefs);
+  });
+});
+
+describe("navigation catalog lookups", () => {
+  it("resolves registered destinations and labels unknown work areas as Home", () => {
+    expect(areaDef("skin")).toMatchObject({ key: "skin", label: "Skin Studio" });
+    expect(areaLabel("skin")).toBe("Skin Studio");
+    expect(areaLabel("future" as never)).toBe("Home");
+    expect(() => areaDef("future" as never)).toThrow('no sidebar destination registered for "future"');
   });
 });

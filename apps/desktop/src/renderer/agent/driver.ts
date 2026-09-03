@@ -12,6 +12,7 @@ import {
   truncate,
   uiSnapshot,
 } from "./driverSnapshot";
+import { handleSkinAgentRequest, type SkinAgentRequestKind } from "../skin/skinAgentBridge";
 
 /**
  * ADD-25: the frontend half of the agent↔UI bridge. The backend emits an
@@ -45,6 +46,9 @@ export async function handleAgentUiRequest(
 async function knownAgentUiRequest(
   req: AgentUiRequest,
 ): Promise<Record<string, unknown>> {
+  if (isSkinRequest(req.kind)) {
+    return handleSkinAgentRequest(req.kind, req.args);
+  }
   switch (req.kind) {
     case "ui_snapshot":
       return uiSnapshot();
@@ -58,6 +62,14 @@ async function knownAgentUiRequest(
   // Unreachable for a well-typed request; a newer backend could still send
   // a kind this build doesn't know.
   return { error: `Unknown agent UI request kind "${String(req.kind)}".` };
+}
+
+const SKIN_REQUESTS: ReadonlySet<string> = new Set([
+  "skin_read", "skin_update", "skin_undo", "skin_validate", "skin_save",
+]);
+
+function isSkinRequest(kind: AgentUiRequest["kind"]): kind is SkinAgentRequestKind {
+  return SKIN_REQUESTS.has(kind);
 }
 
 // -------------------------------------------------------------------- act

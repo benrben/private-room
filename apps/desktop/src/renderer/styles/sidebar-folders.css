@@ -13,6 +13,7 @@
 
 .folder-group {
   margin-top: 2px;
+  background: transparent;
 }
 
 .folder-head {
@@ -25,7 +26,7 @@
 }
 
 .folder-head:hover {
-  background-color: var(--hover);
+  background-color: var(--hover-glass);
 }
 
 /* ADD-16: drag-a-file-onto-a-folder (and onto the Files header to un-group).
@@ -137,7 +138,7 @@
 }
 
 /* ----- File-row "Move to…" menu -----
-   It floats over the list, so it is opaque and casts the system shadow. */
+   It floats over the list, so it uses the raised glass material and shadow. */
 
 .move-wrap {
   position: relative;
@@ -152,7 +153,9 @@
   min-width: 150px;
   margin-top: 2px;
   padding: var(--sp-1);
-  background: var(--raised);
+  background: var(--raised-glass);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
   border: 1px solid var(--rule-strong);
   border-radius: var(--radius);
   box-shadow:

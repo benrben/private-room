@@ -1,8 +1,9 @@
 {
   "source": {
     "include": [
-      "apps/desktop/src/**",
-      "services/agent-sidecar/src/**"
+      "apps/desktop/src/**/*.ts",
+      "apps/desktop/src/**/*.tsx",
+      "services/agent-sidecar/src/**/*.py"
     ]
   },
   "test": {
@@ -13,6 +14,15 @@
       "--report",
       "coverage/quality-metrics.json"
     ],
+    "timeout_seconds": 1200
+  },
+  "mutation": {
+    "test_command": [
+      "python3",
+      "scripts/quality-mutation-tests.py"
+    ],
+    "workers": "auto",
+    "max_mutants": 0,
     "timeout_seconds": 1200
   },
   "metrics": {

@@ -21,6 +21,7 @@ from arcelle_sidecar.config import (
 )
 from arcelle_sidecar.llm import LlmError
 from arcelle_sidecar.messages import Message, ToolCall
+from arcelle_sidecar.agents import REGISTRY
 from arcelle_sidecar.server import RunRegistry, create_app
 
 BODY: dict[str, Any] = {
@@ -72,7 +73,7 @@ async def test_agents_answers_the_composer_menu_from_the_served_names() -> None:
         )
     assert resp.status_code == 200
     rows = resp.json()["agents"]
-    assert len(rows) == 15
+    assert len(rows) == sum(not spec.main for spec in REGISTRY)
     assert {r["key"] for r in rows} >= {"file", "web"}
     # EVERY field, on every row: the host deserializes these into a struct with
     # no optional members (`agent.rs Specialist`), so a row missing one does not
@@ -123,7 +124,7 @@ async def test_agents_on_a_bridge_that_served_nothing_returns_the_stable_catalog
     async with client_for(app) as c:
         resp = await c.post("/agents", json={"web_enabled": True, "served_names": []})
     rows = resp.json()["agents"]
-    assert len(rows) == 15
+    assert len(rows) == sum(not spec.main for spec in REGISTRY)
     assert all(r["capability"] == "unavailable" for r in rows)
     assert all(r["localHandoff"] for r in rows if r["key"] != "connector")
 

@@ -376,7 +376,7 @@
   line-height: 1.7;
 }
 .md-body > h1:first-child {
-  font-family: Georgia, "Times New Roman", serif;
+  font-family: var(--display);
   font-size: clamp(26px, 3cqw, 36px);
   font-weight: 500;
   letter-spacing: -0.02em;

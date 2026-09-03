@@ -10,6 +10,7 @@ vi.mock("../rooms/helpers", () => ({
 }));
 
 import { AgentGraph } from "./AgentGraph";
+import { sameEdges, type Edge } from "./agentGraphShared";
 
 const { act, createElement } = React;
 const globalKeys = [
@@ -159,6 +160,16 @@ afterEach(() => {
 });
 
 describe("AgentGraph", () => {
+  it("compares edge identity and ignores only sub-pixel position jitter", () => {
+    const edge: Edge = { key: "files", status: "running", label: "Files", x1: 10, y1: 20, x2: 30, y2: 40, dx: 20, lx: 1, ly: 2 };
+    expect(sameEdges([edge], [{ ...edge, x1: 10.49, y1: 19.51, x2: 30.49, y2: 39.51 }])).toBe(true);
+    expect(sameEdges([edge], [{ ...edge, x1: 10.5 }])).toBe(false);
+    expect(sameEdges([edge], [{ ...edge, key: "web" }])).toBe(false);
+    expect(sameEdges([edge], [{ ...edge, status: "done" }])).toBe(false);
+    expect(sameEdges([edge], [{ ...edge, label: "Web" }])).toBe(false);
+    expect(sameEdges([edge], [])).toBe(false);
+  });
+
   it("shows the roster and opens a selected agent's report, steps, elapsed time, and close control", async () => {
     hooks.prefersReducedMotion.mockReturnValue(true);
     const timings: {

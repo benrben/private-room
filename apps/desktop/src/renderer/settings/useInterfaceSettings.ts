@@ -1,6 +1,7 @@
 import { useCallback, useSyncExternalStore } from "react";
 import { forgetSavedLayouts } from "../shell/useLayout";
 import { resetNavPrefs } from "../shell/navPrefs";
+import { resetSkinWorkspace } from "../skin/skinStore";
 
 /** How much room the interface gives itself. */
 export type Density = "comfortable" | "compact";
@@ -121,6 +122,7 @@ export function useInterfaceSettings() {
     setTexture("subtle");
     resetNavPrefs();
     forgetSavedLayouts();
+    resetSkinWorkspace();
   }, [setDensity, setTexture]);
 
   return { density, setDensity, texture, setTexture, resetAll };

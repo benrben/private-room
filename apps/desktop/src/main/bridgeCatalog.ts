@@ -58,7 +58,7 @@
  */
 import type { ToolScope, ToolSpec } from "./mcpBridge.js";
 import { includeMcp } from "./mcpBridge.js";
-import { browseToolsSpecs, downloadToolsSpecs, drawToolsSpecs, externalAgentToolsSpecs, jobToolsSpecs, mcpManagementToolsSpecs, mediaToolsSpecs, organizeToolsSpecs, scriptToolsSpecs, studioToolsSpecs, toolsCatalog, transcribeToolsSpecs, uiToolsSpecs, workflowToolsSpecs, type McpRoute, type OllamaToolSpec, type WebLanes } from "./toolSpecs.js";
+import { browseToolsSpecs, downloadToolsSpecs, drawToolsSpecs, externalAgentToolsSpecs, jobToolsSpecs, mcpManagementToolsSpecs, mediaToolsSpecs, organizeToolsSpecs, scriptToolsSpecs, skinToolsSpecs, studioToolsSpecs, toolsCatalog, transcribeToolsSpecs, uiToolsSpecs, workflowToolsSpecs, type McpRoute, type OllamaToolSpec, type WebLanes } from "./toolSpecs.js";
 import { servedToolsWith } from "./bridgeRuntime.js";
 
 
@@ -183,6 +183,8 @@ const ARCELLE_TOOL_ANNOTATIONS: ReadonlyMap<string, ToolAnnotationValues> = new 
       "ui_snapshot",
       "view_screenshot",
       "view_media_frame",
+      "read_skin",
+      "validate_skin",
       "local_generate",
       "list_mcps",
       "read_drawing",
@@ -227,6 +229,9 @@ const ARCELLE_TOOL_ANNOTATIONS: ReadonlyMap<string, ToolAnnotationValues> = new 
       "read_recording",
       "test_workflow",
       "ui_act",
+      "update_skin_draft",
+      "undo_skin_change",
+      "save_skin",
       "organize_files",
       "merge_files",
       "save_mcp",
@@ -442,8 +447,7 @@ function scoredMcpEntries(
 
 function compareMcpEntries([scoreA, a]: [number, SearchableMcpTool], [scoreB, b]: [number, SearchableMcpTool]): number {
   if (scoreB !== scoreA) return scoreB - scoreA;
-  if (a.tool < b.tool) return -1;
-  return a.tool > b.tool ? 1 : 0;
+  return a.tool.localeCompare(b.tool);
 }
 
 
@@ -513,6 +517,7 @@ export function scopedSpecs(webEnabled: boolean, scope: ToolScope): ToolSpec[] {
   const list = builtinMcpTools(webEnabled);
   const extras: OllamaToolSpec[] = [];
   appendToolsWhen(extras, includeUiTools(scope), uiToolsSpecs);
+  appendToolsWhen(extras, includeUiTools(scope), skinToolsSpecs);
   appendToolsWhen(extras, includeJobTools(scope), jobScopedTools);
   appendToolsWhen(extras, includeOrganizeTools(scope), organizeToolsSpecs);
   appendToolsWhen(extras, includeMcpManagementTools(scope), mcpManagementToolsSpecs);

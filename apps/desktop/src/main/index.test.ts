@@ -313,6 +313,7 @@ function fakeElectron(overrides?: {
       setPath: vi.fn((name: string, value: string) => {
         if (name === "userData") userDataDir = value;
       }),
+      setName: vi.fn(),
       quit: vi.fn(),
       isPackaged: false,
     } as unknown as BootstrapElectron["app"],
@@ -746,8 +747,10 @@ describe("bootstrap", () => {
 describe("the native application menu", () => {
   it("builds menu.ts's own template and installs it with Menu.setApplicationMenu", async () => {
     const electron = fakeElectron();
+    (electron.app as { isPackaged: boolean }).isPackaged = true;
     await bootstrap({ electron, resourcesPath: null });
 
+    expect(electron.app.setName).toHaveBeenCalledWith("Arcelle");
     expect(electron.Menu.buildFromTemplate).toHaveBeenCalledOnce();
     const built = (
       electron.Menu.buildFromTemplate as unknown as { mock: { results: { value: unknown }[] } }
@@ -768,6 +771,13 @@ describe("the native application menu", () => {
       enabled: false,
       checked: false,
     });
+  });
+
+  it("keeps the development Electron identity used by macOS capture authorization", async () => {
+    const electron = fakeElectron();
+    await bootstrap({ electron, resourcesPath: null });
+
+    expect(electron.app.setName).not.toHaveBeenCalled();
   });
 
   it("a menu row's click reaches the window as a menu-action event", async () => {

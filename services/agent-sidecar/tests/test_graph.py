@@ -71,10 +71,15 @@ from arcelle_sidecar.prompts import (
     UI_PROMPT,
     WORKFLOWS_PROMPT,
     duplicate_call_note,
+    tag_available_clause,
 )
 from arcelle_sidecar.routing import MCP_MANAGEMENT_TOOL_NAMES, SKILL_TOOL_NAMES, WRITE_TOOL_NAMES
 
 WRITE_ON = {"write": True, "ui": False, "jobs": False}
+
+
+def test_available_specialists_clause_preserves_exact_tag_list() -> None:
+    assert tag_available_clause(["web", "file"]) == "Try: *web, *file"
 
 
 # --------------------------------------------------------------------------- #

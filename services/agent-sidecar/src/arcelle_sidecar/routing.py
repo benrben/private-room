@@ -134,6 +134,17 @@ UI_TOOL_NAMES: tuple[str, ...] = (
     "view_media_frame",
 )
 
+#: Skin Studio's typed visual-system box. These are separate from app.ui:
+#: changing the skin is a data-model operation with revisions and permissions,
+#: not a sequence of screen clicks.
+DESIGN_TOOL_NAMES: tuple[str, ...] = (
+    "read_skin",
+    "update_skin_draft",
+    "undo_skin_change",
+    "validate_skin",
+    "save_skin",
+)
+
 #: BROWSE-1: the private browser's tools. Mirrors
 #: ``commands::browse::BROWSE_TOOL_NAMES`` on the Rust side — the host only
 #: serves these when the room's web setting is on, so a browser box is

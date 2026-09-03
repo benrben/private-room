@@ -230,12 +230,19 @@ describe("useLayout", () => {
 
     await act(async () => current().toggleFocus("library"));
     expect(current().layoutLabel).toBe("Sidebar focus");
+    expect(current().visible).toEqual(["library"]);
     await act(async () => current().togglePane("ai"));
     expect(current().focusPane).toBeNull();
     expect(current().hidden.ai).toBe(false);
     await act(async () => current().toggleFocus("library"));
     expect(current().layoutLabel).toBe("Sidebar focus");
-    await act(async () => current().toggleFocus("library"));
+    await act(async () => current().showPane("ai"));
+    expect(current().focusPane).toBeNull();
+    await act(async () => current().toggleFocus("ai"));
+    expect(current().focusPane).toBe("ai");
+    await act(async () => current().showPane("ai"));
+    expect(current().focusPane).toBe("ai");
+    await act(async () => current().toggleFocus("ai"));
     expect(current().focusPane).toBeNull();
     await act(async () => current().collapsePane("library"));
     await act(async () => current().collapsePane("ai"));
@@ -259,6 +266,12 @@ describe("useLayout", () => {
     expect(current().railExpanded).toBe(false);
     expect(current().railAutoCollapsed).toBe(true);
     await act(async () => current().setFocusedPage(true));
+    expect(current().hidden.ai).toBe(true);
+    await act(async () => current().togglePane("library"));
+    expect(current().hidden.ai).toBe(true);
+    await act(async () => current().toggleFocus("library"));
+    expect(current().hidden.ai).toBe(true);
+    await act(async () => current().collapsePane("library"));
     expect(current().hidden.ai).toBe(true);
     await act(async () => current().setFocusedPage(true));
     await act(async () => current().showPane("ai"));
@@ -285,6 +298,47 @@ describe("useLayout", () => {
     await act(async () => view.root.unmount());
     expect(narrow.removeEventListener).toHaveBeenCalledWith("change", expect.any(Function));
     expect(railNarrow.removeEventListener).toHaveBeenCalledWith("change", expect.any(Function));
+  });
+
+  it("previews skin pane dimensions and restores the reader's prior ratios", async () => {
+    const view = await renderLayout();
+    const original = { ...current().ratios };
+    Object.defineProperty(view.window, "innerWidth", { configurable: true, value: 800 });
+
+    await act(async () => {
+      view.window.dispatchEvent(new view.window.CustomEvent("arcelle-skin-layout", { detail: {} }));
+      view.window.dispatchEvent(new view.window.CustomEvent("arcelle-skin-layout", {
+        detail: {
+          enabled: true,
+          layout: { railWidth: 112, sidebarWidth: 420, agentWidth: 560, paneGap: 40 },
+        },
+      }));
+    });
+    expect(current().ratios.center).toBeGreaterThanOrEqual(0.32);
+    expect(current().ratios.library).toBeCloseTo(0.2993220339);
+    expect(current().ratios.center).toBeCloseTo(0.4);
+    expect(current().ratios.ai).toBeCloseTo(0.3006779661);
+    expect((current().gridStyle as Record<string, string>)["--split-a"]).toBe("24px");
+
+    Object.defineProperty(view.window, "innerWidth", { configurable: true, value: 1400 });
+    await act(async () => view.window.dispatchEvent(new view.window.CustomEvent("arcelle-skin-layout", {
+      detail: {
+        enabled: true,
+        layout: { railWidth: 100, sidebarWidth: 300, agentWidth: 400, paneGap: 10 },
+      },
+    })));
+    expect(current().ratios).toEqual({ library: 0.234375, center: 0.453125, ai: 0.3125 });
+
+    await act(async () => view.window.dispatchEvent(new view.window.CustomEvent("arcelle-skin-layout", {
+      detail: { enabled: false, layout: { railWidth: 84, sidebarWidth: 260, agentWidth: 340, paneGap: 8 } },
+    })));
+    expect(current().ratios).toEqual(original);
+    expect((current().gridStyle as Record<string, string>)["--split-a"]).toBe("5px");
+
+    await act(async () => view.window.dispatchEvent(new view.window.CustomEvent("arcelle-skin-layout", {
+      detail: { enabled: false, layout: { railWidth: 84, sidebarWidth: 260, agentWidth: 340, paneGap: 8 } },
+    })));
+    await act(async () => view.root.unmount());
   });
 
   it("claims only the exact pane shortcut and lets text inputs keep Escape", async () => {
@@ -317,13 +371,16 @@ describe("useLayout", () => {
     const view = await renderLayout();
     await act(async () => current().keyResize("a", 1, false));
     expect(current().ratios.library).toBeCloseTo(0.175);
+    expect(current().ratios.center).toBeCloseTo(0.595);
+    expect(current().ratios.library + current().ratios.center + current().ratios.ai).toBeCloseTo(1);
     await act(async () => current().keyResize("b", -1, true));
     expect(current().ratios.ai).toBeCloseTo(0.27);
+    expect(current().ratios.center).toBeCloseTo(0.555);
 
     const grid = view.host.firstElementChild as HTMLElement;
     Object.defineProperties(grid, {
       getBoundingClientRect: {
-        value: () => ({ left: 0, right: 1000, width: 1000 }),
+        value: () => ({ left: 100, right: 1100, width: 1000 }),
       },
       setPointerCapture: { value: vi.fn() },
       releasePointerCapture: { value: () => { throw new Error("already released"); } },
@@ -336,9 +393,10 @@ describe("useLayout", () => {
     } as never));
     expect(preventDefault).toHaveBeenCalledOnce();
     expect(current().dragging).toBe("a");
-    await act(async () => view.window.dispatchEvent(pointerEvent(view.window, "pointermove", 300)));
+    await act(async () => view.window.dispatchEvent(pointerEvent(view.window, "pointermove", 400)));
     expect(current().ratios.library).toBeCloseTo(0.3);
-    await act(async () => view.window.dispatchEvent(pointerEvent(view.window, "pointerup", 300)));
+    expect(current().ratios.center).toBeCloseTo(0.43);
+    await act(async () => view.window.dispatchEvent(pointerEvent(view.window, "pointerup", 400)));
     expect(current().dragging).toBeNull();
     expect(view.document.body.className).not.toContain("resizing-col");
     await act(async () => current().startDrag("b", {
@@ -346,9 +404,30 @@ describe("useLayout", () => {
       pointerId: 9,
       preventDefault,
     } as never));
-    await act(async () => view.window.dispatchEvent(pointerEvent(view.window, "pointermove", 700)));
-    expect(current().ratios.ai).toBeCloseTo(0.3);
-    await act(async () => view.window.dispatchEvent(pointerEvent(view.window, "pointercancel", 700)));
+    await act(async () => view.window.dispatchEvent(pointerEvent(view.window, "pointermove", 900)));
+    expect(current().ratios.ai).toBeCloseTo(0.2);
+    expect(current().ratios.center).toBeCloseTo(0.5);
+    await act(async () => view.window.dispatchEvent(pointerEvent(view.window, "pointercancel", 900)));
+
+    await act(async () => current().startDrag("a", {
+      currentTarget: grid,
+      pointerId: 9,
+      preventDefault,
+    } as never));
+    await act(async () => view.window.dispatchEvent(pointerEvent(view.window, "pointermove", 1000)));
+    expect(current().ratios.library).toBeCloseTo(0.4);
+    expect(current().ratios.center).toBeCloseTo(0.4);
+    await act(async () => view.window.dispatchEvent(pointerEvent(view.window, "pointerup", 1000)));
+
+    await act(async () => current().startDrag("b", {
+      currentTarget: grid,
+      pointerId: 9,
+      preventDefault,
+    } as never));
+    await act(async () => view.window.dispatchEvent(pointerEvent(view.window, "pointermove", 200)));
+    expect(current().ratios.ai).toBeCloseTo(0.2);
+    expect(current().ratios.center).toBeCloseTo(0.4);
+    await act(async () => view.window.dispatchEvent(pointerEvent(view.window, "pointerup", 200)));
     await act(async () => view.root.unmount());
   });
 

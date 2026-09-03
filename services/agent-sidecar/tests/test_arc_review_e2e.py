@@ -24,7 +24,7 @@ from conftest import (
     specs,
 )
 from arcelle_sidecar import external_llm
-from arcelle_sidecar.agents import ALL_REGISTRY_TOOLS
+from arcelle_sidecar.agents import ALL_REGISTRY_TOOLS, REGISTRY
 from arcelle_sidecar.mcp_client import ToolResult
 from arcelle_sidecar.privacy import cloud_privacy_tool_allowed
 from arcelle_sidecar.server import create_app
@@ -104,7 +104,7 @@ async def test_e2e_arc_004_024_028_capabilities_and_tagged_refusal() -> None:
         )
 
     rows = {row["key"]: row for row in response.json()["agents"]}
-    assert len(rows) == 15
+    assert len(rows) == sum(not spec.main for spec in REGISTRY)
     for tag in ("web", "browse"):
         assert rows[tag]["capability"] == "unavailable"
         assert rows[tag]["capabilityReason"] == "Turn on room internet"

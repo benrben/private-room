@@ -78,6 +78,7 @@ CLOUD_PRIVACY_BLOCKED_TOOLS: frozenset[str] = frozenset(
         "view_media_frame", "view_screenshot", "view_file_image",
         "read_drawing", "browse_look",
         "studio_flashcards", "studio_mindmap", "generate_podcast_script", "draw",
+        "update_skin_draft", "undo_skin_change", "save_skin",
     }
 )
 
@@ -414,7 +415,7 @@ class OutputRedactor:
         )
         # Exact rules win on the same start, and overlaps collapse to the first
         # longest match so a labelled value cannot be partially released.
-        return sorted(found, key=lambda item: (item[0], -(item[1] - item[0])))
+        return sorted(found, key=lambda item: (item[0], -item[1]))
 
     def feed(self, delta: str) -> str:
         if not delta:

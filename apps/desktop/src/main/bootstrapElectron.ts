@@ -31,6 +31,7 @@ export interface BootstrapElectron {
     | "getVersion"
     | "getPath"
     | "setPath"
+    | "setName"
     | "quit"
     | "isPackaged"
   >;
@@ -334,6 +335,12 @@ export async function bootstrap(opts: BootstrapOptions): Promise<BootstrapResult
   const { app, BrowserWindowCtor, screen, ipcMain, Menu, desktopCapturer, dialog, shell } =
     opts.electron;
   const distDir = bootstrapDistDir(opts);
+
+  // The npm workspace name is namespaced for tooling; macOS derives a packaged
+  // application's menu title from Electron's runtime name, so pin the product
+  // name before Electron becomes ready. Development runs keep Electron's host
+  // identity; only the installed product should claim the Arcelle name.
+  if (app.isPackaged) app.setName("Arcelle");
 
   // ---- 1. single-instance lock -------------------------------------------
   claimSingleInstance(app);

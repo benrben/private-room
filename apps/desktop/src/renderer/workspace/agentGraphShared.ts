@@ -15,6 +15,8 @@ export const AGENT_DESCRIPTIONS: Record<string, string> = {
   "chat.browse":
     "Open and operate a web page in the private browser — navigate, read, click and fill in.",
   "app.ui": "See and operate this app's own interface for the user.",
+  "app.design":
+    "Collaborate on the app's visual skin — fonts, colours, canvas, shape, spacing, motion and layout.",
   "jobs.run":
     "Cover an ENTIRE file with a durable background job; report job status.",
   "jobs.workflows": "Author, test, schedule or run saved multi-step workflows.",

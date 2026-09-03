@@ -47,6 +47,14 @@
   --page: #151716; /* matte charcoal, the sheet everything is drawn on */
   --surface: #202321; /* a panel laid on the sheet */
   --raised: #292c29; /* a note lifted off the sheet */
+  --skin-surface-opacity: 86%;
+  --skin-raised-opacity: 94%;
+  --surface-glass: color-mix(in srgb, var(--surface) var(--skin-surface-opacity), transparent);
+  --raised-glass: color-mix(in srgb, var(--raised) var(--skin-raised-opacity), transparent);
+  --hover-glass: color-mix(in srgb, var(--ink) 9%, transparent);
+  --glass-blur: 18px;
+  --glass-saturation: 1.4;
+  --scroll-fade: 18px;
   /* The dotted rule, alpha baked in. Deliberately NOT a color-mix with a
      calc() percentage: WebKit — which is what the app actually ships on —
      rejects calc() inside color-mix()'s percentage, so the grid silently
@@ -154,17 +162,20 @@
 
   /* ----- canonical app surfaces ----- */
   --bg: var(--page);
-  --top: var(--surface); /* top bar */
+  --top: var(--surface-glass); /* top bar */
   --rail: var(--page); /* activity rail sits on the sheet itself */
-  --panel: var(--surface);
-  --panel-2: var(--raised);
+  --panel: var(--surface-glass);
+  --panel-2: var(--raised-glass);
   --editor: var(--page); /* the centre pane IS the sheet — the grid shows */
+  --paper: var(--page);
+  --paper-2: var(--surface-glass);
 
   /* ----- canonical ink ----- */
   --text: var(--ink);
   --text-strong: var(--ink-strong);
   --muted: var(--ink-2);
   --faint: var(--ink-muted);
+  --ink-soft: var(--ink-2);
 
   /* ----- canonical lines ----- */
   --line: var(--rule);
@@ -258,6 +269,10 @@
   --hand: Kalam, "Bradley Hand", "Noteworthy", "Chalkboard SE", cursive;
   --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo,
     monospace;
+  --font-ui: var(--sans);
+  --font-display: var(--display);
+  --font-user: var(--hand);
+  --font-mono: var(--mono);
 
   /* Type scale. The app previously carried ~45 ad-hoc sizes across a px and
      a rem track; these are the rungs. Four tiers with real distance between
@@ -275,6 +290,9 @@
      handwriting from colliding with the line above it. */
   --lh-hand: 1.45;
   --lh-body: 1.55;
+  --tracking-body: 0em;
+  --tracking-heading: -0.02em;
+  --tracking-numeric: -0.02em;
 
   /* ----- shape + rhythm -----
      SYMMETRIC, as of the visual pass. These were four-corner asymmetric
@@ -311,6 +329,7 @@
   --sp-2: 8px;
   --sp-3: 12px;
   --sp-4: 16px;
+  --sp-5: 20px;
   --sp-6: 24px;
   --sp-8: 32px;
 
@@ -319,6 +338,9 @@
   --dur: 200ms;
   --dur-slow: 260ms;
   --ease-pen: cubic-bezier(0.32, 0.72, 0.3, 1);
+  --motion-ease: var(--ease-pen);
+  --press-scale: 0.97;
+  --skin-overscroll: auto;
 
   /* ----- legacy aliases — old rules keep working, on the new palette -----
      A migration debt with a finish line, not a second vocabulary: 107 rules in
@@ -454,6 +476,7 @@
   --sp-2: 6px;
   --sp-3: 9px;
   --sp-4: 12px;
+  --sp-5: 15px;
   --sp-6: 18px;
   --sp-8: 24px;
 

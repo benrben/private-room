@@ -70,6 +70,9 @@ export type WorkArea =
   | "skills"
   | "memory"
   | "connectors"
+  // The device-wide visual system editor. Its draft is local to this Mac and
+  // can be edited by the user, the Design agent, or both.
+  | "skin"
   // Pictures and video, made by whichever connected model can actually make
   // one. Only models a live catalog vouches for are offered.
   | "create"
@@ -92,6 +95,7 @@ export const WORK_AREAS = [
   "skills",
   "memory",
   "connectors",
+  "skin",
   "create",
   "sketch",
   "browser",

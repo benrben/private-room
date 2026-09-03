@@ -190,6 +190,19 @@ def test_output_redactor_uses_one_placeholder_for_an_overlapping_secret() -> Non
     assert "[Protected secret]" in visible
 
 
+def test_output_redactor_orders_same_start_matches_longest_first() -> None:
+    exact = "canary=abcDEF12345678 and its label"
+    redactor = privacy.PrivacyPolicy(
+        active=True, rules=[(exact, "[Whole protected detail]")]
+    ).output_redactor()
+    redactor._buf = exact
+
+    matches = redactor._matches()
+    assert matches[0] == (0, len(exact), "[Whole protected detail]")
+    assert matches[1][0] == 0
+    assert matches[1][1] < matches[0][1]
+
+
 def test_cloud_privacy_allows_safe_media_and_transcript_inspection_only() -> None:
     # Transcript status inspection neither changes room data nor triggers a job.
     assert privacy.cloud_privacy_tool_allowed("stt_status")

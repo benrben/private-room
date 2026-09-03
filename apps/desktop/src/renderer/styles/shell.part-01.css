@@ -383,14 +383,14 @@
      ("Connect") was worse than no visible word at all, so they fall back to
      a native `title` tooltip and 84px is now just resting width, not a fit
      constraint for them. */
-  grid-template-columns: var(--rail-w, 84px) minmax(0, 1fr);
+  grid-template-columns: var(--rail-w, var(--skin-rail-width, 84px)) minmax(0, 1fr);
   transition: grid-template-columns var(--dur-fast) var(--ease-pen);
 }
 /* 192px: wide enough for the longest destination in the list ("Memory &
    scratch pad" at the metadata size, ~128px) beside its icon, and no wider —
    every pixel here comes out of the workspace. */
 .pr-main:has(.activity-rail.is-expanded) {
-  --rail-w: 192px;
+  --rail-w: calc(var(--skin-rail-width, 84px) + 108px);
 }
 @media (prefers-reduced-motion: reduce) {
   .pr-main {
